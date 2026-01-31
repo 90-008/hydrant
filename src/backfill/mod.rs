@@ -244,7 +244,7 @@ impl Worker {
             .ok_or_else(|| miette::miette!("root block missing from CAR"))?;
 
         let commit = jacquard_repo::commit::Commit::from_cbor(root_bytes).into_diagnostic()?;
-        info!("backfilling repo at revision {}", commit.rev);
+        debug!("backfilling repo at revision {}", commit.rev);
 
         // 5. walk mst
         let start = Instant::now();
@@ -384,7 +384,7 @@ impl Worker {
             .event_tx
             .send(db.next_event_id.load(Ordering::SeqCst) - 1);
 
-        info!("marked {did} as synced, draining buffer...");
+        debug!("marked {did} as synced, draining buffer...");
 
         // 7. drain buffer
         let start = Instant::now();
@@ -428,7 +428,7 @@ impl Worker {
             start.elapsed()
         );
 
-        info!("backfill complete for {did}");
+        debug!("backfill complete for {did}");
         Ok(previous_state)
     }
 }
