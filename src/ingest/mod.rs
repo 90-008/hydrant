@@ -75,150 +75,185 @@ impl Ingestor {
     pub async fn run(mut self) -> Result<()> {
         let base_url = Url::parse(&self.relay_host).into_diagnostic()?;
 
-        // 1. load cursor
-        let cursor_key = b"firehose_cursor";
-        let start_cursor = if let Ok(Some(bytes)) =
-            Db::get(self.state.db.cursors.clone(), cursor_key.to_vec()).await
-        {
-            let s = String::from_utf8_lossy(&bytes);
-            debug!("resuming from cursor: {}", s);
-            Some(s.parse::<i64>().unwrap_or(0))
-        } else {
-            info!("no cursor found, live tailing");
-            None
-        };
-
-        if let Some(c) = start_cursor {
-            self.state.cur_firehose.store(c, Ordering::SeqCst);
-        }
-
-        // 2. connect
-        let client = TungsteniteSubscriptionClient::from_base_uri(base_url);
-        let params = if let Some(c) = start_cursor {
-            SubscribeRepos::new().cursor(c).build()
-        } else {
-            SubscribeRepos::new().build()
-        };
-
-        let stream = client.subscribe(&params).await.into_diagnostic()?;
-        let (_sink, mut messages) = stream.into_stream();
-
-        info!("firehose connected");
-
-        // 3. process loop
-        while let Some(msg_res) = messages.next().await {
-            match msg_res {
-                Ok(msg) => {
-                    self.handle_message(msg).await?;
+        loop {
+            // 1. load cursor
+            let current_cursor = self.state.cur_firehose.load(Ordering::SeqCst);
+            let start_cursor = if current_cursor > 0 {
+                Some(current_cursor)
+            } else {
+                let cursor_key = b"firehose_cursor";
+                if let Ok(Some(bytes)) =
+                    Db::get(self.state.db.cursors.clone(), cursor_key.to_vec()).await
+                {
+                    let s = String::from_utf8_lossy(&bytes);
+                    debug!("resuming from cursor: {}", s);
+                    s.parse::<i64>().ok()
+                } else {
+                    info!("no cursor found, live tailing");
+                    None
                 }
+            };
+
+            if let Some(c) = start_cursor {
+                self.state.cur_firehose.store(c, Ordering::SeqCst);
+            }
+
+            // 2. connect
+            let client = TungsteniteSubscriptionClient::from_base_uri(base_url.clone());
+            let params = if let Some(c) = start_cursor {
+                SubscribeRepos::new().cursor(c).build()
+            } else {
+                SubscribeRepos::new().build()
+            };
+
+            let stream = match client.subscribe(&params).await {
+                Ok(s) => s,
                 Err(e) => {
-                    error!("firehose stream error: {}", e);
-                    break;
+                    error!("failed to connect to firehose: {e}, retrying in 5s...");
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    continue;
+                }
+            };
+
+            let (_sink, mut messages) = stream.into_stream();
+
+            info!("firehose connected");
+
+            // 3. process loop
+            while let Some(msg_res) = messages.next().await {
+                match msg_res {
+                    Ok(msg) => {
+                        if let Err(e) = self.handle_message(msg).await {
+                            error!("failed to handle firehose message: {e}");
+                        }
+                    }
+                    Err(e) => {
+                        error!("firehose stream error: {e}");
+                        break;
+                    }
                 }
             }
-        }
 
-        Ok(())
+            error!("firehose disconnected, reconnecting in 5s...");
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        }
     }
 
     async fn handle_message(&mut self, msg: SubscribeReposMessage<'_>) -> Result<()> {
-        let db = self.state.db.clone();
         match msg {
             SubscribeReposMessage::Commit(commit) => {
                 self.state.cur_firehose.store(commit.seq, Ordering::SeqCst);
 
-                let did = &commit.repo;
-
-                let mut should_process = self.full_network;
-                let did_key = keys::repo_key(&did);
-
-                if !should_process {
-                    if Db::contains_key(db.repos.clone(), did_key).await? {
-                        should_process = true;
-                    }
-                }
-
-                if !should_process {
-                    return Ok(());
-                }
-
-                // check repo state
-                let state_bytes = Db::get(db.repos.clone(), did_key).await?;
-
-                let repo_state = if let Some(bytes) = state_bytes {
-                    rmp_serde::from_slice::<RepoState>(&bytes).ok()
-                } else {
-                    None
-                };
-
-                let status = repo_state
-                    .as_ref()
-                    .map(|s| s.status.clone())
-                    .unwrap_or(RepoStatus::New);
-
-                match status {
-                    RepoStatus::New => {
-                        info!("new repo detected: {}", did);
-                        // 1. save state as backfilling
-                        let mut new_state = RepoState::new(commit.repo.clone().into_static());
-                        new_state.status = RepoStatus::Backfilling;
-                        let bytes = rmp_serde::to_vec(&new_state).into_diagnostic()?;
-
-                        let mut batch = db.inner.batch();
-                        batch.insert(&db.repos, did_key, bytes);
-                        batch.insert(&db.pending, did_key, Vec::new());
-
-                        tokio::task::spawn_blocking(move || batch.commit().into_diagnostic())
-                            .await
-                            .into_diagnostic()??;
-
-                        // 2. queue for backfill
-                        if let Err(e) = self.state.backfill_tx.send(did.clone().into_static()) {
-                            error!("failed to queue backfill for {}: {}", did, e);
-                        }
-
-                        // 3. buffer this event
-                        self.buffer_event(&commit).await?;
-                    }
-                    RepoStatus::Backfilling => {
-                        debug!("buffering event for backfilling repo: {}", did);
-                        self.buffer_event(&commit).await?;
-                    }
-                    RepoStatus::Synced => {
-                        // check revision
-                        if let Some(state) = repo_state {
-                            if !state.rev.is_empty() && commit.rev.as_str() <= state.rev.as_str() {
-                                debug!(
-                                    "skipping replayed event for {}: {} <= {}",
-                                    did,
-                                    commit.rev,
-                                    state.rev
-                                );
-                                return Ok(());
-                            }
-                        }
-
-                        // apply immediately
-                        let db = db.clone();
-                        let commit = commit.clone().into_static();
-                        let did = did.clone().into_static();
-
-                        tokio::task::spawn_blocking(move || {
-                            if let Err(e) = ops::apply_commit(&db, &commit, true) {
-                                error!("failed to apply live commit for {}: {}", did, e);
-                            } else {
-                                debug!("synced event for {}, {} ops", did, commit.ops.len());
-                            }
-                        })
-                        .await
-                        .into_diagnostic()?;
-                    }
-                    RepoStatus::Error(_) => {
-                        // maybe retry? for now ignore.
-                    }
+                if let Err(e) = self.process_commit(&commit).await {
+                    error!("failed to process commit {}: {e}", commit.seq);
+                    // buffer for later inspection/retry
+                    let _ = self.buffer_event(&commit).await;
                 }
             }
             _ => {} // ignore identity/account/etc for now
+        }
+        Ok(())
+    }
+
+    async fn process_commit(
+        &mut self,
+        commit: &jacquard::api::com_atproto::sync::subscribe_repos::Commit<'_>,
+    ) -> Result<()> {
+        let db = self.state.db.clone();
+        let did = &commit.repo;
+
+        let mut should_process = self.full_network;
+        let did_key = keys::repo_key(&did);
+
+        if !should_process {
+            if Db::contains_key(db.repos.clone(), did_key).await? {
+                should_process = true;
+            }
+        }
+
+        if !should_process {
+            return Ok(());
+        }
+
+        // check repo state
+        let state_bytes = Db::get(db.repos.clone(), did_key).await?;
+
+        let repo_state = if let Some(bytes) = state_bytes {
+            rmp_serde::from_slice::<RepoState>(&bytes).ok()
+        } else {
+            None
+        };
+
+        let status = repo_state
+            .as_ref()
+            .map(|s| s.status.clone())
+            .unwrap_or(RepoStatus::New);
+
+        match status {
+            RepoStatus::New => {
+                info!("new repo detected: {}", did);
+                // 1. save state as backfilling
+                let mut new_state = RepoState::new(commit.repo.clone().into_static());
+                new_state.status = RepoStatus::Backfilling;
+                let bytes = rmp_serde::to_vec(&new_state).into_diagnostic()?;
+
+                let mut batch = db.inner.batch();
+                batch.insert(&db.repos, did_key, bytes);
+                batch.insert(&db.pending, did_key, Vec::new());
+
+                tokio::task::spawn_blocking(move || batch.commit().into_diagnostic())
+                    .await
+                    .into_diagnostic()??;
+
+                // 2. queue for backfill
+                if let Err(e) = self.state.backfill_tx.send(did.clone().into_static()) {
+                    error!("failed to queue backfill for {}: {}", did, e);
+                }
+
+                // 3. buffer this event
+                self.buffer_event(commit).await?;
+            }
+            RepoStatus::Backfilling => {
+                debug!("buffering event for backfilling repo: {}", did);
+                self.buffer_event(commit).await?;
+            }
+            RepoStatus::Synced => {
+                // check revision
+                if let Some(state) = repo_state {
+                    if !state.rev.is_empty() && commit.rev.as_str() <= state.rev.as_str() {
+                        debug!(
+                            "skipping replayed event for {}: {} <= {}",
+                            did, commit.rev, state.rev
+                        );
+                        return Ok(());
+                    }
+                }
+
+                // apply immediately
+                let db = db.clone();
+                let commit_static = commit.clone().into_static();
+                let did_static = did.clone().into_static();
+
+                let res = tokio::task::spawn_blocking(move || {
+                    ops::apply_commit(&db, &commit_static, true)
+                })
+                .await
+                .into_diagnostic()?;
+
+                if let Err(e) = res {
+                    error!("failed to apply live commit for {}: {}", did_static, e);
+                    self.buffer_event(commit).await?;
+                } else {
+                    debug!(
+                        "synced event for {}, {} ops",
+                        did_static,
+                        commit.ops.len()
+                    );
+                }
+            }
+            RepoStatus::Error(_) => {
+                // maybe retry? for now ignore.
+            }
         }
         Ok(())
     }
