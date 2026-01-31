@@ -244,11 +244,7 @@ impl Ingestor {
                     error!("failed to apply live commit for {}: {}", did_static, e);
                     self.buffer_event(commit).await?;
                 } else {
-                    debug!(
-                        "synced event for {}, {} ops",
-                        did_static,
-                        commit.ops.len()
-                    );
+                    debug!("synced event for {}, {} ops", did_static, commit.ops.len());
                 }
             }
             RepoStatus::Error(_) => {
