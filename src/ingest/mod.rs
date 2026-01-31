@@ -191,7 +191,7 @@ impl Ingestor {
 
         match status {
             RepoStatus::New => {
-                info!("new repo detected: {}", did);
+                debug!("new repo detected: {}", did);
                 // 1. save state as backfilling
                 let mut new_state = RepoState::new(commit.repo.clone().into_static());
                 new_state.status = RepoStatus::Backfilling;

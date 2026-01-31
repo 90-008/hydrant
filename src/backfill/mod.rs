@@ -176,7 +176,7 @@ impl Worker {
         http: &reqwest::Client,
         did: &Did<'static>,
     ) -> Result<RepoState> {
-        info!("backfilling {}", did);
+        debug!("backfilling {}", did);
 
         let db = &app_state.db;
         let did_key = keys::repo_key(did);
