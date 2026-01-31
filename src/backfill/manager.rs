@@ -66,10 +66,12 @@ pub async fn retry_worker(state: Arc<AppState>) {
         .into_diagnostic()
         .unwrap_or_else(|e| {
             warn!("failed to scan errors: {e}");
+            Db::check_poisoned_report(&e);
             Ok(Vec::new())
         })
         .unwrap_or_else(|e| {
             warn!("failed to scan errors: {e}");
+            Db::check_poisoned_report(&e);
             Vec::new()
         });
 
@@ -86,6 +88,7 @@ pub async fn retry_worker(state: Arc<AppState>) {
                     // move back to pending
                     if let Err(e) = Db::insert(db.pending.clone(), key, Vec::new()).await {
                         warn!("failed to move {did} to pending: {e}");
+                        Db::check_poisoned_report(&e);
                         continue;
                     }
 

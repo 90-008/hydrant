@@ -66,7 +66,10 @@ impl Worker {
                     did.clone(),
                     permit,
                 )
-                .inspect_err(move |e| error!("backfill process failed for {did}: {e}")),
+                .inspect_err(move |e| {
+                    error!("backfill process failed for {did}: {e}");
+                    Db::check_poisoned_report(e);
+                }),
             );
         }
     }
@@ -405,6 +408,7 @@ impl Worker {
 
                     if let Err(e) = ops::apply_commit(&state.db, &commit, true) {
                         error!("failed to apply buffered commit for {did}: {e}");
+                        Db::check_poisoned_report(&e);
                     }
 
                     // delete from buffer

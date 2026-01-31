@@ -56,6 +56,7 @@ async fn main() -> miette::Result<()> {
 
     if let Err(e) = crate::backfill::manager::queue_pending_backfills(&state).await {
         error!("failed to queue pending backfills: {e}");
+        Db::check_poisoned_report(&e);
     }
 
     tokio::spawn({
@@ -113,6 +114,7 @@ async fn main() -> miette::Result<()> {
                 .await
                 {
                     error!("failed to save cursor: {e}");
+                    Db::check_poisoned_report(&e);
                 }
 
                 let state = state.clone();
@@ -121,6 +123,7 @@ async fn main() -> miette::Result<()> {
                 match res {
                     Ok(Err(e)) => {
                         error!("db persist failed: {e}");
+                        Db::check_poisoned_report(&e);
                     }
                     Err(e) => {
                         error!("persistence task join failed: {e}");
@@ -139,6 +142,7 @@ async fn main() -> miette::Result<()> {
                 let crawler = Crawler::new(state, crawler_host);
                 if let Err(e) = crawler.run().await {
                     error!("crawler died: {e}");
+                    Db::check_poisoned_report(&e);
                 }
             }
         });
@@ -148,9 +152,13 @@ async fn main() -> miette::Result<()> {
 
     if let Err(e) = ingestor.run().await {
         error!("ingestor died: {e}");
+        Db::check_poisoned_report(&e);
     }
 
-    state.db.persist()?;
+    if let Err(e) = state.db.persist() {
+        Db::check_poisoned_report(&e);
+        return Err(e);
+    }
 
     Ok(())
 }

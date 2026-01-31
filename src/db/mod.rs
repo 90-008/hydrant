@@ -9,6 +9,7 @@ pub mod keys;
 
 use std::sync::atomic::AtomicU64;
 use tokio::sync::broadcast;
+use tracing::error;
 
 #[derive(Clone)]
 pub struct Db {
@@ -98,9 +99,7 @@ impl Db {
     }
 
     pub fn persist(&self) -> Result<()> {
-        self.inner
-            .persist(PersistMode::SyncData)
-            .into_diagnostic()?;
+        self.inner.persist(PersistMode::SyncAll).into_diagnostic()?;
         Ok(())
     }
 
@@ -189,5 +188,19 @@ impl Db {
         .await
         .into_diagnostic()
         .flatten()
+    }
+
+    pub fn check_poisoned(e: &fjall::Error) {
+        if matches!(e, fjall::Error::Poisoned) {
+            error!("!!! DATABASE POISONED !!! exiting");
+            std::process::exit(10);
+        }
+    }
+
+    pub fn check_poisoned_report(e: &miette::Report) {
+        let Some(err) = e.downcast_ref::<fjall::Error>() else {
+            return;
+        };
+        Self::check_poisoned(err);
     }
 }

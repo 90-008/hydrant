@@ -57,7 +57,10 @@ impl Ingestor {
                     let res = tokio::task::spawn_blocking(move || batch.commit()).await;
                     match res {
                         Ok(Ok(_)) => {}
-                        Ok(Err(e)) => error!("failed to persist buffer batch: {}", e),
+                        Ok(Err(e)) => {
+                            Db::check_poisoned(&e);
+                            error!("failed to persist buffer batch: {}", e)
+                        }
                         Err(e) => error!("buffer worker join error: {}", e),
                     }
                 }
@@ -146,6 +149,7 @@ impl Ingestor {
 
                 if let Err(e) = self.process_commit(&commit).await {
                     error!("failed to process commit {}: {e}", commit.seq);
+                    Db::check_poisoned_report(&e);
                     // buffer for later inspection/retry
                     let _ = self.buffer_event(&commit).await;
                 }
@@ -241,7 +245,8 @@ impl Ingestor {
                 .into_diagnostic()?;
 
                 if let Err(e) = res {
-                    error!("failed to apply live commit for {}: {}", did_static, e);
+                    error!("failed to apply live commit for {did_static}: {e}");
+                    Db::check_poisoned_report(&e);
                     self.buffer_event(commit).await?;
                 } else {
                     debug!("synced event for {}, {} ops", did_static, commit.ops.len());
