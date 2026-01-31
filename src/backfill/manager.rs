@@ -6,7 +6,7 @@ use fjall::Slice;
 use miette::{IntoDiagnostic, Result};
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 
 pub async fn queue_pending_backfills(state: &AppState) -> Result<()> {
     info!("scanning for pending backfills...");
@@ -33,7 +33,7 @@ pub async fn queue_pending_backfills(state: &AppState) -> Result<()> {
 
         debug!("queuing did {did}");
         if let Err(e) = state.backfill_tx.send(did) {
-            warn!("failed to queue pending backfill for did:{did_str}: {e}");
+            error!("failed to queue pending backfill for did:{did_str}: {e}");
         } else {
             count += 1;
         }
@@ -64,13 +64,9 @@ pub async fn retry_worker(state: Arc<AppState>) {
         })
         .await
         .into_diagnostic()
+        .flatten()
         .unwrap_or_else(|e| {
-            warn!("failed to scan errors: {e}");
-            Db::check_poisoned_report(&e);
-            Ok(Vec::new())
-        })
-        .unwrap_or_else(|e| {
-            warn!("failed to scan errors: {e}");
+            error!("failed to scan errors: {e}");
             Db::check_poisoned_report(&e);
             Vec::new()
         });
@@ -83,18 +79,18 @@ pub async fn retry_worker(state: Arc<AppState>) {
             };
             if let Ok(err_state) = rmp_serde::from_slice::<ErrorState>(&value) {
                 if err_state.next_retry <= now {
-                    debug!("retrying backfill for {did}");
+                    info!("retrying backfill for {did}");
 
                     // move back to pending
                     if let Err(e) = Db::insert(db.pending.clone(), key, Vec::new()).await {
-                        warn!("failed to move {did} to pending: {e}");
+                        error!("failed to move {did} to pending: {e}");
                         Db::check_poisoned_report(&e);
                         continue;
                     }
 
                     // queue
                     if let Err(e) = state.backfill_tx.send(did.to_owned()) {
-                        warn!("failed to queue retry for {did}: {e}");
+                        error!("failed to queue retry for {did}: {e}");
                     } else {
                         count += 1;
                     }

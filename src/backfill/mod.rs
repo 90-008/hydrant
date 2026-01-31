@@ -106,22 +106,28 @@ impl Worker {
                     .into_diagnostic()??;
 
                 tokio::spawn({
-                    let state = state.clone();
-                    async move {
-                        if is_pending {
-                            let _ = state
-                                .db
-                                .increment_count(keys::count_keyspace_key("pending"), -1)
-                                .await;
-                        }
-                        if is_error {
-                            let _ = state
-                                .db
-                                .increment_count(keys::count_keyspace_key("errors"), -1)
-                                .await;
-                        }
-                    }
+                    let pending_fut = is_pending.then(|| {
+                        state
+                            .db
+                            .increment_count(keys::count_keyspace_key("pending"), -1)
+                    });
+                    let error_fut = is_error.then(|| {
+                        state
+                            .db
+                            .increment_count(keys::count_keyspace_key("errors"), -1)
+                    });
+                    futures::future::join_all(pending_fut.into_iter().chain(error_fut))
                 });
+
+                tokio::task::spawn_blocking(move || {
+                    state
+                        .db
+                        .inner
+                        .persist(fjall::PersistMode::Buffer)
+                        .into_diagnostic()
+                })
+                .await
+                .into_diagnostic()??;
 
                 Ok(())
             }

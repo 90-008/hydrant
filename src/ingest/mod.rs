@@ -11,7 +11,7 @@ use smol_str::SmolStr;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 use url::Url;
 
 pub struct Ingestor {
@@ -125,11 +125,7 @@ impl Ingestor {
             // 3. process loop
             while let Some(msg_res) = messages.next().await {
                 match msg_res {
-                    Ok(msg) => {
-                        if let Err(e) = self.handle_message(msg).await {
-                            error!("failed to handle firehose message: {e}");
-                        }
-                    }
+                    Ok(msg) => self.handle_message(msg).await,
                     Err(e) => {
                         error!("firehose stream error: {e}");
                         break;
@@ -142,7 +138,7 @@ impl Ingestor {
         }
     }
 
-    async fn handle_message(&mut self, msg: SubscribeReposMessage<'_>) -> Result<()> {
+    async fn handle_message(&mut self, msg: SubscribeReposMessage<'_>) {
         match msg {
             SubscribeReposMessage::Commit(commit) => {
                 self.state.cur_firehose.store(commit.seq, Ordering::SeqCst);
@@ -156,7 +152,6 @@ impl Ingestor {
             }
             _ => {} // ignore identity/account/etc for now
         }
-        Ok(())
     }
 
     async fn process_commit(
