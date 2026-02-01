@@ -1,30 +1,18 @@
 use crate::db::keys::reconstruct_did;
-use crate::db::Db;
+use crate::db::{deser_repo_state, ser_repo_state, Db};
 use crate::state::AppState;
-use crate::types::ErrorState;
-use fjall::Slice;
+use crate::types::{ErrorState, RepoStatus};
 use miette::{IntoDiagnostic, Result};
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, error, info};
 
-pub async fn queue_pending_backfills(state: &AppState) -> Result<()> {
+pub fn queue_pending_backfills(state: &AppState) -> Result<()> {
     info!("scanning for pending backfills...");
     let mut count = 0;
 
-    let ks = state.db.pending.clone();
-    let items = tokio::task::spawn_blocking(move || {
-        let mut collected: Vec<Slice> = Vec::new();
-        for item in ks.iter() {
-            let k = item.key().into_diagnostic()?;
-            collected.push(k);
-        }
-        Ok::<Vec<Slice>, miette::Report>(collected)
-    })
-    .await
-    .into_diagnostic()??;
-
-    for key in items {
+    for guard in state.db.pending.iter() {
+        let key = guard.key().into_diagnostic()?;
         let did_str = String::from_utf8_lossy(&key);
         let Ok(did) = reconstruct_did(&did_str) else {
             error!("invalid did in db, skipping: did:{did_str}");
@@ -43,38 +31,68 @@ pub async fn queue_pending_backfills(state: &AppState) -> Result<()> {
     Ok(())
 }
 
-pub async fn retry_worker(state: Arc<AppState>) {
+pub fn queue_gone_backfills(state: &Arc<AppState>) -> Result<()> {
+    info!("scanning for deactivated/takendown repos to retry...");
+    let mut count = 0;
+
+    for guard in state.db.repos.iter() {
+        let (key, val) = guard.into_inner().into_diagnostic()?;
+        let did_str = String::from_utf8_lossy(&key);
+        let Ok(did) = reconstruct_did(&did_str) else {
+            error!("invalid did in db, skipping: did:{did_str}");
+            continue;
+        };
+        if let Ok(repo_state) = deser_repo_state(&val) {
+            if matches!(
+                repo_state.status,
+                RepoStatus::Deactivated | RepoStatus::Takendown | RepoStatus::Suspended
+            ) {
+                info!("queuing retry for gone repo: {did}");
+
+                let mut new_state = repo_state.clone();
+                new_state.status = RepoStatus::Backfilling;
+                let bytes = ser_repo_state(&new_state)?;
+
+                let mut batch = state.db.inner.batch();
+                batch.insert(&state.db.repos, key.clone(), bytes);
+                batch.insert(&state.db.pending, key, Vec::new());
+                batch.commit().into_diagnostic()?;
+
+                if let Err(e) = state.backfill_tx.send(did.clone()) {
+                    error!("failed to queue retry for {did}: {e}");
+                } else {
+                    count += 1;
+                }
+            }
+        }
+    }
+
+    info!("queued {count} gone backfills");
+    Ok(())
+}
+
+pub fn retry_worker(state: Arc<AppState>) {
     let db = &state.db;
     info!("retry worker started");
     loop {
         // sleep first (e.g., check every minute)
-        tokio::time::sleep(Duration::from_secs(60)).await;
+        std::thread::sleep(Duration::from_secs(60));
 
         let now = chrono::Utc::now().timestamp();
         let mut count = 0;
 
-        let ks = db.errors.clone();
-        let items = tokio::task::spawn_blocking(move || {
-            let mut collected: Vec<(Slice, Slice)> = Vec::new();
-            for item in ks.iter() {
-                let (k, v) = item.into_inner().into_diagnostic()?;
-                collected.push((k, v));
-            }
-            Ok::<_, miette::Report>(collected)
-        })
-        .await
-        .into_diagnostic()
-        .flatten()
-        .unwrap_or_else(|e| {
-            error!("failed to scan errors: {e}");
-            Db::check_poisoned_report(&e);
-            Vec::new()
-        });
-
-        for (key, value) in items {
+        for guard in db.errors.iter() {
+            let (key, value) = match guard.into_inner() {
+                Ok(t) => t,
+                Err(e) => {
+                    error!("failed to get error: {e}");
+                    Db::check_poisoned(&e);
+                    continue;
+                }
+            };
             let did_str = String::from_utf8_lossy(&key);
             let Ok(did) = reconstruct_did(&did_str) else {
-                error!("invalid did in db, skipping: {did_str}");
+                error!("invalid did in db, skipping: did:{did_str}");
                 continue;
             };
             if let Ok(err_state) = rmp_serde::from_slice::<ErrorState>(&value) {
@@ -82,14 +100,14 @@ pub async fn retry_worker(state: Arc<AppState>) {
                     info!("retrying backfill for {did}");
 
                     // move back to pending
-                    if let Err(e) = Db::insert(db.pending.clone(), key, Vec::new()).await {
+                    if let Err(e) = db.pending.insert(key, Vec::new()) {
                         error!("failed to move {did} to pending: {e}");
-                        Db::check_poisoned_report(&e);
+                        Db::check_poisoned(&e);
                         continue;
                     }
 
                     // queue
-                    if let Err(e) = state.backfill_tx.send(did.to_owned()) {
+                    if let Err(e) = state.backfill_tx.send(did.clone()) {
                         error!("failed to queue retry for {did}: {e}");
                     } else {
                         count += 1;

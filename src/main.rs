@@ -15,9 +15,12 @@ use crate::crawler::Crawler;
 use crate::db::Db;
 use crate::ingest::Ingestor;
 use crate::state::AppState;
+use futures::TryFutureExt;
+use miette::IntoDiagnostic;
 use mimalloc::MiMalloc;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use tokio::task::spawn_blocking;
 use tracing::{error, info};
 
 #[global_allocator]
@@ -48,22 +51,34 @@ async fn main() -> miette::Result<()> {
     tokio::spawn({
         let state = state.clone();
         let timeout = cfg.repo_fetch_timeout;
-        async move {
-            let worker = Worker::new(state, backfill_rx, timeout, cfg.backfill_concurrency_limit);
-            worker.run().await;
-        }
+        Worker::new(state, backfill_rx, timeout, cfg.backfill_concurrency_limit).run()
     });
 
-    if let Err(e) = crate::backfill::manager::queue_pending_backfills(&state).await {
+    if let Err(e) = spawn_blocking({
+        let state = state.clone();
+        move || crate::backfill::manager::queue_pending_backfills(&state)
+    })
+    .await
+    .into_diagnostic()?
+    {
         error!("failed to queue pending backfills: {e}");
         Db::check_poisoned_report(&e);
     }
 
-    tokio::spawn({
+    if let Err(e) = spawn_blocking({
         let state = state.clone();
-        async move {
-            crate::backfill::manager::retry_worker(state).await;
-        }
+        move || crate::backfill::manager::queue_gone_backfills(&state)
+    })
+    .await
+    .into_diagnostic()?
+    {
+        error!("failed to queue gone backfills: {e}");
+        Db::check_poisoned_report(&e);
+    }
+
+    std::thread::spawn({
+        let state = state.clone();
+        move || crate::backfill::manager::retry_worker(state)
     });
 
     tokio::spawn({
@@ -95,40 +110,29 @@ async fn main() -> miette::Result<()> {
         }
     });
 
-    tokio::spawn({
+    std::thread::spawn({
         let state = state.clone();
         let persist_interval = cfg.cursor_save_interval;
 
-        async move {
+        move || {
             info!("persistence worker started");
             loop {
-                tokio::time::sleep(persist_interval).await;
+                std::thread::sleep(persist_interval);
 
                 let seq = state.cur_firehose.load(Ordering::SeqCst);
                 const CURSOR_KEY: &[u8] = b"firehose_cursor";
-                if let Err(e) = Db::insert(
-                    state.db.cursors.clone(),
-                    CURSOR_KEY,
-                    seq.to_string().into_bytes(),
-                )
-                .await
+                if let Err(e) = state
+                    .db
+                    .cursors
+                    .insert(CURSOR_KEY, seq.to_string().into_bytes())
                 {
                     error!("failed to save cursor: {e}");
-                    Db::check_poisoned_report(&e);
+                    Db::check_poisoned(&e);
                 }
 
-                let state = state.clone();
-                let res = tokio::task::spawn_blocking(move || state.db.persist()).await;
-
-                match res {
-                    Ok(Err(e)) => {
-                        error!("db persist failed: {e}");
-                        Db::check_poisoned_report(&e);
-                    }
-                    Err(e) => {
-                        error!("persistence task join failed: {e}");
-                    }
-                    _ => {}
+                if let Err(e) = state.db.persist() {
+                    error!("db persist failed: {e}");
+                    Db::check_poisoned_report(&e);
                 }
             }
         }
@@ -138,13 +142,11 @@ async fn main() -> miette::Result<()> {
         tokio::spawn({
             let state = state.clone();
             let crawler_host = cfg.relay_host.clone();
-            async move {
-                let crawler = Crawler::new(state, crawler_host);
-                if let Err(e) = crawler.run().await {
-                    error!("crawler died: {e}");
-                    Db::check_poisoned_report(&e);
-                }
-            }
+
+            Crawler::new(state, crawler_host).run().inspect_err(|e| {
+                error!("crawler died: {e}");
+                Db::check_poisoned_report(&e);
+            })
         });
     }
 
