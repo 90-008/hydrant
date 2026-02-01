@@ -1,12 +1,9 @@
 use crate::db::{keys, Db};
 use crate::ops;
 use crate::state::{AppState, BackfillRx};
-use crate::types::{
-    BroadcastEvent, IdentityEvt, RepoState, RepoStatus, ResyncState, StoredEvent,
-};
+use crate::types::{AccountEvt, BroadcastEvent, RepoState, RepoStatus, ResyncState, StoredEvent};
 use futures::TryFutureExt;
 use jacquard::api::com_atproto::sync::get_repo::{GetRepo, GetRepoError};
-use jacquard::api::com_atproto::sync::subscribe_repos::Commit;
 use jacquard::prelude::*;
 use jacquard::types::did::Did;
 use jacquard_common::xrpc::XrpcError;
@@ -84,6 +81,10 @@ impl Worker {
         _permit: tokio::sync::OwnedSemaphorePermit,
     ) -> Result<()> {
         let db = &state.db;
+
+        // block buffer processing for this DID during backfill
+        let _ = state.blocked_dids.insert_async(did.clone()).await;
+
         match Self::process_did(&state, &http, &did).await {
             Ok(previous_state) => {
                 let did_key = keys::repo_key(&did);
@@ -127,9 +128,9 @@ impl Worker {
                     futures::future::join_all(pending_fut.into_iter().chain(resync_fut))
                 });
 
-                let state = state.clone();
+                let state_for_persist = state.clone();
                 tokio::task::spawn_blocking(move || {
-                    state
+                    state_for_persist
                         .db
                         .inner
                         .persist(fjall::PersistMode::Buffer)
@@ -137,8 +138,6 @@ impl Worker {
                 })
                 .await
                 .into_diagnostic()??;
-
-                Ok(())
             }
             Err(e) => {
                 error!("backfill failed for {did}: {e}");
@@ -165,45 +164,47 @@ impl Worker {
                     next_retry,
                 };
 
-                let state = state.clone();
-                let did_key = did_key.to_vec();
+                tokio::task::spawn_blocking({
+                    let state = state.clone();
+                    let did_key = did_key.to_vec();
+                    move || {
+                        // 3. save to resync
+                        let serialized_resync_state =
+                            rmp_serde::to_vec(&resync_state).into_diagnostic()?;
 
-                tokio::task::spawn_blocking(move || {
-                    // 3. save to resync
-                    let serialized_resync_state =
-                        rmp_serde::to_vec(&resync_state).into_diagnostic()?;
+                        // 4. and update the main repo state
+                        let serialized_repo_state = if let Some(state_bytes) =
+                            state.db.repos.get(&did_key).into_diagnostic()?
+                        {
+                            let mut state: RepoState =
+                                rmp_serde::from_slice(&state_bytes).into_diagnostic()?;
+                            state.status = RepoStatus::Error(e.to_string().into());
+                            Some(rmp_serde::to_vec(&state).into_diagnostic()?)
+                        } else {
+                            None
+                        };
 
-                    // 4. and update the main repo state
-                    let serialized_repo_state = if let Some(state_bytes) =
-                        state.db.repos.get(&did_key).into_diagnostic()?
-                    {
-                        let mut state: RepoState =
-                            rmp_serde::from_slice(&state_bytes).into_diagnostic()?;
-                        state.status = RepoStatus::Error(e.to_string().into());
-                        Some(rmp_serde::to_vec(&state).into_diagnostic()?)
-                    } else {
-                        None
-                    };
+                        let mut batch = state.db.inner.batch();
 
-                    let mut batch = state.db.inner.batch();
+                        batch.insert(&state.db.resync, &did_key, serialized_resync_state);
 
-                    batch.insert(&state.db.resync, &did_key, serialized_resync_state);
+                        if let Some(state_bytes) = serialized_repo_state {
+                            batch.insert(&state.db.repos, &did_key, state_bytes);
+                        }
 
-                    if let Some(state_bytes) = serialized_repo_state {
-                        batch.insert(&state.db.repos, &did_key, state_bytes);
+                        // 5. remove from pending
+                        batch.remove(&state.db.pending, &did_key);
+                        batch.commit().into_diagnostic()
                     }
-
-                    // 5. remove from pending
-                    batch.remove(&state.db.pending, &did_key);
-
-                    batch.commit().into_diagnostic()
                 })
                 .await
                 .into_diagnostic()??;
-
-                Ok(())
             }
         }
+
+        // unblock buffer processing for this DID
+        state.blocked_dids.remove_async(&did).await;
+        Ok(())
     }
 
     // returns previous repo state if successful
@@ -235,22 +236,23 @@ impl Worker {
         }
 
         let emit_identity = |status: &RepoStatus| {
-            let evt = IdentityEvt {
+            let evt = AccountEvt {
                 did: did.as_str().into(),
-                handle: state.handle.clone().unwrap_or_default(),
-                is_active: !matches!(
+                active: !matches!(
                     status,
                     RepoStatus::Deactivated | RepoStatus::Takendown | RepoStatus::Suspended
                 ),
-                status: match status {
-                    RepoStatus::Deactivated => "deactivated",
-                    RepoStatus::Takendown => "takendown",
-                    RepoStatus::Suspended => "suspended",
-                    _ => "active",
-                }
-                .into(),
+                status: Some(
+                    match status {
+                        RepoStatus::Deactivated => "deactivated",
+                        RepoStatus::Takendown => "takendown",
+                        RepoStatus::Suspended => "suspended",
+                        _ => "active",
+                    }
+                    .into(),
+                ),
             };
-            ops::emit_identity_event(db, evt);
+            ops::emit_account_event(db, evt);
         };
 
         // 2. fetch repo (car)
@@ -351,11 +353,12 @@ impl Worker {
 
         // 6. insert records into db
         let start = Instant::now();
-        let (added_records, added_blocks, collection_counts, count) = {
+        let (_state, added_records, added_blocks, collection_counts, count) = {
             let app_state = app_state.clone();
-            let loop_did = did.clone();
-            let loop_rev = commit.rev;
+            let did = did.clone();
+            let rev = commit.rev;
             let storage = mst.storage().clone();
+
             tokio::task::spawn_blocking(move || {
                 let mut count = 0;
                 let mut added_records = 0;
@@ -374,7 +377,7 @@ impl Worker {
                             let collection = parts[0];
                             let rkey = parts[1];
 
-                            let db_key = keys::record_key(&loop_did, collection, rkey);
+                            let db_key = keys::record_key(&did, collection, rkey);
                             let cid_str = cid.to_smolstr();
 
                             let val_vec: Vec<u8> = val.to_vec();
@@ -400,8 +403,8 @@ impl Worker {
                                 app_state.db.next_event_id.fetch_add(1, Ordering::SeqCst);
                             let evt = StoredEvent::Record {
                                 live: false,
-                                did: loop_did.as_str().into(),
-                                rev: loop_rev.as_str().into(),
+                                did: did.as_str().into(),
+                                rev: rev.as_str().into(),
                                 collection: collection.into(),
                                 rkey: rkey.into(),
                                 action: "create".into(),
@@ -420,19 +423,25 @@ impl Worker {
                     }
                 }
 
-                // 6. update status to synced (inside batch)
+                // 6. update status to synced
                 state.status = RepoStatus::Synced;
-                state.rev = loop_rev.as_str().into();
+                state.rev = rev.as_str().into();
                 state.data = commit.data.to_smolstr();
                 state.last_updated_at = chrono::Utc::now().timestamp();
 
-                let did_key = keys::repo_key(&loop_did);
+                let did_key = keys::repo_key(&did);
                 let bytes = rmp_serde::to_vec(&state).into_diagnostic()?;
                 batch.insert(&app_state.db.repos, did_key, bytes);
 
                 batch.commit().into_diagnostic()?;
 
-                Ok::<_, miette::Report>((added_records, added_blocks, collection_counts, count))
+                Ok::<_, miette::Report>((
+                    state,
+                    added_records,
+                    added_blocks,
+                    collection_counts,
+                    count,
+                ))
             })
             .await
             .into_diagnostic()??
@@ -473,8 +482,7 @@ impl Worker {
             });
         }
         trace!(
-            "committed backfill batch for {} in {:?}",
-            did,
+            "committed backfill batch for {did} in {:?}",
             start.elapsed()
         );
 
@@ -482,50 +490,7 @@ impl Worker {
             db.next_event_id.load(Ordering::SeqCst) - 1,
         ));
 
-        debug!("marked {did} as synced, draining buffer...");
-
-        // 7. drain buffer
-        let start = Instant::now();
-        let prefix = keys::buffer_prefix(did).to_vec();
-
-        let num_buffered = tokio::task::spawn_blocking({
-            let state = app_state.clone();
-            let did = did.clone();
-            move || -> Result<i64> {
-                let mut batch = state.db.inner.batch();
-
-                for res in state
-                    .db
-                    .buffer
-                    .prefix(&prefix)
-                    .map(|item| item.into_inner().into_diagnostic())
-                {
-                    let (key, value) = res?;
-                    let commit: Commit = rmp_serde::from_slice(&value).into_diagnostic()?;
-                    debug!("applying buffered commit seq: {}", commit.seq);
-
-                    if let Err(e) = ops::apply_commit(&state.db, &commit, true) {
-                        error!("failed to apply buffered commit for {did}: {e}");
-                        Db::check_poisoned_report(&e);
-                    }
-
-                    // delete from buffer
-                    batch.remove(&state.db.buffer, key);
-                }
-
-                batch.commit().into_diagnostic()?;
-
-                Ok(count)
-            }
-        })
-        .await
-        .into_diagnostic()??;
-
-        trace!(
-            "drained {num_buffered} buffered commits for {did} in {:?}",
-            start.elapsed()
-        );
-
+        // buffer processing is handled by BufferProcessor when blocked flag is cleared
         debug!("backfill complete for {did}");
         Ok(previous_state)
     }
