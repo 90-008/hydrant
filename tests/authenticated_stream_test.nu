@@ -49,7 +49,7 @@ def deactivate-account [pds_url: string, jwt: string] {
 
 def activate-account [pds_url: string, jwt: string] {
     print "activating account..."
-    http post -t application/json -H ["Authorization" $"Bearer ($jwt)"] $"($pds_url)/xrpc/com.atproto.server.activateAccount" {}
+    curl -X POST -H "Content-Type: application/json" -H $"Authorization: Bearer ($jwt)" $"($pds_url)/xrpc/com.atproto.server.activateAccount"
 }
 
 def resolve-pds [did: string] {
@@ -72,7 +72,7 @@ def main [] {
 
     let pds_url = resolve-pds $did
     
-    let port = 3003
+    let port = 3005
     let url = $"http://localhost:($port)"
     let ws_url = $"ws://localhost:($port)/stream"
     let db_path = (mktemp -d -t hydrant_auth_test.XXXXXX)
@@ -105,9 +105,6 @@ def main [] {
         } catch {
             print "warning: failed to add repo (might already be tracked), continuing..."
         }
-
-        # wait for connection stability and potential backfill start
-        sleep 2sec
 
         # 5. perform actions
         let collection = "app.bsky.feed.post"
@@ -146,16 +143,23 @@ def main [] {
 
         print "--- action: deactivate ---"
         deactivate-account $pds_url $jwt
-        sleep 2sec
+
+        sleep 1sec
+
+        # we might need to re-auth if session was killed by deactivation
+        print "re-authenticating..."
+        let session = authenticate $pds_url $did $password
+        let jwt = $session.accessJwt
+
+        sleep 1sec
 
         print "--- action: activate ---"
         activate-account $pds_url $jwt
-        sleep 2sec
-
+        
         # 6. verify
-        sleep 2sec
+        sleep 3sec
         print "stopping listener..."
-        try { kill $stream_pid }
+        try { kill -9 $stream_pid }
         
         if ($output_file | path exists) {
             let content = (open $output_file | str trim)
@@ -164,53 +168,56 @@ def main [] {
             } else {
                 # parse json lines
                 let events = ($content | lines | each { |it| $it | from json })
+                let display_events = ($events | each { |e|
+                    let value = if $e.type == "record" { $e | get -o record } else if $e.type == "account" { $e | get -o account } else { $e | get -o identity }
+                    $e | select id type | insert value $value
+                })
                 print $"captured ($events | length) events"
-                
-                # hydrant stream events seem to be type: "record" or "identity"
-                # structure: { id: ..., type: "record", record: { action: ..., collection: ..., rkey: ... } }
-                # structure: { id: ..., type: "identity", identity: { did: ..., status: ..., is_active: ... } }
-                
-                let record_events = ($events | where type == "record" and record.collection == $collection and record.rkey == $rkey)
-                let identity_events = ($events | where type == "identity" and identity.did == $did)
-                
-                let creates = ($record_events | where record.action == "create")
-                let updates = ($record_events | where record.action == "update")
-                let deletes = ($record_events | where record.action == "delete")
+                $display_events | table -e | print
 
-                let deactivations = ($identity_events | where identity.status == "deactivated")
-                let reactivations = ($identity_events | where identity.status == "active" and identity.is_active == true)
-                
-                print $"found creates: ($creates | length)"
-                print $"found updates: ($updates | length)"
-                print $"found deletes: ($deletes | length)"
-                print $"found deactivations: ($deactivations | length)"
-                print $"found reactivations: ($reactivations | length)"
+                # filter live events for the relevant entities
+                let relevant_events = ($events | where { |it|
+                    if $it.type == "record" {
+                        if ($it.record | get -o live) == false {
+                            return false
+                        }
+                    }
+                    true
+                })
 
-                if ($record_events | length) != 3 {
-                     print "test failed: expected exactly 3 record events"
-                     print "captured events:"
-                     print ($events | table -e)
-                } else if ($deactivations | length) == 0 {
-                     print "test failed: expected at least one deactivation event"
-                     print "captured identity events:"
-                     print ($identity_events | table -e)
-                } else if ($reactivations | length) == 0 {
-                     print "test failed: expected at least one reactivation (active) event"
-                     print "captured identity events:"
-                     print ($identity_events | table -e)
+                let checks = [
+                    { |e| $e.type == "account" and $e.account.active == true },
+                    { |e| $e.type == "record" and $e.record.action == "create" },
+                    { |e| $e.type == "record" and $e.record.action == "update" },
+                    { |e| $e.type == "record" and $e.record.action == "delete" },
+                    { |e| $e.type == "account" and $e.account.active == false },
+                    { |e| $e.type == "account" and $e.account.active == true },
+                    { |e| $e.type == "identity" and $e.identity.did == $did }
+                ]
+
+                if ($relevant_events | length) != ($checks | length) {
+                    print $"verification failed: expected ($checks | length) events, got ($relevant_events | length)"
+                    $test_passed = false
                 } else {
-                     let first = ($record_events | get 0)
-                     let second = ($record_events | get 1)
-                     let third = ($record_events | get 2)
 
-                     if ($first.record.action == "create") and ($second.record.action == "update") and ($third.record.action == "delete") {
-                         print "test passed: all record operations captured in correct order, and identity events captured"
-                         $test_passed = true
-                     } else {
-                         print "test failed: record events out of order or incorrect"
-                         print "captured events:"
-                         print ($events | table -e)
-                     }
+                    mut failed = false
+                    for i in 0..(($relevant_events | length) - 1) {
+                        let event = ($relevant_events | get $i)
+                        let check = ($checks | get $i)
+                        if not (do $check $event) {
+                            print $"verification failed at event #($i + 1)"
+                            print $"event: ($event)"
+                            $failed = true
+                            break
+                        }
+                    }
+                    
+                    if not $failed {
+                        print "test success!"
+                        $test_passed = true
+                    } else {
+                        $test_passed = false
+                    }
                 }
             }
         } else {
@@ -223,7 +230,7 @@ def main [] {
 
     # cleanup
     print "cleaning up..."
-    try { kill $instance.pid }
+    try { kill -9 $instance.pid }
     
     if $test_passed {
         exit 0

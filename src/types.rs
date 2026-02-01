@@ -77,6 +77,8 @@ pub struct MarshallableEvt {
     pub record: Option<RecordEvt>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub identity: Option<IdentityEvt>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account: Option<AccountEvt>,
 }
 
 #[derive(Clone, Debug)]
@@ -102,9 +104,16 @@ pub struct RecordEvt {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct IdentityEvt {
     pub did: SmolStr,
-    pub handle: SmolStr,
-    pub is_active: bool,
-    pub status: SmolStr,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub handle: Option<SmolStr>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct AccountEvt {
+    pub did: SmolStr,
+    pub active: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<SmolStr>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -119,4 +128,5 @@ pub enum StoredEvent {
         cid: Option<SmolStr>,
     },
     Identity(IdentityEvt),
+    Account(AccountEvt),
 }

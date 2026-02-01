@@ -104,6 +104,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, query: Strea
                                             cid,
                                         }),
                                         identity: None,
+                                        account: None,
                                     }
                                 }
                                 StoredEvent::Identity(identity) => MarshallableEvt {
@@ -111,6 +112,14 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, query: Strea
                                     event_type: "identity".into(),
                                     record: None,
                                     identity: Some(identity),
+                                    account: None,
+                                },
+                                StoredEvent::Account(account) => MarshallableEvt {
+                                    id,
+                                    event_type: "account".into(),
+                                    record: None,
+                                    identity: None,
+                                    account: Some(account),
                                 },
                             };
 

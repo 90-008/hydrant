@@ -1,5 +1,5 @@
 use crate::db::{keys, Db};
-use crate::types::{BroadcastEvent, IdentityEvt, MarshallableEvt, StoredEvent};
+use crate::types::{AccountEvt, BroadcastEvent, IdentityEvt, MarshallableEvt, StoredEvent};
 use jacquard::api::com_atproto::sync::subscribe_repos::Commit;
 use jacquard::cowstr::ToCowStr;
 use jacquard_repo::car::reader::parse_car_bytes;
@@ -19,6 +19,19 @@ pub fn emit_identity_event(db: &Db, evt: IdentityEvt) {
         event_type: "identity".into(),
         record: None,
         identity: Some(evt),
+        account: None,
+    };
+    let _ = db.event_tx.send(BroadcastEvent::Ephemeral(marshallable));
+}
+
+pub fn emit_account_event(db: &Db, evt: AccountEvt) {
+    let event_id = db.next_event_id.fetch_add(1, Ordering::SeqCst);
+    let marshallable = MarshallableEvt {
+        id: event_id,
+        event_type: "account".into(),
+        record: None,
+        identity: None,
+        account: Some(evt),
     };
     let _ = db.event_tx.send(BroadcastEvent::Ephemeral(marshallable));
 }
