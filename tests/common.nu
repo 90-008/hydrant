@@ -47,12 +47,12 @@ export def wait-for-backfill [url: string] {
         let pending = ($stats | where name == "pending" | first).count
         let records = ($stats | where name == "records" | first).count
         let repos = ($stats | where name == "repos" | first).count
-        let errors = ($stats | where name == "errors" | first).count
+        let resync = ($stats | where name == "resync" | first).count
 
-        print $"[($i)/120] pending: ($pending), records: ($records), repos: ($repos), errors: ($errors)"
+        print $"[($i)/120] pending: ($pending), records: ($records), repos: ($repos), resync: ($resync)"
 
-        if $errors > 0 {
-            print "error detected during backfill!"
+        if $resync > 0 {
+            print "resync state detected (failure or gone)!"
             print ($stats | table)
             return false
         }

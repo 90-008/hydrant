@@ -22,7 +22,7 @@ pub struct Db {
     pub cursors: Keyspace,
     pub buffer: Keyspace,
     pub pending: Keyspace,
-    pub errors: Keyspace,
+    pub resync: Keyspace,
     pub events: Keyspace,
     pub counts: Keyspace,
     pub event_tx: broadcast::Sender<BroadcastEvent>,
@@ -64,7 +64,7 @@ impl Db {
         let cursors = db.keyspace("cursors", opts).into_diagnostic()?;
         let buffer = db.keyspace("buffer", opts).into_diagnostic()?;
         let pending = db.keyspace("pending", opts).into_diagnostic()?;
-        let errors = db.keyspace("errors", opts).into_diagnostic()?;
+        let resync = db.keyspace("resync", opts).into_diagnostic()?;
         let events = db.keyspace("events", opts).into_diagnostic()?;
         let counts = db.keyspace("counts", opts).into_diagnostic()?;
 
@@ -92,7 +92,7 @@ impl Db {
             cursors,
             buffer,
             pending,
-            errors,
+            resync,
             events,
             counts,
             event_tx,

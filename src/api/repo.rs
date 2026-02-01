@@ -95,7 +95,7 @@ pub async fn handle_repo_remove(
             let mut batch = db.inner.batch();
             batch.remove(&db.repos, did_key);
             batch.remove(&db.pending, did_key);
-            batch.remove(&db.errors, did_key);
+            batch.remove(&db.resync, did_key);
 
             tokio::task::spawn_blocking(move || batch.commit().map_err(|e| e.to_string()))
                 .await

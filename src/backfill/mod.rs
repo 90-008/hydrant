@@ -1,7 +1,9 @@
 use crate::db::{keys, Db};
 use crate::ops;
 use crate::state::{AppState, BackfillRx};
-use crate::types::{BroadcastEvent, ErrorState, IdentityEvt, RepoState, RepoStatus, StoredEvent};
+use crate::types::{
+    BroadcastEvent, IdentityEvt, RepoState, RepoStatus, ResyncState, StoredEvent,
+};
 use futures::TryFutureExt;
 use jacquard::api::com_atproto::sync::get_repo::{GetRepo, GetRepoError};
 use jacquard::api::com_atproto::sync::subscribe_repos::Commit;
@@ -90,16 +92,22 @@ impl Worker {
                     previous_state.status,
                     RepoStatus::Backfilling | RepoStatus::New
                 );
-                let is_error = matches!(previous_state.status, RepoStatus::Error(_));
+                let was_resync = matches!(
+                    previous_state.status,
+                    RepoStatus::Error(_)
+                        | RepoStatus::Deactivated
+                        | RepoStatus::Takendown
+                        | RepoStatus::Suspended
+                );
 
                 let mut batch = db.inner.batch();
                 // remove from pending
                 if is_pending {
                     batch.remove(&db.pending, did_key);
                 }
-                // remove from errors (if it was a retry)
-                if is_error {
-                    batch.remove(&db.errors, did_key);
+                // remove from resync
+                if was_resync {
+                    batch.remove(&db.resync, did_key);
                 }
                 tokio::task::spawn_blocking(move || batch.commit().into_diagnostic())
                     .await
@@ -111,12 +119,12 @@ impl Worker {
                             .db
                             .increment_count(keys::count_keyspace_key("pending"), -1)
                     });
-                    let error_fut = is_error.then(|| {
+                    let resync_fut = was_resync.then(|| {
                         state
                             .db
-                            .increment_count(keys::count_keyspace_key("errors"), -1)
+                            .increment_count(keys::count_keyspace_key("resync"), -1)
                     });
-                    futures::future::join_all(pending_fut.into_iter().chain(error_fut))
+                    futures::future::join_all(pending_fut.into_iter().chain(resync_fut))
                 });
 
                 let state = state.clone();
@@ -138,17 +146,21 @@ impl Worker {
 
                 // 1. get current retry count
                 let mut retry_count = 0;
-                if let Ok(Some(bytes)) = Db::get(db.errors.clone(), did_key).await {
-                    if let Ok(old_err) = rmp_serde::from_slice::<ErrorState>(&bytes) {
-                        retry_count = old_err.retry_count + 1;
+                if let Ok(Some(bytes)) = Db::get(db.resync.clone(), did_key).await {
+                    if let Ok(ResyncState::Error {
+                        retry_count: old_count,
+                        ..
+                    }) = rmp_serde::from_slice::<ResyncState>(&bytes)
+                    {
+                        retry_count = old_count + 1;
                     }
                 }
 
                 // 2. calculate backoff
-                let next_retry = ErrorState::next_backoff(retry_count);
+                let next_retry = ResyncState::next_backoff(retry_count);
 
-                let err_state = ErrorState {
-                    error: e.to_string().into(),
+                let resync_state = ResyncState::Error {
+                    message: e.to_string().into(),
                     retry_count,
                     next_retry,
                 };
@@ -157,8 +169,9 @@ impl Worker {
                 let did_key = did_key.to_vec();
 
                 tokio::task::spawn_blocking(move || {
-                    // 3. we will save to errors
-                    let serialized_error_state = rmp_serde::to_vec(&err_state).into_diagnostic()?;
+                    // 3. save to resync
+                    let serialized_resync_state =
+                        rmp_serde::to_vec(&resync_state).into_diagnostic()?;
 
                     // 4. and update the main repo state
                     let serialized_repo_state = if let Some(state_bytes) =
@@ -174,13 +187,13 @@ impl Worker {
 
                     let mut batch = state.db.inner.batch();
 
-                    batch.insert(&state.db.errors, &did_key, serialized_error_state);
+                    batch.insert(&state.db.resync, &did_key, serialized_resync_state);
 
                     if let Some(state_bytes) = serialized_repo_state {
                         batch.insert(&state.db.repos, &did_key, state_bytes);
                     }
 
-                    // 5. remove from pending (it's now in errors)
+                    // 5. remove from pending
                     batch.remove(&state.db.pending, &did_key);
 
                     batch.commit().into_diagnostic()
@@ -265,10 +278,18 @@ impl Worker {
                     warn!("repo {did} is {status:?}, stopping backfill");
 
                     emit_identity(&status);
+
+                    let resync_state = ResyncState::Gone {
+                        status: status.clone(),
+                    };
+                    let resync_bytes = rmp_serde::to_vec(&resync_state).into_diagnostic()?;
+
+                    let app_state_clone = app_state.clone();
                     app_state
                         .db
-                        .update_repo_state_async(did, move |state, _| {
+                        .update_repo_state_async(did, move |state, (key, batch)| {
                             state.status = status;
+                            batch.insert(&app_state_clone.db.resync, key, resync_bytes);
                             Ok((true, ()))
                         })
                         .await?;

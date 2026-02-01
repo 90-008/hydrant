@@ -21,7 +21,7 @@ pub async fn get_stats(State(state): State<Arc<AppState>>) -> Result<Json<StatsR
 
     let stats = futures::future::try_join_all(
         [
-            "repos", "records", "blocks", "events", "buffer", "pending", "errors",
+            "repos", "records", "blocks", "events", "buffer", "pending", "resync",
         ]
         .into_iter()
         .map(|name| async move {

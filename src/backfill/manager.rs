@@ -1,7 +1,7 @@
 use crate::db::keys::reconstruct_did;
 use crate::db::{deser_repo_state, ser_repo_state, Db};
 use crate::state::AppState;
-use crate::types::{ErrorState, RepoStatus};
+use crate::types::{RepoStatus, ResyncState};
 use miette::{IntoDiagnostic, Result};
 use std::sync::Arc;
 use std::time::Duration;
@@ -35,27 +35,31 @@ pub fn queue_gone_backfills(state: &Arc<AppState>) -> Result<()> {
     info!("scanning for deactivated/takendown repos to retry...");
     let mut count = 0;
 
-    for guard in state.db.repos.iter() {
+    for guard in state.db.resync.iter() {
         let (key, val) = guard.into_inner().into_diagnostic()?;
         let did_str = String::from_utf8_lossy(&key);
         let Ok(did) = reconstruct_did(&did_str) else {
             error!("invalid did in db, skipping: did:{did_str}");
             continue;
         };
-        if let Ok(repo_state) = deser_repo_state(&val) {
-            if matches!(
-                repo_state.status,
-                RepoStatus::Deactivated | RepoStatus::Takendown | RepoStatus::Suspended
-            ) {
+
+        if let Ok(resync_state) = rmp_serde::from_slice::<ResyncState>(&val) {
+            if matches!(resync_state, ResyncState::Gone { .. }) {
                 info!("queuing retry for gone repo: {did}");
 
-                let mut new_state = repo_state.clone();
-                new_state.status = RepoStatus::Backfilling;
-                let bytes = ser_repo_state(&new_state)?;
-
+                // move back to pending
                 let mut batch = state.db.inner.batch();
-                batch.insert(&state.db.repos, key.clone(), bytes);
+                batch.remove(&state.db.resync, key.clone());
                 batch.insert(&state.db.pending, key, Vec::new());
+
+                // update repo state back to backfilling
+                let repo_key = crate::db::keys::repo_key(&did);
+                if let Some(state_bytes) = state.db.repos.get(repo_key).into_diagnostic()? {
+                    let mut repo_state = deser_repo_state(&state_bytes)?;
+                    repo_state.status = RepoStatus::Backfilling;
+                    batch.insert(&state.db.repos, repo_key, ser_repo_state(&repo_state)?);
+                }
+
                 batch.commit().into_diagnostic()?;
 
                 if let Err(e) = state.backfill_tx.send(did.clone()) {
@@ -81,11 +85,11 @@ pub fn retry_worker(state: Arc<AppState>) {
         let now = chrono::Utc::now().timestamp();
         let mut count = 0;
 
-        for guard in db.errors.iter() {
+        for guard in db.resync.iter() {
             let (key, value) = match guard.into_inner() {
                 Ok(t) => t,
                 Err(e) => {
-                    error!("failed to get error: {e}");
+                    error!("failed to get resync state: {e}");
                     Db::check_poisoned(&e);
                     continue;
                 }
@@ -95,8 +99,11 @@ pub fn retry_worker(state: Arc<AppState>) {
                 error!("invalid did in db, skipping: did:{did_str}");
                 continue;
             };
-            if let Ok(err_state) = rmp_serde::from_slice::<ErrorState>(&value) {
-                if err_state.next_retry <= now {
+
+            if let Ok(ResyncState::Error { next_retry, .. }) =
+                rmp_serde::from_slice::<ResyncState>(&value)
+            {
+                if next_retry <= now {
                     info!("retrying backfill for {did}");
 
                     // move back to pending

@@ -28,10 +28,10 @@ pub fn delete_repo(db: &Db, did: &jacquard::types::did::Did) -> Result<()> {
     let mut batch = db.inner.batch();
     let repo_key = keys::repo_key(did);
 
-    // 1. delete from repos, pending, errors
+    // 1. delete from repos, pending, resync
     batch.remove(&db.repos, repo_key);
     batch.remove(&db.pending, repo_key);
-    batch.remove(&db.errors, repo_key);
+    batch.remove(&db.resync, repo_key);
 
     // 2. delete from buffer (prefix: repo_key + SEP)
     let mut buffer_prefix = repo_key.to_vec();

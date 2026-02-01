@@ -375,6 +375,8 @@ impl Ingestor {
                 let mut batch = self.state.db.inner.batch();
                 batch.insert(&self.state.db.repos, did_key, bytes);
                 batch.insert(&self.state.db.pending, did_key, Vec::new());
+                batch.remove(&self.state.db.resync, did_key);
+
                 let res = tokio::task::spawn_blocking(move || batch.commit().into_diagnostic())
                     .await
                     .into_diagnostic()
@@ -455,6 +457,7 @@ impl Ingestor {
                         let mut batch = state.db.inner.batch();
                         batch.insert(&state.db.repos, &did_key, ser_repo_state(&new_state)?);
                         batch.insert(&state.db.pending, &did_key, Vec::new());
+                        batch.remove(&state.db.resync, &did_key);
                         batch.commit().into_diagnostic()
                     }
                 })

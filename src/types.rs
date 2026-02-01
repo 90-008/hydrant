@@ -41,16 +41,21 @@ impl RepoState {
     }
 }
 
-// from src/backfill/error_state.rs
+// from src/backfill/resync_state.rs
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ErrorState {
-    pub error: SmolStr,
-    pub retry_count: u32,
-    pub next_retry: i64, // unix timestamp
+pub enum ResyncState {
+    Error {
+        message: SmolStr,
+        retry_count: u32,
+        next_retry: i64, // unix timestamp
+    },
+    Gone {
+        status: RepoStatus, // deactivated, takendown, suspended
+    },
 }
 
-impl ErrorState {
+impl ResyncState {
     pub fn next_backoff(retry_count: u32) -> i64 {
         // exponential backoff: 1m, 2m, 4m, 8m... up to 1h
         let base = 60;
