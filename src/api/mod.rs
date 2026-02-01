@@ -5,7 +5,6 @@ use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
 mod debug;
-pub mod event;
 pub mod repo;
 pub mod stats;
 mod stream;

@@ -1,5 +1,5 @@
 use crate::api::AppState;
-use crate::db::{keys, Db};
+use crate::db::{keys, ser_repo_state, Db};
 use crate::types::{RepoState, RepoStatus};
 use axum::{extract::State, http::StatusCode, routing::post, Json, Router};
 use jacquard::{types::did::Did, IntoStatic};
@@ -36,7 +36,7 @@ pub async fn handle_repo_add(
         {
             let mut repo_state = RepoState::new(did.clone());
             repo_state.status = RepoStatus::Backfilling;
-            let bytes = rmp_serde::to_vec(&repo_state)
+            let bytes = ser_repo_state(&repo_state)
                 .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
             batch.insert(&db.repos, did_key, bytes);

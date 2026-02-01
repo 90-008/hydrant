@@ -1,4 +1,4 @@
-use crate::db::{keys, Db};
+use crate::db::{keys, ser_repo_state, Db};
 use crate::state::AppState;
 use crate::types::{RepoState, RepoStatus};
 use jacquard::api::com_atproto::sync::list_repos::{ListRepos, ListReposOutput};
@@ -57,7 +57,7 @@ impl Crawler {
             let output: ListReposOutput = match res_result {
                 Ok(res) => res.into_output().into_diagnostic()?,
                 Err(e) => {
-                    error!("crawler failed to list repos: {}. retrying in 30s...", e);
+                    error!("crawler failed to list repos: {e}. retrying in 30s...");
                     tokio::time::sleep(Duration::from_secs(30)).await;
                     continue;
                 }
@@ -66,8 +66,6 @@ impl Crawler {
             if output.repos.is_empty() {
                 info!("crawler finished enumeration (or empty page). sleeping for 1 hour.");
                 tokio::time::sleep(Duration::from_secs(3600)).await;
-                // we might want to reset cursor to start over? tap seems to loop.
-                // for now, just wait.
                 continue;
             }
 
@@ -83,14 +81,13 @@ impl Crawler {
 
                 // check if known
                 if !Db::contains_key(db.repos.clone(), did_key).await? {
-                    debug!("crawler found new repo: {}", did_str);
+                    debug!("crawler found new repo: {did_str}");
 
                     // create state (backfilling)
                     let mut state = RepoState::new(repo.did.to_owned());
                     state.status = RepoStatus::Backfilling;
-                    let bytes = rmp_serde::to_vec(&state).into_diagnostic()?;
 
-                    batch.insert(&db.repos, did_key, bytes);
+                    batch.insert(&db.repos, did_key, ser_repo_state(&state)?);
                     batch.insert(&db.pending, did_key, Vec::new());
                     to_queue.push(did_str);
                 }
@@ -99,19 +96,15 @@ impl Crawler {
             // update counts if we found new repos
             if !to_queue.is_empty() {
                 let count = to_queue.len() as i64;
-                tokio::spawn({
-                    let state = self.state.clone();
-                    async move {
-                        let _ = state
-                            .db
-                            .increment_count(keys::count_keyspace_key("repos"), count)
-                            .await;
-                        let _ = state
-                            .db
-                            .increment_count(keys::count_keyspace_key("pending"), count)
-                            .await;
-                    }
-                });
+                let repos_fut = self
+                    .state
+                    .db
+                    .increment_count(keys::count_keyspace_key("repos"), count);
+                let pending_fut = self
+                    .state
+                    .db
+                    .increment_count(keys::count_keyspace_key("pending"), count);
+                tokio::spawn(futures::future::join_all([repos_fut, pending_fut]));
             }
 
             // 4. update cursor

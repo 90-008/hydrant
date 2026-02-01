@@ -1,7 +1,6 @@
-use crate::api::event::MarshallableEvt;
 use crate::api::AppState;
 use crate::db::keys;
-use crate::types::{RecordEvt, StoredEvent};
+use crate::types::{BroadcastEvent, MarshallableEvt, RecordEvt, StoredEvent};
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
@@ -28,7 +27,7 @@ pub async fn handle_stream(
 }
 
 async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, query: StreamQuery) {
-    let (tx, mut rx) = mpsc::channel(100);
+    let (tx, mut rx) = mpsc::channel(500);
 
     std::thread::Builder::new()
         .name(format!(
@@ -135,8 +134,18 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, query: Strea
 
                 // 2. wait for live events
                 match event_rx.blocking_recv() {
-                    Ok(_) => {
+                    Ok(BroadcastEvent::Persisted(_)) => {
                         // just wake up and run catch-up loop again
+                    }
+                    Ok(BroadcastEvent::Ephemeral(evt)) => {
+                        // send ephemeral event directly
+                        let json_str = match serde_json::to_string(&evt) {
+                            Ok(s) => s,
+                            Err(_) => continue,
+                        };
+                        if tx.blocking_send(Message::Text(json_str.into())).is_err() {
+                            return;
+                        }
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => {
                         // continue to catch up
