@@ -42,6 +42,16 @@ def delete-record [pds_url: string, jwt: string, repo: string, collection: strin
     }
 }
 
+def deactivate-account [pds_url: string, jwt: string] {
+    print "deactivating account..."
+    http post -t application/json -H ["Authorization" $"Bearer ($jwt)"] $"($pds_url)/xrpc/com.atproto.server.deactivateAccount" {}
+}
+
+def activate-account [pds_url: string, jwt: string] {
+    print "activating account..."
+    http post -t application/json -H ["Authorization" $"Bearer ($jwt)"] $"($pds_url)/xrpc/com.atproto.server.activateAccount" {}
+}
+
 def resolve-pds [did: string] {
     print $"resolving pds for ($did)..."
     let doc = (http get $"https://plc.wtf/($did)" | from json)
@@ -134,6 +144,14 @@ def main [] {
         delete-record $pds_url $jwt $did $collection $rkey
         print "deleted record"
 
+        print "--- action: deactivate ---"
+        deactivate-account $pds_url $jwt
+        sleep 2sec
+
+        print "--- action: activate ---"
+        activate-account $pds_url $jwt
+        sleep 2sec
+
         # 6. verify
         sleep 2sec
         print "stopping listener..."
@@ -148,33 +166,48 @@ def main [] {
                 let events = ($content | lines | each { |it| $it | from json })
                 print $"captured ($events | length) events"
                 
-                # hydrant stream events seem to be type: "record" with payload in "record" field
+                # hydrant stream events seem to be type: "record" or "identity"
                 # structure: { id: ..., type: "record", record: { action: ..., collection: ..., rkey: ... } }
+                # structure: { id: ..., type: "identity", identity: { did: ..., status: ..., is_active: ... } }
                 
-                let relevant_events = ($events | where type == "record" and record.collection == $collection and record.rkey == $rkey)
+                let record_events = ($events | where type == "record" and record.collection == $collection and record.rkey == $rkey)
+                let identity_events = ($events | where type == "identity" and identity.did == $did)
                 
-                let creates = ($relevant_events | where record.action == "create")
-                let updates = ($relevant_events | where record.action == "update")
-                let deletes = ($relevant_events | where record.action == "delete")
+                let creates = ($record_events | where record.action == "create")
+                let updates = ($record_events | where record.action == "update")
+                let deletes = ($record_events | where record.action == "delete")
+
+                let deactivations = ($identity_events | where identity.status == "deactivated")
+                let reactivations = ($identity_events | where identity.status == "active" and identity.is_active == true)
                 
                 print $"found creates: ($creates | length)"
                 print $"found updates: ($updates | length)"
                 print $"found deletes: ($deletes | length)"
+                print $"found deactivations: ($deactivations | length)"
+                print $"found reactivations: ($reactivations | length)"
 
-                if ($relevant_events | length) != 3 {
-                     print "test failed: expected exactly 3 events"
+                if ($record_events | length) != 3 {
+                     print "test failed: expected exactly 3 record events"
                      print "captured events:"
                      print ($events | table -e)
+                } else if ($deactivations | length) == 0 {
+                     print "test failed: expected at least one deactivation event"
+                     print "captured identity events:"
+                     print ($identity_events | table -e)
+                } else if ($reactivations | length) == 0 {
+                     print "test failed: expected at least one reactivation (active) event"
+                     print "captured identity events:"
+                     print ($identity_events | table -e)
                 } else {
-                     let first = ($relevant_events | get 0)
-                     let second = ($relevant_events | get 1)
-                     let third = ($relevant_events | get 2)
+                     let first = ($record_events | get 0)
+                     let second = ($record_events | get 1)
+                     let third = ($record_events | get 2)
 
                      if ($first.record.action == "create") and ($second.record.action == "update") and ($third.record.action == "delete") {
-                         print "test passed: all operations (create, update, delete) captured in correct order"
+                         print "test passed: all record operations captured in correct order, and identity events captured"
                          $test_passed = true
                      } else {
-                         print "test failed: events out of order or incorrect"
+                         print "test failed: record events out of order or incorrect"
                          print "captured events:"
                          print ($events | table -e)
                      }
