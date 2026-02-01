@@ -1,5 +1,8 @@
-use fjall::{Database, Keyspace, KeyspaceCreateOptions, PersistMode, Slice};
+use crate::types::{BroadcastEvent, RepoState};
+use fjall::{Database, Keyspace, KeyspaceCreateOptions, OwnedWriteBatch, PersistMode, Slice};
 use futures::FutureExt;
+use jacquard::IntoStatic;
+use jacquard_common::types::string::Did;
 use miette::{IntoDiagnostic, Result};
 use std::future::Future;
 use std::path::Path;
@@ -11,7 +14,6 @@ use std::sync::atomic::AtomicU64;
 use tokio::sync::broadcast;
 use tracing::error;
 
-#[derive(Clone)]
 pub struct Db {
     pub inner: Arc<Database>,
     pub repos: Keyspace,
@@ -23,7 +25,7 @@ pub struct Db {
     pub errors: Keyspace,
     pub events: Keyspace,
     pub counts: Keyspace,
-    pub event_tx: broadcast::Sender<u64>,
+    pub event_tx: broadcast::Sender<BroadcastEvent>,
     pub next_event_id: Arc<AtomicU64>,
 }
 
@@ -190,6 +192,54 @@ impl Db {
         .flatten()
     }
 
+    pub fn update_repo_state<F, T>(
+        mut batch: OwnedWriteBatch,
+        repos: &Keyspace,
+        did: &Did<'_>,
+        f: F,
+    ) -> Result<(Option<(RepoState, T)>, fjall::OwnedWriteBatch)>
+    where
+        F: FnOnce(&mut RepoState, (&[u8], &mut fjall::OwnedWriteBatch)) -> Result<(bool, T)>,
+    {
+        let key = keys::repo_key(did);
+        if let Some(bytes) = repos.get(key).into_diagnostic()? {
+            let mut state: RepoState = deser_repo_state(bytes)?;
+            let (changed, result) = f(&mut state, (key, &mut batch))?;
+            if changed {
+                batch.insert(repos, key, ser_repo_state(&state)?);
+            }
+            Ok((Some((state, result)), batch))
+        } else {
+            Ok((None, batch))
+        }
+    }
+
+    pub async fn update_repo_state_async<F, T>(
+        &self,
+        did: &Did<'_>,
+        f: F,
+    ) -> Result<Option<(RepoState, T)>>
+    where
+        F: FnOnce(&mut RepoState, (&[u8], &mut fjall::OwnedWriteBatch)) -> Result<(bool, T)>
+            + Send
+            + 'static,
+        T: Send + 'static,
+    {
+        let batch = self.inner.batch();
+        let repos = self.repos.clone();
+        let did = did.clone().into_static();
+
+        tokio::task::spawn_blocking(move || {
+            let (Some((state, t)), batch) = Self::update_repo_state(batch, &repos, &did, f)? else {
+                return Ok(None);
+            };
+            batch.commit().into_diagnostic()?;
+            Ok(Some((state, t)))
+        })
+        .await
+        .into_diagnostic()?
+    }
+
     pub fn check_poisoned(e: &fjall::Error) {
         if matches!(e, fjall::Error::Poisoned) {
             error!("!!! DATABASE POISONED !!! exiting");
@@ -203,4 +253,12 @@ impl Db {
         };
         Self::check_poisoned(err);
     }
+}
+
+pub fn ser_repo_state(state: &RepoState) -> Result<Vec<u8>> {
+    rmp_serde::to_vec(&state).into_diagnostic()
+}
+
+pub fn deser_repo_state(bytes: impl AsRef<[u8]>) -> Result<RepoState> {
+    rmp_serde::from_slice(bytes.as_ref()).into_diagnostic()
 }
