@@ -33,7 +33,7 @@ async fn main() -> miette::Result<()> {
     let env_filter = tracing_subscriber::EnvFilter::new(&cfg.log_level);
     tracing_subscriber::fmt().with_env_filter(env_filter).init();
 
-    info!("starting hydrant with config: {cfg:?}");
+    info!("starting hydrant with config: {cfg:#?}");
 
     let (state, backfill_rx) = AppState::new(&cfg)?;
     let state = Arc::new(state);
