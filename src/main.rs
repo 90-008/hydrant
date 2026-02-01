@@ -1,5 +1,6 @@
 mod api;
 mod backfill;
+mod buffer;
 mod config;
 mod crawler;
 mod db;
@@ -10,12 +11,13 @@ mod state;
 mod types;
 
 use crate::backfill::Worker;
+use crate::buffer::processor::BufferProcessor;
 use crate::config::Config;
 use crate::crawler::Crawler;
 use crate::db::Db;
 use crate::ingest::Ingestor;
 use crate::state::AppState;
-use futures::TryFutureExt;
+use futures::{future::BoxFuture, FutureExt, TryFutureExt};
 use miette::IntoDiagnostic;
 use mimalloc::MiMalloc;
 use std::sync::atomic::Ordering;
@@ -35,7 +37,7 @@ async fn main() -> miette::Result<()> {
 
     info!("starting hydrant with config: {cfg:#?}");
 
-    let (state, backfill_rx) = AppState::new(&cfg)?;
+    let (state, backfill_rx, buffer_rx) = AppState::new(&cfg)?;
     let state = Arc::new(state);
 
     tokio::spawn({
@@ -52,6 +54,11 @@ async fn main() -> miette::Result<()> {
         let state = state.clone();
         let timeout = cfg.repo_fetch_timeout;
         Worker::new(state, backfill_rx, timeout, cfg.backfill_concurrency_limit).run()
+    });
+
+    let buffer_processor_task = tokio::spawn({
+        let state = state.clone();
+        BufferProcessor::new(state, buffer_rx).run()
     });
 
     if let Err(e) = spawn_blocking({
@@ -152,8 +159,12 @@ async fn main() -> miette::Result<()> {
 
     let ingestor = Ingestor::new(state.clone(), cfg.relay_host.clone(), cfg.full_network);
 
-    if let Err(e) = ingestor.run().await {
-        error!("ingestor died: {e}");
+    let res = futures::future::try_join_all::<[BoxFuture<_>; _]>([
+        Box::pin(buffer_processor_task.map(|r| r.into_diagnostic().flatten())),
+        Box::pin(ingestor.run()),
+    ]);
+    if let Err(e) = res.await {
+        error!("ingestor or buffer processor died: {e}");
         Db::check_poisoned_report(&e);
     }
 

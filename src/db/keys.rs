@@ -1,5 +1,5 @@
 use jacquard_common::types::string::Did;
-use miette::{Context, IntoDiagnostic};
+use miette::{Context, IntoDiagnostic, Result};
 
 /// separator used for composite keys
 pub const SEP: u8 = 0x00;
@@ -8,7 +8,7 @@ pub fn did_prefix<'a>(did: &'a Did<'a>) -> &'a str {
     did.as_str().trim_start_matches("did:")
 }
 
-pub fn reconstruct_did<'a>(trimmed_did: &'a str) -> Result<Did<'static>, miette::Error> {
+pub fn reconstruct_did<'a>(trimmed_did: &'a str) -> Result<Did<'static>> {
     Did::new_owned(format!("did:{trimmed_did}"))
         .into_diagnostic()
         .wrap_err("expected did to be trimmed")
@@ -32,9 +32,6 @@ pub fn record_key(did: &Did, collection: &str, rkey: &str) -> Vec<u8> {
 }
 
 // key format: {DID}
-pub fn buffer_prefix<'a>(did: &'a Did) -> &'a [u8] {
-    repo_key(did)
-}
 
 // key format: {SEQ}
 pub fn event_key(seq: i64) -> [u8; 8] {
@@ -66,4 +63,29 @@ pub fn count_collection_key(did: &Did, collection: &str) -> Vec<u8> {
     key.push(SEP);
     key.extend_from_slice(collection.as_bytes());
     key
+}
+
+// key format: {DID}\x00{timestamp} (for buffer entries)
+pub fn buffer_key(did: &str, timestamp: i64) -> Vec<u8> {
+    let mut key = Vec::with_capacity(did.len() + 1 + 8);
+    key.extend_from_slice(did.as_bytes());
+    key.push(SEP);
+    key.extend_from_slice(&timestamp.to_be_bytes());
+    key
+}
+
+pub fn parse_buffer_key(key: &[u8]) -> Result<(Did<'static>, i64)> {
+    let pos = key
+        .iter()
+        .rposition(|&b| b == SEP)
+        .ok_or_else(|| miette::miette!("buffer key invalid, no seperator found"))?;
+    let did_bytes = &key[..pos];
+    let ts_bytes = &key[pos + 1..];
+    let timestamp = i64::from_be_bytes(
+        ts_bytes
+            .try_into()
+            .map_err(|e| miette::miette!("buffer key invalid, {e}"))?,
+    );
+    let did = reconstruct_did(&String::from_utf8_lossy(did_bytes))?;
+    Ok((did, timestamp))
 }

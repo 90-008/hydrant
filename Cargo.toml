@@ -38,3 +38,4 @@ chrono = { version = "0.4.43", features = ["serde"] }
 humantime = "2.3.0"
 
 mimalloc = { version = "0.1", features = ["v3"] }
+scc = "3"
