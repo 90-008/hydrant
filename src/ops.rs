@@ -1,5 +1,5 @@
 use crate::db::{keys, Db};
-use crate::types::{RepoState, StoredEvent};
+use crate::types::{BroadcastEvent, IdentityEvt, MarshallableEvt, StoredEvent};
 use jacquard::api::com_atproto::sync::subscribe_repos::Commit;
 use jacquard::cowstr::ToCowStr;
 use jacquard_repo::car::reader::parse_car_bytes;
@@ -9,6 +9,70 @@ use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 use tracing::{debug, trace};
+
+// emitting identity is ephemeral
+// we dont replay these, consumers can just fetch identity themselves if they need it
+pub fn emit_identity_event(db: &Db, evt: IdentityEvt) {
+    let event_id = db.next_event_id.fetch_add(1, Ordering::SeqCst);
+    let marshallable = MarshallableEvt {
+        id: event_id,
+        event_type: "identity".into(),
+        record: None,
+        identity: Some(evt),
+    };
+    let _ = db.event_tx.send(BroadcastEvent::Ephemeral(marshallable));
+}
+
+pub fn delete_repo(db: &Db, did: &jacquard::types::did::Did) -> Result<()> {
+    debug!("deleting repo {did}");
+    let mut batch = db.inner.batch();
+    let repo_key = keys::repo_key(did);
+
+    // 1. delete from repos, pending, errors
+    batch.remove(&db.repos, repo_key);
+    batch.remove(&db.pending, repo_key);
+    batch.remove(&db.errors, repo_key);
+
+    // 2. delete from buffer (prefix: repo_key + SEP)
+    let mut buffer_prefix = repo_key.to_vec();
+    buffer_prefix.push(keys::SEP);
+    for guard in db.buffer.prefix(&buffer_prefix) {
+        let k = guard.key().into_diagnostic()?;
+        batch.remove(&db.buffer, k);
+    }
+
+    // 3. delete from records (prefix: repo_key + SEP)
+    let mut records_prefix = repo_key.to_vec();
+    records_prefix.push(keys::SEP);
+    let mut deleted_count = 0;
+
+    for guard in db.records.prefix(&records_prefix) {
+        let k = guard.key().into_diagnostic()?;
+        batch.remove(&db.records, k);
+        deleted_count += 1;
+    }
+
+    // 4. reset collection counts
+    let mut count_prefix = Vec::new();
+    count_prefix.push(b'r');
+    count_prefix.push(keys::SEP);
+    count_prefix.extend_from_slice(keys::did_prefix(did).as_bytes());
+    count_prefix.push(keys::SEP);
+
+    for guard in db.counts.prefix(&count_prefix) {
+        let k = guard.key().into_diagnostic()?;
+        batch.remove(&db.counts, k);
+    }
+
+    batch.commit().into_diagnostic()?;
+
+    // update global record count
+    if deleted_count > 0 {
+        tokio::spawn(db.increment_count(keys::count_keyspace_key("records"), -deleted_count));
+    }
+
+    Ok(())
+}
 
 pub fn apply_commit(db: &Db, commit: &Commit<'_>, live: bool) -> Result<()> {
     let did = &commit.repo;
@@ -24,16 +88,12 @@ pub fn apply_commit(db: &Db, commit: &Commit<'_>, live: bool) -> Result<()> {
 
     trace!("parsed car for {did} in {:?}", start.elapsed());
 
-    let mut batch = db.inner.batch();
-
-    let did_key = keys::repo_key(did);
-    if let Some(state_bytes) = db.repos.get(did_key).into_diagnostic()? {
-        let mut state: RepoState = rmp_serde::from_slice(&state_bytes).into_diagnostic()?;
+    let (_, mut batch) = Db::update_repo_state(db.inner.batch(), &db.repos, did, |state, _| {
         state.rev = commit.rev.as_str().into();
+        state.data = parsed.root.to_smolstr();
         state.last_updated_at = chrono::Utc::now().timestamp();
-        let bytes = rmp_serde::to_vec(&state).into_diagnostic()?;
-        batch.insert(&db.repos, did_key, bytes);
-    }
+        Ok((true, ()))
+    })?;
 
     // store all blocks in the CAS
     for (cid, bytes) in &parsed.blocks {
@@ -133,9 +193,9 @@ pub fn apply_commit(db: &Db, commit: &Commit<'_>, live: bool) -> Result<()> {
         )
     });
 
-    let _ = db
-        .event_tx
-        .send(db.next_event_id.load(Ordering::SeqCst) - 1);
+    let _ = db.event_tx.send(BroadcastEvent::Persisted(
+        db.next_event_id.load(Ordering::SeqCst) - 1,
+    ));
 
     Ok(())
 }
