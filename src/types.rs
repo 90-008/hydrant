@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use smol_str::SmolStr;
 
-// From src/state.rs
+// from src/state.rs
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum RepoStatus {
@@ -11,6 +11,9 @@ pub enum RepoStatus {
     Backfilling,
     Synced,
     Error(SmolStr),
+    Deactivated,
+    Takendown,
+    Suspended,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -18,8 +21,10 @@ pub struct RepoState {
     pub did: SmolStr,
     pub status: RepoStatus,
     pub rev: SmolStr,
+    pub data: SmolStr,
     pub last_seq: Option<i64>,
-    pub last_updated_at: i64, // Unix timestamp
+    pub last_updated_at: i64, // unix timestamp
+    pub handle: Option<SmolStr>,
 }
 
 impl RepoState {
@@ -28,13 +33,15 @@ impl RepoState {
             did: did.as_str().into(),
             status: RepoStatus::New,
             rev: "".into(),
+            data: "".into(),
             last_seq: None,
             last_updated_at: chrono::Utc::now().timestamp(),
+            handle: None,
         }
     }
 }
 
-// From src/backfill/error_state.rs
+// from src/backfill/error_state.rs
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ErrorState {
@@ -54,7 +61,24 @@ impl ErrorState {
     }
 }
 
-// From src/api/event.rs
+// from src/api/event.rs
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct MarshallableEvt {
+    pub id: u64,
+    #[serde(rename = "type")]
+    pub event_type: SmolStr,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub record: Option<RecordEvt>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub identity: Option<IdentityEvt>,
+}
+
+#[derive(Clone, Debug)]
+pub enum BroadcastEvent {
+    Persisted(u64),
+    Ephemeral(MarshallableEvt),
+}
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct RecordEvt {
