@@ -103,7 +103,7 @@ impl BufferProcessor {
                 };
                 ops::emit_identity_event(&self.state.db, evt);
             }
-            SubscribeReposMessage::Account(ref account) => {
+            SubscribeReposMessage::Account(account) => {
                 debug!("processing buffered account for {did}");
                 let evt = AccountEvt {
                     did: did.to_smolstr(),
@@ -111,6 +111,66 @@ impl BufferProcessor {
                     status: account.status.as_ref().map(|s| s.to_smolstr()),
                 };
                 ops::emit_account_event(&self.state.db, evt);
+
+                let state = self.state.clone();
+                let did = did.clone();
+                let account = account.clone(); // Account is 'static in BufferedMessage
+
+                tokio::task::spawn_blocking(move || -> Result<()> {
+                    // handle status updates
+                    if !account.active {
+                        use jacquard::api::com_atproto::sync::subscribe_repos::AccountStatus;
+                        if let Some(status) = &account.status {
+                            match status {
+                                AccountStatus::Deleted => {
+                                    info!("account {did} deleted, wiping data");
+                                    ops::delete_repo(&state.db, &did)?;
+                                }
+                                AccountStatus::Takendown => {
+                                    ops::update_repo_status(
+                                        &state.db,
+                                        &did,
+                                        crate::types::RepoStatus::Takendown,
+                                    )?;
+                                }
+                                AccountStatus::Suspended => {
+                                    ops::update_repo_status(
+                                        &state.db,
+                                        &did,
+                                        crate::types::RepoStatus::Suspended,
+                                    )?;
+                                }
+                                AccountStatus::Deactivated => {
+                                    ops::update_repo_status(
+                                        &state.db,
+                                        &did,
+                                        crate::types::RepoStatus::Deactivated,
+                                    )?;
+                                }
+                                AccountStatus::Throttled | AccountStatus::Desynchronized => {
+                                    let status_str = status.as_str().to_smolstr();
+                                    ops::update_repo_status(
+                                        &state.db,
+                                        &did,
+                                        crate::types::RepoStatus::Error(status_str),
+                                    )?;
+                                }
+                                AccountStatus::Other(s) => {
+                                    warn!("unknown account status for {did}: {s}");
+                                }
+                            }
+                        } else {
+                            warn!("account {did} inactive but no status provided");
+                        }
+                    } else {
+                        // active account, clear any error/suspension states if they exist
+                        // we set it to Synced because we are receiving live events for it
+                        ops::update_repo_status(&state.db, &did, crate::types::RepoStatus::Synced)?;
+                    }
+                    Ok(())
+                })
+                .await
+                .into_diagnostic()??;
             }
             _ => {
                 warn!("unknown message type in buffer for {did}");

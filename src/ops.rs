@@ -87,6 +87,25 @@ pub fn delete_repo(db: &Db, did: &jacquard::types::did::Did) -> Result<()> {
     Ok(())
 }
 
+pub fn update_repo_status(
+    db: &Db,
+    did: &jacquard::types::did::Did,
+    status: crate::types::RepoStatus,
+) -> Result<()> {
+    debug!("updating repo status for {did} to {status:?}");
+    let (updated, mut batch) =
+        Db::update_repo_state(db.inner.batch(), &db.repos, did, |state, _val| {
+            state.status = status.clone();
+            state.last_updated_at = chrono::Utc::now().timestamp();
+            Ok((true, ()))
+        })?;
+
+    if updated.is_some() {
+        batch.commit().into_diagnostic()?;
+    }
+    Ok(())
+}
+
 pub fn apply_commit(db: &Db, commit: &Commit<'_>, live: bool) -> Result<()> {
     let did = &commit.repo;
     debug!("applying commit {} for {did}", &commit.commit);
