@@ -8,6 +8,7 @@ use miette::Result;
 use n0_future::StreamExt;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::{debug, error, info};
 use url::Url;
 
@@ -62,7 +63,7 @@ impl Ingestor {
                 Ok(s) => s,
                 Err(e) => {
                     error!("failed to connect to firehose: {e}, retrying in 5s...");
-                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    tokio::time::sleep(Duration::from_secs(5)).await;
                     continue;
                 }
             };
@@ -83,7 +84,7 @@ impl Ingestor {
             }
 
             error!("firehose disconnected, reconnecting in 5s...");
-            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            tokio::time::sleep(Duration::from_secs(5)).await;
         }
     }
 

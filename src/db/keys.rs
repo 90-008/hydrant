@@ -66,9 +66,9 @@ pub fn count_collection_key(did: &Did, collection: &str) -> Vec<u8> {
 }
 
 // key format: {DID}\x00{timestamp} (for buffer entries)
-pub fn buffer_key(did: &str, timestamp: i64) -> Vec<u8> {
+pub fn buffer_key(did: &Did, timestamp: i64) -> Vec<u8> {
     let mut key = Vec::with_capacity(did.len() + 1 + 8);
-    key.extend_from_slice(did.as_bytes());
+    key.extend_from_slice(did_prefix(did).as_bytes());
     key.push(SEP);
     key.extend_from_slice(&timestamp.to_be_bytes());
     key

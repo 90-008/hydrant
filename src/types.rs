@@ -69,28 +69,32 @@ impl ResyncState {
 // from src/api/event.rs
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct MarshallableEvt {
+pub struct MarshallableEvt<'i> {
     pub id: u64,
     #[serde(rename = "type")]
     pub event_type: SmolStr,
+    #[serde(borrow)]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub record: Option<RecordEvt>,
+    pub record: Option<RecordEvt<'i>>,
+    #[serde(borrow)]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub identity: Option<IdentityEvt>,
+    pub identity: Option<IdentityEvt<'i>>,
+    #[serde(borrow)]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub account: Option<AccountEvt>,
+    pub account: Option<AccountEvt<'i>>,
 }
 
 #[derive(Clone, Debug)]
 pub enum BroadcastEvent {
     Persisted(u64),
-    Ephemeral(MarshallableEvt),
+    Ephemeral(MarshallableEvt<'static>),
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct RecordEvt {
+pub struct RecordEvt<'i> {
     pub live: bool,
-    pub did: SmolStr,
+    #[serde(borrow)]
+    pub did: Did<'i>,
     pub rev: SmolStr,
     pub collection: SmolStr,
     pub rkey: SmolStr,
@@ -102,31 +106,36 @@ pub struct RecordEvt {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct IdentityEvt {
-    pub did: SmolStr,
+pub struct IdentityEvt<'i> {
+    #[serde(borrow)]
+    pub did: Did<'i>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub handle: Option<SmolStr>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct AccountEvt {
-    pub did: SmolStr,
+pub struct AccountEvt<'i> {
+    #[serde(borrow)]
+    pub did: Did<'i>,
     pub active: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<SmolStr>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
-pub enum StoredEvent {
+pub enum StoredEvent<'i> {
     Record {
         live: bool,
-        did: SmolStr,
+        #[serde(borrow)]
+        did: Did<'i>,
         rev: SmolStr,
         collection: SmolStr,
         rkey: SmolStr,
         action: SmolStr,
         cid: Option<SmolStr>,
     },
-    Identity(IdentityEvt),
-    Account(AccountEvt),
+    #[serde(borrow)]
+    Identity(IdentityEvt<'i>),
+    #[serde(borrow)]
+    Account(AccountEvt<'i>),
 }

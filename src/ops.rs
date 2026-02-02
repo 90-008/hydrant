@@ -2,6 +2,7 @@ use crate::db::{keys, Db};
 use crate::types::{AccountEvt, BroadcastEvent, IdentityEvt, MarshallableEvt, StoredEvent};
 use jacquard::api::com_atproto::sync::subscribe_repos::Commit;
 use jacquard::cowstr::ToCowStr;
+use jacquard::IntoStatic;
 use jacquard_repo::car::reader::parse_car_bytes;
 use miette::{IntoDiagnostic, Result};
 use smol_str::{SmolStr, ToSmolStr};
@@ -12,7 +13,7 @@ use tracing::{debug, trace};
 
 // emitting identity is ephemeral
 // we dont replay these, consumers can just fetch identity themselves if they need it
-pub fn emit_identity_event(db: &Db, evt: IdentityEvt) {
+pub fn emit_identity_event(db: &Db, evt: IdentityEvt<'static>) {
     let event_id = db.next_event_id.fetch_add(1, Ordering::SeqCst);
     let marshallable = MarshallableEvt {
         id: event_id,
@@ -24,7 +25,7 @@ pub fn emit_identity_event(db: &Db, evt: IdentityEvt) {
     let _ = db.event_tx.send(BroadcastEvent::Ephemeral(marshallable));
 }
 
-pub fn emit_account_event(db: &Db, evt: AccountEvt) {
+pub fn emit_account_event(db: &Db, evt: AccountEvt<'static>) {
     let event_id = db.next_event_id.fetch_add(1, Ordering::SeqCst);
     let marshallable = MarshallableEvt {
         id: event_id,
@@ -186,7 +187,7 @@ pub fn apply_commit(db: &Db, commit: &Commit<'_>, live: bool) -> Result<()> {
 
         let evt = StoredEvent::Record {
             live,
-            did: did.as_str().into(),
+            did: did.clone().into_static(),
             rev: commit.rev.as_str().into(),
             collection: collection.into(),
             rkey: rkey.into(),

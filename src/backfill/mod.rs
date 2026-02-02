@@ -4,8 +4,8 @@ use crate::state::{AppState, BackfillRx};
 use crate::types::{AccountEvt, BroadcastEvent, RepoState, RepoStatus, ResyncState, StoredEvent};
 use futures::TryFutureExt;
 use jacquard::api::com_atproto::sync::get_repo::{GetRepo, GetRepoError};
-use jacquard::prelude::*;
 use jacquard::types::did::Did;
+use jacquard::{prelude::*, IntoStatic};
 use jacquard_common::xrpc::XrpcError;
 use jacquard_repo::mst::Mst;
 use jacquard_repo::MemoryBlockStore;
@@ -237,7 +237,7 @@ impl Worker {
 
         let emit_identity = |status: &RepoStatus| {
             let evt = AccountEvt {
-                did: did.as_str().into(),
+                did: did.clone(),
                 active: !matches!(
                     status,
                     RepoStatus::Deactivated | RepoStatus::Takendown | RepoStatus::Suspended
@@ -403,7 +403,7 @@ impl Worker {
                                 app_state.db.next_event_id.fetch_add(1, Ordering::SeqCst);
                             let evt = StoredEvent::Record {
                                 live: false,
-                                did: did.as_str().into(),
+                                did: did.clone().into_static(),
                                 rev: rev.as_str().into(),
                                 collection: collection.into(),
                                 rkey: rkey.into(),

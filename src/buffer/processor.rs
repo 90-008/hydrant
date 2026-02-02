@@ -40,12 +40,10 @@ impl BufferProcessor {
         let mut to_remove: Vec<Did<'static>> = Vec::new();
 
         loop {
-            // receive new messages (non-blocking drain)
             while let Ok(msg) = self.rx.try_recv() {
                 queues.entry(msg.did.clone()).or_default().push_back(msg);
             }
 
-            // process unblocked DIDs
             for (did, queue) in &mut queues {
                 if self.state.blocked_dids.contains_sync(did) {
                     continue;
@@ -98,7 +96,7 @@ impl BufferProcessor {
                 debug!("processing buffered identity for {did}");
                 let handle = identity.handle.as_ref().map(|h| h.as_str().to_smolstr());
                 let evt = IdentityEvt {
-                    did: did.to_smolstr(),
+                    did: did.clone(),
                     handle,
                 };
                 ops::emit_identity_event(&self.state.db, evt);
@@ -106,18 +104,17 @@ impl BufferProcessor {
             SubscribeReposMessage::Account(account) => {
                 debug!("processing buffered account for {did}");
                 let evt = AccountEvt {
-                    did: did.to_smolstr(),
+                    did: did.clone(),
                     active: account.active,
                     status: account.status.as_ref().map(|s| s.to_smolstr()),
                 };
                 ops::emit_account_event(&self.state.db, evt);
 
-                let state = self.state.clone();
                 let did = did.clone();
-                let account = account.clone(); // Account is 'static in BufferedMessage
+                let state = self.state.clone();
+                let account = account.clone();
 
                 tokio::task::spawn_blocking(move || -> Result<()> {
-                    // handle status updates
                     if !account.active {
                         use jacquard::api::com_atproto::sync::subscribe_repos::AccountStatus;
                         if let Some(status) = &account.status {
@@ -208,7 +205,7 @@ impl BufferProcessor {
         .flatten()
     }
 
-    async fn remove_from_db_buffer(&self, did: &str, buffered_at: i64) -> Result<()> {
+    async fn remove_from_db_buffer(&self, did: &Did<'_>, buffered_at: i64) -> Result<()> {
         let key = keys::buffer_key(did, buffered_at);
         self.state.db.buffer.remove(key).into_diagnostic()?;
         Ok(())
