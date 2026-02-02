@@ -3,7 +3,7 @@ use fjall::{Database, Keyspace, KeyspaceCreateOptions, OwnedWriteBatch, PersistM
 use futures::FutureExt;
 use jacquard::IntoStatic;
 use jacquard_common::types::string::Did;
-use miette::{IntoDiagnostic, Result};
+use miette::{Context, IntoDiagnostic, Result};
 use std::future::Future;
 use std::path::Path;
 use std::sync::Arc;
@@ -47,39 +47,36 @@ impl Db {
             .into_diagnostic()?;
         let db = Arc::new(db);
 
-        let opts = || KeyspaceCreateOptions::default();
+        let opts = KeyspaceCreateOptions::default;
+        let open_ks = |name: &str, opts: KeyspaceCreateOptions| {
+            db.keyspace(name, move || opts).into_diagnostic()
+        };
 
-        let repos = db.keyspace("repos", opts).into_diagnostic()?;
-        let records = db
-            .keyspace("records", || opts().max_memtable_size(32 * 2_u64.pow(20)))
-            .into_diagnostic()?;
-
-        let block_opts = || {
+        let repos = open_ks("repos", opts().expect_point_read_hits(true))?;
+        let records = open_ks("records", opts().max_memtable_size(32 * 2_u64.pow(20)))?;
+        let blocks = open_ks(
+            "blocks",
             opts()
                 // point reads are used a lot by stream
                 .expect_point_read_hits(true)
-                .max_memtable_size(32 * 2_u64.pow(20))
-        };
-        let blocks = db.keyspace("blocks", block_opts).into_diagnostic()?;
-        let cursors = db.keyspace("cursors", opts).into_diagnostic()?;
-        let buffer = db.keyspace("buffer", opts).into_diagnostic()?;
-        let pending = db.keyspace("pending", opts).into_diagnostic()?;
-        let resync = db.keyspace("resync", opts).into_diagnostic()?;
-        let events = db.keyspace("events", opts).into_diagnostic()?;
-        let counts = db.keyspace("counts", opts).into_diagnostic()?;
+                .max_memtable_size(32 * 2_u64.pow(20)),
+        )?;
+        let cursors = open_ks("cursors", opts().expect_point_read_hits(true))?;
+        let buffer = open_ks("buffer", opts())?;
+        let pending = open_ks("pending", opts())?;
+        let resync = open_ks("resync", opts())?;
+        let events = open_ks("events", opts())?;
+        let counts = open_ks("counts", opts().expect_point_read_hits(true))?;
 
         let mut last_id = 0;
-        let mut iter = events.iter();
-        if let Some(guard) = iter.next_back() {
-            let res: Result<fjall::KvPair, _> = guard.into_inner().map_err(|e| miette::miette!(e));
-            if let Ok(kv) = res {
-                let k = &kv.0;
-                let mut buf = [0u8; 8];
-                if k.len() == 8 {
-                    buf.copy_from_slice(k);
-                    last_id = u64::from_be_bytes(buf);
-                }
-            }
+        if let Some(guard) = events.iter().next_back() {
+            let k = guard.key().into_diagnostic()?;
+            last_id = u64::from_be_bytes(
+                k.as_ref()
+                    .try_into()
+                    .into_diagnostic()
+                    .wrap_err("expected to be id (8 bytes)")?,
+            );
         }
 
         let (event_tx, _) = broadcast::channel(10000);

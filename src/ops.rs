@@ -93,7 +93,7 @@ pub fn update_repo_status(
     status: crate::types::RepoStatus,
 ) -> Result<()> {
     debug!("updating repo status for {did} to {status:?}");
-    let (updated, mut batch) =
+    let (updated, batch) =
         Db::update_repo_state(db.inner.batch(), &db.repos, did, |state, _val| {
             state.status = status.clone();
             state.last_updated_at = chrono::Utc::now().timestamp();
