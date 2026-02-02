@@ -1,13 +1,12 @@
 use crate::api::AppState;
 use crate::db::keys;
 use axum::{
-    extract::{ConnectInfo, Query, State},
+    extract::{Query, State},
     http::StatusCode,
     Json,
 };
 use jacquard::types::ident::AtIdentifier;
 use serde::{Deserialize, Serialize};
-use std::net::SocketAddr;
 use std::sync::Arc;
 
 #[derive(Deserialize)]
@@ -21,15 +20,14 @@ pub struct DebugCountResponse {
     pub count: usize,
 }
 
+pub fn router() -> axum::Router<Arc<AppState>> {
+    axum::Router::new().route("/debug/count", axum::routing::get(handle_debug_count))
+}
+
 pub async fn handle_debug_count(
     State(state): State<Arc<AppState>>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Query(req): Query<DebugCountRequest>,
 ) -> Result<Json<DebugCountResponse>, StatusCode> {
-    if !addr.ip().is_loopback() {
-        return Err(StatusCode::FORBIDDEN);
-    }
-
     let did = state
         .resolver
         .resolve_did(&AtIdentifier::new(req.did.as_str()).map_err(|_| StatusCode::BAD_REQUEST)?)

@@ -40,15 +40,16 @@ async fn main() -> miette::Result<()> {
     let (state, backfill_rx, buffer_rx) = AppState::new(&cfg)?;
     let state = Arc::new(state);
 
-    tokio::spawn({
-        let port = cfg.api_port;
-        let state = state.clone();
-        async move {
-            if let Err(e) = api::serve(state, port).await {
-                error!("API server failed: {e}");
-            }
-        }
-    });
+    tokio::spawn(
+        api::serve(state.clone(), cfg.api_port).inspect_err(|e| error!("API server failed: {e}")),
+    );
+
+    if cfg.enable_debug {
+        tokio::spawn(
+            api::serve_debug(state.clone(), cfg.debug_port)
+                .inspect_err(|e| error!("debug server failed: {e}")),
+        );
+    }
 
     tokio::spawn({
         let state = state.clone();

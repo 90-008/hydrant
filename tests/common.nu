@@ -15,6 +15,8 @@ export def start-hydrant [binary: string, db_path: string, port: int] {
             HYDRANT_DATABASE_PATH: ($db_path),
             HYDRANT_FULL_NETWORK: "false",
             HYDRANT_API_PORT: ($port | into string),
+            HYDRANT_ENABLE_DEBUG: "true",
+            HYDRANT_DEBUG_PORT: ($port + 1 | into string),
             HYDRANT_LOG_LEVEL: "debug"
         } {
             sh -c $"($binary) >($log_file) 2>&1 & echo $!" | str trim | into int

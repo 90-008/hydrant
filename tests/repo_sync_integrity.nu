@@ -55,7 +55,7 @@ export def check-consistency [hydrant_url: string, pds_url: string, did: string]
 }
 
 # verify countRecords API against debug endpoint
-def check-count [hydrant_url: string, did: string] {
+def check-count [hydrant_url: string, debug_url: string, did: string] {
     print "verifying countRecords API..."
     let collections = [
          "app.bsky.feed.post"
@@ -77,7 +77,7 @@ def check-count [hydrant_url: string, did: string] {
 
         # 2. get actual scan count from debug endpoint
         let debug_count = try {
-            (http get $"($hydrant_url)/debug/count?did=($did)&collection=($coll)").count
+            (http get $"($debug_url)/debug/count?did=($did)&collection=($coll)").count
         } catch {
              print $"    error calling debug count for ($coll)"
              return false
@@ -98,6 +98,7 @@ def main [] {
     let pds = "https://zwsp.xyz"
     let port = 3001
     let url = $"http://localhost:($port)"
+    let debug_url = $"http://127.0.0.1:($port + 1)"
     let db_path = (mktemp -d -t hydrant_test.XXXXXX)
 
     print $"testing backfill integrity for ($did)..."
@@ -116,7 +117,7 @@ def main [] {
         if (wait-for-backfill $url) {
             # Run both consistency checks
             let integrity_passed = (check-consistency $url $pds $did)
-            let count_passed = (check-count $url $did)
+            let count_passed = (check-count $url $debug_url $did)
 
             if $integrity_passed and $count_passed {
                 print "all integrity checks passed!"

@@ -15,7 +15,6 @@ pub async fn serve(state: Arc<AppState>, port: u16) -> miette::Result<()> {
         .route("/health", get(|| async { "OK" }))
         .route("/stats", get(stats::get_stats))
         .route("/stream", get(stream::handle_stream))
-        .route("/debug/count", get(debug::handle_debug_count))
         .merge(xrpc::router())
         .merge(repo::router())
         .with_state(state)
@@ -34,6 +33,30 @@ pub async fn serve(state: Arc<AppState>, port: u16) -> miette::Result<()> {
     )
     .await
     .map_err(|e| miette::miette!("axum server error: {e}"))?;
+
+    Ok(())
+}
+
+pub async fn serve_debug(state: Arc<AppState>, port: u16) -> miette::Result<()> {
+    let app = debug::router()
+        .with_state(state)
+        .layer(TraceLayer::new_for_http());
+
+    let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{port}"))
+        .await
+        .map_err(|e| miette::miette!("failed to bind debug server to port {port}: {e}"))?;
+
+    tracing::info!(
+        "Debug server listening on {}",
+        listener.local_addr().unwrap()
+    );
+
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
+    .map_err(|e| miette::miette!("debug server error: {e}"))?;
 
     Ok(())
 }

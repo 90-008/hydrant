@@ -18,6 +18,8 @@ pub struct Config {
     pub cache_size: u64,
     pub backfill_concurrency_limit: usize,
     pub disable_lz4_compression: bool,
+    pub debug_port: u16,
+    pub enable_debug: bool,
 }
 
 impl Config {
@@ -72,6 +74,15 @@ impl Config {
             .map(|v| v == "true")
             .unwrap_or(false);
 
+        let debug_port = env::var("HYDRANT_DEBUG_PORT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(3001);
+
+        let enable_debug = env::var("HYDRANT_ENABLE_DEBUG")
+            .map(|v| v == "true")
+            .unwrap_or(false);
+
         Ok(Self {
             database_path,
             relay_host,
@@ -84,6 +95,8 @@ impl Config {
             cache_size,
             backfill_concurrency_limit,
             disable_lz4_compression,
+            debug_port,
+            enable_debug,
         })
     }
 }
