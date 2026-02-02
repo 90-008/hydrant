@@ -4,9 +4,8 @@ use jacquard::api::com_atproto::sync::subscribe_repos::{SubscribeRepos, Subscrib
 use jacquard::types::did::Did;
 use jacquard_common::xrpc::{SubscriptionClient, TungsteniteSubscriptionClient};
 use jacquard_common::IntoStatic;
-use miette::{IntoDiagnostic, Result};
+use miette::Result;
 use n0_future::StreamExt;
-use smol_str::SmolStr;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tracing::{debug, error, info};
@@ -14,12 +13,12 @@ use url::Url;
 
 pub struct Ingestor {
     state: Arc<AppState>,
-    relay_host: SmolStr,
+    relay_host: Url,
     full_network: bool,
 }
 
 impl Ingestor {
-    pub fn new(state: Arc<AppState>, relay_host: SmolStr, full_network: bool) -> Self {
+    pub fn new(state: Arc<AppState>, relay_host: Url, full_network: bool) -> Self {
         Self {
             state,
             relay_host,
@@ -28,8 +27,6 @@ impl Ingestor {
     }
 
     pub async fn run(mut self) -> Result<()> {
-        let base_url = Url::parse(&self.relay_host).into_diagnostic()?;
-
         loop {
             // 1. load cursor
             let current_cursor = self.state.cur_firehose.load(Ordering::SeqCst);
@@ -54,7 +51,7 @@ impl Ingestor {
             }
 
             // 2. connect
-            let client = TungsteniteSubscriptionClient::from_base_uri(base_url.clone());
+            let client = TungsteniteSubscriptionClient::from_base_uri(self.relay_host.clone());
             let params = if let Some(c) = start_cursor {
                 SubscribeRepos::new().cursor(c).build()
             } else {

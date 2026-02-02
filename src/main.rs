@@ -35,7 +35,7 @@ async fn main() -> miette::Result<()> {
     let env_filter = tracing_subscriber::EnvFilter::new(&cfg.log_level);
     tracing_subscriber::fmt().with_env_filter(env_filter).init();
 
-    info!("starting hydrant with config: {cfg:#?}");
+    info!("{cfg}");
 
     let (state, backfill_rx, buffer_rx) = AppState::new(&cfg)?;
     let state = Arc::new(state);
@@ -147,18 +147,17 @@ async fn main() -> miette::Result<()> {
     });
 
     if cfg.full_network {
-        tokio::spawn({
-            let state = state.clone();
-            let crawler_host = cfg.relay_host.clone();
-
-            Crawler::new(state, crawler_host).run().inspect_err(|e| {
-                error!("crawler died: {e}");
-                Db::check_poisoned_report(&e);
-            })
-        });
+        tokio::spawn(
+            Crawler::new(state.clone(), cfg.relay_host.clone())
+                .run()
+                .inspect_err(|e| {
+                    error!("crawler died: {e}");
+                    Db::check_poisoned_report(&e);
+                }),
+        );
     }
 
-    let ingestor = Ingestor::new(state.clone(), cfg.relay_host.clone(), cfg.full_network);
+    let ingestor = Ingestor::new(state.clone(), cfg.relay_host, cfg.full_network);
 
     let res = futures::future::try_join_all::<[BoxFuture<_>; _]>([
         Box::pin(buffer_processor_task.map(|r| r.into_diagnostic().flatten())),

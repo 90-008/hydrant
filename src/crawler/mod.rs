@@ -14,12 +14,12 @@ use url::Url;
 
 pub struct Crawler {
     state: Arc<AppState>,
-    relay_host: SmolStr,
+    relay_host: Url,
     http: reqwest::Client,
 }
 
 impl Crawler {
-    pub fn new(state: Arc<AppState>, relay_host: SmolStr) -> Self {
+    pub fn new(state: Arc<AppState>, relay_host: Url) -> Self {
         Self {
             state,
             relay_host,
@@ -31,8 +31,6 @@ impl Crawler {
         info!("crawler started");
 
         let db = &self.state.db;
-
-        let relay_url = Url::parse(&self.relay_host).into_diagnostic()?;
 
         // 1. load cursor
         let cursor_key = b"crawler_cursor";
@@ -52,7 +50,7 @@ impl Crawler {
                 .maybe_cursor(cursor.clone().map(|c| CowStr::from(c.to_string())))
                 .build();
 
-            let res_result = self.http.xrpc(relay_url.clone()).send(&req).await;
+            let res_result = self.http.xrpc(self.relay_host.clone()).send(&req).await;
 
             let output: ListReposOutput = match res_result {
                 Ok(res) => res.into_output().into_diagnostic()?,

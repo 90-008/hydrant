@@ -1,6 +1,6 @@
-use miette::{IntoDiagnostic, Result};
+use miette::Result;
 use smol_str::SmolStr;
-use std::env;
+use std::fmt;
 use std::path::PathBuf;
 use std::time::Duration;
 use url::Url;
@@ -8,7 +8,7 @@ use url::Url;
 #[derive(Debug, Clone)]
 pub struct Config {
     pub database_path: PathBuf,
-    pub relay_host: SmolStr,
+    pub relay_host: Url,
     pub plc_url: Url,
     pub full_network: bool,
     pub cursor_save_interval: Duration,
@@ -24,64 +24,45 @@ pub struct Config {
 
 impl Config {
     pub fn from_env() -> Result<Self> {
-        let database_path = env::var("HYDRANT_DATABASE_PATH")
-            .unwrap_or_else(|_| "./hydrant.db".to_string())
-            .into();
+        macro_rules! cfg {
+            (@val $key:expr) => {
+                std::env::var(concat!("HYDRANT_", $key))
+            };
+            ($key:expr, $default:expr, sec) => {
+                cfg!(@val $key)
+                    .ok()
+                    .and_then(|s| humantime::parse_duration(&s).ok())
+                    .unwrap_or(Duration::from_secs($default))
+            };
+            ($key:expr, $default:expr) => {
+                cfg!(@val $key)
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or($default.to_owned())
+                    .into()
+            };
+        }
 
-        let relay_host = env::var("HYDRANT_RELAY_HOST")
-            .unwrap_or_else(|_| "wss://relay.fire.hose.cam".to_string())
-            .into();
+        let log_level = cfg!("LOG_LEVEL", "info");
 
-        let plc_url = env::var("HYDRANT_PLC_URL")
-            .unwrap_or_else(|_| "https://plc.wtf".to_string())
-            .parse()
-            .into_diagnostic()?;
+        let relay_host = cfg!(
+            "RELAY_HOST",
+            Url::parse("wss://relay.fire.hose.cam").unwrap()
+        );
+        let plc_url = cfg!("PLC_URL", Url::parse("https://plc.wtf").unwrap());
 
-        let full_network = env::var("HYDRANT_FULL_NETWORK")
-            .map(|v| v == "true")
-            .unwrap_or(false);
+        let full_network = cfg!("FULL_NETWORK", false);
+        let backfill_concurrency_limit = cfg!("BACKFILL_CONCURRENCY_LIMIT", 32usize);
+        let cursor_save_interval = cfg!("CURSOR_SAVE_INTERVAL", 10, sec);
+        let repo_fetch_timeout = cfg!("REPO_FETCH_TIMEOUT", 300, sec);
 
-        let cursor_save_interval = env::var("HYDRANT_CURSOR_SAVE_INTERVAL")
-            .ok()
-            .and_then(|s| humantime::parse_duration(&s).ok())
-            .unwrap_or(Duration::from_secs(10));
+        let database_path = cfg!("DATABASE_PATH", "./hydrant.db");
+        let cache_size = cfg!("CACHE_SIZE", 256u64);
+        let disable_lz4_compression = cfg!("NO_LZ4_COMPRESSION", false);
 
-        let repo_fetch_timeout = env::var("HYDRANT_REPO_FETCH_TIMEOUT")
-            .ok()
-            .and_then(|s| humantime::parse_duration(&s).ok())
-            .unwrap_or(Duration::from_secs(300));
-
-        let log_level = env::var("HYDRANT_LOG_LEVEL")
-            .unwrap_or_else(|_| "info".to_string())
-            .into();
-
-        let api_port = env::var("HYDRANT_API_PORT")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(3000);
-
-        let cache_size = env::var("HYDRANT_CACHE_SIZE")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(256);
-
-        let backfill_concurrency_limit = env::var("HYDRANT_BACKFILL_CONCURRENCY_LIMIT")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(32);
-
-        let disable_lz4_compression = env::var("HYDRANT_NO_LZ4_COMPRESSION")
-            .map(|v| v == "true")
-            .unwrap_or(false);
-
-        let debug_port = env::var("HYDRANT_DEBUG_PORT")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(3001);
-
-        let enable_debug = env::var("HYDRANT_ENABLE_DEBUG")
-            .map(|v| v == "true")
-            .unwrap_or(false);
+        let api_port = cfg!("API_PORT", 3000u16);
+        let enable_debug = cfg!("ENABLE_DEBUG", false);
+        let debug_port = cfg!("DEBUG_PORT", 3001u16);
 
         Ok(Self {
             database_path,
@@ -98,5 +79,47 @@ impl Config {
             debug_port,
             enable_debug,
         })
+    }
+}
+
+impl fmt::Display for Config {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(f, "hydrant configuration:")?;
+        writeln!(f, "  log level:                {}", self.log_level)?;
+        writeln!(f, "  relay host:               {}", self.relay_host)?;
+        writeln!(f, "  plc url:                  {}", self.plc_url)?;
+        writeln!(f, "  full network indexing:    {}", self.full_network)?;
+        writeln!(
+            f,
+            "  backfill concurrency:     {}",
+            self.backfill_concurrency_limit
+        )?;
+        writeln!(
+            f,
+            "  cursor save interval:     {}sec",
+            self.cursor_save_interval.as_secs()
+        )?;
+        writeln!(
+            f,
+            "  repo fetch timeout:       {}sec",
+            self.repo_fetch_timeout.as_secs()
+        )?;
+        writeln!(
+            f,
+            "  database path:            {}",
+            self.database_path.to_string_lossy()
+        )?;
+        writeln!(f, "  cache size:               {} mb", self.cache_size)?;
+        writeln!(
+            f,
+            "  disable lz4 compression:  {}",
+            self.disable_lz4_compression
+        )?;
+        writeln!(f, "  api port:                 {}", self.api_port)?;
+        writeln!(f, "  enable debug:             {}", self.enable_debug)?;
+        if self.enable_debug {
+            writeln!(f, "  debug port:               {}", self.debug_port)?;
+        }
+        Ok(())
     }
 }
