@@ -15,11 +15,16 @@ use url::Url;
 pub struct Ingestor {
     state: Arc<AppState>,
     relay_host: SmolStr,
+    full_network: bool,
 }
 
 impl Ingestor {
-    pub fn new(state: Arc<AppState>, relay_host: SmolStr, _full_network: bool) -> Self {
-        Self { state, relay_host }
+    pub fn new(state: Arc<AppState>, relay_host: SmolStr, full_network: bool) -> Self {
+        Self {
+            state,
+            relay_host,
+            full_network,
+        }
     }
 
     pub async fn run(mut self) -> Result<()> {
@@ -122,6 +127,9 @@ impl Ingestor {
     }
 
     async fn should_process(&self, did: &Did<'_>) -> Result<bool> {
+        if self.full_network {
+            return Ok(true);
+        }
         let did_key = keys::repo_key(did);
         Db::contains_key(self.state.db.repos.clone(), did_key).await
     }
