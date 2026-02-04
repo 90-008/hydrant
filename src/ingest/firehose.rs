@@ -1,4 +1,4 @@
-use crate::db::{self, keys, Db};
+use crate::db::{self, Db, keys};
 use crate::ingest::BufferTx;
 use crate::state::AppState;
 use jacquard::api::com_atproto::sync::subscribe_repos::{SubscribeRepos, SubscribeReposMessage};
@@ -6,8 +6,8 @@ use jacquard::types::did::Did;
 use jacquard_common::xrpc::{SubscriptionClient, TungsteniteSubscriptionClient};
 use miette::Result;
 use n0_future::StreamExt;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tracing::{error, info};
 use url::Url;
@@ -17,6 +17,7 @@ pub struct FirehoseIngestor {
     buffer_tx: BufferTx,
     relay_host: Url,
     full_network: bool,
+    verify_signatures: bool,
 }
 
 impl FirehoseIngestor {
@@ -25,12 +26,14 @@ impl FirehoseIngestor {
         buffer_tx: BufferTx,
         relay_host: Url,
         full_network: bool,
+        verify_signatures: bool,
     ) -> Self {
         Self {
             state,
             buffer_tx,
             relay_host,
             full_network,
+            verify_signatures,
         }
     }
 
@@ -100,6 +103,15 @@ impl FirehoseIngestor {
 
         if !self.should_process(did).await.unwrap_or(false) {
             return;
+        }
+
+        // pre-warm the key cache for commit events
+        if self.verify_signatures && matches!(&msg, SubscribeReposMessage::Commit(_)) {
+            let state = self.state.clone();
+            let did = did.clone();
+            tokio::spawn(async move {
+                let _ = state.resolver.resolve_signing_key(&did).await;
+            });
         }
 
         if let Err(e) = self.buffer_tx.send(msg) {

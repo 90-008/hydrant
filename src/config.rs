@@ -2,8 +2,38 @@ use miette::Result;
 use smol_str::SmolStr;
 use std::fmt;
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::time::Duration;
 use url::Url;
+
+#[derive(Debug, Clone, Copy)]
+pub enum SignatureVerification {
+    Full,
+    BackfillOnly,
+    None,
+}
+
+impl FromStr for SignatureVerification {
+    type Err = miette::Error;
+    fn from_str(s: &str) -> Result<Self> {
+        match s {
+            "full" => Ok(Self::Full),
+            "backfill-only" => Ok(Self::BackfillOnly),
+            "none" => Ok(Self::None),
+            _ => Err(miette::miette!("invalid signature verification level")),
+        }
+    }
+}
+
+impl fmt::Display for SignatureVerification {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Full => write!(f, "full"),
+            Self::BackfillOnly => write!(f, "backfill-only"),
+            Self::None => write!(f, "none"),
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -20,6 +50,8 @@ pub struct Config {
     pub disable_lz4_compression: bool,
     pub debug_port: u16,
     pub enable_debug: bool,
+    pub verify_signatures: SignatureVerification,
+    pub identity_cache_size: u64,
 }
 
 impl Config {
@@ -63,6 +95,8 @@ impl Config {
         let api_port = cfg!("API_PORT", 3000u16);
         let enable_debug = cfg!("ENABLE_DEBUG", false);
         let debug_port = cfg!("DEBUG_PORT", 3001u16);
+        let verify_signatures = cfg!("VERIFY_SIGNATURES", SignatureVerification::Full);
+        let identity_cache_size = cfg!("IDENTITY_CACHE_SIZE", 100_000u64);
 
         Ok(Self {
             database_path,
@@ -78,6 +112,8 @@ impl Config {
             disable_lz4_compression,
             debug_port,
             enable_debug,
+            verify_signatures,
+            identity_cache_size,
         })
     }
 }
@@ -89,10 +125,16 @@ impl fmt::Display for Config {
         writeln!(f, "  relay host:               {}", self.relay_host)?;
         writeln!(f, "  plc url:                  {}", self.plc_url)?;
         writeln!(f, "  full network indexing:    {}", self.full_network)?;
+        writeln!(f, "  verify signatures:        {}", self.verify_signatures)?;
         writeln!(
             f,
             "  backfill concurrency:     {}",
             self.backfill_concurrency_limit
+        )?;
+        writeln!(
+            f,
+            "  identity cache size:      {}",
+            self.identity_cache_size
         )?;
         writeln!(
             f,

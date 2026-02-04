@@ -9,17 +9,17 @@ mod resolver;
 mod state;
 mod types;
 
-use crate::config::Config;
+use crate::config::{Config, SignatureVerification};
 use crate::crawler::Crawler;
 use crate::db::set_firehose_cursor;
 use crate::ingest::firehose::FirehoseIngestor;
 use crate::state::AppState;
 use crate::{backfill::BackfillWorker, ingest::worker::FirehoseWorker};
-use futures::{future::BoxFuture, FutureExt, TryFutureExt};
+use futures::{FutureExt, TryFutureExt, future::BoxFuture};
 use miette::IntoDiagnostic;
 use mimalloc::MiMalloc;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use tokio::{sync::mpsc, task::spawn_blocking};
 use tracing::{error, info};
 
@@ -53,13 +53,30 @@ async fn main() -> miette::Result<()> {
     tokio::spawn({
         let state = state.clone();
         let timeout = cfg.repo_fetch_timeout;
-        BackfillWorker::new(state, backfill_rx, timeout, cfg.backfill_concurrency_limit).run()
+        BackfillWorker::new(
+            state,
+            backfill_rx,
+            timeout,
+            cfg.backfill_concurrency_limit,
+            matches!(
+                cfg.verify_signatures,
+                SignatureVerification::Full | SignatureVerification::BackfillOnly
+            ),
+        )
+        .run()
     });
 
     let firehose_worker = std::thread::spawn({
         let state = state.clone();
         let handle = tokio::runtime::Handle::current();
-        move || FirehoseWorker::new(state, buffer_rx).run(handle)
+        move || {
+            FirehoseWorker::new(
+                state,
+                buffer_rx,
+                matches!(cfg.verify_signatures, SignatureVerification::Full),
+            )
+            .run(handle)
+        }
     });
 
     if let Err(e) = spawn_blocking({
@@ -161,8 +178,13 @@ async fn main() -> miette::Result<()> {
         );
     }
 
-    let ingestor =
-        FirehoseIngestor::new(state.clone(), buffer_tx, cfg.relay_host, cfg.full_network);
+    let ingestor = FirehoseIngestor::new(
+        state.clone(),
+        buffer_tx,
+        cfg.relay_host,
+        cfg.full_network,
+        matches!(cfg.verify_signatures, SignatureVerification::Full),
+    );
 
     let res = futures::future::try_join_all::<[BoxFuture<_>; _]>([
         Box::pin(

@@ -27,6 +27,7 @@ pub struct BackfillWorker {
     rx: BackfillRx,
     http: reqwest::Client,
     semaphore: Arc<Semaphore>,
+    verify_signatures: bool,
 }
 
 impl BackfillWorker {
@@ -35,6 +36,7 @@ impl BackfillWorker {
         rx: BackfillRx,
         timeout: Duration,
         concurrency_limit: usize,
+        verify_signatures: bool,
     ) -> Self {
         Self {
             state,
@@ -47,6 +49,7 @@ impl BackfillWorker {
                 .build()
                 .expect("failed to build http client"),
             semaphore: Arc::new(Semaphore::new(concurrency_limit)),
+            verify_signatures,
         }
     }
 
@@ -66,6 +69,7 @@ impl BackfillWorker {
                     self.http.clone(),
                     did.clone(),
                     permit,
+                    self.verify_signatures,
                 )
                 .inspect_err(move |e| {
                     error!("backfill process failed for {did}: {e}");
@@ -80,10 +84,11 @@ impl BackfillWorker {
         http: reqwest::Client,
         did: Did<'static>,
         _permit: tokio::sync::OwnedSemaphorePermit,
+        verify_signatures: bool,
     ) -> Result<()> {
         let db = &state.db;
 
-        match Self::process_did(&state, &http, &did).await {
+        match Self::process_did(&state, &http, &did, verify_signatures).await {
             Ok(previous_state) => {
                 let did_key = keys::repo_key(&did);
 
@@ -194,11 +199,11 @@ impl BackfillWorker {
         Ok(())
     }
 
-    // returns previous repo state if successful
     async fn process_did<'i>(
         app_state: &Arc<AppState>,
         http: &reqwest::Client,
         did: &Did<'static>,
+        verify_signatures: bool,
     ) -> Result<RepoState<'static>> {
         debug!("backfilling {}", did);
 
@@ -335,6 +340,15 @@ impl BackfillWorker {
 
         let commit = jacquard_repo::commit::Commit::from_cbor(root_bytes).into_diagnostic()?;
         debug!("backfilling repo at revision {}", commit.rev);
+
+        // 4.5. verify commit signature
+        if verify_signatures {
+            let pubkey = app_state.resolver.resolve_signing_key(did).await?;
+            commit
+                .verify(&pubkey)
+                .map_err(|e| miette::miette!("signature verification failed for {did}: {e}"))?;
+            trace!("signature verified for {did}");
+        }
 
         // 5. walk mst
         let start = Instant::now();

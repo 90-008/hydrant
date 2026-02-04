@@ -1,15 +1,16 @@
 use crate::db::types::TrimmedDid;
-use crate::db::{self, keys, ser_repo_state, Db};
+use crate::db::{self, Db, keys, ser_repo_state};
 use crate::state::AppState;
 use crate::types::{
     AccountEvt, BroadcastEvent, IdentityEvt, MarshallableEvt, RepoState, RepoStatus, ResyncState,
     StoredEvent,
 };
 use fjall::OwnedWriteBatch;
-use jacquard::api::com_atproto::sync::subscribe_repos::Commit;
+use jacquard::CowStr;
 use jacquard::cowstr::ToCowStr;
 use jacquard::types::cid::Cid;
-use jacquard::CowStr;
+use jacquard_api::com_atproto::sync::subscribe_repos::Commit;
+use jacquard_common::types::crypto::PublicKey;
 use jacquard_repo::car::reader::parse_car_bytes;
 use miette::{Context, IntoDiagnostic, Result};
 use std::collections::HashMap;
@@ -148,6 +149,7 @@ pub fn apply_commit<'batch, 'db>(
     db: &'db Db,
     mut repo_state: RepoState,
     commit: &Commit<'_>,
+    signing_key: Option<&PublicKey>,
 ) -> Result<impl FnOnce() + use<'db>> {
     let did = &commit.repo;
     debug!("applying commit {} for {did}", &commit.commit);
@@ -161,6 +163,19 @@ pub fn apply_commit<'batch, 'db>(
     })?;
 
     trace!("parsed car for {did} in {:?}", start.elapsed());
+
+    if let Some(key) = signing_key {
+        let root_bytes = parsed
+            .blocks
+            .get(&parsed.root)
+            .ok_or_else(|| miette::miette!("root block missing from CAR"))?;
+
+        let repo_commit = jacquard_repo::commit::Commit::from_cbor(root_bytes).into_diagnostic()?;
+        repo_commit
+            .verify(key)
+            .map_err(|e| miette::miette!("signature verification failed for {did}: {e}"))?;
+        trace!("signature verified for {did}");
+    }
 
     repo_state.rev = Some(commit.rev.clone());
     repo_state.data = Some(Cid::ipld(parsed.root));

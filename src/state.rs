@@ -25,7 +25,7 @@ impl AppState {
             config.cache_size,
             config.disable_lz4_compression,
         )?;
-        let resolver = Resolver::new(config.plc_url.clone());
+        let resolver = Resolver::new(config.plc_url.clone(), config.identity_cache_size);
         let (backfill_tx, backfill_rx) = mpsc::unbounded_channel();
 
         Ok((

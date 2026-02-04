@@ -6,12 +6,14 @@ use crate::types::{AccountEvt, IdentityEvt, RepoState, RepoStatus};
 use jacquard::api::com_atproto::sync::subscribe_repos::SubscribeReposMessage;
 
 use fjall::OwnedWriteBatch;
+use futures::future::join_all;
 use jacquard::cowstr::ToCowStr;
 use jacquard::types::did::Did;
 use jacquard_common::IntoStatic;
+use jacquard_common::types::crypto::PublicKey;
 use miette::{IntoDiagnostic, Result};
 use smol_str::ToSmolStr;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -31,11 +33,20 @@ enum RepoCheckResult {
 pub struct FirehoseWorker {
     state: Arc<AppState>,
     rx: mpsc::UnboundedReceiver<BufferedMessage>,
+    verify_signatures: bool,
 }
 
 impl FirehoseWorker {
-    pub fn new(state: Arc<AppState>, rx: mpsc::UnboundedReceiver<BufferedMessage>) -> Self {
-        Self { state, rx }
+    pub fn new(
+        state: Arc<AppState>,
+        rx: mpsc::UnboundedReceiver<BufferedMessage>,
+        verify_signatures: bool,
+    ) -> Self {
+        Self {
+            state,
+            rx,
+            verify_signatures,
+        }
     }
 
     pub fn run(mut self, handle: tokio::runtime::Handle) -> Result<()> {
@@ -46,6 +57,35 @@ impl FirehoseWorker {
         loop {
             let mut batch = self.state.db.inner.batch();
             let mut deleted = HashSet::new();
+
+            // resolve signing keys for commits if verification is enabled
+            let keys = if self.verify_signatures {
+                let dids: HashSet<Did> = buf
+                    .iter()
+                    .filter_map(|msg| match msg {
+                        SubscribeReposMessage::Commit(c) => Some(c.repo.clone()),
+                        _ => None,
+                    })
+                    .collect();
+
+                let futures = dids.into_iter().map(|did| async {
+                    match self.state.resolver.resolve_signing_key(&did).await {
+                        Ok(key) => Some((did, key)),
+                        Err(e) => {
+                            warn!("failed to resolve key for {did}: {e}");
+                            None
+                        }
+                    }
+                });
+
+                handle
+                    .block_on(join_all(futures))
+                    .into_iter()
+                    .flatten()
+                    .collect()
+            } else {
+                HashMap::new()
+            };
 
             for msg in buf.drain(..) {
                 let (did, seq) = match &msg {
@@ -64,7 +104,7 @@ impl FirehoseWorker {
                     continue;
                 }
 
-                match Self::process_message(&self.state, &mut batch, &msg, did) {
+                match Self::process_message(&self.state, &mut batch, &msg, did, &keys) {
                     Ok(ProcessResult::Ok) => {}
                     Ok(ProcessResult::Deleted) => {
                         deleted.insert(did.clone());
@@ -114,10 +154,11 @@ impl FirehoseWorker {
     }
 
     fn process_message(
-        state: &AppState,
+        state: &Arc<AppState>,
         batch: &mut OwnedWriteBatch,
         msg: &BufferedMessage,
         did: &Did,
+        keys: &HashMap<Did<'static>, PublicKey<'static>>,
     ) -> Result<ProcessResult> {
         let RepoCheckResult::Ok(repo_state) = Self::check_repo_state(batch, state, did)? else {
             return Ok(ProcessResult::Ok);
@@ -160,7 +201,7 @@ impl FirehoseWorker {
                     return Ok(ProcessResult::Ok);
                 }
 
-                ops::apply_commit(batch, &state.db, repo_state, &commit)?();
+                ops::apply_commit(batch, &state.db, repo_state, &commit, keys.get(did))?();
             }
             SubscribeReposMessage::Identity(identity) => {
                 debug!("processing buffered identity for {did}");
