@@ -105,6 +105,8 @@ impl FirehoseWorker {
         let mut buf = Vec::<BufferedMessage>::with_capacity(BUF_SIZE);
         let mut failed = Vec::<BufferedMessage>::new();
 
+        let _g = handle.enter();
+
         loop {
             let mut batch = self.state.db.inner.batch();
             let mut deleted = HashSet::new();
@@ -187,10 +189,13 @@ impl FirehoseWorker {
             // wait until we receive some messages
             // this does mean we will have an up to 1 second delay, before we send events to consumers
             // but thats reasonable imo, could also be configured of course
-            let _ = handle.block_on(tokio::time::timeout(
-                Duration::from_secs(1),
-                self.rx.recv_many(&mut buf, BUF_SIZE),
-            ));
+            let _ = handle.block_on(async {
+                tokio::time::timeout(
+                    Duration::from_secs(1),
+                    self.rx.recv_many(&mut buf, BUF_SIZE),
+                )
+                .await
+            });
             if buf.is_empty() {
                 if self.rx.is_closed() {
                     error!("ingestor crashed? shutting down buffer processor");
