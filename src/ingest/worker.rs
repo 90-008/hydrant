@@ -1,6 +1,7 @@
 use crate::db::{self, keys};
 use crate::ingest::BufferedMessage;
 use crate::ops::{self, send_backfill_req};
+use crate::resolver::NoSigningKeyError;
 use crate::state::AppState;
 use crate::types::{AccountEvt, IdentityEvt, RepoState, RepoStatus};
 use jacquard::api::com_atproto::sync::subscribe_repos::SubscribeReposMessage;
@@ -11,13 +12,63 @@ use jacquard::cowstr::ToCowStr;
 use jacquard::types::did::Did;
 use jacquard_common::IntoStatic;
 use jacquard_common::types::crypto::PublicKey;
-use miette::{IntoDiagnostic, Result};
+use jacquard_repo::error::CommitError;
+use miette::{Diagnostic, IntoDiagnostic, Result};
 use smol_str::ToSmolStr;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{debug, error, trace, warn};
+
+#[derive(Debug)]
+struct KeyFetchError(miette::Report);
+
+impl std::fmt::Display for KeyFetchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for KeyFetchError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.0.source()
+    }
+}
+
+impl Diagnostic for KeyFetchError {
+    fn code<'a>(&'a self) -> Option<Box<dyn std::fmt::Display + 'a>> {
+        self.0.code()
+    }
+
+    fn help<'a>(&'a self) -> Option<Box<dyn std::fmt::Display + 'a>> {
+        self.0.help()
+    }
+
+    fn labels(&self) -> Option<Box<dyn Iterator<Item = miette::LabeledSpan> + '_>> {
+        self.0.labels()
+    }
+
+    fn diagnostic_source(&self) -> Option<&dyn Diagnostic> {
+        self.0.diagnostic_source()
+    }
+
+    fn related<'a>(&'a self) -> Option<Box<dyn Iterator<Item = &'a dyn Diagnostic> + 'a>> {
+        self.0.related()
+    }
+
+    fn source_code(&self) -> Option<&dyn miette::SourceCode> {
+        self.0.source_code()
+    }
+
+    fn severity(&self) -> Option<miette::Severity> {
+        self.0.severity()
+    }
+
+    fn url<'a>(&'a self) -> Option<Box<dyn std::fmt::Display + 'a>> {
+        self.0.url()
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 enum ProcessResult {
@@ -58,31 +109,23 @@ impl FirehoseWorker {
             let mut batch = self.state.db.inner.batch();
             let mut deleted = HashSet::new();
 
-            // resolve signing keys for commits if verification is enabled
+            // resolve signing keys for commits and syncs if verification is enabled
             let keys = if self.verify_signatures {
                 let dids: HashSet<Did> = buf
                     .iter()
                     .filter_map(|msg| match msg {
                         SubscribeReposMessage::Commit(c) => Some(c.repo.clone()),
+                        SubscribeReposMessage::Sync(s) => Some(s.did.clone()),
                         _ => None,
                     })
                     .collect();
 
                 let futures = dids.into_iter().map(|did| async {
-                    match self.state.resolver.resolve_signing_key(&did).await {
-                        Ok(key) => Some((did, key)),
-                        Err(e) => {
-                            warn!("failed to resolve key for {did}: {e}");
-                            None
-                        }
-                    }
+                    let res = self.state.resolver.resolve_signing_key(&did).await;
+                    (did, res)
                 });
 
-                handle
-                    .block_on(join_all(futures))
-                    .into_iter()
-                    .flatten()
-                    .collect()
+                handle.block_on(join_all(futures)).into_iter().collect()
             } else {
                 HashMap::new()
             };
@@ -104,15 +147,22 @@ impl FirehoseWorker {
                     continue;
                 }
 
-                match Self::process_message(&self.state, &mut batch, &msg, did, &keys) {
+                match self.process_message(&mut batch, &msg, did, &keys) {
                     Ok(ProcessResult::Ok) => {}
                     Ok(ProcessResult::Deleted) => {
                         deleted.insert(did.clone());
                     }
                     Err(e) => {
-                        error!("failed to process buffered message for {did}: {e}");
+                        error!("error processing message for {did}: {e}");
                         db::check_poisoned_report(&e);
-                        failed.push(msg);
+                        // dont retry commit or sync on key fetch errors
+                        // since we'll just try again later if we get commit or sync again
+                        if e.downcast_ref::<KeyFetchError>().is_none()
+                            && e.downcast_ref::<CommitError>().is_none()
+                            && e.downcast_ref::<NoSigningKeyError>().is_none()
+                        {
+                            failed.push(msg);
+                        }
                     }
                 }
 
@@ -154,14 +204,37 @@ impl FirehoseWorker {
     }
 
     fn process_message(
-        state: &Arc<AppState>,
+        &self,
         batch: &mut OwnedWriteBatch,
         msg: &BufferedMessage,
         did: &Did,
-        keys: &HashMap<Did<'static>, PublicKey<'static>>,
+        keys: &HashMap<Did<'static>, Result<PublicKey<'static>>>,
     ) -> Result<ProcessResult> {
+        let state = &self.state;
+        let verify_signatures = self.verify_signatures;
+
         let RepoCheckResult::Ok(repo_state) = Self::check_repo_state(batch, state, did)? else {
             return Ok(ProcessResult::Ok);
+        };
+
+        let get_key = || {
+            if verify_signatures {
+                let key = keys.get(did).ok_or_else(|| {
+                    KeyFetchError(miette::miette!(
+                        "!!! THIS IS A BUG !!! missing pubkey for {did}"
+                    ))
+                })?;
+                match key {
+                    Ok(key) => Ok(Some(key)),
+                    Err(e) => {
+                        return Err(KeyFetchError(miette::miette!(
+                            "failed to get pubkey for {did}: {e}"
+                        )));
+                    }
+                }
+            } else {
+                Ok(None)
+            }
         };
 
         match msg {
@@ -195,13 +268,50 @@ impl FirehoseWorker {
                         RepoStatus::Backfilling,
                     )?;
                     batch.commit().into_diagnostic()?;
-
                     send_backfill_req(state, did.clone().into_static())?;
 
                     return Ok(ProcessResult::Ok);
                 }
 
-                ops::apply_commit(batch, &state.db, repo_state, &commit, keys.get(did))?();
+                ops::apply_commit(batch, &state.db, repo_state, &commit, get_key()?)?();
+            }
+            SubscribeReposMessage::Sync(sync) => {
+                debug!("processing buffered sync for {did}");
+
+                match ops::verify_sync_event(sync.blocks.as_ref(), get_key()?) {
+                    Ok((root, rev)) => {
+                        if let Some(current_data) = &repo_state.data {
+                            if current_data == &root {
+                                debug!("skipping noop sync for {did}");
+                                return Ok(ProcessResult::Ok);
+                            }
+                        }
+
+                        if let Some(current_rev) = &repo_state.rev {
+                            if rev.as_str() <= current_rev.as_str() {
+                                debug!("skipping replayed sync for {did}");
+                                return Ok(ProcessResult::Ok);
+                            }
+                        }
+
+                        warn!("sync event for {did}: triggering backfill");
+                        let mut batch = state.db.inner.batch();
+                        ops::update_repo_status(
+                            &mut batch,
+                            &state.db,
+                            did,
+                            repo_state,
+                            RepoStatus::Backfilling,
+                        )?;
+                        batch.commit().into_diagnostic()?;
+
+                        send_backfill_req(state, did.clone().into_static())?;
+                        return Ok(ProcessResult::Ok);
+                    }
+                    Err(e) => {
+                        error!("failed to process sync event for {did}: {e}");
+                    }
+                }
             }
             SubscribeReposMessage::Identity(identity) => {
                 debug!("processing buffered identity for {did}");

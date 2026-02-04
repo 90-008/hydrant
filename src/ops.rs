@@ -7,6 +7,7 @@ use crate::types::{
 };
 use fjall::OwnedWriteBatch;
 use jacquard::CowStr;
+use jacquard::IntoStatic;
 use jacquard::cowstr::ToCowStr;
 use jacquard::types::cid::Cid;
 use jacquard_api::com_atproto::sync::subscribe_repos::Commit;
@@ -142,6 +143,31 @@ pub fn update_repo_status<'batch, 's>(
     batch.insert(&db.repos, &key, ser_repo_state(&repo_state)?);
 
     Ok(repo_state)
+}
+pub fn verify_sync_event(blocks: &[u8], key: Option<&PublicKey>) -> Result<(Cid<'static>, String)> {
+    let parsed = tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current()
+            .block_on(parse_car_bytes(blocks))
+            .into_diagnostic()
+    })?;
+
+    let root_bytes = parsed
+        .blocks
+        .get(&parsed.root)
+        .ok_or_else(|| miette::miette!("root block missing from CAR"))?;
+
+    let repo_commit = jacquard_repo::commit::Commit::from_cbor(root_bytes).into_diagnostic()?;
+
+    if let Some(key) = key {
+        repo_commit
+            .verify(key)
+            .map_err(|e| miette::miette!("signature verification failed: {e}"))?;
+    }
+
+    Ok((
+        Cid::ipld(repo_commit.data).into_static(),
+        repo_commit.rev.to_string(),
+    ))
 }
 
 pub fn apply_commit<'batch, 'db>(

@@ -1,3 +1,4 @@
+use std::fmt::Display;
 use std::ops::Not;
 use std::sync::Arc;
 use std::time::Duration;
@@ -78,10 +79,8 @@ impl Resolver {
         Ok((pds, handle))
     }
 
-    pub async fn resolve_signing_key(&self, did: &Did<'_>) -> Result<PublicKey<'static>> {
-        let did_static = did.clone().into_static();
-
-        if let Some(entry) = self.inner.key_cache.get_async(&did_static).await {
+    pub async fn resolve_signing_key(&self, did: &Did<'static>) -> Result<PublicKey<'static>> {
+        if let Some(entry) = self.inner.key_cache.get_async(did).await {
             return Ok(entry.get().clone());
         }
 
@@ -96,14 +95,26 @@ impl Resolver {
         let key = doc
             .atproto_public_key()
             .into_diagnostic()?
-            .ok_or_else(|| miette::miette!("no atproto signing key in DID doc for {did}"))?;
+            .ok_or_else(|| NoSigningKeyError(did.clone()))
+            .into_diagnostic()?;
 
         let _ = self
             .inner
             .key_cache
-            .put_async(did_static, key.clone())
+            .put_async(did.clone(), key.clone())
             .await;
 
         Ok(key)
     }
 }
+
+#[derive(Debug)]
+pub struct NoSigningKeyError(Did<'static>);
+
+impl Display for NoSigningKeyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "no atproto signing key in DID doc for {}", self.0)
+    }
+}
+
+impl std::error::Error for NoSigningKeyError {}
