@@ -1,5 +1,5 @@
-use crate::db::keys::reconstruct_did;
-use crate::db::{deser_repo_state, ser_repo_state, Db};
+use crate::db::types::TrimmedDid;
+use crate::db::{self, deser_repo_state, ser_repo_state};
 use crate::state::AppState;
 use crate::types::{RepoStatus, ResyncState};
 use miette::{IntoDiagnostic, Result};
@@ -13,15 +13,17 @@ pub fn queue_pending_backfills(state: &AppState) -> Result<()> {
 
     for guard in state.db.pending.iter() {
         let key = guard.key().into_diagnostic()?;
-        let did_str = String::from_utf8_lossy(&key);
-        let Ok(did) = reconstruct_did(&did_str) else {
-            error!("invalid did in db, skipping: did:{did_str}");
-            continue;
+        let did = match TrimmedDid::try_from(key.as_ref()) {
+            Ok(did) => did.to_did(),
+            Err(e) => {
+                error!("invalid did in db, skipping: {e}");
+                continue;
+            }
         };
 
         debug!("queuing did {did}");
-        if let Err(e) = state.backfill_tx.send(did) {
-            error!("failed to queue pending backfill for did:{did_str}: {e}");
+        if let Err(e) = state.backfill_tx.send(did.clone()) {
+            error!("failed to queue pending backfill for did:{did}: {e}");
         } else {
             count += 1;
         }
@@ -37,10 +39,12 @@ pub fn queue_gone_backfills(state: &Arc<AppState>) -> Result<()> {
 
     for guard in state.db.resync.iter() {
         let (key, val) = guard.into_inner().into_diagnostic()?;
-        let did_str = String::from_utf8_lossy(&key);
-        let Ok(did) = reconstruct_did(&did_str) else {
-            error!("invalid did in db, skipping: did:{did_str}");
-            continue;
+        let did = match TrimmedDid::try_from(key.as_ref()) {
+            Ok(did) => did.to_did(),
+            Err(e) => {
+                error!("invalid did in db, skipping: {e}");
+                continue;
+            }
         };
 
         if let Ok(resync_state) = rmp_serde::from_slice::<ResyncState>(&val) {
@@ -54,10 +58,10 @@ pub fn queue_gone_backfills(state: &Arc<AppState>) -> Result<()> {
 
                 // update repo state back to backfilling
                 let repo_key = crate::db::keys::repo_key(&did);
-                if let Some(state_bytes) = state.db.repos.get(repo_key).into_diagnostic()? {
+                if let Some(state_bytes) = state.db.repos.get(&repo_key).into_diagnostic()? {
                     let mut repo_state = deser_repo_state(&state_bytes)?;
                     repo_state.status = RepoStatus::Backfilling;
-                    batch.insert(&state.db.repos, repo_key, ser_repo_state(&repo_state)?);
+                    batch.insert(&state.db.repos, &repo_key, ser_repo_state(&repo_state)?);
                 }
 
                 batch.commit().into_diagnostic()?;
@@ -90,14 +94,16 @@ pub fn retry_worker(state: Arc<AppState>) {
                 Ok(t) => t,
                 Err(e) => {
                     error!("failed to get resync state: {e}");
-                    Db::check_poisoned(&e);
+                    db::check_poisoned(&e);
                     continue;
                 }
             };
-            let did_str = String::from_utf8_lossy(&key);
-            let Ok(did) = reconstruct_did(&did_str) else {
-                error!("invalid did in db, skipping: did:{did_str}");
-                continue;
+            let did = match TrimmedDid::try_from(key.as_ref()) {
+                Ok(did) => did.to_did(),
+                Err(e) => {
+                    error!("invalid did in db, skipping: {e}");
+                    continue;
+                }
             };
 
             if let Ok(ResyncState::Error { next_retry, .. }) =
@@ -109,7 +115,7 @@ pub fn retry_worker(state: Arc<AppState>) {
                     // move back to pending
                     if let Err(e) = db.pending.insert(key, Vec::new()) {
                         error!("failed to move {did} to pending: {e}");
-                        Db::check_poisoned(&e);
+                        db::check_poisoned(&e);
                         continue;
                     }
 

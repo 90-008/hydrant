@@ -1,6 +1,8 @@
-use crate::api::AppState;
-use crate::db::{keys, Db};
+use crate::api::{AppState, XrpcResult};
+use crate::db::types::TrimmedDid;
+use crate::db::{self, keys, Db};
 use axum::{extract::State, http::StatusCode, Json, Router};
+use futures::TryFutureExt;
 use jacquard::types::ident::AtIdentifier;
 use jacquard::{
     api::com_atproto::repo::{
@@ -22,6 +24,7 @@ use jacquard_common::{
 use serde::{Deserialize, Serialize};
 use smol_str::ToSmolStr;
 use std::{fmt::Display, sync::Arc};
+use tokio::task::spawn_blocking;
 
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
@@ -125,7 +128,7 @@ pub async fn handle_list_records(
 
     let prefix = format!(
         "{}{}{}{}",
-        keys::did_prefix(&did),
+        TrimmedDid::from(&did).as_str(),
         keys::SEP as char,
         req.collection.as_str(),
         keys::SEP as char
@@ -254,7 +257,7 @@ pub async fn handle_list_records(
 
 #[derive(Serialize, Deserialize, jacquard_derive::IntoStatic)]
 pub struct CountRecordsOutput {
-    pub count: i64,
+    pub count: u64,
 }
 
 pub struct CountRecordsResponse;
@@ -290,18 +293,19 @@ impl jacquard_common::xrpc::XrpcEndpoint for CountRecords {
 pub async fn handle_count_records(
     State(state): State<Arc<AppState>>,
     ExtractXrpc(req): ExtractXrpc<CountRecords>,
-) -> Result<Json<CountRecordsOutput>, XrpcErrorResponse<GenericXrpcError>> {
-    let db = &state.db;
+) -> XrpcResult<Json<CountRecordsOutput>> {
     let did = state
         .resolver
         .resolve_did(&req.identifier)
         .await
         .map_err(|e| bad_request(CountRecordsRequest::NSID, e))?;
 
-    let count = db
-        .get_count(keys::count_collection_key(&did, &req.collection))
-        .await
-        .map_err(|e| internal_error(CountRecordsRequest::NSID, e))?;
+    let count = spawn_blocking(move || {
+        db::get_record_count(&state.db, &did, &req.collection)
+            .map_err(|e| internal_error(CountRecordsRequest::NSID, e))
+    })
+    .map_err(|e| internal_error(CountRecordsRequest::NSID, e))
+    .await??;
 
     Ok(Json(CountRecordsOutput { count }))
 }

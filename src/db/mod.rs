@@ -1,14 +1,15 @@
 use crate::types::{BroadcastEvent, RepoState};
 use fjall::{Database, Keyspace, KeyspaceCreateOptions, OwnedWriteBatch, PersistMode, Slice};
-use futures::FutureExt;
 use jacquard::IntoStatic;
 use jacquard_common::types::string::Did;
 use miette::{Context, IntoDiagnostic, Result};
-use std::future::Future;
+use scc::HashMap;
+use smol_str::SmolStr;
 use std::path::Path;
 use std::sync::Arc;
 
 pub mod keys;
+pub mod types;
 
 use std::sync::atomic::AtomicU64;
 use tokio::sync::broadcast;
@@ -20,13 +21,13 @@ pub struct Db {
     pub records: Keyspace,
     pub blocks: Keyspace,
     pub cursors: Keyspace,
-    pub buffer: Keyspace,
     pub pending: Keyspace,
     pub resync: Keyspace,
     pub events: Keyspace,
     pub counts: Keyspace,
     pub event_tx: broadcast::Sender<BroadcastEvent>,
     pub next_event_id: Arc<AtomicU64>,
+    pub counts_map: HashMap<SmolStr, u64>,
 }
 
 impl Db {
@@ -62,7 +63,6 @@ impl Db {
                 .max_memtable_size(32 * 2_u64.pow(20)),
         )?;
         let cursors = open_ks("cursors", opts().expect_point_read_hits(true))?;
-        let buffer = open_ks("buffer", opts())?;
         let pending = open_ks("pending", opts())?;
         let resync = open_ks("resync", opts())?;
         let events = open_ks("events", opts())?;
@@ -79,6 +79,19 @@ impl Db {
             );
         }
 
+        // load counts into memory
+        let counts_map = HashMap::new();
+        for guard in counts.prefix(keys::COUNT_KS_PREFIX) {
+            let (k, v) = guard.into_inner().into_diagnostic()?;
+            let name = std::str::from_utf8(&k[keys::COUNT_KS_PREFIX.len()..])
+                .into_diagnostic()
+                .wrap_err("expected valid utf8 for ks count key")?;
+            let _ = counts_map.insert_sync(
+                SmolStr::new(name),
+                u64::from_be_bytes(v.as_ref().try_into().unwrap()),
+            );
+        }
+
         let (event_tx, _) = broadcast::channel(10000);
 
         Ok(Self {
@@ -87,12 +100,12 @@ impl Db {
             records,
             blocks,
             cursors,
-            buffer,
             pending,
             resync,
             events,
             counts,
             event_tx,
+            counts_map,
             next_event_id: Arc::new(AtomicU64::new(last_id + 1)),
         })
     }
@@ -109,6 +122,7 @@ impl Db {
             .into_diagnostic()?
     }
 
+    #[allow(dead_code)]
     pub async fn insert(
         ks: Keyspace,
         key: impl AsRef<[u8]>,
@@ -136,78 +150,46 @@ impl Db {
             .into_diagnostic()?
     }
 
-    pub fn increment_count(
-        &self,
-        key: impl AsRef<[u8]>,
-        delta: i64,
-    ) -> impl Future<Output = Result<i64>> + Send + 'static {
-        let key = key.as_ref().to_vec();
-        let counts = self.counts.clone();
-        tokio::task::spawn_blocking(move || {
-            let current = counts
-                .get(&key)
-                .into_diagnostic()?
-                .map(|v| {
-                    let mut buf = [0u8; 8];
-                    if v.len() == 8 {
-                        buf.copy_from_slice(&v);
-                        i64::from_be_bytes(buf)
-                    } else {
-                        0
-                    }
-                })
-                .unwrap_or(0);
-            let new_val = current.saturating_add(delta);
-            counts
-                .insert(key, new_val.to_be_bytes())
-                .into_diagnostic()?;
-            Ok(new_val)
-        })
-        .map(|res| res.into_diagnostic().flatten())
+    pub fn update_count(&self, key: &str, delta: i64) {
+        let mut entry = self.counts_map.entry_sync(SmolStr::new(key)).or_insert(0);
+        *entry = (*entry as i64).saturating_add(delta) as u64;
     }
 
-    pub async fn get_count(&self, key: impl AsRef<[u8]>) -> Result<i64> {
-        let key = key.as_ref().to_vec();
-        let counts = self.counts.clone();
-        tokio::task::spawn_blocking(move || {
-            Ok(counts
-                .get(&key)
-                .into_diagnostic()?
-                .map(|v| {
-                    let mut buf = [0u8; 8];
-                    if v.len() == 8 {
-                        buf.copy_from_slice(&v);
-                        i64::from_be_bytes(buf)
-                    } else {
-                        0
-                    }
-                })
-                .unwrap_or(0))
-        })
-        .await
-        .into_diagnostic()
-        .flatten()
+    pub async fn update_count_async(&self, key: &str, delta: i64) {
+        let mut entry = self
+            .counts_map
+            .entry_async(SmolStr::new(key))
+            .await
+            .or_insert(0);
+        *entry = (*entry as i64).saturating_add(delta) as u64;
+    }
+
+    pub async fn get_count(&self, key: &str) -> u64 {
+        self.counts_map
+            .read_async(key, |_, v| *v)
+            .await
+            .unwrap_or(0)
     }
 
     pub fn update_repo_state<F, T>(
-        mut batch: OwnedWriteBatch,
+        batch: &mut OwnedWriteBatch,
         repos: &Keyspace,
         did: &Did<'_>,
         f: F,
-    ) -> Result<(Option<(RepoState, T)>, fjall::OwnedWriteBatch)>
+    ) -> Result<Option<(RepoState<'static>, T)>>
     where
         F: FnOnce(&mut RepoState, (&[u8], &mut fjall::OwnedWriteBatch)) -> Result<(bool, T)>,
     {
         let key = keys::repo_key(did);
-        if let Some(bytes) = repos.get(key).into_diagnostic()? {
-            let mut state: RepoState = deser_repo_state(bytes)?;
-            let (changed, result) = f(&mut state, (key, &mut batch))?;
+        if let Some(bytes) = repos.get(&key).into_diagnostic()? {
+            let mut state: RepoState = deser_repo_state(bytes.as_ref())?.into_static();
+            let (changed, result) = f(&mut state, (key.as_bytes(), batch))?;
             if changed {
                 batch.insert(repos, key, ser_repo_state(&state)?);
             }
-            Ok((Some((state, result)), batch))
+            Ok(Some((state, result)))
         } else {
-            Ok((None, batch))
+            Ok(None)
         }
     }
 
@@ -215,19 +197,19 @@ impl Db {
         &self,
         did: &Did<'_>,
         f: F,
-    ) -> Result<Option<(RepoState, T)>>
+    ) -> Result<Option<(RepoState<'static>, T)>>
     where
         F: FnOnce(&mut RepoState, (&[u8], &mut fjall::OwnedWriteBatch)) -> Result<(bool, T)>
             + Send
             + 'static,
         T: Send + 'static,
     {
-        let batch = self.inner.batch();
+        let mut batch = self.inner.batch();
         let repos = self.repos.clone();
         let did = did.clone().into_static();
 
         tokio::task::spawn_blocking(move || {
-            let (Some((state, t)), batch) = Self::update_repo_state(batch, &repos, &did, f)? else {
+            let Some((state, t)) = Self::update_repo_state(&mut batch, &repos, &did, f)? else {
                 return Ok(None);
             };
             batch.commit().into_diagnostic()?;
@@ -236,26 +218,116 @@ impl Db {
         .await
         .into_diagnostic()?
     }
+}
 
-    pub fn check_poisoned(e: &fjall::Error) {
-        if matches!(e, fjall::Error::Poisoned) {
-            error!("!!! DATABASE POISONED !!! exiting");
-            std::process::exit(10);
-        }
-    }
+pub fn set_firehose_cursor(db: &Db, cursor: i64) -> Result<()> {
+    db.cursors
+        .insert(keys::CURSOR_KEY, cursor.to_be_bytes())
+        .into_diagnostic()
+}
 
-    pub fn check_poisoned_report(e: &miette::Report) {
-        let Some(err) = e.downcast_ref::<fjall::Error>() else {
-            return;
-        };
-        Self::check_poisoned(err);
-    }
+pub async fn get_firehose_cursor(db: &Db) -> Result<Option<i64>> {
+    Db::get(db.cursors.clone(), keys::CURSOR_KEY)
+        .await?
+        .map(|v| {
+            Ok(i64::from_be_bytes(
+                v.as_ref()
+                    .try_into()
+                    .into_diagnostic()
+                    .wrap_err("cursor is not 8 bytes")?,
+            ))
+        })
+        .transpose()
 }
 
 pub fn ser_repo_state(state: &RepoState) -> Result<Vec<u8>> {
     rmp_serde::to_vec(&state).into_diagnostic()
 }
 
-pub fn deser_repo_state(bytes: impl AsRef<[u8]>) -> Result<RepoState> {
-    rmp_serde::from_slice(bytes.as_ref()).into_diagnostic()
+pub fn deser_repo_state<'b>(bytes: &'b [u8]) -> Result<RepoState<'b>> {
+    rmp_serde::from_slice(bytes).into_diagnostic()
+}
+
+pub fn check_poisoned(e: &fjall::Error) {
+    if matches!(e, fjall::Error::Poisoned) {
+        error!("!!! DATABASE POISONED !!! exiting");
+        std::process::exit(10);
+    }
+}
+
+pub fn check_poisoned_report(e: &miette::Report) {
+    let Some(err) = e.downcast_ref::<fjall::Error>() else {
+        return;
+    };
+    self::check_poisoned(err);
+}
+
+pub fn set_ks_count(batch: &mut OwnedWriteBatch, db: &Db, name: &str, count: u64) {
+    let key = keys::count_keyspace_key(name);
+    batch.insert(&db.counts, key, count.to_be_bytes());
+}
+
+pub fn persist_counts(db: &Db) -> Result<()> {
+    let mut batch = db.inner.batch();
+    db.counts_map.iter_sync(|k, v| {
+        set_ks_count(&mut batch, db, k, *v);
+        true
+    });
+    batch.commit().into_diagnostic()
+}
+
+pub fn set_record_count(
+    batch: &mut OwnedWriteBatch,
+    db: &Db,
+    did: &Did<'_>,
+    collection: &str,
+    count: u64,
+) {
+    let key = keys::count_collection_key(did, collection);
+    batch.insert(&db.counts, key, count.to_be_bytes());
+}
+
+pub fn update_record_count(
+    batch: &mut OwnedWriteBatch,
+    db: &Db,
+    did: &Did<'_>,
+    collection: &str,
+    delta: i64,
+) -> Result<()> {
+    let key = keys::count_collection_key(did, collection);
+    let count = db
+        .counts
+        .get(&key)
+        .into_diagnostic()?
+        .map(|v| -> Result<_> {
+            Ok(u64::from_be_bytes(
+                v.as_ref()
+                    .try_into()
+                    .into_diagnostic()
+                    .wrap_err("expected to be count (8 bytes)")?,
+            ))
+        })
+        .transpose()?
+        .unwrap_or(0);
+    let new_count = (count as i64).saturating_add(delta) as u64;
+    batch.insert(&db.counts, key, new_count.to_be_bytes());
+    Ok(())
+}
+
+pub fn get_record_count(db: &Db, did: &Did<'_>, collection: &str) -> Result<u64> {
+    let key = keys::count_collection_key(did, collection);
+    let count = db
+        .counts
+        .get(&key)
+        .into_diagnostic()?
+        .map(|v| -> Result<_> {
+            Ok(u64::from_be_bytes(
+                v.as_ref()
+                    .try_into()
+                    .into_diagnostic()
+                    .wrap_err("expected to be count (8 bytes)")?,
+            ))
+        })
+        .transpose()?;
+    Ok(count.unwrap_or(0))
 }

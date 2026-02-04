@@ -1,15 +1,30 @@
-use crate::db::{keys, Db};
-use crate::types::{AccountEvt, BroadcastEvent, IdentityEvt, MarshallableEvt, StoredEvent};
+use crate::db::types::TrimmedDid;
+use crate::db::{self, keys, ser_repo_state, Db};
+use crate::state::AppState;
+use crate::types::{
+    AccountEvt, BroadcastEvent, IdentityEvt, MarshallableEvt, RepoState, RepoStatus, ResyncState,
+    StoredEvent,
+};
+use fjall::OwnedWriteBatch;
 use jacquard::api::com_atproto::sync::subscribe_repos::Commit;
 use jacquard::cowstr::ToCowStr;
-use jacquard::IntoStatic;
+use jacquard::types::cid::Cid;
+use jacquard::CowStr;
 use jacquard_repo::car::reader::parse_car_bytes;
-use miette::{IntoDiagnostic, Result};
-use smol_str::{SmolStr, ToSmolStr};
+use miette::{Context, IntoDiagnostic, Result};
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 use tracing::{debug, trace};
+
+pub fn send_backfill_req(state: &AppState, did: jacquard::types::did::Did<'static>) -> Result<()> {
+    state
+        .backfill_tx
+        .send(did.clone())
+        .map_err(|_| miette::miette!("failed to send backfill request for {did}"))?;
+    let _ = state.blocked_dids.insert_sync(did);
+    Ok(())
+}
 
 // emitting identity is ephemeral
 // we dont replay these, consumers can just fetch identity themselves if they need it
@@ -37,40 +52,32 @@ pub fn emit_account_event(db: &Db, evt: AccountEvt<'static>) {
     let _ = db.event_tx.send(BroadcastEvent::Ephemeral(marshallable));
 }
 
-pub fn delete_repo(db: &Db, did: &jacquard::types::did::Did) -> Result<()> {
+pub fn delete_repo<'batch>(
+    batch: &'batch mut OwnedWriteBatch,
+    db: &Db,
+    did: &jacquard::types::did::Did,
+) -> Result<()> {
     debug!("deleting repo {did}");
-    let mut batch = db.inner.batch();
     let repo_key = keys::repo_key(did);
 
     // 1. delete from repos, pending, resync
-    batch.remove(&db.repos, repo_key);
-    batch.remove(&db.pending, repo_key);
-    batch.remove(&db.resync, repo_key);
+    batch.remove(&db.repos, &repo_key);
+    batch.remove(&db.pending, &repo_key);
+    batch.remove(&db.resync, &repo_key);
 
-    // 2. delete from buffer (prefix: repo_key + SEP)
-    let mut buffer_prefix = repo_key.to_vec();
-    buffer_prefix.push(keys::SEP);
-    for guard in db.buffer.prefix(&buffer_prefix) {
-        let k = guard.key().into_diagnostic()?;
-        batch.remove(&db.buffer, k);
-    }
-
-    // 3. delete from records (prefix: repo_key + SEP)
-    let mut records_prefix = repo_key.to_vec();
+    // 2. delete from records (prefix: repo_key + SEP)
+    let mut records_prefix = repo_key.as_bytes().to_vec();
     records_prefix.push(keys::SEP);
-    let mut deleted_count = 0;
-
     for guard in db.records.prefix(&records_prefix) {
         let k = guard.key().into_diagnostic()?;
         batch.remove(&db.records, k);
-        deleted_count += 1;
     }
 
-    // 4. reset collection counts
+    // 3. reset collection counts
     let mut count_prefix = Vec::new();
     count_prefix.push(b'r');
     count_prefix.push(keys::SEP);
-    count_prefix.extend_from_slice(keys::did_prefix(did).as_bytes());
+    count_prefix.extend_from_slice(TrimmedDid::from(did).as_bytes());
     count_prefix.push(keys::SEP);
 
     for guard in db.counts.prefix(&count_prefix) {
@@ -78,36 +85,70 @@ pub fn delete_repo(db: &Db, did: &jacquard::types::did::Did) -> Result<()> {
         batch.remove(&db.counts, k);
     }
 
-    batch.commit().into_diagnostic()?;
-
-    // update global record count
-    if deleted_count > 0 {
-        tokio::spawn(db.increment_count(keys::count_keyspace_key("records"), -deleted_count));
-    }
-
     Ok(())
 }
 
-pub fn update_repo_status(
+pub fn update_repo_status<'batch, 's>(
+    batch: &'batch mut OwnedWriteBatch,
     db: &Db,
     did: &jacquard::types::did::Did,
-    status: crate::types::RepoStatus,
-) -> Result<()> {
-    debug!("updating repo status for {did} to {status:?}");
-    let (updated, batch) =
-        Db::update_repo_state(db.inner.batch(), &db.repos, did, |state, _val| {
-            state.status = status.clone();
-            state.last_updated_at = chrono::Utc::now().timestamp();
-            Ok((true, ()))
-        })?;
+    mut repo_state: RepoState<'s>,
+    new_status: RepoStatus,
+) -> Result<RepoState<'s>> {
+    debug!("updating repo status for {did} to {new_status:?}");
 
-    if updated.is_some() {
-        batch.commit().into_diagnostic()?;
+    let key = keys::repo_key(did);
+
+    // manage queues
+    match &new_status {
+        RepoStatus::Synced => {
+            batch.remove(&db.pending, &key);
+            batch.remove(&db.resync, &key);
+        }
+        RepoStatus::Backfilling => {
+            batch.insert(&db.pending, &key, &[]);
+            batch.remove(&db.resync, &key);
+        }
+        RepoStatus::Error(msg) => {
+            batch.remove(&db.pending, &key);
+            let resync_state = ResyncState::Error {
+                message: msg.clone(),
+                retry_count: 0,
+                next_retry: chrono::Utc::now().timestamp(),
+            };
+            batch.insert(
+                &db.resync,
+                &key,
+                rmp_serde::to_vec(&resync_state).into_diagnostic()?,
+            );
+        }
+        RepoStatus::Deactivated | RepoStatus::Takendown | RepoStatus::Suspended => {
+            batch.remove(&db.pending, &key);
+            let resync_state = ResyncState::Gone {
+                status: new_status.clone(),
+            };
+            batch.insert(
+                &db.resync,
+                &key,
+                rmp_serde::to_vec(&resync_state).into_diagnostic()?,
+            );
+        }
     }
-    Ok(())
+
+    repo_state.status = new_status;
+    repo_state.last_updated_at = chrono::Utc::now().timestamp();
+
+    batch.insert(&db.repos, &key, ser_repo_state(&repo_state)?);
+
+    Ok(repo_state)
 }
 
-pub fn apply_commit(db: &Db, commit: &Commit<'_>, live: bool) -> Result<()> {
+pub fn apply_commit<'batch, 'db>(
+    batch: &'batch mut OwnedWriteBatch,
+    db: &'db Db,
+    mut repo_state: RepoState,
+    commit: &Commit<'_>,
+) -> Result<impl FnOnce() + use<'db>> {
     let did = &commit.repo;
     debug!("applying commit {} for {did}", &commit.commit);
 
@@ -121,12 +162,11 @@ pub fn apply_commit(db: &Db, commit: &Commit<'_>, live: bool) -> Result<()> {
 
     trace!("parsed car for {did} in {:?}", start.elapsed());
 
-    let (_, mut batch) = Db::update_repo_state(db.inner.batch(), &db.repos, did, |state, _| {
-        state.rev = commit.rev.as_str().into();
-        state.data = parsed.root.to_smolstr();
-        state.last_updated_at = chrono::Utc::now().timestamp();
-        Ok((true, ()))
-    })?;
+    repo_state.rev = Some(commit.rev.clone());
+    repo_state.data = Some(Cid::ipld(parsed.root));
+    repo_state.last_updated_at = chrono::Utc::now().timestamp();
+
+    batch.insert(&db.repos, keys::repo_key(did), ser_repo_state(&repo_state)?);
 
     // store all blocks in the CAS
     for (cid, bytes) in &parsed.blocks {
@@ -140,21 +180,13 @@ pub fn apply_commit(db: &Db, commit: &Commit<'_>, live: bool) -> Result<()> {
     // 2. iterate ops and update records index
     let mut records_delta = 0;
     let mut events_count = 0;
-    let mut collection_deltas: HashMap<SmolStr, i64> = HashMap::new();
+    let mut collection_deltas: HashMap<&str, i64> = HashMap::new();
 
     for op in &commit.ops {
-        let parts: Vec<&str> = op.path.splitn(2, '/').collect();
-        if parts.len() != 2 {
-            continue;
-        }
-        let collection = parts[0];
-        let rkey = parts[1];
-
+        let (collection, rkey) = parse_path(&op.path)?;
         let db_key = keys::record_key(did, collection, rkey);
 
         let event_id = db.next_event_id.fetch_add(1, Ordering::SeqCst);
-
-        let mut cid_str = None;
 
         match op.action.as_str() {
             "create" | "update" => {
@@ -163,14 +195,11 @@ pub fn apply_commit(db: &Db, commit: &Commit<'_>, live: bool) -> Result<()> {
                 };
                 let s = smol_str::SmolStr::from(cid.as_str());
                 batch.insert(&db.records, db_key, s.as_bytes().to_vec());
-                cid_str = Some(s);
 
                 // accumulate counts
                 if op.action.as_str() == "create" {
                     records_delta += 1;
-                    *collection_deltas
-                        .entry(collection.to_smolstr())
-                        .or_default() += 1;
+                    *collection_deltas.entry(collection).or_default() += 1;
                 }
             }
             "delete" => {
@@ -178,57 +207,55 @@ pub fn apply_commit(db: &Db, commit: &Commit<'_>, live: bool) -> Result<()> {
 
                 // accumulate counts
                 records_delta -= 1;
-                *collection_deltas
-                    .entry(collection.to_smolstr())
-                    .or_default() -= 1;
+                *collection_deltas.entry(collection).or_default() -= 1;
             }
             _ => {}
         }
 
-        let evt = StoredEvent::Record {
-            live,
-            did: did.clone().into_static(),
-            rev: commit.rev.as_str().into(),
-            collection: collection.into(),
-            rkey: rkey.into(),
-            action: op.action.as_str().into(),
-            cid: cid_str,
+        let evt = StoredEvent {
+            did: TrimmedDid::from(did),
+            rev: CowStr::Borrowed(commit.rev.as_str()),
+            collection: CowStr::Borrowed(collection),
+            rkey: CowStr::Borrowed(rkey),
+            action: CowStr::Borrowed(op.action.as_str()),
+            cid: op.cid.as_ref().map(|c| c.0.clone()),
         };
 
         let bytes = rmp_serde::to_vec(&evt).into_diagnostic()?;
-        batch.insert(&db.events, keys::event_key(event_id as i64), bytes);
+        batch.insert(&db.events, keys::event_key(event_id), bytes);
         events_count += 1;
     }
 
     let start = Instant::now();
 
-    batch.commit().into_diagnostic()?;
     trace!("committed sync batch for {did} in {:?}", start.elapsed());
 
+    // update counts
     let blocks_count = parsed.blocks.len() as i64;
-    tokio::spawn({
-        let blocks_fut = (blocks_count > 0)
-            .then(|| db.increment_count(keys::count_keyspace_key("blocks"), blocks_count));
-        let records_fut = (records_delta != 0)
-            .then(|| db.increment_count(keys::count_keyspace_key("records"), records_delta));
-        let events_fut = (events_count > 0)
-            .then(|| db.increment_count(keys::count_keyspace_key("events"), events_count));
-        let collections_fut = collection_deltas
-            .into_iter()
-            .map(|(col, delta)| db.increment_count(keys::count_collection_key(&did, &col), delta))
-            .collect::<Vec<_>>();
-        futures::future::join_all(
-            blocks_fut
-                .into_iter()
-                .chain(records_fut)
-                .chain(events_fut)
-                .chain(collections_fut),
-        )
-    });
+    for (col, delta) in collection_deltas {
+        db::update_record_count(batch, db, did, col, delta)?;
+    }
 
     let _ = db.event_tx.send(BroadcastEvent::Persisted(
         db.next_event_id.load(Ordering::SeqCst) - 1,
     ));
 
-    Ok(())
+    Ok(move || {
+        if blocks_count > 0 {
+            db.update_count("blocks", blocks_count);
+        }
+        if records_delta != 0 {
+            db.update_count("records", records_delta);
+        }
+        if events_count > 0 {
+            db.update_count("events", events_count);
+        }
+    })
+}
+
+pub fn parse_path(path: &str) -> Result<(&str, &str)> {
+    let mut parts = path.splitn(2, '/');
+    let collection = parts.next().wrap_err("missing collection")?;
+    let rkey = parts.next().wrap_err("missing rkey")?;
+    Ok((collection, rkey))
 }

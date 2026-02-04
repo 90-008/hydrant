@@ -1,9 +1,9 @@
 use crate::db::{keys, ser_repo_state, Db};
+use crate::ops::send_backfill_req;
 use crate::state::AppState;
-use crate::types::{RepoState, RepoStatus};
+use crate::types::RepoState;
 use jacquard::api::com_atproto::sync::list_repos::{ListRepos, ListReposOutput};
 use jacquard::prelude::*;
-use jacquard::types::did::Did;
 use jacquard_common::CowStr;
 use miette::{IntoDiagnostic, Result};
 use smol_str::SmolStr;
@@ -74,35 +74,17 @@ impl Crawler {
 
             // 3. process repos
             for repo in output.repos {
-                let did_str = smol_str::SmolStr::from(repo.did.as_str());
                 let did_key = keys::repo_key(&repo.did);
 
                 // check if known
-                if !Db::contains_key(db.repos.clone(), did_key).await? {
-                    debug!("crawler found new repo: {did_str}");
+                if !Db::contains_key(db.repos.clone(), &did_key).await? {
+                    debug!("crawler found new repo: {}", repo.did);
 
-                    // create state (backfilling)
-                    let mut state = RepoState::new(repo.did.to_owned());
-                    state.status = RepoStatus::Backfilling;
-
-                    batch.insert(&db.repos, did_key, ser_repo_state(&state)?);
-                    batch.insert(&db.pending, did_key, Vec::new());
-                    to_queue.push(did_str);
+                    let state = RepoState::backfilling(&repo.did);
+                    batch.insert(&db.repos, &did_key, ser_repo_state(&state)?);
+                    batch.insert(&db.pending, &did_key, Vec::new());
+                    to_queue.push(repo.did.clone());
                 }
-            }
-
-            // update counts if we found new repos
-            if !to_queue.is_empty() {
-                let count = to_queue.len() as i64;
-                let repos_fut = self
-                    .state
-                    .db
-                    .increment_count(keys::count_keyspace_key("repos"), count);
-                let pending_fut = self
-                    .state
-                    .db
-                    .increment_count(keys::count_keyspace_key("pending"), count);
-                tokio::spawn(futures::future::join_all([repos_fut, pending_fut]));
             }
 
             // 4. update cursor
@@ -124,18 +106,16 @@ impl Crawler {
                 .await
                 .into_diagnostic()??;
 
+            // update counts if we found new repos
+            if !to_queue.is_empty() {
+                let count = to_queue.len() as i64;
+                self.state.db.update_count_async("repos", count).await;
+                self.state.db.update_count_async("pending", count).await;
+            }
+
             // 5. queue for backfill
-            for did_str in to_queue {
-                let did = match Did::new_owned(did_str.as_str()) {
-                    Ok(d) => d,
-                    Err(e) => {
-                        error!("got invalid DID ({did_str}) from relay, skipping this: {e}");
-                        continue;
-                    }
-                };
-                if let Err(e) = self.state.backfill_tx.send(did) {
-                    error!("crawler failed to queue {did_str}: {e}");
-                }
+            for did in to_queue {
+                send_backfill_req(&self.state, did)?;
             }
 
             if cursor.is_none() {

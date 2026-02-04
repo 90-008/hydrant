@@ -1,6 +1,5 @@
 mod api;
 mod backfill;
-mod buffer;
 mod config;
 mod crawler;
 mod db;
@@ -10,19 +9,18 @@ mod resolver;
 mod state;
 mod types;
 
-use crate::backfill::Worker;
-use crate::buffer::processor::BufferProcessor;
 use crate::config::Config;
 use crate::crawler::Crawler;
-use crate::db::Db;
-use crate::ingest::Ingestor;
+use crate::db::set_firehose_cursor;
+use crate::ingest::firehose::FirehoseIngestor;
 use crate::state::AppState;
+use crate::{backfill::BackfillWorker, ingest::worker::FirehoseWorker};
 use futures::{future::BoxFuture, FutureExt, TryFutureExt};
 use miette::IntoDiagnostic;
 use mimalloc::MiMalloc;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use tokio::task::spawn_blocking;
+use tokio::{sync::mpsc, task::spawn_blocking};
 use tracing::{error, info};
 
 #[global_allocator]
@@ -37,7 +35,8 @@ async fn main() -> miette::Result<()> {
 
     info!("{cfg}");
 
-    let (state, backfill_rx, buffer_rx) = AppState::new(&cfg)?;
+    let (state, backfill_rx) = AppState::new(&cfg)?;
+    let (buffer_tx, buffer_rx) = mpsc::unbounded_channel();
     let state = Arc::new(state);
 
     tokio::spawn(
@@ -54,12 +53,13 @@ async fn main() -> miette::Result<()> {
     tokio::spawn({
         let state = state.clone();
         let timeout = cfg.repo_fetch_timeout;
-        Worker::new(state, backfill_rx, timeout, cfg.backfill_concurrency_limit).run()
+        BackfillWorker::new(state, backfill_rx, timeout, cfg.backfill_concurrency_limit).run()
     });
 
-    let buffer_processor_task = tokio::spawn({
+    let firehose_worker = std::thread::spawn({
         let state = state.clone();
-        BufferProcessor::new(state, buffer_rx).run()
+        let handle = tokio::runtime::Handle::current();
+        move || FirehoseWorker::new(state, buffer_rx).run(handle)
     });
 
     if let Err(e) = spawn_blocking({
@@ -70,7 +70,7 @@ async fn main() -> miette::Result<()> {
     .into_diagnostic()?
     {
         error!("failed to queue pending backfills: {e}");
-        Db::check_poisoned_report(&e);
+        db::check_poisoned_report(&e);
     }
 
     if let Err(e) = spawn_blocking({
@@ -81,7 +81,7 @@ async fn main() -> miette::Result<()> {
     .into_diagnostic()?
     {
         error!("failed to queue gone backfills: {e}");
-        Db::check_poisoned_report(&e);
+        db::check_poisoned_report(&e);
     }
 
     std::thread::spawn({
@@ -127,20 +127,24 @@ async fn main() -> miette::Result<()> {
             loop {
                 std::thread::sleep(persist_interval);
 
+                // persist firehose cursor
                 let seq = state.cur_firehose.load(Ordering::SeqCst);
-                const CURSOR_KEY: &[u8] = b"firehose_cursor";
-                if let Err(e) = state
-                    .db
-                    .cursors
-                    .insert(CURSOR_KEY, seq.to_string().into_bytes())
-                {
+                if let Err(e) = set_firehose_cursor(&state.db, seq) {
                     error!("failed to save cursor: {e}");
-                    Db::check_poisoned(&e);
+                    db::check_poisoned_report(&e);
                 }
 
+                // persist counts
+                // TODO: make this more durable
+                if let Err(e) = db::persist_counts(&state.db) {
+                    error!("failed to persist counts: {e}");
+                    db::check_poisoned_report(&e);
+                }
+
+                // persist journal
                 if let Err(e) = state.db.persist() {
                     error!("db persist failed: {e}");
-                    Db::check_poisoned_report(&e);
+                    db::check_poisoned_report(&e);
                 }
             }
         }
@@ -152,24 +156,32 @@ async fn main() -> miette::Result<()> {
                 .run()
                 .inspect_err(|e| {
                     error!("crawler died: {e}");
-                    Db::check_poisoned_report(&e);
+                    db::check_poisoned_report(&e);
                 }),
         );
     }
 
-    let ingestor = Ingestor::new(state.clone(), cfg.relay_host, cfg.full_network);
+    let ingestor =
+        FirehoseIngestor::new(state.clone(), buffer_tx, cfg.relay_host, cfg.full_network);
 
     let res = futures::future::try_join_all::<[BoxFuture<_>; _]>([
-        Box::pin(buffer_processor_task.map(|r| r.into_diagnostic().flatten())),
+        Box::pin(
+            tokio::task::spawn_blocking(move || {
+                firehose_worker
+                    .join()
+                    .map_err(|e| miette::miette!("buffer processor thread died: {e:?}"))
+            })
+            .map(|r| r.into_diagnostic().flatten().flatten()),
+        ),
         Box::pin(ingestor.run()),
     ]);
     if let Err(e) = res.await {
         error!("ingestor or buffer processor died: {e}");
-        Db::check_poisoned_report(&e);
+        db::check_poisoned_report(&e);
     }
 
     if let Err(e) = state.db.persist() {
-        Db::check_poisoned_report(&e);
+        db::check_poisoned_report(&e);
         return Err(e);
     }
 

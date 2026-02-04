@@ -53,74 +53,55 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, query: Strea
                 // 1. catch up from DB
                 loop {
                     let mut found = false;
-                    for item in ks.range(keys::event_key((current_id + 1) as i64)..) {
+                    for item in ks.range(keys::event_key(current_id + 1)..) {
                         if let Ok((k, v)) = item.into_inner() {
                             let mut buf = [0u8; 8];
                             buf.copy_from_slice(&k);
                             let id = u64::from_be_bytes(buf);
                             current_id = id;
 
-                            let stored_evt: StoredEvent = match rmp_serde::from_slice(&v) {
+                            let StoredEvent {
+                                did,
+                                rev,
+                                collection,
+                                rkey,
+                                action,
+                                cid,
+                            } = match rmp_serde::from_slice(&v) {
                                 Ok(e) => e,
                                 Err(_) => continue,
                             };
 
-                            let marshallable = match stored_evt {
-                                StoredEvent::Record {
-                                    live,
-                                    did,
-                                    rev,
-                                    collection,
-                                    rkey,
-                                    action,
-                                    cid,
-                                } => {
-                                    let mut record_val = None;
-                                    if let Some(cid_str) = &cid {
-                                        if let Ok(Some(block_bytes)) =
-                                            db.blocks.get(keys::block_key(cid_str))
+                            let marshallable = {
+                                let mut record_val = None;
+                                if let Some(cid_str) = &cid {
+                                    if let Ok(Some(block_bytes)) =
+                                        db.blocks.get(keys::block_key(cid_str))
+                                    {
+                                        if let Ok(raw_data) =
+                                            serde_ipld_dagcbor::from_slice::<RawData>(&block_bytes)
                                         {
-                                            if let Ok(raw_data) =
-                                                serde_ipld_dagcbor::from_slice::<RawData>(
-                                                    &block_bytes,
-                                                )
-                                            {
-                                                record_val = serde_json::to_value(raw_data).ok();
-                                            }
+                                            record_val = serde_json::to_value(raw_data).ok();
                                         }
                                     }
-
-                                    MarshallableEvt {
-                                        id,
-                                        event_type: "record".into(),
-                                        record: Some(RecordEvt {
-                                            live,
-                                            did,
-                                            rev,
-                                            collection,
-                                            rkey,
-                                            action,
-                                            record: record_val,
-                                            cid,
-                                        }),
-                                        identity: None,
-                                        account: None,
-                                    }
                                 }
-                                StoredEvent::Identity(identity) => MarshallableEvt {
+
+                                MarshallableEvt {
                                     id,
-                                    event_type: "identity".into(),
-                                    record: None,
-                                    identity: Some(identity),
-                                    account: None,
-                                },
-                                StoredEvent::Account(account) => MarshallableEvt {
-                                    id,
-                                    event_type: "account".into(),
-                                    record: None,
+                                    event_type: "record".into(),
+                                    record: Some(RecordEvt {
+                                        live: true,
+                                        did: did.to_did(),
+                                        rev,
+                                        collection,
+                                        rkey,
+                                        action,
+                                        record: record_val,
+                                        cid,
+                                    }),
                                     identity: None,
-                                    account: Some(account),
-                                },
+                                    account: None,
+                                }
                             };
 
                             let json_str = match serde_json::to_string(&marshallable) {

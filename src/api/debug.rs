@@ -1,5 +1,5 @@
-use crate::api::AppState;
 use crate::db::keys;
+use crate::{api::AppState, db::types::TrimmedDid};
 use axum::{
     extract::{Query, State},
     http::StatusCode,
@@ -39,25 +39,19 @@ pub async fn handle_debug_count(
 
     // {did_prefix}\x00{collection}\x00
     let mut prefix = Vec::new();
-    prefix.extend_from_slice(keys::did_prefix(&did).as_bytes());
+    prefix.extend_from_slice(TrimmedDid::from(&did).as_bytes());
     prefix.push(keys::SEP);
     prefix.extend_from_slice(req.collection.as_bytes());
     prefix.push(keys::SEP);
 
     let count = tokio::task::spawn_blocking(move || {
-        let mut count = 0;
         let start_key = prefix.clone();
         let mut end_key = prefix.clone();
         if let Some(msg) = end_key.last_mut() {
             *msg += 1;
         }
 
-        for item in ks.range(start_key..end_key) {
-            if item.into_inner().is_ok() {
-                count += 1;
-            }
-        }
-        count
+        ks.range(start_key..end_key).count()
     })
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;

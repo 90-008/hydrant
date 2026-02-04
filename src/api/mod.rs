@@ -1,5 +1,7 @@
 use crate::state::AppState;
 use axum::{routing::get, Router};
+use jacquard::xrpc::GenericXrpcError;
+use jacquard_axum::XrpcErrorResponse;
 use std::{net::SocketAddr, sync::Arc};
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
@@ -9,6 +11,8 @@ pub mod repo;
 pub mod stats;
 mod stream;
 pub mod xrpc;
+
+pub type XrpcResult<T> = Result<T, XrpcErrorResponse<GenericXrpcError>>;
 
 pub async fn serve(state: Arc<AppState>, port: u16) -> miette::Result<()> {
     let app = Router::new()
@@ -47,7 +51,7 @@ pub async fn serve_debug(state: Arc<AppState>, port: u16) -> miette::Result<()> 
         .map_err(|e| miette::miette!("failed to bind debug server to port {port}: {e}"))?;
 
     tracing::info!(
-        "Debug server listening on {}",
+        "debug server listening on {}",
         listener.local_addr().unwrap()
     );
 

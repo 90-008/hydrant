@@ -1,34 +1,35 @@
-use crate::db::{keys, Db};
+use crate::db::types::TrimmedDid;
+use crate::db::{self, Db, keys, ser_repo_state};
 use crate::ops;
 use crate::state::{AppState, BackfillRx};
 use crate::types::{AccountEvt, BroadcastEvent, RepoState, RepoStatus, ResyncState, StoredEvent};
 use futures::TryFutureExt;
 use jacquard::api::com_atproto::sync::get_repo::{GetRepo, GetRepoError};
+use jacquard::types::cid::Cid;
 use jacquard::types::did::Did;
-use jacquard::{prelude::*, IntoStatic};
+use jacquard::{CowStr, IntoStatic, prelude::*};
 use jacquard_common::xrpc::XrpcError;
-use jacquard_repo::mst::Mst;
 use jacquard_repo::MemoryBlockStore;
+use jacquard_repo::mst::Mst;
 use miette::{IntoDiagnostic, Result};
-use smol_str::{SmolStr, ToSmolStr};
+use smol_str::{SmolStr, ToSmolStr, format_smolstr};
 use std::collections::HashMap;
-use std::iter::once;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
 use tracing::{debug, error, info, trace, warn};
 
 pub mod manager;
 
-pub struct Worker {
+pub struct BackfillWorker {
     state: Arc<AppState>,
     rx: BackfillRx,
     http: reqwest::Client,
     semaphore: Arc<Semaphore>,
 }
 
-impl Worker {
+impl BackfillWorker {
     pub fn new(
         state: Arc<AppState>,
         rx: BackfillRx,
@@ -68,7 +69,7 @@ impl Worker {
                 )
                 .inspect_err(move |e| {
                     error!("backfill process failed for {did}: {e}");
-                    Db::check_poisoned_report(e);
+                    db::check_poisoned_report(e);
                 }),
             );
         }
@@ -82,17 +83,11 @@ impl Worker {
     ) -> Result<()> {
         let db = &state.db;
 
-        // block buffer processing for this DID during backfill
-        let _ = state.blocked_dids.insert_async(did.clone()).await;
-
         match Self::process_did(&state, &http, &did).await {
             Ok(previous_state) => {
                 let did_key = keys::repo_key(&did);
 
-                let is_pending = matches!(
-                    previous_state.status,
-                    RepoStatus::Backfilling | RepoStatus::New
-                );
+                let was_pending = matches!(previous_state.status, RepoStatus::Backfilling);
                 let was_resync = matches!(
                     previous_state.status,
                     RepoStatus::Error(_)
@@ -103,30 +98,22 @@ impl Worker {
 
                 let mut batch = db.inner.batch();
                 // remove from pending
-                if is_pending {
-                    batch.remove(&db.pending, did_key);
+                if was_pending {
+                    batch.remove(&db.pending, &did_key);
                 }
                 // remove from resync
                 if was_resync {
-                    batch.remove(&db.resync, did_key);
+                    batch.remove(&db.resync, &did_key);
                 }
                 tokio::task::spawn_blocking(move || batch.commit().into_diagnostic())
                     .await
                     .into_diagnostic()??;
-
-                tokio::spawn({
-                    let pending_fut = is_pending.then(|| {
-                        state
-                            .db
-                            .increment_count(keys::count_keyspace_key("pending"), -1)
-                    });
-                    let resync_fut = was_resync.then(|| {
-                        state
-                            .db
-                            .increment_count(keys::count_keyspace_key("resync"), -1)
-                    });
-                    futures::future::join_all(pending_fut.into_iter().chain(resync_fut))
-                });
+                if was_pending {
+                    state.db.update_count_async("pending", -1).await;
+                }
+                if was_resync {
+                    state.db.update_count_async("resync", -1).await;
+                }
 
                 let state_for_persist = state.clone();
                 tokio::task::spawn_blocking(move || {
@@ -145,7 +132,7 @@ impl Worker {
 
                 // 1. get current retry count
                 let mut retry_count = 0;
-                if let Ok(Some(bytes)) = Db::get(db.resync.clone(), did_key).await {
+                if let Ok(Some(bytes)) = Db::get(db.resync.clone(), &did_key).await {
                     if let Ok(ResyncState::Error {
                         retry_count: old_count,
                         ..
@@ -166,7 +153,7 @@ impl Worker {
 
                 tokio::task::spawn_blocking({
                     let state = state.clone();
-                    let did_key = did_key.to_vec();
+                    let did_key = did_key.into_static();
                     move || {
                         // 3. save to resync
                         let serialized_resync_state =
@@ -208,11 +195,11 @@ impl Worker {
     }
 
     // returns previous repo state if successful
-    async fn process_did(
+    async fn process_did<'i>(
         app_state: &Arc<AppState>,
         http: &reqwest::Client,
         did: &Did<'static>,
-    ) -> Result<RepoState> {
+    ) -> Result<RepoState<'static>> {
         debug!("backfilling {}", did);
 
         let db = &app_state.db;
@@ -220,7 +207,9 @@ impl Worker {
         let state_bytes = Db::get(db.repos.clone(), did_key)
             .await?
             .ok_or_else(|| miette::miette!("!!!THIS IS A BUG!!! repo state for {did} missing"))?;
-        let mut state: RepoState = rmp_serde::from_slice(&state_bytes).into_diagnostic()?;
+        let mut state: RepoState<'static> = rmp_serde::from_slice::<RepoState>(&state_bytes)
+            .into_diagnostic()?
+            .into_static();
         let previous_state = state.clone();
 
         // 1. resolve pds
@@ -265,7 +254,9 @@ impl Worker {
             Err(XrpcError::Xrpc(e)) => {
                 if matches!(e, GetRepoError::RepoNotFound(_)) {
                     warn!("repo {did} not found, deleting");
-                    ops::delete_repo(db, did)?;
+                    let mut batch = db.inner.batch();
+                    ops::delete_repo(&mut batch, db, did)?;
+                    batch.commit().into_diagnostic()?;
                     return Ok(previous_state); // stop backfill
                 }
 
@@ -353,7 +344,7 @@ impl Worker {
 
         // 6. insert records into db
         let start = Instant::now();
-        let (_state, added_records, added_blocks, collection_counts, count) = {
+        let (_state, added_records, added_blocks, count) = {
             let app_state = app_state.clone();
             let did = did.clone();
             let rev = commit.rev;
@@ -363,8 +354,20 @@ impl Worker {
                 let mut count = 0;
                 let mut added_records = 0;
                 let mut added_blocks = 0;
-                let mut collection_counts: HashMap<SmolStr, i64> = HashMap::new();
+                let mut collection_counts: HashMap<SmolStr, u64> = HashMap::new();
                 let mut batch = app_state.db.inner.batch();
+
+                // pre-load existing record CIDs for this DID to detect duplicates/updates
+                let prefix = keys::record_prefix(&did);
+                let prefix_len = prefix.len();
+                let mut existing_cids: HashMap<SmolStr, SmolStr> = HashMap::new();
+                for guard in app_state.db.records.prefix(&prefix) {
+                    let (key, cid_bytes) = guard.into_inner().into_diagnostic()?;
+                    // extract path (collection/rkey) from key by skipping the DID prefix
+                    let path = String::from_utf8_lossy(&key[prefix_len..]).to_smolstr();
+                    let cid = String::from_utf8_lossy(&cid_bytes).to_smolstr();
+                    existing_cids.insert(path, cid);
+                }
 
                 for (key, cid) in leaves {
                     let val_bytes = tokio::runtime::Handle::current()
@@ -372,76 +375,74 @@ impl Worker {
                         .into_diagnostic()?;
 
                     if let Some(val) = val_bytes {
-                        let parts: Vec<&str> = key.splitn(2, '/').collect();
-                        if parts.len() == 2 {
-                            let collection = parts[0];
-                            let rkey = parts[1];
+                        let (collection, rkey) = ops::parse_path(&key)?;
+                        let collection = collection.to_smolstr();
+                        let cid = Cid::ipld(cid);
 
-                            let db_key = keys::record_key(&did, collection, rkey);
-                            let cid_str = cid.to_smolstr();
+                        // check if this record already exists with same CID
+                        let path = format_smolstr!("{collection}{}{rkey}", keys::SEP as char);
+                        let (action, is_new) = if let Some(existing_cid) = existing_cids.get(&path)
+                        {
+                            if existing_cid == cid.as_str() {
+                                continue; // skip unchanged record
+                            }
+                            ("update", false)
+                        } else {
+                            ("create", true)
+                        };
 
-                            let val_vec: Vec<u8> = val.to_vec();
-                            batch.insert(
-                                &app_state.db.blocks,
-                                keys::block_key(&cid_str),
-                                val_vec.clone(),
-                            );
+                        let db_key = keys::record_key(&did, &collection, rkey);
 
-                            batch.insert(
-                                &app_state.db.records,
-                                db_key,
-                                cid_str.as_bytes().to_vec(),
-                            );
+                        batch.insert(
+                            &app_state.db.blocks,
+                            keys::block_key(cid.as_str()),
+                            val.as_ref(),
+                        );
+                        batch.insert(&app_state.db.records, db_key, cid.as_str().as_bytes());
 
+                        added_blocks += 1;
+                        if is_new {
                             added_records += 1;
-                            added_blocks += 1;
-                            *collection_counts
-                                .entry(collection.to_smolstr())
-                                .or_default() += 1;
-
-                            let event_id =
-                                app_state.db.next_event_id.fetch_add(1, Ordering::SeqCst);
-                            let evt = StoredEvent::Record {
-                                live: false,
-                                did: did.clone().into_static(),
-                                rev: rev.as_str().into(),
-                                collection: collection.into(),
-                                rkey: rkey.into(),
-                                action: "create".into(),
-                                cid: Some(cid_str),
-                            };
-
-                            let bytes = rmp_serde::to_vec(&evt).into_diagnostic()?;
-                            batch.insert(
-                                &app_state.db.events,
-                                keys::event_key(event_id as i64),
-                                bytes,
-                            );
-
-                            count += 1;
+                            *collection_counts.entry(collection.clone()).or_default() += 1;
                         }
+
+                        let event_id = app_state.db.next_event_id.fetch_add(1, Ordering::SeqCst);
+                        let evt = StoredEvent {
+                            did: TrimmedDid::from(&did),
+                            rev: CowStr::Borrowed(rev.as_str()),
+                            collection: CowStr::Borrowed(collection.as_str()),
+                            rkey: CowStr::Borrowed(rkey),
+                            action: CowStr::Borrowed(action),
+                            cid: Some(cid),
+                        };
+
+                        let bytes = rmp_serde::to_vec(&evt).into_diagnostic()?;
+                        batch.insert(&app_state.db.events, keys::event_key(event_id), bytes);
+
+                        count += 1;
                     }
                 }
 
                 // 6. update status to synced
                 state.status = RepoStatus::Synced;
-                state.rev = rev.as_str().into();
-                state.data = commit.data.to_smolstr();
+                state.rev = Some(rev);
+                state.data = Some(Cid::ipld(parsed.root));
                 state.last_updated_at = chrono::Utc::now().timestamp();
 
-                let did_key = keys::repo_key(&did);
-                let bytes = rmp_serde::to_vec(&state).into_diagnostic()?;
-                batch.insert(&app_state.db.repos, did_key, bytes);
+                batch.insert(
+                    &app_state.db.repos,
+                    keys::repo_key(&did),
+                    ser_repo_state(&state)?,
+                );
+
+                // add the counts
+                for (col, cnt) in collection_counts {
+                    db::set_record_count(&mut batch, &app_state.db, &did, &col, cnt);
+                }
 
                 batch.commit().into_diagnostic()?;
 
-                Ok::<_, miette::Report>((
-                    state,
-                    added_records,
-                    added_blocks,
-                    collection_counts,
-                    count,
-                ))
+                Ok::<_, miette::Report>((state, added_records, added_blocks, count))
             })
             .await
             .into_diagnostic()??
@@ -456,30 +457,14 @@ impl Worker {
 
         // do the counts
         if added_records > 0 {
-            tokio::spawn({
-                let state = app_state.clone();
-                let did = did.clone();
-                let records_fut = state
-                    .db
-                    .increment_count(keys::count_keyspace_key("records"), added_records);
-                let blocks_fut = state
-                    .db
-                    .increment_count(keys::count_keyspace_key("blocks"), added_blocks);
-                let events_fut = state
-                    .db
-                    .increment_count(keys::count_keyspace_key("events"), added_records);
-                let collections_futs = collection_counts.into_iter().map(|(col, cnt)| {
-                    state
-                        .db
-                        .increment_count(keys::count_collection_key(&did, &col), cnt)
-                });
-                futures::future::join_all(
-                    once(records_fut)
-                        .chain(once(blocks_fut))
-                        .chain(once(events_fut))
-                        .chain(collections_futs),
-                )
-            });
+            app_state
+                .db
+                .update_count_async("records", added_records)
+                .await;
+            app_state
+                .db
+                .update_count_async("blocks", added_blocks)
+                .await;
         }
         trace!(
             "committed backfill batch for {did} in {:?}",

@@ -5,14 +5,10 @@ use tokio::sync::mpsc;
 
 use miette::Result;
 
-use crate::buffer::BufferedMessage;
 use crate::{config::Config, db::Db, resolver::Resolver};
 
 pub type BackfillTx = mpsc::UnboundedSender<Did<'static>>;
 pub type BackfillRx = mpsc::UnboundedReceiver<Did<'static>>;
-
-pub type BufferTx = mpsc::UnboundedSender<BufferedMessage>;
-pub type BufferRx = mpsc::UnboundedReceiver<BufferedMessage>;
 
 pub struct AppState {
     pub db: Db,
@@ -20,11 +16,10 @@ pub struct AppState {
     pub resolver: Resolver,
     pub cur_firehose: AtomicI64,
     pub blocked_dids: scc::HashSet<Did<'static>>,
-    pub buffer_tx: BufferTx,
 }
 
 impl AppState {
-    pub fn new(config: &Config) -> Result<(Self, BackfillRx, BufferRx)> {
+    pub fn new(config: &Config) -> Result<(Self, BackfillRx)> {
         let db = Db::open(
             &config.database_path,
             config.cache_size,
@@ -32,7 +27,6 @@ impl AppState {
         )?;
         let resolver = Resolver::new(config.plc_url.clone());
         let (backfill_tx, backfill_rx) = mpsc::unbounded_channel();
-        let (buffer_tx, buffer_rx) = mpsc::unbounded_channel();
 
         Ok((
             Self {
@@ -41,10 +35,8 @@ impl AppState {
                 resolver,
                 cur_firehose: AtomicI64::new(0),
                 blocked_dids: scc::HashSet::new(),
-                buffer_tx,
             },
             backfill_rx,
-            buffer_rx,
         ))
     }
 }
