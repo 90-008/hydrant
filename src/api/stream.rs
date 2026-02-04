@@ -3,8 +3,8 @@ use crate::db::keys;
 use crate::types::{BroadcastEvent, MarshallableEvt, RecordEvt, StoredEvent};
 use axum::{
     extract::{
-        ws::{Message, WebSocket, WebSocketUpgrade},
         Query, State,
+        ws::{Message, WebSocket, WebSocketUpgrade},
     },
     response::IntoResponse,
 };
@@ -97,7 +97,10 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, query: Strea
                                         rkey,
                                         action,
                                         record: record_val,
-                                        cid,
+                                        cid: cid.map(|c| match c {
+                                            jacquard::types::cid::Cid::Ipld { s, .. } => s,
+                                            jacquard::types::cid::Cid::Str(s) => s,
+                                        }),
                                     }),
                                     identity: None,
                                     account: None,

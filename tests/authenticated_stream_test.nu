@@ -105,6 +105,8 @@ def main [] {
         } catch {
             print "warning: failed to add repo (might already be tracked), continuing..."
         }
+        
+        sleep 5sec
 
         # 5. perform actions
         let collection = "app.bsky.feed.post"

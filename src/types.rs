@@ -1,8 +1,8 @@
 use std::fmt::Display;
 
 use jacquard::{
-    types::{cid::Cid, tid::Tid},
     CowStr, IntoStatic,
+    types::{cid::Cid, tid::Tid},
 };
 use jacquard_common::types::string::Did;
 use serde::{Deserialize, Serialize};
@@ -140,7 +140,7 @@ pub struct RecordEvt<'i> {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub record: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub cid: Option<Cid<'i>>,
+    pub cid: Option<CowStr<'i>>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

@@ -1,8 +1,9 @@
 use crate::api::AppState;
-use crate::db::{keys, ser_repo_state, Db};
+use crate::db::{Db, keys, ser_repo_state};
+use crate::ops::send_backfill_req;
 use crate::types::RepoState;
-use axum::{extract::State, http::StatusCode, routing::post, Json, Router};
-use jacquard::{types::did::Did, IntoStatic};
+use axum::{Json, Router, extract::State, http::StatusCode, routing::post};
+use jacquard::types::did::Did;
 use serde::Deserialize;
 use std::sync::Arc;
 
@@ -59,7 +60,8 @@ pub async fn handle_repo_add(
 
         // trigger backfill
         for did in to_backfill {
-            let _ = state.backfill_tx.send(did.into_static());
+            send_backfill_req(&state, did)
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         }
     }
     Ok(StatusCode::OK)

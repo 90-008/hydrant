@@ -170,13 +170,13 @@ pub fn verify_sync_event(blocks: &[u8], key: Option<&PublicKey>) -> Result<(Cid<
     ))
 }
 
-pub fn apply_commit<'batch, 'db>(
+pub fn apply_commit<'batch, 'db, 's>(
     batch: &'batch mut OwnedWriteBatch,
     db: &'db Db,
-    mut repo_state: RepoState,
+    mut repo_state: RepoState<'s>,
     commit: &Commit<'_>,
     signing_key: Option<&PublicKey>,
-) -> Result<impl FnOnce() + use<'db>> {
+) -> Result<(RepoState<'s>, impl FnOnce() + use<'db>)> {
     let did = &commit.repo;
     debug!("applying commit {} for {did}", &commit.commit);
 
@@ -281,7 +281,7 @@ pub fn apply_commit<'batch, 'db>(
         db.next_event_id.load(Ordering::SeqCst) - 1,
     ));
 
-    Ok(move || {
+    Ok((repo_state, move || {
         if blocks_count > 0 {
             db.update_count("blocks", blocks_count);
         }
@@ -291,7 +291,7 @@ pub fn apply_commit<'batch, 'db>(
         if events_count > 0 {
             db.update_count("events", events_count);
         }
-    })
+    }))
 }
 
 pub fn parse_path(path: &str) -> Result<(&str, &str)> {

@@ -106,10 +106,13 @@ impl FirehoseWorker {
         let mut failed = Vec::<BufferedMessage>::new();
 
         let _g = handle.enter();
+        let mut repo_cache = HashMap::new();
+        let mut deleted = HashSet::new();
 
         loop {
             let mut batch = self.state.db.inner.batch();
-            let mut deleted = HashSet::new();
+            repo_cache.clear();
+            deleted.clear();
 
             // resolve signing keys for commits and syncs if verification is enabled
             let keys = if self.verify_signatures {
@@ -149,7 +152,7 @@ impl FirehoseWorker {
                     continue;
                 }
 
-                match self.process_message(&mut batch, &msg, did, &keys) {
+                match self.process_message(&mut repo_cache, &mut batch, &msg, did, &keys) {
                     Ok(ProcessResult::Ok) => {}
                     Ok(ProcessResult::Deleted) => {
                         deleted.insert(did.clone());
@@ -210,6 +213,7 @@ impl FirehoseWorker {
 
     fn process_message(
         &self,
+        repo_cache: &mut HashMap<Did<'static>, RepoState<'static>>,
         batch: &mut OwnedWriteBatch,
         msg: &BufferedMessage,
         did: &Did,
@@ -218,7 +222,9 @@ impl FirehoseWorker {
         let state = &self.state;
         let verify_signatures = self.verify_signatures;
 
-        let RepoCheckResult::Ok(repo_state) = Self::check_repo_state(batch, state, did)? else {
+        let RepoCheckResult::Ok(repo_state) =
+            Self::check_repo_state(repo_cache, batch, state, did, msg)?
+        else {
             return Ok(ProcessResult::Ok);
         };
 
@@ -278,7 +284,10 @@ impl FirehoseWorker {
                     return Ok(ProcessResult::Ok);
                 }
 
-                ops::apply_commit(batch, &state.db, repo_state, &commit, get_key()?)?();
+                let (new_state, cb) =
+                    ops::apply_commit(batch, &state.db, repo_state, &commit, get_key()?)?;
+                cb();
+                repo_cache.insert(did.clone().into_static(), new_state);
             }
             SubscribeReposMessage::Sync(sync) => {
                 debug!("processing buffered sync for {did}");
@@ -348,7 +357,7 @@ impl FirehoseWorker {
                             return Ok(ProcessResult::Deleted);
                         }
                         status => {
-                            let status = match status {
+                            let target_status = match status {
                                 Some(status) => match status {
                                     AccountStatus::Deleted => {
                                         unreachable!("deleted account status is handled before")
@@ -374,7 +383,20 @@ impl FirehoseWorker {
                                     RepoStatus::Error("unknown".into())
                                 }
                             };
-                            ops::update_repo_status(batch, &state.db, did, repo_state, status)?;
+
+                            if repo_state.status == target_status {
+                                debug!("account status unchanged for {did}: {target_status:?}");
+                                return Ok(ProcessResult::Ok);
+                            }
+
+                            let new_state = ops::update_repo_status(
+                                batch,
+                                &state.db,
+                                did,
+                                repo_state,
+                                target_status,
+                            )?;
+                            repo_cache.insert(did.clone().into_static(), new_state);
                         }
                     }
                 } else {
@@ -395,11 +417,17 @@ impl FirehoseWorker {
     }
 
     fn check_repo_state(
+        repo_cache: &mut HashMap<Did<'static>, RepoState<'static>>,
         batch: &mut OwnedWriteBatch,
         state: &AppState,
         did: &Did<'_>,
+        msg: &BufferedMessage,
     ) -> Result<RepoCheckResult> {
         // check if we have this repo
+        if let Some(state) = repo_cache.get(did) {
+            return Ok(RepoCheckResult::Ok(state.clone()));
+        }
+
         let repo_key = keys::repo_key(&did);
         let Some(state_bytes) = state.db.repos.get(&repo_key).into_diagnostic()? else {
             // we don't know this repo, but we are receiving events for it
@@ -444,6 +472,13 @@ impl FirehoseWorker {
             RepoStatus::Deactivated | RepoStatus::Suspended | RepoStatus::Takendown => {
                 // if it was in deactivated/takendown/suspended state, we can mark it as synced
                 // because we are receiving live events now
+                // UNLESS it is an account status event that keeps it deactivated
+                if let SubscribeReposMessage::Account(acc) = msg {
+                    if !acc.active {
+                        return Ok(RepoCheckResult::Ok(repo_state));
+                    }
+                }
+
                 repo_state = ops::update_repo_status(
                     batch,
                     &state.db,
@@ -451,6 +486,7 @@ impl FirehoseWorker {
                     repo_state,
                     RepoStatus::Synced,
                 )?;
+                repo_cache.insert(did.clone().into_static(), repo_state.clone());
                 Ok(RepoCheckResult::Ok(repo_state))
             }
         }
