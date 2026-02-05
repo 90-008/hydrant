@@ -262,12 +262,12 @@ impl FirehoseWorker {
                     return Ok(ProcessResult::Ok);
                 }
 
-                if let (Some(prev_repo), Some(prev_commit)) = (&repo_state.data, &commit.prev_data)
-                    && prev_repo != &prev_commit.0
+                if let (Some(repo), Some(prev_commit)) = (&repo_state.data, &commit.prev_data)
+                    && repo != &prev_commit.0
                 {
                     warn!(
-                        "gap detected for {}: prev {} != stored {}. triggering backfill",
-                        did, prev_repo, prev_commit.0
+                        "gap detected for {}: repo {} != commit prev {}. triggering backfill",
+                        did, repo, prev_commit.0
                     );
 
                     let mut batch = state.db.inner.batch();

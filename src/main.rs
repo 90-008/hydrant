@@ -1,20 +1,9 @@
-mod api;
-mod backfill;
-mod config;
-mod crawler;
-mod db;
-mod ingest;
-mod ops;
-mod resolver;
-mod state;
-mod types;
-
-use crate::config::{Config, SignatureVerification};
-use crate::crawler::Crawler;
-use crate::db::set_firehose_cursor;
-use crate::ingest::firehose::FirehoseIngestor;
-use crate::state::AppState;
-use crate::{backfill::BackfillWorker, ingest::worker::FirehoseWorker};
+use hydrant::config::{Config, SignatureVerification};
+use hydrant::crawler::Crawler;
+use hydrant::db::{self, set_firehose_cursor};
+use hydrant::ingest::firehose::FirehoseIngestor;
+use hydrant::state::AppState;
+use hydrant::{api, backfill::BackfillWorker, ingest::worker::FirehoseWorker};
 use futures::{FutureExt, TryFutureExt, future::BoxFuture};
 use miette::IntoDiagnostic;
 use mimalloc::MiMalloc;
@@ -81,7 +70,7 @@ async fn main() -> miette::Result<()> {
 
     if let Err(e) = spawn_blocking({
         let state = state.clone();
-        move || crate::backfill::manager::queue_pending_backfills(&state)
+        move || hydrant::backfill::manager::queue_pending_backfills(&state)
     })
     .await
     .into_diagnostic()?
@@ -92,7 +81,7 @@ async fn main() -> miette::Result<()> {
 
     if let Err(e) = spawn_blocking({
         let state = state.clone();
-        move || crate::backfill::manager::queue_gone_backfills(&state)
+        move || hydrant::backfill::manager::queue_gone_backfills(&state)
     })
     .await
     .into_diagnostic()?
@@ -103,7 +92,7 @@ async fn main() -> miette::Result<()> {
 
     std::thread::spawn({
         let state = state.clone();
-        move || crate::backfill::manager::retry_worker(state)
+        move || hydrant::backfill::manager::retry_worker(state)
     });
 
     tokio::spawn({

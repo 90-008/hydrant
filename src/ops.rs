@@ -190,13 +190,14 @@ pub fn apply_commit<'batch, 'db, 's>(
 
     trace!("parsed car for {did} in {:?}", start.elapsed());
 
-    if let Some(key) = signing_key {
-        let root_bytes = parsed
-            .blocks
-            .get(&parsed.root)
-            .ok_or_else(|| miette::miette!("root block missing from CAR"))?;
+    let root_bytes = parsed
+        .blocks
+        .get(&parsed.root)
+        .ok_or_else(|| miette::miette!("root block missing from CAR"))?;
 
-        let repo_commit = jacquard_repo::commit::Commit::from_cbor(root_bytes).into_diagnostic()?;
+    let repo_commit = jacquard_repo::commit::Commit::from_cbor(root_bytes).into_diagnostic()?;
+
+    if let Some(key) = signing_key {
         repo_commit
             .verify(key)
             .map_err(|e| miette::miette!("signature verification failed for {did}: {e}"))?;
@@ -204,7 +205,7 @@ pub fn apply_commit<'batch, 'db, 's>(
     }
 
     repo_state.rev = Some(commit.rev.clone());
-    repo_state.data = Some(Cid::ipld(parsed.root));
+    repo_state.data = Some(Cid::ipld(repo_commit.data));
     repo_state.last_updated_at = chrono::Utc::now().timestamp();
 
     batch.insert(&db.repos, keys::repo_key(did), ser_repo_state(&repo_state)?);

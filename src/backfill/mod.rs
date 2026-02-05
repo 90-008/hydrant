@@ -9,8 +9,8 @@ use jacquard::types::cid::Cid;
 use jacquard::types::did::Did;
 use jacquard::{CowStr, IntoStatic, prelude::*};
 use jacquard_common::xrpc::XrpcError;
-use jacquard_repo::MemoryBlockStore;
 use jacquard_repo::mst::Mst;
+use jacquard_repo::{BlockStore, MemoryBlockStore};
 use miette::{IntoDiagnostic, Result};
 use smol_str::{SmolStr, ToSmolStr, format_smolstr};
 use std::collections::HashMap;
@@ -305,9 +305,8 @@ impl BackfillWorker {
         emit_identity(&state.status);
 
         trace!(
-            "fetched {} bytes for {} in {:?}",
+            "fetched {} bytes for {did} in {:?}",
             car_bytes.body.len(),
-            did,
             start.elapsed()
         );
 
@@ -316,35 +315,34 @@ impl BackfillWorker {
         let parsed = jacquard_repo::car::reader::parse_car_bytes(&car_bytes.body)
             .await
             .into_diagnostic()?;
-        trace!("parsed car for {} in {:?}", did, start.elapsed());
+        trace!("parsed car for {did} in {:?}", start.elapsed());
 
         let start = Instant::now();
-        let store = Arc::new(MemoryBlockStore::new());
-        for (_cid, bytes) in &parsed.blocks {
-            jacquard_repo::BlockStore::put(store.as_ref(), bytes)
-                .await
-                .into_diagnostic()?;
-        }
+        let store = Arc::new(MemoryBlockStore::new_from_blocks(parsed.blocks));
         trace!(
-            "stored {} blocks in memory for {} in {:?}",
-            parsed.blocks.len(),
-            did,
+            "stored {} blocks in memory for {did} in {:?}",
+            store.len(),
             start.elapsed()
         );
 
         // 4. parse root commit to get mst root
-        let root_bytes = parsed
-            .blocks
+        let root_bytes = store
             .get(&parsed.root)
+            .await
+            .into_diagnostic()?
             .ok_or_else(|| miette::miette!("root block missing from CAR"))?;
 
-        let commit = jacquard_repo::commit::Commit::from_cbor(root_bytes).into_diagnostic()?;
-        debug!("backfilling repo at revision {}", commit.rev);
+        let root_commit =
+            jacquard_repo::commit::Commit::from_cbor(&root_bytes).into_diagnostic()?;
+        debug!(
+            "backfilling repo at revision {}, root cid {}",
+            root_commit.rev, root_commit.data
+        );
 
         // 4.5. verify commit signature
         if verify_signatures {
             let pubkey = app_state.resolver.resolve_signing_key(did).await?;
-            commit
+            root_commit
                 .verify(&pubkey)
                 .map_err(|e| miette::miette!("signature verification failed for {did}: {e}"))?;
             trace!("signature verified for {did}");
@@ -352,7 +350,7 @@ impl BackfillWorker {
 
         // 5. walk mst
         let start = Instant::now();
-        let mst: Mst<MemoryBlockStore> = Mst::load(store, commit.data, None);
+        let mst: Mst<MemoryBlockStore> = Mst::load(store, root_commit.data, None);
         let leaves = mst.leaves().await.into_diagnostic()?;
         trace!("walked mst for {} in {:?}", did, start.elapsed());
 
@@ -361,8 +359,7 @@ impl BackfillWorker {
         let (_state, added_records, added_blocks, count) = {
             let app_state = app_state.clone();
             let did = did.clone();
-            let rev = commit.rev;
-            let storage = mst.storage().clone();
+            let rev = root_commit.rev;
 
             tokio::task::spawn_blocking(move || {
                 let mut count = 0;
@@ -370,6 +367,7 @@ impl BackfillWorker {
                 let mut added_blocks = 0;
                 let mut collection_counts: HashMap<SmolStr, u64> = HashMap::new();
                 let mut batch = app_state.db.inner.batch();
+                let store = mst.storage();
 
                 // pre-load existing record CIDs for this DID to detect duplicates/updates
                 let prefix = keys::record_prefix(&did);
@@ -385,7 +383,7 @@ impl BackfillWorker {
 
                 for (key, cid) in leaves {
                     let val_bytes = tokio::runtime::Handle::current()
-                        .block_on(jacquard_repo::BlockStore::get(storage.as_ref(), &cid))
+                        .block_on(store.get(&cid))
                         .into_diagnostic()?;
 
                     if let Some(val) = val_bytes {
@@ -398,12 +396,14 @@ impl BackfillWorker {
                         let (action, is_new) = if let Some(existing_cid) = existing_cids.get(&path)
                         {
                             if existing_cid == cid.as_str() {
+                                debug!("skip {did}/{collection}/{rkey} ({cid})");
                                 continue; // skip unchanged record
                             }
                             ("update", false)
                         } else {
                             ("create", true)
                         };
+                        debug!("{action} {did}/{collection}/{rkey} ({cid})");
 
                         let db_key = keys::record_key(&did, &collection, rkey);
 
@@ -440,7 +440,7 @@ impl BackfillWorker {
                 // 6. update status to synced
                 state.status = RepoStatus::Synced;
                 state.rev = Some(rev);
-                state.data = Some(Cid::ipld(parsed.root));
+                state.data = Some(Cid::ipld(root_commit.data));
                 state.last_updated_at = chrono::Utc::now().timestamp();
 
                 batch.insert(
