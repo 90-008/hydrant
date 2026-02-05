@@ -12,7 +12,7 @@ use jacquard_common::xrpc::XrpcError;
 use jacquard_repo::mst::Mst;
 use jacquard_repo::{BlockStore, MemoryBlockStore};
 use miette::{IntoDiagnostic, Result};
-use smol_str::{SmolStr, ToSmolStr, format_smolstr};
+use smol_str::{SmolStr, ToSmolStr};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -356,14 +356,14 @@ impl BackfillWorker {
 
         // 6. insert records into db
         let start = Instant::now();
-        let (_state, added_records, added_blocks, count) = {
+        let (_state, records_cnt_delta, added_blocks, count) = {
             let app_state = app_state.clone();
             let did = did.clone();
             let rev = root_commit.rev;
 
             tokio::task::spawn_blocking(move || {
                 let mut count = 0;
-                let mut added_records = 0;
+                let mut delta = 0;
                 let mut added_blocks = 0;
                 let mut collection_counts: HashMap<SmolStr, u64> = HashMap::new();
                 let mut batch = app_state.db.inner.batch();
@@ -372,13 +372,29 @@ impl BackfillWorker {
                 // pre-load existing record CIDs for this DID to detect duplicates/updates
                 let prefix = keys::record_prefix(&did);
                 let prefix_len = prefix.len();
-                let mut existing_cids: HashMap<SmolStr, SmolStr> = HashMap::new();
+                let mut existing_cids: HashMap<(SmolStr, SmolStr), SmolStr> = HashMap::new();
                 for guard in app_state.db.records.prefix(&prefix) {
                     let (key, cid_bytes) = guard.into_inner().into_diagnostic()?;
                     // extract path (collection/rkey) from key by skipping the DID prefix
-                    let path = String::from_utf8_lossy(&key[prefix_len..]).to_smolstr();
-                    let cid = String::from_utf8_lossy(&cid_bytes).to_smolstr();
-                    existing_cids.insert(path, cid);
+                    let mut path_split = key[prefix_len..].split(|b| *b == keys::SEP);
+                    let collection = std::str::from_utf8(
+                        path_split
+                            .next()
+                            .ok_or_else(|| miette::miette!("collection not found"))?,
+                    )
+                    .into_diagnostic()?
+                    .to_smolstr();
+                    let rkey = std::str::from_utf8(
+                        path_split
+                            .next()
+                            .ok_or_else(|| miette::miette!("record key not found"))?,
+                    )
+                    .into_diagnostic()?
+                    .to_smolstr();
+                    let cid = std::str::from_utf8(&cid_bytes)
+                        .into_diagnostic()?
+                        .to_smolstr();
+                    existing_cids.insert((collection, rkey), cid);
                 }
 
                 for (key, cid) in leaves {
@@ -388,24 +404,23 @@ impl BackfillWorker {
 
                     if let Some(val) = val_bytes {
                         let (collection, rkey) = ops::parse_path(&key)?;
-                        let collection = collection.to_smolstr();
+                        let path = (collection.to_smolstr(), rkey.to_smolstr());
                         let cid = Cid::ipld(cid);
 
                         // check if this record already exists with same CID
-                        let path = format_smolstr!("{collection}{}{rkey}", keys::SEP as char);
-                        let (action, is_new) = if let Some(existing_cid) = existing_cids.get(&path)
-                        {
-                            if existing_cid == cid.as_str() {
-                                debug!("skip {did}/{collection}/{rkey} ({cid})");
-                                continue; // skip unchanged record
-                            }
-                            ("update", false)
-                        } else {
-                            ("create", true)
-                        };
+                        let (action, is_new) =
+                            if let Some(existing_cid) = existing_cids.remove(&path) {
+                                if existing_cid == cid.as_str() {
+                                    debug!("skip {did}/{collection}/{rkey} ({cid})");
+                                    continue; // skip unchanged record
+                                }
+                                ("update", false)
+                            } else {
+                                ("create", true)
+                            };
                         debug!("{action} {did}/{collection}/{rkey} ({cid})");
 
-                        let db_key = keys::record_key(&did, &collection, rkey);
+                        let db_key = keys::record_key(&did, &collection, &rkey);
 
                         batch.insert(
                             &app_state.db.blocks,
@@ -416,25 +431,48 @@ impl BackfillWorker {
 
                         added_blocks += 1;
                         if is_new {
-                            added_records += 1;
-                            *collection_counts.entry(collection.clone()).or_default() += 1;
+                            delta += 1;
+                            *collection_counts.entry(path.0.clone()).or_default() += 1;
                         }
 
                         let event_id = app_state.db.next_event_id.fetch_add(1, Ordering::SeqCst);
                         let evt = StoredEvent {
                             did: TrimmedDid::from(&did),
                             rev: CowStr::Borrowed(rev.as_str()),
-                            collection: CowStr::Borrowed(collection.as_str()),
+                            collection: CowStr::Borrowed(collection),
                             rkey: CowStr::Borrowed(rkey),
                             action: CowStr::Borrowed(action),
                             cid: Some(cid),
                         };
-
                         let bytes = rmp_serde::to_vec(&evt).into_diagnostic()?;
                         batch.insert(&app_state.db.events, keys::event_key(event_id), bytes);
 
                         count += 1;
                     }
+                }
+
+                // remove any remaining existing records (they weren't in the new MST)
+                for ((collection, rkey), cid) in existing_cids {
+                    debug!("remove {did}/{collection}/{rkey} ({cid})");
+                    batch.remove(
+                        &app_state.db.records,
+                        keys::record_key(&did, &collection, &rkey),
+                    );
+
+                    let event_id = app_state.db.next_event_id.fetch_add(1, Ordering::SeqCst);
+                    let evt = StoredEvent {
+                        did: TrimmedDid::from(&did),
+                        rev: CowStr::Borrowed(rev.as_str()),
+                        collection: CowStr::Borrowed(&collection),
+                        rkey: CowStr::Borrowed(&rkey),
+                        action: CowStr::Borrowed("delete"),
+                        cid: None,
+                    };
+                    let bytes = rmp_serde::to_vec(&evt).into_diagnostic()?;
+                    batch.insert(&app_state.db.events, keys::event_key(event_id), bytes);
+
+                    delta -= 1;
+                    count += 1;
                 }
 
                 // 6. update status to synced
@@ -456,24 +494,18 @@ impl BackfillWorker {
 
                 batch.commit().into_diagnostic()?;
 
-                Ok::<_, miette::Report>((state, added_records, added_blocks, count))
+                Ok::<_, miette::Report>((state, delta, added_blocks, count))
             })
             .await
             .into_diagnostic()??
         };
-
-        trace!(
-            "inserted {} records into db for {} in {:?}",
-            count,
-            did,
-            start.elapsed()
-        );
+        trace!("did {count} ops for {did} in {:?}", start.elapsed());
 
         // do the counts
-        if added_records > 0 {
+        if records_cnt_delta > 0 {
             app_state
                 .db
-                .update_count_async("records", added_records)
+                .update_count_async("records", records_cnt_delta)
                 .await;
             app_state
                 .db
