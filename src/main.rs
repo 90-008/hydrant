@@ -1,10 +1,10 @@
+use futures::{FutureExt, TryFutureExt, future::BoxFuture};
 use hydrant::config::{Config, SignatureVerification};
 use hydrant::crawler::Crawler;
 use hydrant::db::{self, set_firehose_cursor};
 use hydrant::ingest::firehose::FirehoseIngestor;
 use hydrant::state::AppState;
 use hydrant::{api, backfill::BackfillWorker, ingest::worker::FirehoseWorker};
-use futures::{FutureExt, TryFutureExt, future::BoxFuture};
 use miette::IntoDiagnostic;
 use mimalloc::MiMalloc;
 use std::sync::Arc;

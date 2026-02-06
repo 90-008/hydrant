@@ -46,7 +46,7 @@ pub async fn handle_debug_count(
 
     // {did_prefix}\x00{collection}\x00
     let mut prefix = Vec::new();
-    prefix.extend_from_slice(TrimmedDid::from(&did).as_bytes());
+    TrimmedDid::from(&did).write_to_vec(&mut prefix);
     prefix.push(keys::SEP);
     prefix.extend_from_slice(req.collection.as_bytes());
     prefix.push(keys::SEP);

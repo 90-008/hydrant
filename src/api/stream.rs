@@ -8,6 +8,7 @@ use axum::{
     },
     response::IntoResponse,
 };
+use jacquard::CowStr;
 use jacquard_common::types::value::RawData;
 use miette::{Context, IntoDiagnostic};
 use serde::Deserialize;
@@ -96,9 +97,10 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, query: Strea
 
                         let marshallable = {
                             let mut record_val = None;
-                            if let Some(cid_str) = &cid {
+                            if let Some(cid_struct) = &cid {
+                                let cid_str = cid_struct.to_string();
                                 if let Ok(Some(block_bytes)) =
-                                    db.blocks.get(keys::block_key(cid_str))
+                                    db.blocks.get(keys::block_key(&cid_str))
                                 {
                                     if let Ok(raw_data) =
                                         serde_ipld_dagcbor::from_slice::<RawData>(&block_bytes)
@@ -114,15 +116,12 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, query: Strea
                                 record: Some(RecordEvt {
                                     live,
                                     did: did.to_did(),
-                                    rev,
+                                    rev: CowStr::Owned(rev.to_tid().into()),
                                     collection,
-                                    rkey,
-                                    action,
+                                    rkey: CowStr::Owned(rkey.to_smolstr().into()),
+                                    action: CowStr::Borrowed(action.as_str()),
                                     record: record_val,
-                                    cid: cid.map(|c| match c {
-                                        jacquard::types::cid::Cid::Ipld { s, .. } => s,
-                                        jacquard::types::cid::Cid::Str(s) => s,
-                                    }),
+                                    cid: cid.map(|c| jacquard::types::cid::Cid::ipld(c).into()),
                                 }),
                                 identity: None,
                                 account: None,

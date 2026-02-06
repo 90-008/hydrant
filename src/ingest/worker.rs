@@ -279,18 +279,23 @@ impl FirehoseWorker {
             SubscribeReposMessage::Commit(commit) => {
                 trace!("processing buffered commit for {did}");
 
-                if matches!(repo_state.rev, Some(ref rev) if commit.rev.as_str() <= rev.as_str()) {
+                if matches!(repo_state.rev, Some(ref rev) if commit.rev.as_str() <= rev.to_tid().as_str())
+                {
                     debug!(
                         "skipping replayed event for {}: {} <= {}",
                         did,
                         commit.rev,
-                        repo_state.rev.as_ref().expect("we checked in if")
+                        repo_state
+                            .rev
+                            .as_ref()
+                            .map(|r| r.to_tid())
+                            .expect("we checked in if")
                     );
                     return Ok(ProcessResult::Ok);
                 }
 
                 if let (Some(repo), Some(prev_commit)) = (&repo_state.data, &commit.prev_data)
-                    && repo != &prev_commit.0
+                    && repo != &prev_commit.0.to_ipld().expect("valid cid")
                 {
                     warn!(
                         "gap detected for {}: repo {} != commit prev {}. triggering backfill",
@@ -329,14 +334,14 @@ impl FirehoseWorker {
                 match ops::verify_sync_event(sync.blocks.as_ref(), get_key()?) {
                     Ok((root, rev)) => {
                         if let Some(current_data) = &repo_state.data {
-                            if current_data == &root {
+                            if current_data == &root.to_ipld().expect("valid cid") {
                                 debug!("skipping noop sync for {did}");
                                 return Ok(ProcessResult::Ok);
                             }
                         }
 
                         if let Some(current_rev) = &repo_state.rev {
-                            if rev.as_str() <= current_rev.as_str() {
+                            if rev.as_str() <= current_rev.to_tid().as_str() {
                                 debug!("skipping replayed sync for {did}");
                                 return Ok(ProcessResult::Ok);
                             }

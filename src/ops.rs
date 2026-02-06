@@ -1,4 +1,4 @@
-use crate::db::types::TrimmedDid;
+use crate::db::types::{DbAction, DbRkey, DbTid, TrimmedDid};
 use crate::db::{self, Db, keys, ser_repo_state};
 use crate::state::AppState;
 use crate::types::{
@@ -68,7 +68,7 @@ pub fn delete_repo<'batch>(
     batch.remove(&db.resync, &repo_key);
 
     // 2. delete from records (prefix: repo_key + SEP)
-    let mut records_prefix = repo_key.as_bytes().to_vec();
+    let mut records_prefix = repo_key.clone();
     records_prefix.push(keys::SEP);
     for guard in db.records.prefix(&records_prefix) {
         let k = guard.key().into_diagnostic()?;
@@ -79,7 +79,7 @@ pub fn delete_repo<'batch>(
     let mut count_prefix = Vec::new();
     count_prefix.push(b'r');
     count_prefix.push(keys::SEP);
-    count_prefix.extend_from_slice(TrimmedDid::from(did).as_bytes());
+    TrimmedDid::from(did).write_to_vec(&mut count_prefix);
     count_prefix.push(keys::SEP);
 
     for guard in db.counts.prefix(&count_prefix) {
@@ -210,8 +210,8 @@ pub fn apply_commit<'batch, 'db, 'commit, 's>(
         trace!("signature verified for {did}");
     }
 
-    repo_state.rev = Some(commit.rev.clone());
-    repo_state.data = Some(Cid::ipld(repo_commit.data));
+    repo_state.rev = Some(commit.rev.clone().into());
+    repo_state.data = Some(repo_commit.data);
     repo_state.last_updated_at = chrono::Utc::now().timestamp();
 
     batch.insert(&db.repos, keys::repo_key(did), ser_repo_state(&repo_state)?);
@@ -264,11 +264,11 @@ pub fn apply_commit<'batch, 'db, 'commit, 's>(
         let evt = StoredEvent {
             live: true,
             did: TrimmedDid::from(did),
-            rev: CowStr::Borrowed(commit.rev.as_str()),
+            rev: DbTid::from(&commit.rev),
             collection: CowStr::Borrowed(collection),
-            rkey: CowStr::Borrowed(rkey),
-            action: CowStr::Borrowed(op.action.as_str()),
-            cid: op.cid.as_ref().map(|c| c.0.clone()),
+            rkey: DbRkey::new(rkey),
+            action: DbAction::from(op.action.as_str()),
+            cid: op.cid.as_ref().map(|c| c.0.to_ipld().expect("valid cid")),
         };
 
         let bytes = rmp_serde::to_vec(&evt).into_diagnostic()?;

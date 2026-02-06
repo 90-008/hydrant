@@ -1,4 +1,4 @@
-use crate::db::types::TrimmedDid;
+use crate::db::types::{DbAction, DbRkey, DbTid, TrimmedDid};
 use crate::db::{self, Db, keys, ser_repo_state};
 use crate::ops;
 use crate::state::{AppState, BackfillRx};
@@ -432,11 +432,11 @@ impl BackfillWorker {
                         let evt = StoredEvent {
                             live: false,
                             did: TrimmedDid::from(&did),
-                            rev: CowStr::Borrowed(rev.as_str()),
+                            rev: DbTid::from(rev.clone()),
                             collection: CowStr::Borrowed(collection),
-                            rkey: CowStr::Borrowed(rkey),
-                            action: CowStr::Borrowed(action),
-                            cid: Some(cid),
+                            rkey: DbRkey::new(rkey),
+                            action: DbAction::from(action),
+                            cid: Some(cid.to_ipld().expect("valid cid")),
                         };
                         let bytes = rmp_serde::to_vec(&evt).into_diagnostic()?;
                         batch.insert(&app_state.db.events, keys::event_key(event_id), bytes);
@@ -457,10 +457,10 @@ impl BackfillWorker {
                     let evt = StoredEvent {
                         live: false,
                         did: TrimmedDid::from(&did),
-                        rev: CowStr::Borrowed(rev.as_str()),
+                        rev: DbTid::from(rev.clone()),
                         collection: CowStr::Borrowed(&collection),
-                        rkey: CowStr::Borrowed(&rkey),
-                        action: CowStr::Borrowed("delete"),
+                        rkey: DbRkey::new(&rkey),
+                        action: DbAction::Delete,
                         cid: None,
                     };
                     let bytes = rmp_serde::to_vec(&evt).into_diagnostic()?;
@@ -472,8 +472,8 @@ impl BackfillWorker {
 
                 // 6. update status to synced
                 state.status = RepoStatus::Synced;
-                state.rev = Some(rev);
-                state.data = Some(Cid::ipld(root_commit.data));
+                state.rev = Some(rev.clone().into());
+                state.data = Some(root_commit.data);
                 state.last_updated_at = chrono::Utc::now().timestamp();
 
                 batch.insert(

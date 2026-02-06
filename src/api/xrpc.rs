@@ -1,16 +1,16 @@
 use crate::api::{AppState, XrpcResult};
 use crate::db::types::TrimmedDid;
-use crate::db::{self, keys, Db};
-use axum::{extract::State, http::StatusCode, Json, Router};
+use crate::db::{self, Db, keys};
+use axum::{Json, Router, extract::State, http::StatusCode};
 use futures::TryFutureExt;
 use jacquard::types::ident::AtIdentifier;
 use jacquard::{
+    IntoStatic,
     api::com_atproto::repo::{
         get_record::{GetRecordError, GetRecordOutput, GetRecordRequest},
         list_records::{ListRecordsOutput, ListRecordsRequest, Record as RepoRecord},
     },
     xrpc::XrpcRequest,
-    IntoStatic,
 };
 use jacquard_api::com_atproto::repo::{get_record::GetRecord, list_records::ListRecords};
 use jacquard_axum::{ExtractXrpc, IntoRouter, XrpcErrorResponse};
@@ -128,7 +128,7 @@ pub async fn handle_list_records(
 
     let prefix = format!(
         "{}{}{}{}",
-        TrimmedDid::from(&did).as_str(),
+        TrimmedDid::from(&did),
         keys::SEP as char,
         req.collection.as_str(),
         keys::SEP as char

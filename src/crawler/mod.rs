@@ -1,4 +1,4 @@
-use crate::db::{keys, ser_repo_state, Db};
+use crate::db::{Db, keys, ser_repo_state};
 use crate::ops::send_backfill_req;
 use crate::state::AppState;
 use crate::types::RepoState;

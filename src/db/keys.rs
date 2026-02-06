@@ -8,15 +8,17 @@ pub const SEP: u8 = b'|';
 pub const CURSOR_KEY: &[u8] = b"firehose_cursor";
 
 // Key format: {DID} (trimmed)
-pub fn repo_key<'a>(did: &'a Did) -> TrimmedDid<'a> {
-    TrimmedDid::from(did)
+pub fn repo_key<'a>(did: &'a Did) -> Vec<u8> {
+    let mut vec = Vec::with_capacity(32);
+    TrimmedDid::from(did).write_to_vec(&mut vec);
+    vec
 }
 
 // key format: {DID}\x00{Collection}\x00{RKey} (DID trimmed)
 pub fn record_key(did: &Did, collection: &str, rkey: &str) -> Vec<u8> {
     let repo = TrimmedDid::from(did);
     let mut key = Vec::with_capacity(repo.len() + collection.len() + rkey.len() + 2);
-    key.extend_from_slice(repo.as_bytes());
+    repo.write_to_vec(&mut key);
     key.push(SEP);
     key.extend_from_slice(collection.as_bytes());
     key.push(SEP);
@@ -28,7 +30,7 @@ pub fn record_key(did: &Did, collection: &str, rkey: &str) -> Vec<u8> {
 pub fn record_prefix(did: &Did) -> Vec<u8> {
     let repo = TrimmedDid::from(did);
     let mut prefix = Vec::with_capacity(repo.len() + 1);
-    prefix.extend_from_slice(repo.as_bytes());
+    repo.write_to_vec(&mut prefix);
     prefix.push(SEP);
     prefix
 }
@@ -64,7 +66,7 @@ pub fn count_collection_key(did: &Did, collection: &str) -> Vec<u8> {
     let mut key =
         Vec::with_capacity(COUNT_COLLECTION_PREFIX.len() + repo.len() + 1 + collection.len());
     key.extend_from_slice(COUNT_COLLECTION_PREFIX);
-    key.extend_from_slice(repo.as_bytes());
+    repo.write_to_vec(&mut key);
     key.push(SEP);
     key.extend_from_slice(collection.as_bytes());
     key

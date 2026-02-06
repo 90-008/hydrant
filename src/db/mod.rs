@@ -183,7 +183,7 @@ impl Db {
         let key = keys::repo_key(did);
         if let Some(bytes) = repos.get(&key).into_diagnostic()? {
             let mut state: RepoState = deser_repo_state(bytes.as_ref())?.into_static();
-            let (changed, result) = f(&mut state, (key.as_bytes(), batch))?;
+            let (changed, result) = f(&mut state, (key.as_slice(), batch))?;
             if changed {
                 batch.insert(repos, key, ser_repo_state(&state)?);
             }

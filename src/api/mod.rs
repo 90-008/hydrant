@@ -1,5 +1,5 @@
 use crate::state::AppState;
-use axum::{routing::get, Router};
+use axum::{Router, routing::get};
 use jacquard::xrpc::GenericXrpcError;
 use jacquard_axum::XrpcErrorResponse;
 use std::{net::SocketAddr, sync::Arc};

@@ -40,3 +40,4 @@ humantime = "2.3.0"
 mimalloc = { version = "0.1", features = ["v3"] }
 hex = "0.4"
 scc = "3"
+data-encoding = "2.10.0"

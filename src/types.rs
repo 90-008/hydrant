@@ -1,15 +1,13 @@
 use std::fmt::Display;
 
-use jacquard::{
-    CowStr, IntoStatic,
-    types::{cid::Cid, tid::Tid},
-};
+use jacquard::{CowStr, IntoStatic};
 use jacquard_common::types::string::Did;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use smol_str::SmolStr;
 
-use crate::db::types::TrimmedDid;
+use crate::db::types::{DbAction, DbRkey, DbTid, TrimmedDid};
+use jacquard::types::cid::IpldCid;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum RepoStatus {
@@ -40,9 +38,8 @@ pub struct RepoState<'i> {
     #[serde(borrow)]
     pub did: TrimmedDid<'i>,
     pub status: RepoStatus,
-    pub rev: Option<Tid>,
-    #[serde(borrow)]
-    pub data: Option<Cid<'i>>,
+    pub rev: Option<DbTid>,
+    pub data: Option<IpldCid>,
     pub last_seq: Option<i64>,
     pub last_updated_at: i64, // unix timestamp
     pub handle: Option<SmolStr>,
@@ -70,7 +67,7 @@ impl<'i> IntoStatic for RepoState<'i> {
             did: self.did.into_static(),
             status: self.status,
             rev: self.rev,
-            data: self.data.map(|c| c.into_static()),
+            data: self.data,
             last_seq: self.last_seq,
             last_updated_at: self.last_updated_at,
             handle: self.handle,
@@ -167,16 +164,12 @@ pub struct StoredEvent<'i> {
     pub live: bool,
     #[serde(borrow)]
     pub did: TrimmedDid<'i>,
-    #[serde(borrow)]
-    pub rev: CowStr<'i>,
+    pub rev: DbTid,
     #[serde(borrow)]
     pub collection: CowStr<'i>,
-    #[serde(borrow)]
-    pub rkey: CowStr<'i>,
-    #[serde(borrow)]
-    pub action: CowStr<'i>,
-    #[serde(borrow)]
+    pub rkey: DbRkey,
+    pub action: DbAction,
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub cid: Option<Cid<'i>>,
+    pub cid: Option<IpldCid>,
 }
