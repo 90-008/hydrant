@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hydrant::resolver::Resolver;
-use jacquard::IntoStatic; // Corrected from jacquard_identity::IntoStatic
+use jacquard::IntoStatic;
 use jacquard::api::com_atproto::sync::get_repo::GetRepo;
 use jacquard::prelude::XrpcExt;
 use jacquard::types::did::Did;
@@ -12,8 +12,8 @@ use jacquard_repo::MemoryBlockStore;
 use jacquard_repo::mst::Mst;
 use miette::{IntoDiagnostic, Result};
 use tracing::{Level, info};
-use tracing_subscriber::FmtSubscriber; // Restored
-use url::Url; // Restored
+use tracing_subscriber::FmtSubscriber;
+use url::Url;
 
 #[tokio::main]
 async fn main() -> Result<()> {

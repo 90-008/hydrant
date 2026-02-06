@@ -1623,6 +1623,7 @@ dependencies = [
  "chrono",
  "fjall",
  "futures",
+ "hex",
  "humantime",
  "jacquard",
  "jacquard-api",

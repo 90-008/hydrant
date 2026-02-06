@@ -3,7 +3,7 @@ use jacquard_common::types::string::Did;
 use crate::db::types::TrimmedDid;
 
 /// separator used for composite keys
-pub const SEP: u8 = 0x00;
+pub const SEP: u8 = b'|';
 
 pub const CURSOR_KEY: &[u8] = b"firehose_cursor";
 
