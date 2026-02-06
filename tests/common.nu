@@ -45,11 +45,11 @@ export def wait-for-api [url: string] {
 export def wait-for-backfill [url: string] {
     print "waiting for backfill to complete..."
     for i in 1..120 {
-        let stats = (http get $"($url)/stats?accurate=true").keyspace_stats
-        let pending = ($stats | where name == "pending" | first).count
-        let records = ($stats | where name == "records" | first).count
-        let repos = ($stats | where name == "repos" | first).count
-        let resync = ($stats | where name == "resync" | first).count
+        let stats = (http get $"($url)/stats?accurate=true").counts
+        let pending = ($stats.pending | into int)
+        let records = ($stats.records | into int)
+        let repos = ($stats.repos | into int)
+        let resync = ($stats.resync | into int)
 
         print $"[($i)/120] pending: ($pending), records: ($records), repos: ($repos), resync: ($resync)"
 

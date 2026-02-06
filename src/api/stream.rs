@@ -79,6 +79,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, query: Strea
                         current_id = id;
 
                         let StoredEvent {
+                            live,
                             did,
                             rev,
                             collection,
@@ -111,7 +112,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, query: Strea
                                 id,
                                 event_type: "record".into(),
                                 record: Some(RecordEvt {
-                                    live: true,
+                                    live,
                                     did: did.to_did(),
                                     rev,
                                     collection,

@@ -67,8 +67,8 @@ def main [] {
             
             sleep 2sec
             
-            let stats = (http get $"($url)/stats?accurate=true").keyspace_stats
-            let events_count = ($stats | where name == "events" | first).count
+            let stats = (http get $"($url)/stats?accurate=true").counts
+            let events_count = ($stats.events | into int)
             print $"total events in db: ($events_count)"
             
             if $events_count > 0 {

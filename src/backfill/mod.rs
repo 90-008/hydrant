@@ -430,6 +430,7 @@ impl BackfillWorker {
 
                         let event_id = app_state.db.next_event_id.fetch_add(1, Ordering::SeqCst);
                         let evt = StoredEvent {
+                            live: false,
                             did: TrimmedDid::from(&did),
                             rev: CowStr::Borrowed(rev.as_str()),
                             collection: CowStr::Borrowed(collection),
@@ -454,6 +455,7 @@ impl BackfillWorker {
 
                     let event_id = app_state.db.next_event_id.fetch_add(1, Ordering::SeqCst);
                     let evt = StoredEvent {
+                        live: false,
                         did: TrimmedDid::from(&did),
                         rev: CowStr::Borrowed(rev.as_str()),
                         collection: CowStr::Borrowed(&collection),

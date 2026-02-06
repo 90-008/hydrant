@@ -163,6 +163,8 @@ pub struct AccountEvt<'i> {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(bound(deserialize = "'i: 'de"))]
 pub struct StoredEvent<'i> {
+    #[serde(default)]
+    pub live: bool,
     #[serde(borrow)]
     pub did: TrimmedDid<'i>,
     #[serde(borrow)]

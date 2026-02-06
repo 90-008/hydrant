@@ -262,6 +262,7 @@ pub fn apply_commit<'batch, 'db, 'commit, 's>(
         }
 
         let evt = StoredEvent {
+            live: true,
             did: TrimmedDid::from(did),
             rev: CowStr::Borrowed(commit.rev.as_str()),
             collection: CowStr::Borrowed(collection),
