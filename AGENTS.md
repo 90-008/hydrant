@@ -22,25 +22,27 @@ Please review AGENTS.md#for-humans. In particular, LLM-assisted contributions mu
 
 ## Project overview
 
-Hydrant is an AT Protocol indexer built on the `fjall` LSM-tree engine. It supports both full-network indexing and efficient targeted indexing (filtered by DID), while maintaining full Firehose compatibility.
+Hydrant is an AT Protocol indexer built on the `fjall` database. It supports both full-network indexing and filtered indexing (eg. by DID).
 
 Key design goals:
 - Ingestion via the `fjall` storage engine.
 - Content-Addressable Storage (CAS) for IPLD blocks.
 - Reliable backfill mechanism with buffered live-event replay.
 - Efficient binary storage using MessagePack (`rmp-serde`).
-- Native integration with the `jacquard` suite of ATProto crates.
+- Uses `jacquard` suite of ATProto crates.
 
 ## System architecture
 
-Hydrant consists of several concurrent components:
-- **Ingestor**: Connects to an upstream Firehose (Relay) and filters events. It manages the transition between discovery and synchronization.
-- **Crawler**: Periodically enumerates the network via `com.atproto.sync.listRepos` to discover new repositories when in full-network mode.
-- **Backfill worker**: A dedicated worker that fetches full repository CAR files from PDS instances when a new repo is detected.
-- **API server**: An Axum-based XRPC server implementing repository read methods (`getRecord`, `listRecords`) and system stats. It also provides a TAP-compatible JSON stream API via WebSockets.
-- **Persistence worker**: Manages periodic background flushes of the LSM-tree and cursor state.
+Hydrant consists of several components:
+- **[`hydrant::ingest::firehose`]**: Connects to an upstream Firehose (Relay) and filters events. It manages the transition between discovery and synchronization.
+- **[`hydrant::ingest::worker`]**: Processes buffered Firehose messages concurrently. Verifies signatures, updates repository state, detects gaps for backfill, and persists records.
+- **[`hydrant::crawler`]**: Periodically enumerates the network via `com.atproto.sync.listRepos` to discover new repositories when in full-network mode.
+- **[`hydrant::backfill`]**: A dedicated worker that fetches full repository CAR files from PDS instances when a new repo is detected.
+- **[`hydrant::api`]**: An Axum-based XRPC server implementing repository read methods (`getRecord`, `listRecords`) and system stats. It also provides a event stream API via WebSockets.
+- **Persistence worker** (in `src/main.rs`): Manages periodic background flushes of the LSM-tree and cursor state.
 
 ### Lazy event inflation
+
 To minimize latency in `apply_commit` and the backfill worker, events are stored in a compact `StoredEvent` format. The expansion into full TAP-compatible JSON (including fetching record content from the CAS and DAG-CBOR parsing) is performed lazily within the WebSocket stream handler.
 
 ## General conventions
@@ -52,7 +54,7 @@ To minimize latency in `apply_commit` and the backfill worker, events are stored
 - Prefer compile-time guarantees over runtime checks where possible.
 
 ### Production-grade engineering
-- Use `miette` for rich, diagnostic-driven error reporting.
+- Use `miette` for diagnostic-driven error reporting.
 - Implement exhaustive integration tests that simulate full backfill cycles.
 - Adhere to lowercase comments and sentence case in documentation.
 - Avoid unnecessary comments if the code is self-documenting.
@@ -60,31 +62,28 @@ To minimize latency in `apply_commit` and the backfill worker, events are stored
 ### Storage and serialization
 - **State**: Use `rmp-serde` (MessagePack) for all internal state (`RepoState`, `ErrorState`, `StoredEvent`).
 - **Blocks**: Store IPLD blocks as raw DAG-CBOR bytes in the CAS. This avoids expensive transcoding and allows direct serving of block content.
-- **Cursors**: Store cursors as plain UTF-8 strings for visibility and manual debugging.
+- **Cursors**: Store cursors as big-endian bytes (`u64`/`i64`).
 - **Keyspaces**: Use the `keys.rs` module to maintain consistent composite key formats.
 
 ## Database schema (keyspaces)
 
 Hydrant uses multiple `fjall` keyspaces:
 - `repos`: Maps `{DID}` -> `RepoState` (MessagePack).
-- `records`: Maps `{DID}\x00{Collection}\x00{RKey}` -> `{CID}` (String).
+- `records`: Maps `{DID}|{Collection}|{RKey}` -> `{CID}` (String).
 - `blocks`: Maps `{CID}` -> `Block Data` (Raw CBOR).
 - `events`: Maps `{ID}` (u64) -> `StoredEvent` (MessagePack). This is the source for the JSON stream API.
-- `cursors`: Maps `firehose_cursor` or `crawler_cursor` -> `Value` (String).
+- `cursors`: Maps `firehose_cursor` or `crawler_cursor` -> `Value` (u64/i64 BE Bytes).
 - `pending`: Index of DIDs awaiting backfill.
-- `errors`: Maps `{DID}` -> `ErrorState` (MessagePack) for retry logic.
-- `buffer`: Maps `{DID}\x00{SEQ}` -> `Buffered Commit` (MessagePack).
+- `resync`: Maps `{DID}` -> `ResyncState` (MessagePack) for retry logic/tombstones.
+- `counts`: Maps `k|{NAME}` or `r|{DID}|{COL}` -> `Count` (u64 BE Bytes).
 
 ## Safe commands
-
-### Compilation and linting
-- `cargo check` - fast validation of changes.
-- `cargo clippy` - ensure idiomatic Rust code.
 
 ### Testing
 - `nu tests/repo_sync_integrity.nu` - Runs the full integration test suite using Nushell. This builds the binary, starts a temporary instance, performs a backfill against a real PDS, and verifies record integrity.
 - `nu tests/stream_test.nu` - Tests WebSocket streaming functionality. Verifies both live event streaming during backfill and historical replay with cursor.
 - `nu tests/authenticated_stream_test.nu` - Tests authenticated event streaming. Verifies that create, update, and delete actions on a real account are correctly streamed by Hydrant in the correct order. Requires `TEST_REPO` and `TEST_PASSWORD` in `.env`.
+- `nu tests/debug_endpoints.nu` - Tests debug/introspection endpoints (`/debug/iter`, `/debug/get`) and verifies DB content and serialization.
 
 ## Rust code style
 
