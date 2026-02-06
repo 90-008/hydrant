@@ -11,7 +11,7 @@ use jacquard::{CowStr, IntoStatic, prelude::*};
 use jacquard_common::xrpc::XrpcError;
 use jacquard_repo::mst::Mst;
 use jacquard_repo::{BlockStore, MemoryBlockStore};
-use miette::{IntoDiagnostic, Result};
+use miette::{Context, IntoDiagnostic, Result};
 use smol_str::{SmolStr, ToSmolStr};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -246,7 +246,7 @@ impl BackfillWorker {
                     .into(),
                 ),
             };
-            ops::emit_account_event(db, evt);
+            let _ = app_state.db.event_tx.send(ops::make_account_event(db, evt));
         };
 
         // 2. fetch repo (car)
@@ -377,20 +377,13 @@ impl BackfillWorker {
                     let (key, cid_bytes) = guard.into_inner().into_diagnostic()?;
                     // extract path (collection/rkey) from key by skipping the DID prefix
                     let mut path_split = key[prefix_len..].split(|b| *b == keys::SEP);
-                    let collection = std::str::from_utf8(
-                        path_split
-                            .next()
-                            .ok_or_else(|| miette::miette!("collection not found"))?,
-                    )
-                    .into_diagnostic()?
-                    .to_smolstr();
-                    let rkey = std::str::from_utf8(
-                        path_split
-                            .next()
-                            .ok_or_else(|| miette::miette!("record key not found"))?,
-                    )
-                    .into_diagnostic()?
-                    .to_smolstr();
+                    let collection =
+                        std::str::from_utf8(path_split.next().wrap_err("collection not found")?)
+                            .into_diagnostic()?
+                            .to_smolstr();
+                    let rkey = std::str::from_utf8(path_split.next().wrap_err("rkey not found")?)
+                        .into_diagnostic()?
+                        .to_smolstr();
                     let cid = std::str::from_utf8(&cid_bytes)
                         .into_diagnostic()?
                         .to_smolstr();

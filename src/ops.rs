@@ -17,7 +17,7 @@ use miette::{Context, IntoDiagnostic, Result};
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
-use tracing::{debug, trace};
+use tracing::{debug, trace, warn};
 
 pub fn send_backfill_req(state: &AppState, did: jacquard::types::did::Did<'static>) -> Result<()> {
     state
@@ -30,7 +30,7 @@ pub fn send_backfill_req(state: &AppState, did: jacquard::types::did::Did<'stati
 
 // emitting identity is ephemeral
 // we dont replay these, consumers can just fetch identity themselves if they need it
-pub fn emit_identity_event(db: &Db, evt: IdentityEvt<'static>) {
+pub fn make_identity_event(db: &Db, evt: IdentityEvt<'static>) -> BroadcastEvent {
     let event_id = db.next_event_id.fetch_add(1, Ordering::SeqCst);
     let marshallable = MarshallableEvt {
         id: event_id,
@@ -39,10 +39,10 @@ pub fn emit_identity_event(db: &Db, evt: IdentityEvt<'static>) {
         identity: Some(evt),
         account: None,
     };
-    let _ = db.event_tx.send(BroadcastEvent::Ephemeral(marshallable));
+    BroadcastEvent::Ephemeral(marshallable)
 }
 
-pub fn emit_account_event(db: &Db, evt: AccountEvt<'static>) {
+pub fn make_account_event(db: &Db, evt: AccountEvt<'static>) -> BroadcastEvent {
     let event_id = db.next_event_id.fetch_add(1, Ordering::SeqCst);
     let marshallable = MarshallableEvt {
         id: event_id,
@@ -51,7 +51,7 @@ pub fn emit_account_event(db: &Db, evt: AccountEvt<'static>) {
         identity: None,
         account: Some(evt),
     };
-    let _ = db.event_tx.send(BroadcastEvent::Ephemeral(marshallable));
+    BroadcastEvent::Ephemeral(marshallable)
 }
 
 pub fn delete_repo<'batch>(
@@ -170,13 +170,19 @@ pub fn verify_sync_event(blocks: &[u8], key: Option<&PublicKey>) -> Result<(Cid<
     ))
 }
 
-pub fn apply_commit<'batch, 'db, 's>(
+pub struct ApplyCommitResults<'s> {
+    pub repo_state: RepoState<'s>,
+    pub records_delta: i64,
+    pub blocks_count: i64,
+}
+
+pub fn apply_commit<'batch, 'db, 'commit, 's>(
     batch: &'batch mut OwnedWriteBatch,
     db: &'db Db,
     mut repo_state: RepoState<'s>,
-    commit: &Commit<'_>,
+    commit: &'commit Commit<'commit>,
     signing_key: Option<&PublicKey>,
-) -> Result<(RepoState<'s>, impl FnOnce() + use<'db>)> {
+) -> Result<ApplyCommitResults<'s>> {
     let did = &commit.repo;
     debug!("applying commit {} for {did}", &commit.commit);
 
@@ -221,7 +227,6 @@ pub fn apply_commit<'batch, 'db, 's>(
 
     // 2. iterate ops and update records index
     let mut records_delta = 0;
-    let mut events_count = 0;
     let mut collection_deltas: HashMap<&str, i64> = HashMap::new();
 
     for op in &commit.ops {
@@ -251,7 +256,9 @@ pub fn apply_commit<'batch, 'db, 's>(
                 records_delta -= 1;
                 *collection_deltas.entry(collection).or_default() -= 1;
             }
-            _ => {}
+            _ => {
+                warn!("{did}/{}: unknown op action '{}'", op.path, op.action);
+            }
         }
 
         let evt = StoredEvent {
@@ -265,12 +272,7 @@ pub fn apply_commit<'batch, 'db, 's>(
 
         let bytes = rmp_serde::to_vec(&evt).into_diagnostic()?;
         batch.insert(&db.events, keys::event_key(event_id), bytes);
-        events_count += 1;
     }
-
-    let start = Instant::now();
-
-    trace!("committed sync batch for {did} in {:?}", start.elapsed());
 
     // update counts
     let blocks_count = parsed.blocks.len() as i64;
@@ -278,21 +280,11 @@ pub fn apply_commit<'batch, 'db, 's>(
         db::update_record_count(batch, db, did, col, delta)?;
     }
 
-    let _ = db.event_tx.send(BroadcastEvent::Persisted(
-        db.next_event_id.load(Ordering::SeqCst) - 1,
-    ));
-
-    Ok((repo_state, move || {
-        if blocks_count > 0 {
-            db.update_count("blocks", blocks_count);
-        }
-        if records_delta != 0 {
-            db.update_count("records", records_delta);
-        }
-        if events_count > 0 {
-            db.update_count("events", events_count);
-        }
-    }))
+    Ok(ApplyCommitResults {
+        repo_state,
+        records_delta,
+        blocks_count,
+    })
 }
 
 pub fn parse_path(path: &str) -> Result<(&str, &str)> {

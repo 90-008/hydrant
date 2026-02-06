@@ -105,7 +105,7 @@ impl ResyncState {
 
 // from src/api/event.rs
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Clone)]
 pub struct MarshallableEvt<'i> {
     pub id: u64,
     #[serde(rename = "type")]
@@ -128,7 +128,7 @@ pub enum BroadcastEvent {
     Ephemeral(MarshallableEvt<'static>),
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Clone)]
 pub struct RecordEvt<'i> {
     pub live: bool,
     #[serde(borrow)]
@@ -143,7 +143,7 @@ pub struct RecordEvt<'i> {
     pub cid: Option<CowStr<'i>>,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Clone)]
 pub struct IdentityEvt<'i> {
     #[serde(borrow)]
     pub did: Did<'i>,
@@ -151,7 +151,7 @@ pub struct IdentityEvt<'i> {
     pub handle: Option<CowStr<'i>>,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Clone)]
 pub struct AccountEvt<'i> {
     #[serde(borrow)]
     pub did: Did<'i>,
@@ -174,6 +174,7 @@ pub struct StoredEvent<'i> {
     #[serde(borrow)]
     pub action: CowStr<'i>,
     #[serde(borrow)]
+    #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cid: Option<Cid<'i>>,
 }

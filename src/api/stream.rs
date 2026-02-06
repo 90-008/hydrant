@@ -9,9 +9,11 @@ use axum::{
     response::IntoResponse,
 };
 use jacquard_common::types::value::RawData;
+use miette::{Context, IntoDiagnostic};
 use serde::Deserialize;
 use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc};
+use tracing::error;
 
 #[derive(Deserialize)]
 pub struct StreamQuery {
@@ -54,71 +56,92 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, query: Strea
                 loop {
                     let mut found = false;
                     for item in ks.range(keys::event_key(current_id + 1)..) {
-                        if let Ok((k, v)) = item.into_inner() {
-                            let mut buf = [0u8; 8];
-                            buf.copy_from_slice(&k);
-                            let id = u64::from_be_bytes(buf);
-                            current_id = id;
+                        let (k, v) = match item.into_inner() {
+                            Ok((k, v)) => (k, v),
+                            Err(e) => {
+                                error!("failed to read event from db: {e}");
+                                break;
+                            }
+                        };
+                        let id = match k
+                            .as_ref()
+                            .try_into()
+                            .into_diagnostic()
+                            .wrap_err("expected event id to be 8 bytes")
+                            .map(u64::from_be_bytes)
+                        {
+                            Ok(id) => id,
+                            Err(e) => {
+                                error!("failed to parse event id: {e}");
+                                continue;
+                            }
+                        };
+                        current_id = id;
 
-                            let StoredEvent {
-                                did,
-                                rev,
-                                collection,
-                                rkey,
-                                action,
-                                cid,
-                            } = match rmp_serde::from_slice(&v) {
-                                Ok(e) => e,
-                                Err(_) => continue,
-                            };
+                        let StoredEvent {
+                            did,
+                            rev,
+                            collection,
+                            rkey,
+                            action,
+                            cid,
+                        } = match rmp_serde::from_slice(&v) {
+                            Ok(e) => e,
+                            Err(e) => {
+                                error!("failed to deserialize stored event: {e}");
+                                continue;
+                            }
+                        };
 
-                            let marshallable = {
-                                let mut record_val = None;
-                                if let Some(cid_str) = &cid {
-                                    if let Ok(Some(block_bytes)) =
-                                        db.blocks.get(keys::block_key(cid_str))
+                        let marshallable = {
+                            let mut record_val = None;
+                            if let Some(cid_str) = &cid {
+                                if let Ok(Some(block_bytes)) =
+                                    db.blocks.get(keys::block_key(cid_str))
+                                {
+                                    if let Ok(raw_data) =
+                                        serde_ipld_dagcbor::from_slice::<RawData>(&block_bytes)
                                     {
-                                        if let Ok(raw_data) =
-                                            serde_ipld_dagcbor::from_slice::<RawData>(&block_bytes)
-                                        {
-                                            record_val = serde_json::to_value(raw_data).ok();
-                                        }
+                                        record_val = serde_json::to_value(raw_data).ok();
                                     }
                                 }
-
-                                MarshallableEvt {
-                                    id,
-                                    event_type: "record".into(),
-                                    record: Some(RecordEvt {
-                                        live: true,
-                                        did: did.to_did(),
-                                        rev,
-                                        collection,
-                                        rkey,
-                                        action,
-                                        record: record_val,
-                                        cid: cid.map(|c| match c {
-                                            jacquard::types::cid::Cid::Ipld { s, .. } => s,
-                                            jacquard::types::cid::Cid::Str(s) => s,
-                                        }),
-                                    }),
-                                    identity: None,
-                                    account: None,
-                                }
-                            };
-
-                            let json_str = match serde_json::to_string(&marshallable) {
-                                Ok(s) => s,
-                                Err(_) => continue,
-                            };
-
-                            if tx.blocking_send(Message::Text(json_str.into())).is_err() {
-                                return;
                             }
-                            found = true;
-                        } else {
-                            break;
+
+                            MarshallableEvt {
+                                id,
+                                event_type: "record".into(),
+                                record: Some(RecordEvt {
+                                    live: true,
+                                    did: did.to_did(),
+                                    rev,
+                                    collection,
+                                    rkey,
+                                    action,
+                                    record: record_val,
+                                    cid: cid.map(|c| match c {
+                                        jacquard::types::cid::Cid::Ipld { s, .. } => s,
+                                        jacquard::types::cid::Cid::Str(s) => s,
+                                    }),
+                                }),
+                                identity: None,
+                                account: None,
+                            }
+                        };
+
+                        let json_str = match serde_json::to_string(&marshallable) {
+                            Ok(s) => s,
+                            Err(e) => {
+                                error!("failed to serialize ws event: {e}");
+                                continue;
+                            }
+                        };
+
+                        if let Err(e) = tx.blocking_send(Message::Text(json_str.into())) {
+                            error!("failed to send ws message: {e}");
+                            return;
                         }
+
+                        found = true;
                     }
                     if !found {
                         break;
@@ -134,9 +157,13 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, query: Strea
                         // send ephemeral event directly
                         let json_str = match serde_json::to_string(&evt) {
                             Ok(s) => s,
-                            Err(_) => continue,
+                            Err(e) => {
+                                error!("failed to serialize ws event: {e}");
+                                continue;
+                            }
                         };
-                        if tx.blocking_send(Message::Text(json_str.into())).is_err() {
+                        if let Err(e) = tx.blocking_send(Message::Text(json_str.into())) {
+                            error!("failed to send ws message: {e}");
                             return;
                         }
                     }

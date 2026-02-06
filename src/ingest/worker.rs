@@ -3,7 +3,7 @@ use crate::ingest::BufferedMessage;
 use crate::ops::{self, send_backfill_req};
 use crate::resolver::NoSigningKeyError;
 use crate::state::AppState;
-use crate::types::{AccountEvt, IdentityEvt, RepoState, RepoStatus};
+use crate::types::{AccountEvt, BroadcastEvent, IdentityEvt, RepoState, RepoStatus};
 use jacquard::api::com_atproto::sync::subscribe_repos::SubscribeReposMessage;
 
 use fjall::OwnedWriteBatch;
@@ -108,11 +108,13 @@ impl FirehoseWorker {
         let _g = handle.enter();
         let mut repo_cache = HashMap::new();
         let mut deleted = HashSet::new();
+        let mut broadcast_events = Vec::<BroadcastEvent>::with_capacity(BUF_SIZE);
 
         loop {
             let mut batch = self.state.db.inner.batch();
             repo_cache.clear();
             deleted.clear();
+            broadcast_events.clear();
 
             // resolve signing keys for commits and syncs if verification is enabled
             let keys = if self.verify_signatures {
@@ -135,6 +137,8 @@ impl FirehoseWorker {
                 HashMap::new()
             };
 
+            let mut added_blocks = 0;
+            let mut records_delta = 0;
             for msg in buf.drain(..) {
                 let (did, seq) = match &msg {
                     SubscribeReposMessage::Commit(c) => (&c.repo, c.seq),
@@ -152,7 +156,16 @@ impl FirehoseWorker {
                     continue;
                 }
 
-                match self.process_message(&mut repo_cache, &mut batch, &msg, did, &keys) {
+                match self.process_message(
+                    &mut repo_cache,
+                    &mut batch,
+                    &mut added_blocks,
+                    &mut records_delta,
+                    &mut broadcast_events,
+                    &msg,
+                    did,
+                    &keys,
+                ) {
                     Ok(ProcessResult::Ok) => {}
                     Ok(ProcessResult::Deleted) => {
                         deleted.insert(did.clone());
@@ -178,6 +191,17 @@ impl FirehoseWorker {
 
             // commit all changes to db
             batch.commit().into_diagnostic()?;
+
+            if added_blocks > 0 {
+                self.state.db.update_count("blocks", added_blocks);
+            }
+            if records_delta != 0 {
+                self.state.db.update_count("records", records_delta);
+            }
+            for evt in broadcast_events.drain(..) {
+                let _ = self.state.db.event_tx.send(evt);
+            }
+
             self.state
                 .db
                 .inner
@@ -215,6 +239,9 @@ impl FirehoseWorker {
         &self,
         repo_cache: &mut HashMap<Did<'static>, RepoState<'static>>,
         batch: &mut OwnedWriteBatch,
+        added_blocks: &mut i64,
+        records_delta: &mut i64,
+        broadcast_events: &mut Vec<BroadcastEvent>,
         msg: &BufferedMessage,
         did: &Did,
         keys: &HashMap<Did<'static>, Result<PublicKey<'static>>>,
@@ -284,10 +311,17 @@ impl FirehoseWorker {
                     return Ok(ProcessResult::Ok);
                 }
 
-                let (new_state, cb) =
-                    ops::apply_commit(batch, &state.db, repo_state, &commit, get_key()?)?;
-                cb();
-                repo_cache.insert(did.clone().into_static(), new_state);
+                let res = ops::apply_commit(batch, &state.db, repo_state, &commit, get_key()?)?;
+                repo_cache.insert(did.clone().into_static(), res.repo_state);
+                *added_blocks += res.blocks_count;
+                *records_delta += res.records_delta;
+                broadcast_events.push(BroadcastEvent::Persisted(
+                    self.state
+                        .db
+                        .next_event_id
+                        .load(std::sync::atomic::Ordering::SeqCst)
+                        - 1,
+                ));
             }
             SubscribeReposMessage::Sync(sync) => {
                 debug!("processing buffered sync for {did}");
@@ -338,7 +372,7 @@ impl FirehoseWorker {
                     did: did.clone().into_static(),
                     handle,
                 };
-                ops::emit_identity_event(&state.db, evt);
+                broadcast_events.push(ops::make_identity_event(&state.db, evt));
             }
             SubscribeReposMessage::Account(account) => {
                 debug!("processing buffered account for {did}");
@@ -406,7 +440,7 @@ impl FirehoseWorker {
                     // 2. initiating backfilling is also handled there
                 }
 
-                ops::emit_account_event(&state.db, evt);
+                broadcast_events.push(ops::make_account_event(&state.db, evt));
             }
             _ => {
                 warn!("unknown message type in buffer for {did}");
