@@ -11,7 +11,7 @@ use jacquard::{CowStr, IntoStatic, prelude::*};
 use jacquard_common::xrpc::XrpcError;
 use jacquard_repo::mst::Mst;
 use jacquard_repo::{BlockStore, MemoryBlockStore};
-use miette::{Context, IntoDiagnostic, Result};
+use miette::{IntoDiagnostic, Result};
 use smol_str::{SmolStr, ToSmolStr};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -369,25 +369,32 @@ impl BackfillWorker {
                 let mut batch = app_state.db.inner.batch();
                 let store = mst.storage();
 
-                // pre-load existing record CIDs for this DID to detect duplicates/updates
                 let prefix = keys::record_prefix(&did);
-                let prefix_len = prefix.len();
                 let mut existing_cids: HashMap<(SmolStr, SmolStr), SmolStr> = HashMap::new();
-                for guard in app_state.db.records.prefix(&prefix) {
-                    let (key, cid_bytes) = guard.into_inner().into_diagnostic()?;
-                    // extract path (collection/rkey) from key by skipping the DID prefix
-                    let mut path_split = key[prefix_len..].split(|b| *b == keys::SEP);
-                    let collection =
-                        std::str::from_utf8(path_split.next().wrap_err("collection not found")?)
-                            .into_diagnostic()?
-                            .to_smolstr();
-                    let rkey = std::str::from_utf8(path_split.next().wrap_err("rkey not found")?)
-                        .into_diagnostic()?
-                        .to_smolstr();
-                    let cid = std::str::from_utf8(&cid_bytes)
-                        .into_diagnostic()?
-                        .to_smolstr();
-                    existing_cids.insert((collection, rkey), cid);
+
+                let mut partitions = Vec::new();
+                app_state.db.record_partitions.iter_sync(|col, ks| {
+                    partitions.push((col.clone(), ks.clone()));
+                    true
+                });
+
+                for (col_name, ks) in partitions {
+                    for guard in ks.prefix(&prefix) {
+                        let (key, cid_bytes) = guard.into_inner().into_diagnostic()?;
+                        // key: {DID}|{RKey}
+                        let key_str = std::str::from_utf8(&key).into_diagnostic()?;
+                        let parts: Vec<&str> = key_str.split(keys::SEP as char).collect();
+                        if parts.len() == 2 {
+                            let rkey = parts[1].to_smolstr();
+                            let cid = if let Ok(c) = cid::Cid::read_bytes(cid_bytes.as_ref()) {
+                                c.to_string().to_smolstr()
+                            } else {
+                                continue;
+                            };
+
+                            existing_cids.insert((col_name.as_str().into(), rkey), cid);
+                        }
+                    }
                 }
 
                 for (key, cid) in leaves {
@@ -398,12 +405,13 @@ impl BackfillWorker {
                     if let Some(val) = val_bytes {
                         let (collection, rkey) = ops::parse_path(&key)?;
                         let path = (collection.to_smolstr(), rkey.to_smolstr());
-                        let cid = Cid::ipld(cid);
+                        let cid_obj = Cid::ipld(cid);
+                        let partition = app_state.db.record_partition(collection)?;
 
                         // check if this record already exists with same CID
                         let (action, is_new) =
                             if let Some(existing_cid) = existing_cids.remove(&path) {
-                                if existing_cid == cid.as_str() {
+                                if existing_cid == cid_obj.as_str() {
                                     debug!("skip {did}/{collection}/{rkey} ({cid})");
                                     continue; // skip unchanged record
                                 }
@@ -413,14 +421,11 @@ impl BackfillWorker {
                             };
                         debug!("{action} {did}/{collection}/{rkey} ({cid})");
 
-                        let db_key = keys::record_key(&did, &collection, &rkey);
+                        // Key is just did|rkey
+                        let db_key = keys::record_key(&did, &rkey);
 
-                        batch.insert(
-                            &app_state.db.blocks,
-                            keys::block_key(cid.as_str()),
-                            val.as_ref(),
-                        );
-                        batch.insert(&app_state.db.records, db_key, cid.as_str().as_bytes());
+                        batch.insert(&app_state.db.blocks, cid.to_bytes(), val.as_ref());
+                        batch.insert(&partition, db_key, cid.to_bytes());
 
                         added_blocks += 1;
                         if is_new {
@@ -436,7 +441,7 @@ impl BackfillWorker {
                             collection: CowStr::Borrowed(collection),
                             rkey: DbRkey::new(rkey),
                             action: DbAction::from(action),
-                            cid: Some(cid.to_ipld().expect("valid cid")),
+                            cid: Some(cid_obj.to_ipld().expect("valid cid")),
                         };
                         let bytes = rmp_serde::to_vec(&evt).into_diagnostic()?;
                         batch.insert(&app_state.db.events, keys::event_key(event_id), bytes);
@@ -448,10 +453,9 @@ impl BackfillWorker {
                 // remove any remaining existing records (they weren't in the new MST)
                 for ((collection, rkey), cid) in existing_cids {
                     debug!("remove {did}/{collection}/{rkey} ({cid})");
-                    batch.remove(
-                        &app_state.db.records,
-                        keys::record_key(&did, &collection, &rkey),
-                    );
+                    let partition = app_state.db.record_partition(collection.as_str())?;
+
+                    batch.remove(&partition, keys::record_key(&did, &rkey));
 
                     let event_id = app_state.db.next_event_id.fetch_add(1, Ordering::SeqCst);
                     let evt = StoredEvent {

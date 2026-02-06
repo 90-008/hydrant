@@ -14,19 +14,17 @@ pub fn repo_key<'a>(did: &'a Did) -> Vec<u8> {
     vec
 }
 
-// key format: {DID}\x00{Collection}\x00{RKey} (DID trimmed)
-pub fn record_key(did: &Did, collection: &str, rkey: &str) -> Vec<u8> {
+// key format: {DID}\x00{RKey} (DID trimmed)
+pub fn record_key(did: &Did, rkey: &str) -> Vec<u8> {
     let repo = TrimmedDid::from(did);
-    let mut key = Vec::with_capacity(repo.len() + collection.len() + rkey.len() + 2);
+    let mut key = Vec::with_capacity(repo.len() + rkey.len() + 1);
     repo.write_to_vec(&mut key);
-    key.push(SEP);
-    key.extend_from_slice(collection.as_bytes());
     key.push(SEP);
     key.extend_from_slice(rkey.as_bytes());
     key
 }
 
-// prefix format: {DID}\x00 (DID trimmed) - for scanning all records of a DID
+// prefix format: {DID}\x00 (DID trimmed) - for scanning all records of a DID within a collection
 pub fn record_prefix(did: &Did) -> Vec<u8> {
     let repo = TrimmedDid::from(did);
     let mut prefix = Vec::with_capacity(repo.len() + 1);
@@ -40,11 +38,6 @@ pub fn record_prefix(did: &Did) -> Vec<u8> {
 // key format: {SEQ}
 pub fn event_key(seq: u64) -> [u8; 8] {
     seq.to_be_bytes()
-}
-
-// key format: {CID}
-pub fn block_key(cid: &str) -> &[u8] {
-    cid.as_bytes()
 }
 
 pub const COUNT_KS_PREFIX: &[u8] = &[b'k', SEP];

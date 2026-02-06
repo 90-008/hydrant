@@ -42,13 +42,13 @@ pub async fn handle_debug_count(
         .map_err(|_| StatusCode::BAD_REQUEST)?;
 
     let db = &state.db;
-    let ks = db.records.clone();
+    let ks = db
+        .record_partition(&req.collection)
+        .map_err(|_| StatusCode::NOT_FOUND)?;
 
-    // {did_prefix}\x00{collection}\x00
+    // {TrimmedDid}\x00
     let mut prefix = Vec::new();
     TrimmedDid::from(&did).write_to_vec(&mut prefix);
-    prefix.push(keys::SEP);
-    prefix.extend_from_slice(req.collection.as_bytes());
     prefix.push(keys::SEP);
 
     let count = tokio::task::spawn_blocking(move || {
@@ -185,7 +185,6 @@ pub async fn handle_debug_iter(
     let items = tokio::task::spawn_blocking(move || {
         let limit = req.limit.unwrap_or(50).min(1000);
 
-        // Helper closure to avoid generic type complexity
         let collect = |iter: &mut dyn Iterator<Item = fjall::Guard>| {
             let mut items = Vec::new();
             for guard in iter.take(limit) {
@@ -247,13 +246,18 @@ pub async fn handle_debug_iter(
 fn get_keyspace_by_name(db: &crate::db::Db, name: &str) -> Result<fjall::Keyspace, StatusCode> {
     match name {
         "repos" => Ok(db.repos.clone()),
-        "records" => Ok(db.records.clone()),
         "blocks" => Ok(db.blocks.clone()),
         "cursors" => Ok(db.cursors.clone()),
         "pending" => Ok(db.pending.clone()),
         "resync" => Ok(db.resync.clone()),
         "events" => Ok(db.events.clone()),
         "counts" => Ok(db.counts.clone()),
-        _ => Err(StatusCode::BAD_REQUEST),
+        _ => {
+            if let Some(col) = name.strip_prefix(crate::db::RECORDS_PARTITION_PREFIX) {
+                db.record_partition(col).map_err(|_| StatusCode::NOT_FOUND)
+            } else {
+                Err(StatusCode::BAD_REQUEST)
+            }
+        }
     }
 }

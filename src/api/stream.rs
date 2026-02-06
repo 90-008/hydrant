@@ -97,11 +97,8 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, query: Strea
 
                         let marshallable = {
                             let mut record_val = None;
-                            if let Some(cid_struct) = &cid {
-                                let cid_str = cid_struct.to_string();
-                                if let Ok(Some(block_bytes)) =
-                                    db.blocks.get(keys::block_key(&cid_str))
-                                {
+                            if let Some(cid) = &cid {
+                                if let Ok(Some(block_bytes)) = db.blocks.get(&cid.to_bytes()) {
                                     if let Ok(raw_data) =
                                         serde_ipld_dagcbor::from_slice::<RawData>(&block_bytes)
                                     {

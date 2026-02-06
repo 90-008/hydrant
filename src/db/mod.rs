@@ -4,7 +4,7 @@ use jacquard::IntoStatic;
 use jacquard_common::types::string::Did;
 use miette::{Context, IntoDiagnostic, Result};
 use scc::HashMap;
-use smol_str::SmolStr;
+use smol_str::{SmolStr, format_smolstr};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -15,10 +15,20 @@ use std::sync::atomic::AtomicU64;
 use tokio::sync::broadcast;
 use tracing::error;
 
+pub const RECORDS_PARTITION_PREFIX: &str = "r:";
+
+fn default_opts() -> KeyspaceCreateOptions {
+    KeyspaceCreateOptions::default()
+}
+
+fn record_partition_opts() -> KeyspaceCreateOptions {
+    default_opts().max_memtable_size(32 * 2_u64.pow(20))
+}
+
 pub struct Db {
     pub inner: Arc<Database>,
     pub repos: Keyspace,
-    pub records: Keyspace,
+    pub record_partitions: HashMap<String, Keyspace>,
     pub blocks: Keyspace,
     pub cursors: Keyspace,
     pub pending: Keyspace,
@@ -48,13 +58,12 @@ impl Db {
             .into_diagnostic()?;
         let db = Arc::new(db);
 
-        let opts = KeyspaceCreateOptions::default;
+        let opts = default_opts;
         let open_ks = |name: &str, opts: KeyspaceCreateOptions| {
             db.keyspace(name, move || opts).into_diagnostic()
         };
 
         let repos = open_ks("repos", opts().expect_point_read_hits(true))?;
-        let records = open_ks("records", opts().max_memtable_size(32 * 2_u64.pow(20)))?;
         let blocks = open_ks(
             "blocks",
             opts()
@@ -67,6 +76,19 @@ impl Db {
         let resync = open_ks("resync", opts())?;
         let events = open_ks("events", opts())?;
         let counts = open_ks("counts", opts().expect_point_read_hits(true))?;
+
+        let record_partitions = HashMap::new();
+        {
+            let names = db.list_keyspace_names();
+            for name in names {
+                let name_str: &str = name.as_ref();
+                if let Some(collection) = name_str.strip_prefix(RECORDS_PARTITION_PREFIX) {
+                    let popts = record_partition_opts();
+                    let ks = db.keyspace(name_str, move || popts).into_diagnostic()?;
+                    let _ = record_partitions.insert_sync(collection.to_string(), ks);
+                }
+            }
+        }
 
         let mut last_id = 0;
         if let Some(guard) = events.iter().next_back() {
@@ -97,7 +119,7 @@ impl Db {
         Ok(Self {
             inner: db,
             repos,
-            records,
+            record_partitions,
             blocks,
             cursors,
             pending,
@@ -108,6 +130,21 @@ impl Db {
             counts_map,
             next_event_id: Arc::new(AtomicU64::new(last_id + 1)),
         })
+    }
+
+    pub fn record_partition(&self, collection: &str) -> Result<Keyspace> {
+        use scc::hash_map::Entry;
+        match self.record_partitions.entry_sync(collection.to_string()) {
+            Entry::Occupied(o) => Ok(o.get().clone()),
+            Entry::Vacant(v) => {
+                let name = format_smolstr!("{}{}", RECORDS_PARTITION_PREFIX, collection);
+                let ks = self
+                    .inner
+                    .keyspace(&name, record_partition_opts)
+                    .into_diagnostic()?;
+                Ok(v.insert_entry(ks).get().clone())
+            }
+        }
     }
 
     pub fn persist(&self) -> Result<()> {

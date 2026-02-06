@@ -1621,6 +1621,7 @@ dependencies = [
  "async-stream",
  "axum",
  "chrono",
+ "cid",
  "data-encoding",
  "fjall",
  "futures",

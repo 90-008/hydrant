@@ -8,7 +8,7 @@ use crate::types::{
 use fjall::OwnedWriteBatch;
 use jacquard::CowStr;
 use jacquard::IntoStatic;
-use jacquard::cowstr::ToCowStr;
+
 use jacquard::types::cid::Cid;
 use jacquard_api::com_atproto::sync::subscribe_repos::Commit;
 use jacquard_common::types::crypto::PublicKey;
@@ -67,12 +67,19 @@ pub fn delete_repo<'batch>(
     batch.remove(&db.pending, &repo_key);
     batch.remove(&db.resync, &repo_key);
 
-    // 2. delete from records (prefix: repo_key + SEP)
-    let mut records_prefix = repo_key.clone();
-    records_prefix.push(keys::SEP);
-    for guard in db.records.prefix(&records_prefix) {
-        let k = guard.key().into_diagnostic()?;
-        batch.remove(&db.records, k);
+    // 2. delete from records (all partitions)
+    let mut partitions = Vec::new();
+    db.record_partitions.iter_sync(|_, v| {
+        partitions.push(v.clone());
+        true
+    });
+
+    let records_prefix = keys::record_prefix(did);
+    for ks in partitions {
+        for guard in ks.prefix(&records_prefix) {
+            let k = guard.key().into_diagnostic()?;
+            batch.remove(&ks, k);
+        }
     }
 
     // 3. reset collection counts
@@ -218,11 +225,7 @@ pub fn apply_commit<'batch, 'db, 'commit, 's>(
 
     // store all blocks in the CAS
     for (cid, bytes) in &parsed.blocks {
-        batch.insert(
-            &db.blocks,
-            keys::block_key(&cid.to_cowstr()),
-            bytes.to_vec(),
-        );
+        batch.insert(&db.blocks, cid.to_bytes(), bytes.to_vec());
     }
 
     // 2. iterate ops and update records index
@@ -231,7 +234,8 @@ pub fn apply_commit<'batch, 'db, 'commit, 's>(
 
     for op in &commit.ops {
         let (collection, rkey) = parse_path(&op.path)?;
-        let db_key = keys::record_key(did, collection, rkey);
+        let partition = db.record_partition(collection)?;
+        let db_key = keys::record_key(did, rkey); // removed collection arg
 
         let event_id = db.next_event_id.fetch_add(1, Ordering::SeqCst);
 
@@ -240,8 +244,14 @@ pub fn apply_commit<'batch, 'db, 'commit, 's>(
                 let Some(cid) = &op.cid else {
                     continue;
                 };
-                let s = smol_str::SmolStr::from(cid.as_str());
-                batch.insert(&db.records, db_key, s.as_bytes().to_vec());
+                batch.insert(
+                    &partition,
+                    db_key.clone(),
+                    cid.to_ipld()
+                        .into_diagnostic()
+                        .wrap_err("expected valid cid from relay")?
+                        .to_bytes(),
+                );
 
                 // accumulate counts
                 if op.action.as_str() == "create" {
@@ -250,7 +260,7 @@ pub fn apply_commit<'batch, 'db, 'commit, 's>(
                 }
             }
             "delete" => {
-                batch.remove(&db.records, db_key);
+                batch.remove(&partition, db_key);
 
                 // accumulate counts
                 records_delta -= 1;
@@ -268,7 +278,7 @@ pub fn apply_commit<'batch, 'db, 'commit, 's>(
             collection: CowStr::Borrowed(collection),
             rkey: DbRkey::new(rkey),
             action: DbAction::from(op.action.as_str()),
-            cid: op.cid.as_ref().map(|c| c.0.to_ipld().expect("valid cid")),
+            cid: op.cid.as_ref().map(|c| c.to_ipld().expect("valid cid")),
         };
 
         let bytes = rmp_serde::to_vec(&evt).into_diagnostic()?;

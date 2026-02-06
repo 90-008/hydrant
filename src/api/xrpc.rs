@@ -3,6 +3,7 @@ use crate::db::types::TrimmedDid;
 use crate::db::{self, Db, keys};
 use axum::{Json, Router, extract::State, http::StatusCode};
 use futures::TryFutureExt;
+use jacquard::cowstr::ToCowStr;
 use jacquard::types::ident::AtIdentifier;
 use jacquard::{
     IntoStatic,
@@ -21,6 +22,7 @@ use jacquard_common::{
     },
     xrpc::{GenericXrpcError, XrpcError},
 };
+use miette::IntoDiagnostic;
 use serde::{Deserialize, Serialize};
 use smol_str::ToSmolStr;
 use std::{fmt::Display, sync::Arc};
@@ -76,17 +78,19 @@ pub async fn handle_get_record(
         .await
         .map_err(|e| bad_request(GetRecord::NSID, e))?;
 
-    let db_key = keys::record_key(&did, req.collection.as_str(), req.rkey.0.as_str());
+    let partition = db
+        .record_partition(req.collection.as_str())
+        .map_err(|e| internal_error(GetRecord::NSID, e))?;
 
-    let cid_bytes = Db::get(db.records.clone(), db_key)
+    let db_key = keys::record_key(&did, req.rkey.0.as_str()); // 2 args
+
+    let cid_bytes = Db::get(partition, db_key)
         .await
         .map_err(|e| internal_error(GetRecord::NSID, e))?;
 
     if let Some(cid_bytes) = cid_bytes {
-        let cid_str =
-            std::str::from_utf8(&cid_bytes).map_err(|e| internal_error(GetRecord::NSID, e))?;
-
-        let block_bytes = Db::get(db.blocks.clone(), keys::block_key(cid_str))
+        // lookup block using binary cid
+        let block_bytes = Db::get(db.blocks.clone(), &cid_bytes)
             .await
             .map_err(|e| internal_error(GetRecord::NSID, e))?
             .ok_or_else(|| internal_error(GetRecord::NSID, "not found"))?;
@@ -94,7 +98,9 @@ pub async fn handle_get_record(
         let value: Data = serde_ipld_dagcbor::from_slice(&block_bytes)
             .map_err(|e| internal_error(GetRecord::NSID, e))?;
 
-        let cid = Cid::new(cid_str.as_bytes()).unwrap().into_static();
+        let cid = Cid::new(&cid_bytes)
+            .map_err(|e| internal_error(GetRecord::NSID, e))?
+            .into_static();
 
         Ok(Json(GetRecordOutput {
             uri: AtUri::from_parts_owned(
@@ -103,7 +109,7 @@ pub async fn handle_get_record(
                 req.rkey.0.as_str(),
             )
             .unwrap(),
-            cid: Some(cid),
+            cid: Some(Cid::Str(cid.to_cowstr()).into_static()),
             value: value.into_static(),
             extra_data: Default::default(),
         }))
@@ -126,17 +132,16 @@ pub async fn handle_list_records(
         .await
         .map_err(|e| bad_request(ListRecords::NSID, e))?;
 
-    let prefix = format!(
-        "{}{}{}{}",
-        TrimmedDid::from(&did),
-        keys::SEP as char,
-        req.collection.as_str(),
-        keys::SEP as char
-    );
+    let ks = db
+        .record_partition(req.collection.as_str())
+        .map_err(|e| internal_error(ListRecords::NSID, e))?;
+
+    let mut prefix = Vec::new();
+    TrimmedDid::from(&did).write_to_vec(&mut prefix);
+    prefix.push(keys::SEP);
 
     let limit = req.limit.unwrap_or(50).min(100) as usize;
     let reverse = req.reverse.unwrap_or(false);
-    let ks = db.records.clone();
     let blocks_ks = db.blocks.clone();
 
     let did_str = smol_str::SmolStr::from(did.as_str());
@@ -146,107 +151,78 @@ pub async fn handle_list_records(
         let mut results = Vec::new();
         let mut cursor = None;
 
-        let mut end_prefix = prefix.clone().into_bytes();
-        if let Some(last) = end_prefix.last_mut() {
-            *last += 1;
-        }
+        let iter: Box<dyn Iterator<Item = _>> = if !reverse {
+            let mut end_prefix = prefix.clone();
+            if let Some(last) = end_prefix.last_mut() {
+                *last += 1;
+            }
 
-        if !reverse {
             let end_key = if let Some(cursor) = &req.cursor {
-                format!("{}{}", prefix, cursor).into_bytes()
+                let mut k = prefix.clone();
+                k.extend_from_slice(cursor.as_bytes());
+                k
             } else {
-                end_prefix.clone()
+                end_prefix
             };
 
-            for item in ks.range(prefix.as_bytes()..end_key.as_slice()).rev() {
-                let (key, cid_bytes) = item.into_inner().ok()?;
-
-                if !key.starts_with(prefix.as_bytes()) {
-                    break;
-                }
-                if results.len() >= limit {
-                    let key_str = String::from_utf8_lossy(&key);
-                    if let Some(last_part) = key_str.split(keys::SEP as char).last() {
-                        cursor = Some(smol_str::SmolStr::from(last_part));
-                    }
-                    break;
-                }
-
-                let key_str = String::from_utf8_lossy(&key);
-                let parts: Vec<&str> = key_str.split(keys::SEP as char).collect();
-                if parts.len() == 3 {
-                    let rkey = parts[2];
-                    let cid_str = std::str::from_utf8(&cid_bytes).ok()?;
-
-                    if let Ok(Some(block_bytes)) = blocks_ks.get(keys::block_key(cid_str)) {
-                        let val: Data =
-                            serde_ipld_dagcbor::from_slice(&block_bytes).unwrap_or(Data::Null);
-                        let cid = Cid::new(cid_str.as_bytes()).unwrap().into_static();
-                        results.push(RepoRecord {
-                            uri: AtUri::from_parts_owned(
-                                did_str.as_str(),
-                                collection_str.as_str(),
-                                rkey,
-                            )
-                            .unwrap(),
-                            cid,
-                            value: val.into_static(),
-                            extra_data: Default::default(),
-                        });
-                    }
-                }
-            }
+            Box::new(ks.range(prefix.as_slice()..end_key.as_slice()).rev())
         } else {
             let start_key = if let Some(cursor) = &req.cursor {
-                format!("{}{}\0", prefix, cursor).into_bytes()
+                let mut k = prefix.clone();
+                k.extend_from_slice(cursor.as_bytes());
+                k.push(0);
+                k
             } else {
-                prefix.clone().into_bytes()
+                prefix.clone()
             };
 
-            for item in ks.range(start_key.as_slice()..) {
-                let (key, cid_bytes) = item.into_inner().ok()?;
+            Box::new(ks.range(start_key.as_slice()..))
+        };
 
-                if !key.starts_with(prefix.as_bytes()) {
-                    break;
-                }
-                if results.len() >= limit {
-                    let key_str = String::from_utf8_lossy(&key);
-                    if let Some(last_part) = key_str.split(keys::SEP as char).last() {
-                        cursor = Some(smol_str::SmolStr::from(last_part));
-                    }
-                    break;
-                }
+        for item in iter {
+            let (key, cid_bytes) = item.into_inner().into_diagnostic()?;
 
+            if !key.starts_with(prefix.as_slice()) {
+                break;
+            }
+            if results.len() >= limit {
                 let key_str = String::from_utf8_lossy(&key);
-                let parts: Vec<&str> = key_str.split(keys::SEP as char).collect();
-                if parts.len() == 3 {
-                    let rkey = parts[2];
-                    let cid_str = std::str::from_utf8(&cid_bytes).ok()?;
+                if let Some(last_part) = key_str.split(keys::SEP as char).last() {
+                    cursor = Some(smol_str::SmolStr::from(last_part));
+                }
+                break;
+            }
 
-                    if let Ok(Some(block_bytes)) = blocks_ks.get(keys::block_key(cid_str)) {
-                        let val: Data =
-                            serde_ipld_dagcbor::from_slice(&block_bytes).unwrap_or(Data::Null);
-                        let cid = Cid::new(cid_str.as_bytes()).unwrap().into_static();
-                        results.push(RepoRecord {
-                            uri: AtUri::from_parts_owned(
-                                did_str.as_str(),
-                                collection_str.as_str(),
-                                rkey,
-                            )
-                            .unwrap(),
-                            cid,
-                            value: val.into_static(),
-                            extra_data: Default::default(),
-                        });
-                    }
+            // key: {TrimmedDid}|{RKey}
+            let key_str = String::from_utf8_lossy(&key);
+            let parts: Vec<&str> = key_str.split(keys::SEP as char).collect();
+            if parts.len() == 2 {
+                let rkey = parts[1];
+                // look up using binary cid bytes from the record
+                if let Ok(Some(block_bytes)) = blocks_ks.get(&cid_bytes) {
+                    let val: Data =
+                        serde_ipld_dagcbor::from_slice(&block_bytes).unwrap_or(Data::Null);
+                    let cid =
+                        Cid::Str(Cid::new(&cid_bytes).into_diagnostic()?.to_cowstr()).into_static();
+                    results.push(RepoRecord {
+                        uri: AtUri::from_parts_owned(
+                            did_str.as_str(),
+                            collection_str.as_str(),
+                            rkey,
+                        )
+                        .into_diagnostic()?,
+                        cid,
+                        value: val.into_static(),
+                        extra_data: Default::default(),
+                    });
                 }
             }
         }
-        Some((results, cursor))
+        Result::<_, miette::Report>::Ok((results, cursor))
     })
     .await
     .map_err(|e| internal_error(ListRecords::NSID, e))?
-    .ok_or_else(|| internal_error(ListRecords::NSID, "not found"))?;
+    .map_err(|e| internal_error(ListRecords::NSID, e))?;
 
     Ok(Json(ListRecordsOutput {
         records: results,
