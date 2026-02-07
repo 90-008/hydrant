@@ -106,6 +106,9 @@ fn deserialize_value(partition: &str, value: &[u8]) -> Value {
             if let Ok(arr) = value.try_into() {
                 return Value::Number(u64::from_be_bytes(arr).into());
             }
+            if let Ok(s) = String::from_utf8(value.to_vec()) {
+                return Value::String(s);
+            }
         }
         "blocks" => {
             if let Ok(val) = serde_ipld_dagcbor::from_slice::<Value>(value) {

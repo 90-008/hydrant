@@ -27,6 +27,7 @@
                 go
                 cmake
                 websocat
+                http-nu
               ];
             };
           };

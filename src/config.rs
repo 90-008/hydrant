@@ -52,6 +52,8 @@ pub struct Config {
     pub enable_debug: bool,
     pub verify_signatures: SignatureVerification,
     pub identity_cache_size: u64,
+    pub disable_firehose: bool,
+    pub disable_backfill: bool,
 }
 
 impl Config {
@@ -97,6 +99,8 @@ impl Config {
         let debug_port = cfg!("DEBUG_PORT", 3001u16);
         let verify_signatures = cfg!("VERIFY_SIGNATURES", SignatureVerification::Full);
         let identity_cache_size = cfg!("IDENTITY_CACHE_SIZE", 100_000u64);
+        let disable_firehose = cfg!("DISABLE_FIREHOSE", false);
+        let disable_backfill = cfg!("DISABLE_BACKFILL", false);
 
         Ok(Self {
             database_path,
@@ -114,6 +118,8 @@ impl Config {
             enable_debug,
             verify_signatures,
             identity_cache_size,
+            disable_firehose,
+            disable_backfill,
         })
     }
 }

@@ -39,34 +39,23 @@ async fn main() -> miette::Result<()> {
         );
     }
 
-    tokio::spawn({
-        let state = state.clone();
-        let timeout = cfg.repo_fetch_timeout;
-        BackfillWorker::new(
-            state,
-            backfill_rx,
-            timeout,
-            cfg.backfill_concurrency_limit,
-            matches!(
-                cfg.verify_signatures,
-                SignatureVerification::Full | SignatureVerification::BackfillOnly
-            ),
-        )
-        .run()
-    });
-
-    let firehose_worker = std::thread::spawn({
-        let state = state.clone();
-        let handle = tokio::runtime::Handle::current();
-        move || {
-            FirehoseWorker::new(
+    if !cfg.disable_backfill {
+        tokio::spawn({
+            let state = state.clone();
+            let timeout = cfg.repo_fetch_timeout;
+            BackfillWorker::new(
                 state,
-                buffer_rx,
-                matches!(cfg.verify_signatures, SignatureVerification::Full),
+                backfill_rx,
+                timeout,
+                cfg.backfill_concurrency_limit,
+                matches!(
+                    cfg.verify_signatures,
+                    SignatureVerification::Full | SignatureVerification::BackfillOnly
+                ),
             )
-            .run(handle)
-        }
-    });
+            .run()
+        });
+    }
 
     if let Err(e) = spawn_blocking({
         let state = state.clone();
@@ -167,27 +156,49 @@ async fn main() -> miette::Result<()> {
         );
     }
 
-    let ingestor = FirehoseIngestor::new(
-        state.clone(),
-        buffer_tx,
-        cfg.relay_host,
-        cfg.full_network,
-        matches!(cfg.verify_signatures, SignatureVerification::Full),
-    );
+    let tasks = if !cfg.disable_firehose {
+        let firehose_worker = std::thread::spawn({
+            let state = state.clone();
+            let handle = tokio::runtime::Handle::current();
+            move || {
+                FirehoseWorker::new(
+                    state,
+                    buffer_rx,
+                    matches!(cfg.verify_signatures, SignatureVerification::Full),
+                )
+                .run(handle)
+            }
+        });
 
-    let res = futures::future::try_join_all::<[BoxFuture<_>; _]>([
-        Box::pin(
-            tokio::task::spawn_blocking(move || {
-                firehose_worker
-                    .join()
-                    .map_err(|e| miette::miette!("buffer processor thread died: {e:?}"))
-            })
-            .map(|r| r.into_diagnostic().flatten().flatten()),
-        ),
-        Box::pin(ingestor.run()),
-    ]);
-    if let Err(e) = res.await {
-        error!("ingestor or buffer processor died: {e}");
+        let ingestor = FirehoseIngestor::new(
+            state.clone(),
+            buffer_tx,
+            cfg.relay_host,
+            cfg.full_network,
+            matches!(cfg.verify_signatures, SignatureVerification::Full),
+        );
+
+        vec![
+            Box::pin(
+                tokio::task::spawn_blocking(move || {
+                    firehose_worker
+                        .join()
+                        .map_err(|e| miette::miette!("buffer processor thread died: {e:?}"))
+                })
+                .map(|r| r.into_diagnostic().flatten().flatten()),
+            ) as BoxFuture<_>,
+            Box::pin(ingestor.run()),
+        ]
+    } else {
+        info!("firehose ingestion disabled by config");
+        // if firehose is disabled, we just wait indefinitely (or until signal)
+        // essentially we just want to keep the main thread alive for the other components
+        vec![Box::pin(futures::future::pending::<miette::Result<()>>()) as BoxFuture<_>]
+    };
+
+    let res = futures::future::select_all(tasks);
+    if let (Err(e), _, _) = res.await {
+        error!("critical worker died: {e}");
         db::check_poisoned_report(&e);
     }
 
