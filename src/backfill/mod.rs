@@ -5,6 +5,7 @@ use crate::state::{AppState, BackfillRx};
 use crate::types::{AccountEvt, BroadcastEvent, RepoState, RepoStatus, ResyncState, StoredEvent};
 use futures::TryFutureExt;
 use jacquard::api::com_atproto::sync::get_repo::{GetRepo, GetRepoError};
+use jacquard::error::{ClientError, ClientErrorKind};
 use jacquard::types::cid::Cid;
 use jacquard::types::did::Did;
 use jacquard::{CowStr, IntoStatic, prelude::*};
@@ -132,7 +133,16 @@ impl BackfillWorker {
                 .into_diagnostic()??;
             }
             Err(e) => {
-                error!("backfill failed for {did}: {e}");
+                {
+                    if e.downcast_ref::<ClientError>()
+                        .map_or(false, |e| matches!(e.kind(), ClientErrorKind::Transport))
+                    {
+                        let reason = e.root_cause();
+                        error!("backfill failed for {did}: {e}: {reason}");
+                    } else {
+                        warn!("backfill failed for {did}: {e}");
+                    }
+                }
                 let did_key = keys::repo_key(&did);
 
                 // 1. get current retry count
