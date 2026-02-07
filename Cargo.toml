@@ -21,7 +21,7 @@ serde_ipld_dagcbor = "0.6"
 url = "2.5"
 smol_str = "0.3"
 futures = "0.3"
-reqwest = { version = "0.12", features = ["json", "rustls-tls", "stream", "gzip", "brotli", "zstd"], default-features = false }
+reqwest = { version = "0.12", features = ["json", "rustls-tls", "stream", "gzip", "brotli", "zstd", "http2"], default-features = false }
 axum = { version = "0.8.8", features = ["ws", "macros"] }
 tower-http = { version = "0.6.6", features = ["cors", "trace"] }
 tokio-stream = "0.1"
