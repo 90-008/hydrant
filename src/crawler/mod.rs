@@ -50,7 +50,10 @@ impl Crawler {
                 .maybe_cursor(cursor.clone().map(|c| CowStr::from(c.to_string())))
                 .build();
 
-            let res_result = self.http.xrpc(self.relay_host.clone()).send(&req).await;
+            let mut url = self.relay_host.clone();
+            url.set_scheme("https")
+                .map_err(|_| miette::miette!("invalid url: {url}"))?;
+            let res_result = self.http.xrpc(url).send(&req).await;
 
             let output: ListReposOutput = match res_result {
                 Ok(res) => res.into_output().into_diagnostic()?,
