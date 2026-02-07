@@ -106,13 +106,13 @@ impl FirehoseIngestor {
         }
 
         // pre-warm the key cache for commit events
-        if self.verify_signatures && matches!(&msg, SubscribeReposMessage::Commit(_)) {
-            let state = self.state.clone();
-            let did = did.clone();
-            tokio::spawn(async move {
-                let _ = state.resolver.resolve_signing_key(&did).await;
-            });
-        }
+        // if self.verify_signatures && matches!(&msg, SubscribeReposMessage::Commit(_)) {
+        //     let state = self.state.clone();
+        //     let did = did.clone();
+        //     tokio::spawn(async move {
+        //         let _ = state.resolver.resolve_signing_key(&did).await;
+        //     });
+        // }
 
         if let Err(e) = self.buffer_tx.send(msg) {
             error!("failed to send message to buffer processor: {e}");
