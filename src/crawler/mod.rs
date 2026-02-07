@@ -55,6 +55,10 @@ impl Crawler {
             let output: ListReposOutput = match res_result {
                 Ok(res) => res.into_output().into_diagnostic()?,
                 Err(e) => {
+                    let e = e
+                        .source_err()
+                        .map(|e| e.to_string())
+                        .unwrap_or_else(|| e.to_string());
                     error!("crawler failed to list repos: {e}. retrying in 30s...");
                     tokio::time::sleep(Duration::from_secs(30)).await;
                     continue;
