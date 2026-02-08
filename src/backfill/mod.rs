@@ -13,6 +13,7 @@ use jacquard_common::xrpc::XrpcError;
 use jacquard_repo::mst::Mst;
 use jacquard_repo::{BlockStore, MemoryBlockStore};
 use miette::{IntoDiagnostic, Result};
+use reqwest::StatusCode;
 use smol_str::{SmolStr, ToSmolStr};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -133,38 +134,66 @@ impl BackfillWorker {
                 .into_diagnostic()??;
             }
             Err(e) => {
-                {
-                    if e.downcast_ref::<ClientError>()
-                        .map_or(false, |e| matches!(e.kind(), ClientErrorKind::Transport))
-                    {
-                        let reason = e.root_cause();
-                        error!("backfill failed for {did}: {e}: {reason}");
-                    } else {
-                        warn!("backfill failed for {did}: {e}");
+                let mut was_ratelimited = false;
+                'err: {
+                    let Some(e) = e.downcast_ref::<ClientError>() else {
+                        error!("failed for {did}: {e}");
+                        break 'err;
+                    };
+
+                    match e.kind() {
+                        ClientErrorKind::Http {
+                            status: StatusCode::TOO_MANY_REQUESTS,
+                        } => {
+                            debug!("failed for {did}: too many requests");
+                            was_ratelimited = true;
+                            break 'err;
+                        }
+                        ClientErrorKind::Transport => {
+                            let reason = e.source_err().unwrap();
+                            error!("failed for {did}: {e}: {reason}");
+                            break 'err;
+                        }
+                        _ => {
+                            error!("failed for {did}: {e}");
+                            break 'err;
+                        }
                     }
                 }
+
                 let did_key = keys::repo_key(&did);
 
                 // 1. get current retry count
-                let mut retry_count = 0;
-                if let Ok(Some(bytes)) = Db::get(db.resync.clone(), &did_key).await {
-                    if let Ok(ResyncState::Error {
-                        retry_count: old_count,
-                        ..
-                    }) = rmp_serde::from_slice::<ResyncState>(&bytes)
-                    {
-                        retry_count = old_count + 1;
-                    }
-                }
+                let mut resync_state = Db::get(db.resync.clone(), &did_key)
+                    .await
+                    .and_then(|b| {
+                        b.map(|b| rmp_serde::from_slice::<ResyncState>(&b).into_diagnostic())
+                            .transpose()
+                    })?
+                    .and_then(|s| {
+                        matches!(s, ResyncState::Gone { .. })
+                            .then_some(None)
+                            .unwrap_or(Some(s))
+                    })
+                    .unwrap_or_else(|| ResyncState::Error {
+                        message: SmolStr::new_static(""),
+                        retry_count: 0,
+                        next_retry: 0,
+                    });
 
-                // 2. calculate backoff
-                let next_retry = ResyncState::next_backoff(retry_count);
-
-                let resync_state = ResyncState::Error {
-                    message: e.to_string().into(),
+                let ResyncState::Error {
+                    message,
                     retry_count,
                     next_retry,
+                } = &mut resync_state
+                else {
+                    unreachable!("we handled the gone case above");
                 };
+
+                // 2. calculate backoff and update the other fields
+                *retry_count += was_ratelimited.then_some(3).unwrap_or(1);
+                *next_retry = ResyncState::next_backoff(*retry_count);
+                *message = e.to_smolstr();
 
                 tokio::task::spawn_blocking({
                     let state = state.clone();
