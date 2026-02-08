@@ -187,20 +187,19 @@ impl BackfillWorker {
                         };
 
                         let mut batch = state.db.inner.batch();
-
                         batch.insert(&state.db.resync, &did_key, serialized_resync_state);
-
+                        batch.remove(&state.db.pending, &did_key);
                         if let Some(state_bytes) = serialized_repo_state {
                             batch.insert(&state.db.repos, &did_key, state_bytes);
                         }
-
-                        // 5. remove from pending
-                        batch.remove(&state.db.pending, &did_key);
                         batch.commit().into_diagnostic()
                     }
                 })
                 .await
                 .into_diagnostic()??;
+
+                state.db.update_count_async("resync", 1).await;
+                state.db.update_count_async("pending", -1).await;
             }
         }
 
