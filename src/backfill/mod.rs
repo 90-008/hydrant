@@ -486,19 +486,21 @@ impl BackfillWorker {
                 for (col_name, ks) in partitions {
                     for guard in ks.prefix(&prefix) {
                         let (key, cid_bytes) = guard.into_inner().into_diagnostic()?;
-                        // key: {DID}|{RKey}
-                        let key_str = std::str::from_utf8(&key).into_diagnostic()?;
-                        let parts: Vec<&str> = key_str.split(keys::SEP as char).collect();
-                        if parts.len() == 2 {
-                            let rkey = parts[1].to_smolstr();
-                            let cid = if let Ok(c) = cid::Cid::read_bytes(cid_bytes.as_ref()) {
-                                c.to_string().to_smolstr()
-                            } else {
-                                continue;
-                            };
+                        let Some(sep_pos) = key.iter().position(|&b| b == keys::SEP) else {
+                            error!("invalid key for {did}: {key:?}");
+                            continue;
+                        };
+                        let rkey = std::str::from_utf8(&key[sep_pos + 1..])
+                            .into_diagnostic()?
+                            .to_smolstr();
+                        let cid = if let Ok(c) = cid::Cid::read_bytes(cid_bytes.as_ref()) {
+                            c.to_string().to_smolstr()
+                        } else {
+                            error!("invalid cid for {did}: {cid_bytes:?}");
+                            continue;
+                        };
 
-                            existing_cids.insert((col_name.as_str().into(), rkey), cid);
-                        }
+                        existing_cids.insert((col_name.as_str().into(), rkey), cid);
                     }
                 }
 
