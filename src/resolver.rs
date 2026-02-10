@@ -79,15 +79,16 @@ impl Resolver {
         Ok((pds, handle))
     }
 
-    pub async fn resolve_signing_key(&self, did: &Did<'static>) -> Result<PublicKey<'static>> {
-        if let Some(entry) = self.inner.key_cache.get_async(did).await {
+    pub async fn resolve_signing_key(&self, did: &Did<'_>) -> Result<PublicKey<'static>> {
+        let did = did.clone().into_static();
+        if let Some(entry) = self.inner.key_cache.get_async(&did).await {
             return Ok(entry.get().clone());
         }
 
         let doc_resp = self
             .inner
             .jacquard
-            .resolve_did_doc(did)
+            .resolve_did_doc(&did)
             .await
             .into_diagnostic()?;
         let doc = doc_resp.parse().into_diagnostic()?;
@@ -98,11 +99,7 @@ impl Resolver {
             .ok_or_else(|| NoSigningKeyError(did.clone()))
             .into_diagnostic()?;
 
-        let _ = self
-            .inner
-            .key_cache
-            .put_async(did.clone(), key.clone())
-            .await;
+        let _ = self.inner.key_cache.put_async(did, key.clone()).await;
 
         Ok(key)
     }
