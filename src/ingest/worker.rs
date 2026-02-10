@@ -101,12 +101,13 @@ impl FirehoseWorker {
         state: Arc<AppState>,
         rx: mpsc::UnboundedReceiver<BufferedMessage>,
         verify_signatures: bool,
+        num_shards: usize,
     ) -> Self {
         Self {
             state,
             rx,
             verify_signatures,
-            num_shards: 64,
+            num_shards,
         }
     }
 

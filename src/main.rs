@@ -143,6 +143,7 @@ async fn main() -> miette::Result<()> {
                     state,
                     buffer_rx,
                     matches!(cfg.verify_signatures, SignatureVerification::Full),
+                    cfg.firehose_workers,
                 )
                 .run(handle)
             }

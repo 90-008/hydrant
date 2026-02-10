@@ -54,6 +54,7 @@ pub struct Config {
     pub identity_cache_size: u64,
     pub disable_firehose: bool,
     pub disable_backfill: bool,
+    pub firehose_workers: usize,
 }
 
 impl Config {
@@ -101,6 +102,7 @@ impl Config {
         let identity_cache_size = cfg!("IDENTITY_CACHE_SIZE", 100_000u64);
         let disable_firehose = cfg!("DISABLE_FIREHOSE", false);
         let disable_backfill = cfg!("DISABLE_BACKFILL", false);
+        let firehose_workers = cfg!("FIREHOSE_WORKERS", 64usize);
 
         Ok(Self {
             database_path,
@@ -120,6 +122,7 @@ impl Config {
             identity_cache_size,
             disable_firehose,
             disable_backfill,
+            firehose_workers,
         })
     }
 }
@@ -164,6 +167,7 @@ impl fmt::Display for Config {
             self.disable_lz4_compression
         )?;
         writeln!(f, "  api port:                 {}", self.api_port)?;
+        writeln!(f, "  firehose workers:         {}", self.firehose_workers)?;
         writeln!(f, "  enable debug:             {}", self.enable_debug)?;
         if self.enable_debug {
             writeln!(f, "  debug port:               {}", self.debug_port)?;
