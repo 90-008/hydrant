@@ -203,15 +203,19 @@ impl<'de> Deserialize<'de> for TrimmedDid<'de> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[repr(transparent)]
-pub struct DbTid(u64);
+pub struct DbTid([u8; 8]);
 
 impl DbTid {
-    pub fn new(tid: u64) -> Self {
-        Self(tid)
+    pub fn new_from_bytes(bytes: [u8; 8]) -> Self {
+        Self(bytes)
     }
 
-    pub fn as_u64(&self) -> u64 {
-        self.0
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
     }
 
     pub fn to_tid(&self) -> Tid {
@@ -219,7 +223,7 @@ impl DbTid {
     }
 
     fn to_smolstr(&self) -> SmolStr {
-        let mut i = self.0;
+        let mut i = u64::from_be_bytes(self.0);
         let mut s = SmolStrBuilder::new();
         for _ in 0..13 {
             let c = i & 0x1F;
@@ -235,15 +239,17 @@ impl DbTid {
     }
 }
 
-impl From<&Tid> for DbTid {
-    fn from(tid: &Tid) -> Self {
-        DbTid(jacquard_common::types::tid::s32decode(tid.to_string()))
+pub fn s32decode(s: &str) -> u64 {
+    let mut i: usize = 0;
+    for c in s.chars() {
+        i = i * 32 + S32_CHAR.chars().position(|x| x == c).unwrap();
     }
+    i as u64
 }
 
-impl From<Tid> for DbTid {
-    fn from(tid: Tid) -> Self {
-        DbTid::from(&tid)
+impl From<&Tid> for DbTid {
+    fn from(tid: &Tid) -> Self {
+        DbTid(s32decode(tid.as_str()).to_be_bytes())
     }
 }
 
@@ -277,18 +283,26 @@ impl DbAction {
     }
 }
 
-impl<'a> From<&'a str> for DbAction {
-    fn from(s: &'a str) -> Self {
+impl<'a> TryFrom<&'a str> for DbAction {
+    type Error = miette::Report;
+
+    fn try_from(s: &'a str) -> Result<Self, Self::Error> {
         match s {
-            "create" => DbAction::Create,
-            "update" => DbAction::Update,
-            "delete" => DbAction::Delete,
-            _ => panic!("invalid action: {}", s),
+            "create" => Ok(DbAction::Create),
+            "update" => Ok(DbAction::Update),
+            "delete" => Ok(DbAction::Delete),
+            _ => miette::bail!("invalid action: {}", s),
         }
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+impl Display for DbAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum DbRkey {
     Tid(DbTid),
@@ -298,9 +312,16 @@ pub enum DbRkey {
 impl DbRkey {
     pub fn new(s: &str) -> Self {
         if let Ok(tid) = Tid::new(s) {
-            DbRkey::Tid(DbTid::from(tid))
+            DbRkey::Tid(DbTid::from(&tid))
         } else {
             DbRkey::Str(SmolStr::from(s))
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        match self {
+            DbRkey::Tid(tid) => tid.len(),
+            DbRkey::Str(s) => s.len(),
         }
     }
 
@@ -308,6 +329,13 @@ impl DbRkey {
         match self {
             DbRkey::Tid(tid) => tid.to_smolstr(),
             DbRkey::Str(s) => s.clone(),
+        }
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        match self {
+            DbRkey::Tid(tid) => tid.as_bytes(),
+            DbRkey::Str(s) => s.as_bytes(),
         }
     }
 }

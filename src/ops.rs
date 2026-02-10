@@ -17,7 +17,7 @@ use miette::{Context, IntoDiagnostic, Result};
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
-use tracing::{debug, trace, warn};
+use tracing::{debug, trace};
 
 pub fn persist_to_resync_buffer(db: &Db, did: &Did, commit: &Commit) -> Result<()> {
     let key = keys::resync_buffer_key(did, DbTid::from(&commit.rev));
@@ -231,7 +231,7 @@ pub fn apply_commit<'batch, 'db, 'commit, 's>(
         trace!("signature verified for {did}");
     }
 
-    repo_state.rev = Some(commit.rev.clone().into());
+    repo_state.rev = Some((&commit.rev).into());
     repo_state.data = Some(repo_commit.data);
     repo_state.last_updated_at = chrono::Utc::now().timestamp();
 
@@ -248,13 +248,15 @@ pub fn apply_commit<'batch, 'db, 'commit, 's>(
 
     for op in &commit.ops {
         let (collection, rkey) = parse_path(&op.path)?;
+        let rkey = DbRkey::new(rkey);
         let partition = db.record_partition(collection)?;
-        let db_key = keys::record_key(did, rkey); // removed collection arg
+        let db_key = keys::record_key(did, &rkey);
 
         let event_id = db.next_event_id.fetch_add(1, Ordering::SeqCst);
 
-        match op.action.as_str() {
-            "create" | "update" => {
+        let action = DbAction::try_from(op.action.as_str())?;
+        match action {
+            DbAction::Create | DbAction::Update => {
                 let Some(cid) = &op.cid else {
                     continue;
                 };
@@ -268,20 +270,17 @@ pub fn apply_commit<'batch, 'db, 'commit, 's>(
                 );
 
                 // accumulate counts
-                if op.action.as_str() == "create" {
+                if action == DbAction::Create {
                     records_delta += 1;
                     *collection_deltas.entry(collection).or_default() += 1;
                 }
             }
-            "delete" => {
+            DbAction::Delete => {
                 batch.remove(&partition, db_key);
 
                 // accumulate counts
                 records_delta -= 1;
                 *collection_deltas.entry(collection).or_default() -= 1;
-            }
-            _ => {
-                warn!("{did}/{}: unknown op action '{}'", op.path, op.action);
             }
         }
 
@@ -290,8 +289,8 @@ pub fn apply_commit<'batch, 'db, 'commit, 's>(
             did: TrimmedDid::from(did),
             rev: DbTid::from(&commit.rev),
             collection: CowStr::Borrowed(collection),
-            rkey: DbRkey::new(rkey),
-            action: DbAction::from(op.action.as_str()),
+            rkey,
+            action,
             cid: op.cid.as_ref().map(|c| c.to_ipld().expect("valid cid")),
         };
 

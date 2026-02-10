@@ -1,6 +1,6 @@
 use jacquard_common::types::string::Did;
 
-use crate::db::types::{DbTid, TrimmedDid};
+use crate::db::types::{DbRkey, DbTid, TrimmedDid};
 
 /// separator used for composite keys
 pub const SEP: u8 = b'|';
@@ -14,16 +14,6 @@ pub fn repo_key<'a>(did: &'a Did) -> Vec<u8> {
     vec
 }
 
-// key format: {DID}\x00{RKey} (DID trimmed)
-pub fn record_key(did: &Did, rkey: &str) -> Vec<u8> {
-    let repo = TrimmedDid::from(did);
-    let mut key = Vec::with_capacity(repo.len() + rkey.len() + 1);
-    repo.write_to_vec(&mut key);
-    key.push(SEP);
-    key.extend_from_slice(rkey.as_bytes());
-    key
-}
-
 // prefix format: {DID}\x00 (DID trimmed) - for scanning all records of a DID within a collection
 pub fn record_prefix(did: &Did) -> Vec<u8> {
     let repo = TrimmedDid::from(did);
@@ -33,7 +23,15 @@ pub fn record_prefix(did: &Did) -> Vec<u8> {
     prefix
 }
 
-// key format: {DID}
+// key format: {DID}\x00{rkey} (DID trimmed)
+pub fn record_key(did: &Did, rkey: &DbRkey) -> Vec<u8> {
+    let repo = TrimmedDid::from(did);
+    let mut key = Vec::with_capacity(repo.len() + rkey.len() + 1);
+    repo.write_to_vec(&mut key);
+    key.push(SEP);
+    key.extend_from_slice(rkey.as_bytes());
+    key
+}
 
 // key format: {SEQ}
 pub fn event_key(seq: u64) -> [u8; 8] {
@@ -71,7 +69,7 @@ pub fn resync_buffer_key(did: &Did, rev: DbTid) -> Vec<u8> {
     let mut key = Vec::with_capacity(repo.len() + 1 + 8);
     repo.write_to_vec(&mut key);
     key.push(SEP);
-    key.extend_from_slice(&rev.as_u64().to_be_bytes());
+    key.extend_from_slice(&rev.as_bytes());
     key
 }
 

@@ -457,7 +457,7 @@ impl BackfillWorker {
         let start = Instant::now();
         let mst: Mst<MemoryBlockStore> = Mst::load(store, root_commit.data, None);
         let leaves = mst.leaves().await.into_diagnostic()?;
-        trace!("walked mst for {} in {:?}", did, start.elapsed());
+        trace!("walked mst for {did} in {}", start.elapsed().as_secs_f64());
 
         // 6. insert records into db
         let start = Instant::now();
@@ -475,7 +475,7 @@ impl BackfillWorker {
                 let store = mst.storage();
 
                 let prefix = keys::record_prefix(&did);
-                let mut existing_cids: HashMap<(SmolStr, SmolStr), SmolStr> = HashMap::new();
+                let mut existing_cids: HashMap<(SmolStr, DbRkey), SmolStr> = HashMap::new();
 
                 let mut partitions = Vec::new();
                 app_state.db.record_partitions.iter_sync(|col, ks| {
@@ -486,13 +486,8 @@ impl BackfillWorker {
                 for (col_name, ks) in partitions {
                     for guard in ks.prefix(&prefix) {
                         let (key, cid_bytes) = guard.into_inner().into_diagnostic()?;
-                        let Some(sep_pos) = key.iter().position(|&b| b == keys::SEP) else {
-                            error!("invalid key for {did}: {key:?}");
-                            continue;
-                        };
-                        let rkey = std::str::from_utf8(&key[sep_pos + 1..])
-                            .into_diagnostic()?
-                            .to_smolstr();
+                        let rkey: DbRkey =
+                            rmp_serde::from_slice(&key[prefix.len()..]).into_diagnostic()?;
                         let cid = if let Ok(c) = cid::Cid::read_bytes(cid_bytes.as_ref()) {
                             c.to_string().to_smolstr()
                         } else {
@@ -511,7 +506,8 @@ impl BackfillWorker {
 
                     if let Some(val) = val_bytes {
                         let (collection, rkey) = ops::parse_path(&key)?;
-                        let path = (collection.to_smolstr(), rkey.to_smolstr());
+                        let rkey = DbRkey::new(rkey);
+                        let path = (collection.to_smolstr(), rkey.clone());
                         let cid_obj = Cid::ipld(cid);
                         let partition = app_state.db.record_partition(collection)?;
 
@@ -522,9 +518,9 @@ impl BackfillWorker {
                                     debug!("skip {did}/{collection}/{rkey} ({cid})");
                                     continue; // skip unchanged record
                                 }
-                                ("update", false)
+                                (DbAction::Update, false)
                             } else {
-                                ("create", true)
+                                (DbAction::Create, true)
                             };
                         debug!("{action} {did}/{collection}/{rkey} ({cid})");
 
@@ -544,10 +540,10 @@ impl BackfillWorker {
                         let evt = StoredEvent {
                             live: false,
                             did: TrimmedDid::from(&did),
-                            rev: DbTid::from(rev.clone()),
+                            rev: DbTid::from(&rev),
                             collection: CowStr::Borrowed(collection),
-                            rkey: DbRkey::new(rkey),
-                            action: DbAction::from(action),
+                            rkey,
+                            action,
                             cid: Some(cid_obj.to_ipld().expect("valid cid")),
                         };
                         let bytes = rmp_serde::to_vec(&evt).into_diagnostic()?;
@@ -568,9 +564,9 @@ impl BackfillWorker {
                     let evt = StoredEvent {
                         live: false,
                         did: TrimmedDid::from(&did),
-                        rev: DbTid::from(rev.clone()),
+                        rev: DbTid::from(&rev),
                         collection: CowStr::Borrowed(&collection),
-                        rkey: DbRkey::new(&rkey),
+                        rkey,
                         action: DbAction::Delete,
                         cid: None,
                     };
@@ -582,7 +578,7 @@ impl BackfillWorker {
                 }
 
                 // 6. update data, status is updated in worker shard
-                state.rev = Some(rev.clone().into());
+                state.rev = Some((&rev).into());
                 state.data = Some(root_commit.data);
                 state.last_updated_at = chrono::Utc::now().timestamp();
 

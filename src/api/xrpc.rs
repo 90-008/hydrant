@@ -1,5 +1,5 @@
 use crate::api::{AppState, XrpcResult};
-use crate::db::types::TrimmedDid;
+use crate::db::types::DbRkey;
 use crate::db::{self, Db, keys};
 use axum::{Json, Router, extract::State, http::StatusCode};
 use futures::TryFutureExt;
@@ -82,7 +82,7 @@ pub async fn handle_get_record(
         .record_partition(req.collection.as_str())
         .map_err(|e| internal_error(GetRecord::NSID, e))?;
 
-    let db_key = keys::record_key(&did, req.rkey.0.as_str()); // 2 args
+    let db_key = keys::record_key(&did, &DbRkey::new(req.rkey.0.as_str()));
 
     let cid_bytes = Db::get(partition, db_key)
         .await
@@ -136,16 +136,11 @@ pub async fn handle_list_records(
         .record_partition(req.collection.as_str())
         .map_err(|e| internal_error(ListRecords::NSID, e))?;
 
-    let mut prefix = Vec::new();
-    TrimmedDid::from(&did).write_to_vec(&mut prefix);
-    prefix.push(keys::SEP);
+    let prefix = keys::record_prefix(&did);
 
     let limit = req.limit.unwrap_or(50).min(100) as usize;
     let reverse = req.reverse.unwrap_or(false);
     let blocks_ks = db.blocks.clone();
-
-    let did_str = smol_str::SmolStr::from(did.as_str());
-    let collection_str = smol_str::SmolStr::from(req.collection.as_str());
 
     let (results, cursor) = tokio::task::spawn_blocking(move || {
         let mut results = Vec::new();
@@ -193,29 +188,23 @@ pub async fn handle_list_records(
                 break;
             }
 
-            // key: {TrimmedDid}|{RKey}
-            let key_str = String::from_utf8_lossy(&key);
-            let parts: Vec<&str> = key_str.split(keys::SEP as char).collect();
-            if parts.len() == 2 {
-                let rkey = parts[1];
-                // look up using binary cid bytes from the record
-                if let Ok(Some(block_bytes)) = blocks_ks.get(&cid_bytes) {
-                    let val: Data =
-                        serde_ipld_dagcbor::from_slice(&block_bytes).unwrap_or(Data::Null);
-                    let cid =
-                        Cid::Str(Cid::new(&cid_bytes).into_diagnostic()?.to_cowstr()).into_static();
-                    results.push(RepoRecord {
-                        uri: AtUri::from_parts_owned(
-                            did_str.as_str(),
-                            collection_str.as_str(),
-                            rkey,
-                        )
-                        .into_diagnostic()?,
-                        cid,
-                        value: val.into_static(),
-                        extra_data: Default::default(),
-                    });
-                }
+            let rkey: DbRkey = rmp_serde::from_slice(&key[prefix.len()..]).into_diagnostic()?;
+            // look up using binary cid bytes from the record
+            if let Ok(Some(block_bytes)) = blocks_ks.get(&cid_bytes) {
+                let val: Data = serde_ipld_dagcbor::from_slice(&block_bytes).unwrap_or(Data::Null);
+                let cid =
+                    Cid::Str(Cid::new(&cid_bytes).into_diagnostic()?.to_cowstr()).into_static();
+                results.push(RepoRecord {
+                    uri: AtUri::from_parts_owned(
+                        did.as_str(),
+                        req.collection.as_str(),
+                        rkey.to_smolstr(),
+                    )
+                    .into_diagnostic()?,
+                    cid,
+                    value: val.into_static(),
+                    extra_data: Default::default(),
+                });
             }
         }
         Result::<_, miette::Report>::Ok((results, cursor))
