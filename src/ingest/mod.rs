@@ -4,7 +4,15 @@ use tokio::sync::mpsc;
 pub mod firehose;
 pub mod worker;
 
-pub type BufferedMessage = SubscribeReposMessage<'static>;
+use jacquard::types::did::Did;
+
+#[derive(Debug)]
+pub enum IngestMessage {
+    Firehose(SubscribeReposMessage<'static>),
+    BackfillFinished(Did<'static>),
+}
+
+pub type BufferedMessage = IngestMessage;
 
 pub type BufferTx = mpsc::UnboundedSender<BufferedMessage>;
 #[allow(dead_code)]

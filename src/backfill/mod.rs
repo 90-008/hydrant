@@ -1,9 +1,9 @@
 use crate::db::types::{DbAction, DbRkey, DbTid, TrimmedDid};
 use crate::db::{self, Db, keys, ser_repo_state};
 use crate::ops;
-use crate::state::{AppState, BackfillRx};
+use crate::state::AppState;
 use crate::types::{AccountEvt, BroadcastEvent, RepoState, RepoStatus, ResyncState, StoredEvent};
-use futures::TryFutureExt;
+
 use jacquard::api::com_atproto::sync::get_repo::{GetRepo, GetRepoError};
 use jacquard::error::{ClientError, ClientErrorKind};
 use jacquard::types::cid::Cid;
@@ -24,25 +24,28 @@ use tracing::{debug, error, info, trace, warn};
 
 pub mod manager;
 
+use crate::ingest::{BufferTx, IngestMessage};
+
 pub struct BackfillWorker {
     state: Arc<AppState>,
-    rx: BackfillRx,
+    buffer_tx: BufferTx,
     http: reqwest::Client,
     semaphore: Arc<Semaphore>,
     verify_signatures: bool,
+    in_flight: Arc<scc::HashSet<Did<'static>>>,
 }
 
 impl BackfillWorker {
     pub fn new(
         state: Arc<AppState>,
-        rx: BackfillRx,
+        buffer_tx: BufferTx,
         timeout: Duration,
         concurrency_limit: usize,
         verify_signatures: bool,
     ) -> Self {
         Self {
             state,
-            rx,
+            buffer_tx,
             http: reqwest::Client::builder()
                 .timeout(timeout)
                 .zstd(true)
@@ -52,38 +55,97 @@ impl BackfillWorker {
                 .expect("failed to build http client"),
             semaphore: Arc::new(Semaphore::new(concurrency_limit)),
             verify_signatures,
+            in_flight: Arc::new(scc::HashSet::new()),
         }
     }
+}
 
-    pub async fn run(mut self) {
+struct InFlightGuard {
+    did: Did<'static>,
+    set: Arc<scc::HashSet<Did<'static>>>,
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        let _ = self.set.remove_sync(&self.did);
+    }
+}
+
+impl BackfillWorker {
+    pub async fn run(self) {
         info!("backfill worker started");
-        while let Some(did) = self.rx.recv().await {
-            let permit = self
-                .semaphore
-                .clone()
-                .acquire_owned()
-                .await
-                .expect("semaphore closed");
+        loop {
+            let mut spawned = 0;
 
-            tokio::spawn(
-                Self::process_did_wrapper(
-                    self.state.clone(),
-                    self.http.clone(),
-                    did.clone(),
-                    permit,
-                    self.verify_signatures,
-                )
-                .inspect_err(move |e| {
-                    error!("backfill process failed for {did}: {e}");
-                    db::check_poisoned_report(e);
-                }),
-            );
+            for guard in self.state.db.pending.iter() {
+                let key = match guard.key() {
+                    Ok(k) => k,
+                    Err(e) => {
+                        error!("failed to read pending key: {e}");
+                        db::check_poisoned(&e);
+                        continue;
+                    }
+                };
+
+                let did = match TrimmedDid::try_from(key.as_ref()) {
+                    Ok(d) => d.to_did(),
+                    Err(e) => {
+                        error!("invalid did in pending: {e}");
+                        continue;
+                    }
+                };
+
+                if self.in_flight.contains_sync(&did) {
+                    continue;
+                }
+                let _ = self.in_flight.insert_sync(did.clone().into_static());
+
+                let permit = match self.semaphore.clone().try_acquire_owned() {
+                    Ok(p) => p,
+                    Err(_) => break,
+                };
+
+                let guard = InFlightGuard {
+                    did: did.clone().into_static(),
+                    set: self.in_flight.clone(),
+                };
+
+                let state = self.state.clone();
+                let http = self.http.clone();
+                let buffer_tx_clone = self.buffer_tx.clone();
+                let did_clone = did.clone();
+                let verify = self.verify_signatures;
+
+                tokio::spawn(async move {
+                    let _guard = guard;
+                    Self::process_did_wrapper(
+                        state,
+                        http,
+                        buffer_tx_clone,
+                        did_clone.clone(),
+                        permit,
+                        verify,
+                    )
+                    .await
+                    .inspect_err(move |e| {
+                        error!("backfill process failed for {did_clone}: {e}");
+                        db::check_poisoned_report(e);
+                    })
+                });
+
+                spawned += 1;
+            }
+
+            if spawned == 0 {
+                self.state.backfill_notify.notified().await;
+            }
         }
     }
 
     async fn process_did_wrapper(
         state: Arc<AppState>,
         http: reqwest::Client,
+        buffer_tx: BufferTx,
         did: Did<'static>,
         _permit: tokio::sync::OwnedSemaphorePermit,
         verify_signatures: bool,
@@ -132,6 +194,11 @@ impl BackfillWorker {
                 })
                 .await
                 .into_diagnostic()??;
+
+                // Notify completion to worker shard
+                if let Err(e) = buffer_tx.send(IngestMessage::BackfillFinished(did.clone())) {
+                    error!("failed to send BackfillFinished for {did}: {e}");
+                }
             }
             Err(e) => {
                 let mut was_ratelimited = false;
@@ -232,8 +299,8 @@ impl BackfillWorker {
             }
         }
 
-        // unblock buffer processing for this DID
-        state.blocked_dids.remove_async(&did).await;
+        // wake worker to pick up more
+        state.backfill_notify.notify_one();
         Ok(())
     }
 
@@ -512,8 +579,7 @@ impl BackfillWorker {
                     count += 1;
                 }
 
-                // 6. update status to synced
-                state.status = RepoStatus::Synced;
+                // 6. update data, status is updated in worker shard
                 state.rev = Some(rev.clone().into());
                 state.data = Some(root_commit.data);
                 state.last_updated_at = chrono::Utc::now().timestamp();

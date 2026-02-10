@@ -1,42 +1,35 @@
 use std::sync::atomic::AtomicI64;
 
-use jacquard_common::types::string::Did;
-use tokio::sync::mpsc;
-
 use miette::Result;
+use tokio::sync::Notify;
 
 use crate::{config::Config, db::Db, resolver::Resolver};
 
-pub type BackfillTx = mpsc::UnboundedSender<Did<'static>>;
-pub type BackfillRx = mpsc::UnboundedReceiver<Did<'static>>;
-
 pub struct AppState {
     pub db: Db,
-    pub backfill_tx: BackfillTx,
     pub resolver: Resolver,
     pub cur_firehose: AtomicI64,
-    pub blocked_dids: scc::HashSet<Did<'static>>,
+    pub backfill_notify: Notify,
 }
 
 impl AppState {
-    pub fn new(config: &Config) -> Result<(Self, BackfillRx)> {
+    pub fn new(config: &Config) -> Result<Self> {
         let db = Db::open(
             &config.database_path,
             config.cache_size,
             config.disable_lz4_compression,
         )?;
         let resolver = Resolver::new(config.plc_url.clone(), config.identity_cache_size);
-        let (backfill_tx, backfill_rx) = mpsc::unbounded_channel();
 
-        Ok((
-            Self {
-                db,
-                backfill_tx,
-                resolver,
-                cur_firehose: AtomicI64::new(0),
-                blocked_dids: scc::HashSet::new(),
-            },
-            backfill_rx,
-        ))
+        Ok(Self {
+            db,
+            resolver,
+            cur_firehose: AtomicI64::new(0),
+            backfill_notify: Notify::new(),
+        })
+    }
+
+    pub fn notify_backfill(&self) {
+        self.backfill_notify.notify_one();
     }
 }

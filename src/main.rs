@@ -24,20 +24,9 @@ async fn main() -> miette::Result<()> {
 
     info!("{cfg}");
 
-    let (state, backfill_rx) = AppState::new(&cfg)?;
+    let state = AppState::new(&cfg)?;
     let (buffer_tx, buffer_rx) = mpsc::unbounded_channel();
     let state = Arc::new(state);
-
-    tokio::spawn(
-        api::serve(state.clone(), cfg.api_port).inspect_err(|e| error!("API server failed: {e}")),
-    );
-
-    if cfg.enable_debug {
-        tokio::spawn(
-            api::serve_debug(state.clone(), cfg.debug_port)
-                .inspect_err(|e| error!("debug server failed: {e}")),
-        );
-    }
 
     if !cfg.disable_backfill {
         tokio::spawn({
@@ -45,7 +34,7 @@ async fn main() -> miette::Result<()> {
             let timeout = cfg.repo_fetch_timeout;
             BackfillWorker::new(
                 state,
-                backfill_rx,
+                buffer_tx.clone(),
                 timeout,
                 cfg.backfill_concurrency_limit,
                 matches!(
@@ -55,17 +44,6 @@ async fn main() -> miette::Result<()> {
             )
             .run()
         });
-    }
-
-    if let Err(e) = spawn_blocking({
-        let state = state.clone();
-        move || hydrant::backfill::manager::queue_pending_backfills(&state)
-    })
-    .await
-    .into_diagnostic()?
-    {
-        error!("failed to queue pending backfills: {e}");
-        db::check_poisoned_report(&e);
     }
 
     if let Err(e) = spawn_blocking({
@@ -156,7 +134,7 @@ async fn main() -> miette::Result<()> {
         );
     }
 
-    let tasks = if !cfg.disable_firehose {
+    let mut tasks = if !cfg.disable_firehose {
         let firehose_worker = std::thread::spawn({
             let state = state.clone();
             let handle = tokio::runtime::Handle::current();
@@ -195,6 +173,22 @@ async fn main() -> miette::Result<()> {
         // essentially we just want to keep the main thread alive for the other components
         vec![Box::pin(futures::future::pending::<miette::Result<()>>()) as BoxFuture<_>]
     };
+
+    let state_api = state.clone();
+    tasks.push(Box::pin(async move {
+        api::serve(state_api, cfg.api_port)
+            .await
+            .map_err(|e| miette::miette!("API server failed: {e}"))
+    }) as BoxFuture<_>);
+
+    if cfg.enable_debug {
+        let state_debug = state.clone();
+        tasks.push(Box::pin(async move {
+            api::serve_debug(state_debug, cfg.debug_port)
+                .await
+                .map_err(|e| miette::miette!("debug server failed: {e}"))
+        }) as BoxFuture<_>);
+    }
 
     let res = futures::future::select_all(tasks);
     if let (Err(e), _, _) = res.await {

@@ -7,34 +7,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, error, info};
 
-pub fn queue_pending_backfills(state: &AppState) -> Result<()> {
-    info!("scanning for pending backfills...");
-    let mut count = 0;
-
-    for guard in state.db.pending.iter() {
-        let key = guard.key().into_diagnostic()?;
-        let did = match TrimmedDid::try_from(key.as_ref()) {
-            Ok(did) => did.to_did(),
-            Err(e) => {
-                error!("invalid did in db, skipping: {e}");
-                continue;
-            }
-        };
-
-        debug!("queuing did {did}");
-        if let Err(e) = state.backfill_tx.send(did.clone()) {
-            error!("failed to queue pending backfill for did:{did}: {e}");
-        } else {
-            count += 1;
-        }
-    }
-
-    info!("queued {count} pending backfills");
-    Ok(())
-}
-
 pub fn queue_gone_backfills(state: &Arc<AppState>) -> Result<()> {
-    info!("scanning for deactivated/takendown repos to retry...");
+    debug!("scanning for deactivated/takendown repos to retry...");
     let mut count = 0;
 
     for guard in state.db.resync.iter() {
@@ -49,7 +23,7 @@ pub fn queue_gone_backfills(state: &Arc<AppState>) -> Result<()> {
 
         if let Ok(resync_state) = rmp_serde::from_slice::<ResyncState>(&val) {
             if matches!(resync_state, ResyncState::Gone { .. }) {
-                info!("queuing retry for gone repo: {did}");
+                debug!("queuing retry for gone repo: {did}");
 
                 // move back to pending
                 let mut batch = state.db.inner.batch();
@@ -64,13 +38,12 @@ pub fn queue_gone_backfills(state: &Arc<AppState>) -> Result<()> {
                     batch.insert(&state.db.repos, &repo_key, ser_repo_state(&repo_state)?);
                 }
 
+                state.db.update_count("resync", -1);
+                state.db.update_count("pending", 1);
                 batch.commit().into_diagnostic()?;
 
-                if let Err(e) = state.backfill_tx.send(did.clone()) {
-                    error!("failed to queue retry for {did}: {e}");
-                } else {
-                    count += 1;
-                }
+                state.notify_backfill();
+                count += 1;
             }
         }
     }
@@ -110,21 +83,18 @@ pub fn retry_worker(state: Arc<AppState>) {
                 rmp_serde::from_slice::<ResyncState>(&value)
             {
                 if next_retry <= now {
-                    info!("retrying backfill for {did}");
+                    debug!("retrying backfill for {did}");
 
                     // move back to pending
+                    state.db.update_count("pending", 1);
                     if let Err(e) = db.pending.insert(key, Vec::new()) {
                         error!("failed to move {did} to pending: {e}");
                         db::check_poisoned(&e);
                         continue;
                     }
 
-                    // queue
-                    if let Err(e) = state.backfill_tx.send(did.clone()) {
-                        error!("failed to queue retry for {did}: {e}");
-                    } else {
-                        count += 1;
-                    }
+                    state.notify_backfill();
+                    count += 1;
                 }
             }
         }

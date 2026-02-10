@@ -1,6 +1,5 @@
 use crate::db::types::{DbAction, DbRkey, DbTid, TrimmedDid};
 use crate::db::{self, Db, keys, ser_repo_state};
-use crate::state::AppState;
 use crate::types::{
     AccountEvt, BroadcastEvent, IdentityEvt, MarshallableEvt, RepoState, RepoStatus, ResyncState,
     StoredEvent,
@@ -10,6 +9,7 @@ use jacquard::CowStr;
 use jacquard::IntoStatic;
 
 use jacquard::types::cid::Cid;
+use jacquard::types::did::Did;
 use jacquard_api::com_atproto::sync::subscribe_repos::Commit;
 use jacquard_common::types::crypto::PublicKey;
 use jacquard_repo::car::reader::parse_car_bytes;
@@ -19,13 +19,20 @@ use std::sync::atomic::Ordering;
 use std::time::Instant;
 use tracing::{debug, trace, warn};
 
-pub fn send_backfill_req(state: &AppState, did: jacquard::types::did::Did<'static>) -> Result<()> {
-    state
-        .backfill_tx
-        .send(did.clone())
-        .map_err(|_| miette::miette!("failed to send backfill request for {did}"))?;
-    let _ = state.blocked_dids.insert_sync(did);
+pub fn persist_to_resync_buffer(db: &Db, did: &Did, commit: &Commit) -> Result<()> {
+    let key = keys::resync_buffer_key(did, DbTid::from(&commit.rev));
+    let value = rmp_serde::to_vec(commit).into_diagnostic()?;
+    db.resync_buffer.insert(key, value).into_diagnostic()?;
+    debug!(
+        "buffered commit seq {} for {did} to resync_buffer",
+        commit.seq
+    );
     Ok(())
+}
+
+pub fn has_buffered_commits(db: &Db, did: &Did) -> bool {
+    let prefix = keys::resync_buffer_prefix(did);
+    db.resync_buffer.prefix(&prefix).next().is_some()
 }
 
 // emitting identity is ephemeral
@@ -66,6 +73,12 @@ pub fn delete_repo<'batch>(
     batch.remove(&db.repos, &repo_key);
     batch.remove(&db.pending, &repo_key);
     batch.remove(&db.resync, &repo_key);
+
+    let resync_prefix = keys::resync_buffer_prefix(did);
+    for guard in db.resync_buffer.prefix(&resync_prefix) {
+        let k = guard.key().into_diagnostic()?;
+        batch.remove(&db.resync_buffer, k);
+    }
 
     // 2. delete from records (all partitions)
     let mut partitions = Vec::new();
@@ -151,6 +164,7 @@ pub fn update_repo_status<'batch, 's>(
 
     Ok(repo_state)
 }
+
 pub fn verify_sync_event(blocks: &[u8], key: Option<&PublicKey>) -> Result<(Cid<'static>, String)> {
     let parsed = tokio::task::block_in_place(|| {
         tokio::runtime::Handle::current()

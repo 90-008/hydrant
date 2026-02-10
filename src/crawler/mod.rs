@@ -1,5 +1,4 @@
 use crate::db::{Db, keys, ser_repo_state};
-use crate::ops::send_backfill_req;
 use crate::state::AppState;
 use crate::types::RepoState;
 use jacquard::api::com_atproto::sync::list_repos::{ListRepos, ListReposOutput};
@@ -120,9 +119,9 @@ impl Crawler {
                 self.state.db.update_count_async("pending", count).await;
             }
 
-            // 5. queue for backfill
-            for did in to_queue {
-                send_backfill_req(&self.state, did)?;
+            // 5. notify backfill worker
+            if !to_queue.is_empty() {
+                self.state.notify_backfill();
             }
 
             if cursor.is_none() {

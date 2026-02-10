@@ -1,5 +1,5 @@
 use crate::db::{self, Db, keys};
-use crate::ingest::BufferTx;
+use crate::ingest::{BufferTx, IngestMessage};
 use crate::state::AppState;
 use jacquard::api::com_atproto::sync::subscribe_repos::{SubscribeRepos, SubscribeReposMessage};
 use jacquard::types::did::Did;
@@ -17,7 +17,7 @@ pub struct FirehoseIngestor {
     buffer_tx: BufferTx,
     relay_host: Url,
     full_network: bool,
-    verify_signatures: bool,
+    _verify_signatures: bool,
 }
 
 impl FirehoseIngestor {
@@ -33,7 +33,7 @@ impl FirehoseIngestor {
             buffer_tx,
             relay_host,
             full_network,
-            verify_signatures,
+            _verify_signatures: verify_signatures,
         }
     }
 
@@ -114,7 +114,7 @@ impl FirehoseIngestor {
         //     });
         // }
 
-        if let Err(e) = self.buffer_tx.send(msg) {
+        if let Err(e) = self.buffer_tx.send(IngestMessage::Firehose(msg)) {
             error!("failed to send message to buffer processor: {e}");
         }
     }

@@ -1,6 +1,5 @@
 use crate::api::AppState;
 use crate::db::{Db, keys, ser_repo_state};
-use crate::ops::send_backfill_req;
 use crate::types::RepoState;
 use axum::{Json, Router, extract::State, http::StatusCode, routing::post};
 use jacquard::types::did::Did;
@@ -25,7 +24,6 @@ pub async fn handle_repo_add(
     let db = &state.db;
     let mut batch = db.inner.batch();
     let mut added = 0;
-    let mut to_backfill = Vec::new();
 
     for did_str in req.dids {
         let did = Did::new_owned(did_str.as_str())
@@ -43,10 +41,6 @@ pub async fn handle_repo_add(
             batch.insert(&db.pending, &did_key, Vec::new());
 
             added += 1;
-
-            let jacquard_did = Did::new_owned(did.as_str())
-                .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
-            to_backfill.push(jacquard_did);
         }
     }
 
@@ -55,14 +49,12 @@ pub async fn handle_repo_add(
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
         state.db.update_count_async("repos", added).await;
         state.db.update_count_async("pending", added).await;
 
-        // trigger backfill
-        for did in to_backfill {
-            send_backfill_req(&state, did)
-                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-        }
+        // trigger backfill worker
+        state.notify_backfill();
     }
     Ok(StatusCode::OK)
 }
