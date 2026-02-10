@@ -63,7 +63,7 @@ async fn main() -> Result<()> {
         .into_diagnostic()?;
 
     let req = GetRepo::new().did(did.clone()).build();
-    let resp = http.xrpc(pds_url).send(&req).await.into_diagnostic()?;
+    let resp = http.xrpc(pds_url).send(&req).await?;
     let car_bytes = resp.into_output().map_err(|e| miette::miette!("{}", e))?; // explicit map_err
 
     info!("Fetched {} bytes", car_bytes.body.len());

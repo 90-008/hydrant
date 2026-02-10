@@ -357,7 +357,7 @@ impl BackfillWorker {
         // 2. fetch repo (car)
         let start = Instant::now();
         let req = GetRepo::new().did(did.clone()).build();
-        let resp = http.xrpc(pds_url).send(&req).await.into_diagnostic()?;
+        let resp = http.xrpc(pds_url).send(&req).await?;
 
         let car_bytes = match resp.into_output() {
             Ok(o) => o,

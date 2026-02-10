@@ -49,25 +49,15 @@ impl Resolver {
         match identifier {
             AtIdentifier::Did(did) => Ok(did.clone().into_static()),
             AtIdentifier::Handle(handle) => {
-                let did = self
-                    .inner
-                    .jacquard
-                    .resolve_handle(handle)
-                    .await
-                    .into_diagnostic()?;
+                let did = self.inner.jacquard.resolve_handle(handle).await?;
                 Ok(did.into_static())
             }
         }
     }
 
     pub async fn resolve_identity_info(&self, did: &Did<'_>) -> Result<(Url, Option<Handle<'_>>)> {
-        let doc_resp = self
-            .inner
-            .jacquard
-            .resolve_did_doc(did)
-            .await
-            .into_diagnostic()?;
-        let doc = doc_resp.parse().into_diagnostic()?;
+        let doc_resp = self.inner.jacquard.resolve_did_doc(did).await?;
+        let doc = doc_resp.parse()?;
 
         let pds = doc
             .pds_endpoint()
@@ -85,17 +75,11 @@ impl Resolver {
             return Ok(entry.get().clone());
         }
 
-        let doc_resp = self
-            .inner
-            .jacquard
-            .resolve_did_doc(&did)
-            .await
-            .into_diagnostic()?;
-        let doc = doc_resp.parse().into_diagnostic()?;
+        let doc_resp = self.inner.jacquard.resolve_did_doc(&did).await?;
+        let doc = doc_resp.parse()?;
 
         let key = doc
-            .atproto_public_key()
-            .into_diagnostic()?
+            .atproto_public_key()?
             .ok_or_else(|| NoSigningKeyError(did.clone()))
             .into_diagnostic()?;
 
