@@ -1,6 +1,6 @@
 use jacquard_common::types::string::Did;
 
-use crate::db::types::TrimmedDid;
+use crate::db::types::{DbTid, TrimmedDid};
 
 /// separator used for composite keys
 pub const SEP: u8 = b'|';
@@ -53,7 +53,7 @@ pub fn count_keyspace_key(name: &str) -> Vec<u8> {
 
 pub const COUNT_COLLECTION_PREFIX: &[u8] = &[b'r', SEP];
 
-// key format: r\x00{DID}\x00{collection} (DID trimmed)
+// key format: r|{DID}|{collection} (DID trimmed)
 pub fn count_collection_key(did: &Did, collection: &str) -> Vec<u8> {
     let repo = TrimmedDid::from(did);
     let mut key =
@@ -63,4 +63,23 @@ pub fn count_collection_key(did: &Did, collection: &str) -> Vec<u8> {
     key.push(SEP);
     key.extend_from_slice(collection.as_bytes());
     key
+}
+
+// key format: {DID}|{rev}
+pub fn resync_buffer_key(did: &Did, rev: DbTid) -> Vec<u8> {
+    let repo = TrimmedDid::from(did);
+    let mut key = Vec::with_capacity(repo.len() + 1 + 8);
+    repo.write_to_vec(&mut key);
+    key.push(SEP);
+    key.extend_from_slice(&rev.as_u64().to_be_bytes());
+    key
+}
+
+// prefix format: {DID}| (DID trimmed)
+pub fn resync_buffer_prefix(did: &Did) -> Vec<u8> {
+    let repo = TrimmedDid::from(did);
+    let mut prefix = Vec::with_capacity(repo.len() + 1);
+    repo.write_to_vec(&mut prefix);
+    prefix.push(SEP);
+    prefix
 }

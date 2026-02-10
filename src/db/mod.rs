@@ -33,6 +33,7 @@ pub struct Db {
     pub cursors: Keyspace,
     pub pending: Keyspace,
     pub resync: Keyspace,
+    pub resync_buffer: Keyspace,
     pub events: Keyspace,
     pub counts: Keyspace,
     pub event_tx: broadcast::Sender<BroadcastEvent>,
@@ -74,6 +75,7 @@ impl Db {
         let cursors = open_ks("cursors", opts().expect_point_read_hits(true))?;
         let pending = open_ks("pending", opts())?;
         let resync = open_ks("resync", opts())?;
+        let resync_buffer = open_ks("resync_buffer", opts())?;
         let events = open_ks("events", opts())?;
         let counts = open_ks("counts", opts().expect_point_read_hits(true))?;
 
@@ -124,6 +126,7 @@ impl Db {
             cursors,
             pending,
             resync,
+            resync_buffer,
             events,
             counts,
             event_tx,
