@@ -1,4 +1,3 @@
-use std::fmt::Display;
 use std::ops::Not;
 use std::sync::Arc;
 use std::time::Duration;
@@ -10,8 +9,9 @@ use jacquard_common::types::ident::AtIdentifier;
 use jacquard_common::types::string::Did;
 use jacquard_identity::JacquardResolver;
 use jacquard_identity::resolver::{IdentityResolver, PlcSource, ResolverOptions};
-use miette::{IntoDiagnostic, Result};
+use miette::{Diagnostic, IntoDiagnostic, Result};
 use scc::HashCache;
+use thiserror::Error;
 use url::Url;
 
 struct ResolverInner {
@@ -89,13 +89,6 @@ impl Resolver {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Diagnostic, Error)]
+#[error("no atproto signing key in DID doc for {0}")]
 pub struct NoSigningKeyError(Did<'static>);
-
-impl Display for NoSigningKeyError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "no atproto signing key in DID doc for {}", self.0)
-    }
-}
-
-impl std::error::Error for NoSigningKeyError {}
