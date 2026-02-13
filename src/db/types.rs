@@ -202,8 +202,7 @@ impl<'de> Deserialize<'de> for TrimmedDid<'de> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[repr(transparent)]
-pub struct DbTid([u8; 8]);
+pub struct DbTid(#[serde(with = "serde_bytes")] [u8; 8]);
 
 impl DbTid {
     pub fn new_from_bytes(bytes: [u8; 8]) -> Self {
@@ -329,13 +328,6 @@ impl DbRkey {
         match self {
             DbRkey::Tid(tid) => tid.to_smolstr(),
             DbRkey::Str(s) => s.clone(),
-        }
-    }
-
-    pub fn as_bytes(&self) -> &[u8] {
-        match self {
-            DbRkey::Tid(tid) => tid.as_bytes(),
-            DbRkey::Str(s) => s.as_bytes(),
         }
     }
 }

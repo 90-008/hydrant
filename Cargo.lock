@@ -1641,6 +1641,7 @@ dependencies = [
  "rmp-serde",
  "scc",
  "serde",
+ "serde_bytes",
  "serde_ipld_dagcbor",
  "serde_json",
  "smallvec 2.0.0-alpha.12",
