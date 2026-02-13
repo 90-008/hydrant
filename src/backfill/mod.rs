@@ -506,14 +506,11 @@ async fn process_did<'i>(
             for (col_name, ks) in partitions {
                 for guard in ks.prefix(&prefix) {
                     let (key, cid_bytes) = guard.into_inner().into_diagnostic()?;
-                    let rkey: DbRkey =
-                        rmp_serde::from_slice(&key[prefix.len()..]).into_diagnostic()?;
-                    let cid = if let Ok(c) = cid::Cid::read_bytes(cid_bytes.as_ref()) {
-                        c.to_string().to_smolstr()
-                    } else {
-                        error!("invalid cid for {did}: {cid_bytes:?}");
-                        continue;
-                    };
+                    let rkey = keys::parse_rkey(&key[prefix.len()..])
+                        .map_err(|e| miette::miette!("invalid rkey '{key:?}' for {did}: {e}"))?;
+                    let cid = cid::Cid::read_bytes(cid_bytes.as_ref())
+                        .map_err(|e| miette::miette!("invalid cid '{cid_bytes:?}' for {did}: {e}"))?
+                        .to_smolstr();
 
                     existing_cids.insert((col_name.as_str().into(), rkey), cid);
                 }

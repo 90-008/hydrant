@@ -1,4 +1,5 @@
 use jacquard_common::types::string::Did;
+use smol_str::SmolStr;
 
 use crate::db::types::{DbRkey, DbTid, TrimmedDid};
 
@@ -7,14 +8,14 @@ pub const SEP: u8 = b'|';
 
 pub const CURSOR_KEY: &[u8] = b"firehose_cursor";
 
-// Key format: {DID} (trimmed)
+// Key format: {DID}
 pub fn repo_key<'a>(did: &'a Did) -> Vec<u8> {
     let mut vec = Vec::with_capacity(32);
     TrimmedDid::from(did).write_to_vec(&mut vec);
     vec
 }
 
-// prefix format: {DID}\x00 (DID trimmed) - for scanning all records of a DID within a collection
+// prefix format: {DID}\x00
 pub fn record_prefix(did: &Did) -> Vec<u8> {
     let repo = TrimmedDid::from(did);
     let mut prefix = Vec::with_capacity(repo.len() + 1);
@@ -23,14 +24,46 @@ pub fn record_prefix(did: &Did) -> Vec<u8> {
     prefix
 }
 
-// key format: {DID}\x00{rkey} (DID trimmed)
+// key format: {DID}\x00{rkey}
 pub fn record_key(did: &Did, rkey: &DbRkey) -> Vec<u8> {
     let repo = TrimmedDid::from(did);
     let mut key = Vec::with_capacity(repo.len() + rkey.len() + 1);
     repo.write_to_vec(&mut key);
     key.push(SEP);
-    key.extend_from_slice(rkey.as_bytes());
+    write_rkey(&mut key, rkey);
     key
+}
+
+pub fn write_rkey(buf: &mut Vec<u8>, rkey: &DbRkey) {
+    match rkey {
+        DbRkey::Tid(tid) => {
+            buf.push(b't');
+            buf.extend_from_slice(tid.as_bytes());
+        }
+        DbRkey::Str(s) => {
+            buf.push(b's');
+            buf.extend_from_slice(s.as_bytes());
+        }
+    }
+}
+
+pub fn parse_rkey(raw: &[u8]) -> miette::Result<DbRkey> {
+    let Some(kind) = raw.first() else {
+        miette::bail!("record key is empty");
+    };
+    let rkey = match kind {
+        b't' => {
+            DbRkey::Tid(DbTid::new_from_bytes(raw[1..].try_into().map_err(|e| {
+                miette::miette!("record key '{raw:?}' is invalid: {e}")
+            })?))
+        }
+        b's' => DbRkey::Str(SmolStr::new(
+            std::str::from_utf8(&raw[1..])
+                .map_err(|e| miette::miette!("record key '{raw:?}' is invalid: {e}"))?,
+        )),
+        _ => miette::bail!("invalid record key kind: {}", *kind as char),
+    };
+    Ok(rkey)
 }
 
 // key format: {SEQ}

@@ -180,24 +180,12 @@ pub async fn handle_list_records(
             if !key.starts_with(prefix.as_slice()) {
                 break;
             }
+
+            let rkey = keys::parse_rkey(&key[prefix.len()..])?;
             if results.len() >= limit {
-                let key_str = String::from_utf8_lossy(&key);
-                if let Some(last_part) = key_str.split(keys::SEP as char).last() {
-                    cursor = Some(smol_str::SmolStr::from(last_part));
-                }
+                cursor = Some(rkey);
                 break;
             }
-
-            // manual deserialization of the key suffix since it is raw bytes, not msgpack
-            let suffix = &key[prefix.len()..];
-            let rkey = if suffix.len() == 8 {
-                let mut bytes = [0u8; 8];
-                bytes.copy_from_slice(suffix);
-                DbRkey::Tid(crate::db::types::DbTid::new_from_bytes(bytes))
-            } else {
-                let s = String::from_utf8_lossy(suffix);
-                DbRkey::Str(smol_str::SmolStr::from(s.as_ref()))
-            };
 
             // look up using binary cid bytes from the record
             if let Ok(Some(block_bytes)) = blocks_ks.get(&cid_bytes) {
@@ -225,7 +213,7 @@ pub async fn handle_list_records(
 
     Ok(Json(ListRecordsOutput {
         records: results,
-        cursor: cursor.map(|c| c.into()),
+        cursor: cursor.map(|c| jacquard::CowStr::Owned(c.to_smolstr())),
         extra_data: Default::default(),
     }))
 }
