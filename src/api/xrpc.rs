@@ -188,7 +188,17 @@ pub async fn handle_list_records(
                 break;
             }
 
-            let rkey: DbRkey = rmp_serde::from_slice(&key[prefix.len()..]).into_diagnostic()?;
+            // manual deserialization of the key suffix since it is raw bytes, not msgpack
+            let suffix = &key[prefix.len()..];
+            let rkey = if suffix.len() == 8 {
+                let mut bytes = [0u8; 8];
+                bytes.copy_from_slice(suffix);
+                DbRkey::Tid(crate::db::types::DbTid::new_from_bytes(bytes))
+            } else {
+                let s = String::from_utf8_lossy(suffix);
+                DbRkey::Str(smol_str::SmolStr::from(s.as_ref()))
+            };
+
             // look up using binary cid bytes from the record
             if let Ok(Some(block_bytes)) = blocks_ks.get(&cid_bytes) {
                 let val: Data = serde_ipld_dagcbor::from_slice(&block_bytes).unwrap_or(Data::Null);
