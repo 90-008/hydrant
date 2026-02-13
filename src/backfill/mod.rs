@@ -12,14 +12,14 @@ use jacquard::{CowStr, IntoStatic, prelude::*};
 use jacquard_common::xrpc::XrpcError;
 use jacquard_repo::mst::Mst;
 use jacquard_repo::{BlockStore, MemoryBlockStore};
-use miette::{IntoDiagnostic, Result};
+use miette::{Diagnostic, IntoDiagnostic, Result};
 use reqwest::StatusCode;
 use smol_str::{SmolStr, ToSmolStr};
 use std::collections::HashMap;
-use std::fmt::Display;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
+use thiserror::Error;
 use tokio::sync::Semaphore;
 use tracing::{debug, error, info, trace, warn};
 
@@ -293,9 +293,13 @@ async fn did_task(
     Ok(())
 }
 
+#[derive(Debug, Diagnostic, Error)]
 enum BackfillError {
+    #[error("{0}")]
     Generic(miette::Report),
+    #[error("too many requests")]
     Ratelimited,
+    #[error("transport error: {0}")]
     Transport(SmolStr),
 }
 
@@ -318,16 +322,6 @@ impl From<ClientError> for BackfillError {
 impl From<miette::Report> for BackfillError {
     fn from(e: miette::Report) -> Self {
         Self::Generic(e)
-    }
-}
-
-impl Display for BackfillError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            BackfillError::Generic(e) => e.fmt(f),
-            BackfillError::Ratelimited => write!(f, "too many requests"),
-            BackfillError::Transport(reason) => write!(f, "transport error: {reason}"),
-        }
     }
 }
 
