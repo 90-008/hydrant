@@ -16,6 +16,7 @@ use miette::{IntoDiagnostic, Result};
 use reqwest::StatusCode;
 use smol_str::{SmolStr, ToSmolStr};
 use std::collections::HashMap;
+use std::fmt::Display;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
@@ -118,7 +119,7 @@ impl BackfillWorker {
 
                 tokio::spawn(async move {
                     let _guard = guard;
-                    Self::process_did_wrapper(
+                    did_task(
                         state,
                         http,
                         buffer_tx_clone,
@@ -141,489 +142,512 @@ impl BackfillWorker {
             }
         }
     }
+}
 
-    async fn process_did_wrapper(
-        state: Arc<AppState>,
-        http: reqwest::Client,
-        buffer_tx: BufferTx,
-        did: Did<'static>,
-        _permit: tokio::sync::OwnedSemaphorePermit,
-        verify_signatures: bool,
-    ) -> Result<()> {
-        let db = &state.db;
+async fn did_task(
+    state: Arc<AppState>,
+    http: reqwest::Client,
+    buffer_tx: BufferTx,
+    did: Did<'static>,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+    verify_signatures: bool,
+) -> Result<()> {
+    let db = &state.db;
 
-        match Self::process_did(&state, &http, &did, verify_signatures).await {
-            Ok(previous_state) => {
-                let did_key = keys::repo_key(&did);
+    match process_did(&state, &http, &did, verify_signatures).await {
+        Ok(previous_state) => {
+            let did_key = keys::repo_key(&did);
 
-                let was_pending = matches!(previous_state.status, RepoStatus::Backfilling);
-                let was_resync = matches!(
-                    previous_state.status,
-                    RepoStatus::Error(_)
-                        | RepoStatus::Deactivated
-                        | RepoStatus::Takendown
-                        | RepoStatus::Suspended
-                );
+            let was_pending = matches!(previous_state.status, RepoStatus::Backfilling);
+            let was_resync = matches!(
+                previous_state.status,
+                RepoStatus::Error(_)
+                    | RepoStatus::Deactivated
+                    | RepoStatus::Takendown
+                    | RepoStatus::Suspended
+            );
 
-                let mut batch = db.inner.batch();
-                // remove from pending
-                if was_pending {
-                    batch.remove(&db.pending, &did_key);
-                }
-                // remove from resync
-                if was_resync {
-                    batch.remove(&db.resync, &did_key);
-                }
-                tokio::task::spawn_blocking(move || batch.commit().into_diagnostic())
-                    .await
-                    .into_diagnostic()??;
-                if was_pending {
-                    state.db.update_count_async("pending", -1).await;
-                }
-                if was_resync {
-                    state.db.update_count_async("resync", -1).await;
-                }
-
-                let state_for_persist = state.clone();
-                tokio::task::spawn_blocking(move || {
-                    state_for_persist
-                        .db
-                        .inner
-                        .persist(fjall::PersistMode::Buffer)
-                        .into_diagnostic()
-                })
-                .await
-                .into_diagnostic()??;
-
-                // Notify completion to worker shard
-                if let Err(e) = buffer_tx.send(IngestMessage::BackfillFinished(did.clone())) {
-                    error!("failed to send BackfillFinished for {did}: {e}");
-                }
+            let mut batch = db.inner.batch();
+            // remove from pending
+            if was_pending {
+                batch.remove(&db.pending, &did_key);
             }
-            Err(e) => {
-                let mut was_ratelimited = false;
-                'err: {
-                    let Some(e) = e.downcast_ref::<ClientError>() else {
-                        error!("failed for {did}: {e}");
-                        break 'err;
-                    };
-
-                    match e.kind() {
-                        ClientErrorKind::Http {
-                            status: StatusCode::TOO_MANY_REQUESTS,
-                        } => {
-                            debug!("failed for {did}: too many requests");
-                            was_ratelimited = true;
-                            break 'err;
-                        }
-                        ClientErrorKind::Transport => {
-                            let reason = e.source_err().unwrap();
-                            error!("failed for {did}: {e}: {reason}");
-                            break 'err;
-                        }
-                        _ => {
-                            error!("failed for {did}: {e}");
-                            break 'err;
-                        }
-                    }
-                }
-
-                let did_key = keys::repo_key(&did);
-
-                // 1. get current retry count
-                let mut resync_state = Db::get(db.resync.clone(), &did_key)
-                    .await
-                    .and_then(|b| {
-                        b.map(|b| rmp_serde::from_slice::<ResyncState>(&b).into_diagnostic())
-                            .transpose()
-                    })?
-                    .and_then(|s| {
-                        matches!(s, ResyncState::Gone { .. })
-                            .then_some(None)
-                            .unwrap_or(Some(s))
-                    })
-                    .unwrap_or_else(|| ResyncState::Error {
-                        message: SmolStr::new_static(""),
-                        retry_count: 0,
-                        next_retry: 0,
-                    });
-
-                let ResyncState::Error {
-                    message,
-                    retry_count,
-                    next_retry,
-                } = &mut resync_state
-                else {
-                    unreachable!("we handled the gone case above");
-                };
-
-                // 2. calculate backoff and update the other fields
-                *retry_count += was_ratelimited.then_some(3).unwrap_or(1);
-                *next_retry = ResyncState::next_backoff(*retry_count);
-                *message = e.to_smolstr();
-
-                tokio::task::spawn_blocking({
-                    let state = state.clone();
-                    let did_key = did_key.into_static();
-                    move || {
-                        // 3. save to resync
-                        let serialized_resync_state =
-                            rmp_serde::to_vec(&resync_state).into_diagnostic()?;
-
-                        // 4. and update the main repo state
-                        let serialized_repo_state = if let Some(state_bytes) =
-                            state.db.repos.get(&did_key).into_diagnostic()?
-                        {
-                            let mut state: RepoState =
-                                rmp_serde::from_slice(&state_bytes).into_diagnostic()?;
-                            state.status = RepoStatus::Error(e.to_string().into());
-                            Some(rmp_serde::to_vec(&state).into_diagnostic()?)
-                        } else {
-                            None
-                        };
-
-                        let mut batch = state.db.inner.batch();
-                        batch.insert(&state.db.resync, &did_key, serialized_resync_state);
-                        batch.remove(&state.db.pending, &did_key);
-                        if let Some(state_bytes) = serialized_repo_state {
-                            batch.insert(&state.db.repos, &did_key, state_bytes);
-                        }
-                        batch.commit().into_diagnostic()
-                    }
-                })
+            // remove from resync
+            if was_resync {
+                batch.remove(&db.resync, &did_key);
+            }
+            tokio::task::spawn_blocking(move || batch.commit().into_diagnostic())
                 .await
                 .into_diagnostic()??;
-
-                state.db.update_count_async("resync", 1).await;
+            if was_pending {
                 state.db.update_count_async("pending", -1).await;
             }
-        }
-
-        // wake worker to pick up more
-        state.backfill_notify.notify_one();
-        Ok(())
-    }
-
-    async fn process_did<'i>(
-        app_state: &Arc<AppState>,
-        http: &reqwest::Client,
-        did: &Did<'static>,
-        verify_signatures: bool,
-    ) -> Result<RepoState<'static>> {
-        debug!("backfilling {}", did);
-
-        let db = &app_state.db;
-        let did_key = keys::repo_key(did);
-        let state_bytes = Db::get(db.repos.clone(), did_key)
-            .await?
-            .ok_or_else(|| miette::miette!("!!!THIS IS A BUG!!! repo state for {did} missing"))?;
-        let mut state: RepoState<'static> = rmp_serde::from_slice::<RepoState>(&state_bytes)
-            .into_diagnostic()?
-            .into_static();
-        let previous_state = state.clone();
-
-        // 1. resolve pds
-        let start = Instant::now();
-        let (pds_url, handle) = app_state.resolver.resolve_identity_info(did).await?;
-        trace!(
-            "resolved {did} to pds {pds_url} handle {handle:?} in {:?}",
-            start.elapsed()
-        );
-
-        if let Some(h) = handle {
-            state.handle = Some(h.to_smolstr());
-        }
-
-        let emit_identity = |status: &RepoStatus| {
-            let evt = AccountEvt {
-                did: did.clone(),
-                active: !matches!(
-                    status,
-                    RepoStatus::Deactivated | RepoStatus::Takendown | RepoStatus::Suspended
-                ),
-                status: Some(
-                    match status {
-                        RepoStatus::Deactivated => "deactivated",
-                        RepoStatus::Takendown => "takendown",
-                        RepoStatus::Suspended => "suspended",
-                        _ => "active",
-                    }
-                    .into(),
-                ),
-            };
-            let _ = app_state.db.event_tx.send(ops::make_account_event(db, evt));
-        };
-
-        // 2. fetch repo (car)
-        let start = Instant::now();
-        let req = GetRepo::new().did(did.clone()).build();
-        let resp = http.xrpc(pds_url).send(&req).await?;
-
-        let car_bytes = match resp.into_output() {
-            Ok(o) => o,
-            Err(XrpcError::Xrpc(e)) => {
-                if matches!(e, GetRepoError::RepoNotFound(_)) {
-                    warn!("repo {did} not found, deleting");
-                    let mut batch = db.inner.batch();
-                    ops::delete_repo(&mut batch, db, did)?;
-                    batch.commit().into_diagnostic()?;
-                    return Ok(previous_state); // stop backfill
-                }
-
-                let inactive_status = match e {
-                    GetRepoError::RepoDeactivated(_) => Some(RepoStatus::Deactivated),
-                    GetRepoError::RepoTakendown(_) => Some(RepoStatus::Takendown),
-                    GetRepoError::RepoSuspended(_) => Some(RepoStatus::Suspended),
-                    _ => None,
-                };
-
-                if let Some(status) = inactive_status {
-                    warn!("repo {did} is {status:?}, stopping backfill");
-
-                    emit_identity(&status);
-
-                    let resync_state = ResyncState::Gone {
-                        status: status.clone(),
-                    };
-                    let resync_bytes = rmp_serde::to_vec(&resync_state).into_diagnostic()?;
-
-                    let app_state_clone = app_state.clone();
-                    app_state
-                        .db
-                        .update_repo_state_async(did, move |state, (key, batch)| {
-                            state.status = status;
-                            batch.insert(&app_state_clone.db.resync, key, resync_bytes);
-                            Ok((true, ()))
-                        })
-                        .await?;
-
-                    // return success so wrapper stops retrying
-                    return Ok(previous_state);
-                }
-
-                return Err(e).into_diagnostic();
+            if was_resync {
+                state.db.update_count_async("resync", -1).await;
             }
-            Err(e) => return Err(e).into_diagnostic(),
-        };
 
-        // emit identity event so any consumers know
-        emit_identity(&state.status);
-
-        trace!(
-            "fetched {} bytes for {did} in {:?}",
-            car_bytes.body.len(),
-            start.elapsed()
-        );
-
-        // 3. import repo
-        let start = Instant::now();
-        let parsed = jacquard_repo::car::reader::parse_car_bytes(&car_bytes.body)
-            .await
-            .into_diagnostic()?;
-        trace!("parsed car for {did} in {:?}", start.elapsed());
-
-        let start = Instant::now();
-        let store = Arc::new(MemoryBlockStore::new_from_blocks(parsed.blocks));
-        trace!(
-            "stored {} blocks in memory for {did} in {:?}",
-            store.len(),
-            start.elapsed()
-        );
-
-        // 4. parse root commit to get mst root
-        let root_bytes = store
-            .get(&parsed.root)
-            .await
-            .into_diagnostic()?
-            .ok_or_else(|| miette::miette!("root block missing from CAR"))?;
-
-        let root_commit =
-            jacquard_repo::commit::Commit::from_cbor(&root_bytes).into_diagnostic()?;
-        debug!(
-            "backfilling repo at revision {}, root cid {}",
-            root_commit.rev, root_commit.data
-        );
-
-        // 4.5. verify commit signature
-        if verify_signatures {
-            let pubkey = app_state.resolver.resolve_signing_key(did).await?;
-            root_commit
-                .verify(&pubkey)
-                .map_err(|e| miette::miette!("signature verification failed for {did}: {e}"))?;
-            trace!("signature verified for {did}");
-        }
-
-        // 5. walk mst
-        let start = Instant::now();
-        let mst: Mst<MemoryBlockStore> = Mst::load(store, root_commit.data, None);
-        let leaves = mst.leaves().await.into_diagnostic()?;
-        trace!("walked mst for {did} in {}", start.elapsed().as_secs_f64());
-
-        // 6. insert records into db
-        let start = Instant::now();
-        let (_state, records_cnt_delta, added_blocks, count) = {
-            let app_state = app_state.clone();
-            let did = did.clone();
-            let rev = root_commit.rev;
-
+            let state = state.clone();
             tokio::task::spawn_blocking(move || {
-                let mut count = 0;
-                let mut delta = 0;
-                let mut added_blocks = 0;
-                let mut collection_counts: HashMap<SmolStr, u64> = HashMap::new();
-                let mut batch = app_state.db.inner.batch();
-                let store = mst.storage();
+                state
+                    .db
+                    .inner
+                    .persist(fjall::PersistMode::Buffer)
+                    .into_diagnostic()
+            })
+            .await
+            .into_diagnostic()??;
 
-                let prefix = keys::record_prefix(&did);
-                let mut existing_cids: HashMap<(SmolStr, DbRkey), SmolStr> = HashMap::new();
+            // Notify completion to worker shard
+            if let Err(e) = buffer_tx.send(IngestMessage::BackfillFinished(did.clone())) {
+                error!("failed to send BackfillFinished for {did}: {e}");
+            }
+        }
+        Err(e) => {
+            let mut was_ratelimited = false;
+            match &e {
+                BackfillError::Ratelimited => {
+                    was_ratelimited = true;
+                    debug!("failed for {did}: too many requests");
+                }
+                BackfillError::Transport(reason) => {
+                    error!("failed for {did}: transport error: {reason}");
+                }
+                BackfillError::Generic(e) => {
+                    error!("failed for {did}: {e}");
+                }
+            }
 
-                let mut partitions = Vec::new();
-                app_state.db.record_partitions.iter_sync(|col, ks| {
-                    partitions.push((col.clone(), ks.clone()));
-                    true
+            let did_key = keys::repo_key(&did);
+
+            // 1. get current retry count
+            let mut resync_state = Db::get(db.resync.clone(), &did_key)
+                .await
+                .and_then(|b| {
+                    b.map(|b| rmp_serde::from_slice::<ResyncState>(&b).into_diagnostic())
+                        .transpose()
+                })?
+                .and_then(|s| {
+                    matches!(s, ResyncState::Gone { .. })
+                        .then_some(None)
+                        .unwrap_or(Some(s))
+                })
+                .unwrap_or_else(|| ResyncState::Error {
+                    message: SmolStr::new_static(""),
+                    retry_count: 0,
+                    next_retry: 0,
                 });
 
-                for (col_name, ks) in partitions {
-                    for guard in ks.prefix(&prefix) {
-                        let (key, cid_bytes) = guard.into_inner().into_diagnostic()?;
-                        let rkey: DbRkey =
-                            rmp_serde::from_slice(&key[prefix.len()..]).into_diagnostic()?;
-                        let cid = if let Ok(c) = cid::Cid::read_bytes(cid_bytes.as_ref()) {
-                            c.to_string().to_smolstr()
-                        } else {
-                            error!("invalid cid for {did}: {cid_bytes:?}");
-                            continue;
-                        };
+            let ResyncState::Error {
+                message,
+                retry_count,
+                next_retry,
+            } = &mut resync_state
+            else {
+                unreachable!("we handled the gone case above");
+            };
 
-                        existing_cids.insert((col_name.as_str().into(), rkey), cid);
+            // 2. calculate backoff and update the other fields
+            *retry_count += was_ratelimited.then_some(3).unwrap_or(1);
+            *next_retry = ResyncState::next_backoff(*retry_count);
+            *message = e.to_smolstr();
+
+            tokio::task::spawn_blocking({
+                let state = state.clone();
+                let did_key = did_key.into_static();
+                move || {
+                    // 3. save to resync
+                    let serialized_resync_state =
+                        rmp_serde::to_vec(&resync_state).into_diagnostic()?;
+
+                    // 4. and update the main repo state
+                    let serialized_repo_state = if let Some(state_bytes) =
+                        state.db.repos.get(&did_key).into_diagnostic()?
+                    {
+                        let mut state: RepoState =
+                            rmp_serde::from_slice(&state_bytes).into_diagnostic()?;
+                        state.status = RepoStatus::Error(e.to_string().into());
+                        Some(rmp_serde::to_vec(&state).into_diagnostic()?)
+                    } else {
+                        None
+                    };
+
+                    let mut batch = state.db.inner.batch();
+                    batch.insert(&state.db.resync, &did_key, serialized_resync_state);
+                    batch.remove(&state.db.pending, &did_key);
+                    if let Some(state_bytes) = serialized_repo_state {
+                        batch.insert(&state.db.repos, &did_key, state_bytes);
                     }
+                    batch.commit().into_diagnostic()
                 }
+            })
+            .await
+            .into_diagnostic()??;
 
-                for (key, cid) in leaves {
-                    let val_bytes = tokio::runtime::Handle::current()
-                        .block_on(store.get(&cid))
-                        .into_diagnostic()?;
+            state.db.update_count_async("resync", 1).await;
+            state.db.update_count_async("pending", -1).await;
+        }
+    }
 
-                    if let Some(val) = val_bytes {
-                        let (collection, rkey) = ops::parse_path(&key)?;
-                        let rkey = DbRkey::new(rkey);
-                        let path = (collection.to_smolstr(), rkey.clone());
-                        let cid_obj = Cid::ipld(cid);
-                        let partition = app_state.db.record_partition(collection)?;
+    // wake worker to pick up more
+    state.backfill_notify.notify_one();
+    Ok(())
+}
 
-                        // check if this record already exists with same CID
-                        let (action, is_new) =
-                            if let Some(existing_cid) = existing_cids.remove(&path) {
-                                if existing_cid == cid_obj.as_str() {
-                                    debug!("skip {did}/{collection}/{rkey} ({cid})");
-                                    continue; // skip unchanged record
-                                }
-                                (DbAction::Update, false)
-                            } else {
-                                (DbAction::Create, true)
-                            };
-                        debug!("{action} {did}/{collection}/{rkey} ({cid})");
+enum BackfillError {
+    Generic(miette::Report),
+    Ratelimited,
+    Transport(SmolStr),
+}
 
-                        // Key is just did|rkey
-                        let db_key = keys::record_key(&did, &rkey);
+impl From<ClientError> for BackfillError {
+    fn from(e: ClientError) -> Self {
+        match e.kind() {
+            ClientErrorKind::Http {
+                status: StatusCode::TOO_MANY_REQUESTS,
+            } => Self::Ratelimited,
+            ClientErrorKind::Transport => Self::Transport(
+                e.source_err()
+                    .expect("transport error without source")
+                    .to_smolstr(),
+            ),
+            _ => Self::Generic(e.into()),
+        }
+    }
+}
 
-                        batch.insert(&app_state.db.blocks, cid.to_bytes(), val.as_ref());
-                        batch.insert(&partition, db_key, cid.to_bytes());
+impl From<miette::Report> for BackfillError {
+    fn from(e: miette::Report) -> Self {
+        Self::Generic(e)
+    }
+}
 
-                        added_blocks += 1;
-                        if is_new {
-                            delta += 1;
-                            *collection_counts.entry(path.0.clone()).or_default() += 1;
+impl Display for BackfillError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BackfillError::Generic(e) => e.fmt(f),
+            BackfillError::Ratelimited => write!(f, "too many requests"),
+            BackfillError::Transport(reason) => write!(f, "transport error: {reason}"),
+        }
+    }
+}
+
+async fn process_did<'i>(
+    app_state: &Arc<AppState>,
+    http: &reqwest::Client,
+    did: &Did<'static>,
+    verify_signatures: bool,
+) -> Result<RepoState<'static>, BackfillError> {
+    debug!("backfilling {}", did);
+
+    let db = &app_state.db;
+    let did_key = keys::repo_key(did);
+    let state_bytes = Db::get(db.repos.clone(), did_key)
+        .await?
+        .ok_or_else(|| miette::miette!("!!!THIS IS A BUG!!! repo state for {did} missing"))?;
+    let mut state: RepoState<'static> = rmp_serde::from_slice::<RepoState>(&state_bytes)
+        .into_diagnostic()?
+        .into_static();
+    let previous_state = state.clone();
+
+    // 1. resolve pds
+    let start = Instant::now();
+    let (pds_url, handle) = app_state.resolver.resolve_identity_info(did).await?;
+    trace!(
+        "resolved {did} to pds {pds_url} handle {handle:?} in {:?}",
+        start.elapsed()
+    );
+
+    if let Some(h) = handle {
+        state.handle = Some(h.to_smolstr());
+    }
+
+    let emit_identity = |status: &RepoStatus| {
+        let evt = AccountEvt {
+            did: did.clone(),
+            active: !matches!(
+                status,
+                RepoStatus::Deactivated | RepoStatus::Takendown | RepoStatus::Suspended
+            ),
+            status: Some(
+                match status {
+                    RepoStatus::Deactivated => "deactivated",
+                    RepoStatus::Takendown => "takendown",
+                    RepoStatus::Suspended => "suspended",
+                    _ => "active",
+                }
+                .into(),
+            ),
+        };
+        let _ = app_state.db.event_tx.send(ops::make_account_event(db, evt));
+    };
+
+    // 2. fetch repo (car)
+    let start = Instant::now();
+    let req = GetRepo::new().did(did.clone()).build();
+    let resp = http.xrpc(pds_url).send(&req).await?;
+
+    let car_bytes = match resp.into_output() {
+        Ok(o) => o,
+        Err(XrpcError::Xrpc(e)) => {
+            if matches!(e, GetRepoError::RepoNotFound(_)) {
+                warn!("repo {did} not found, deleting");
+                let mut batch = db.inner.batch();
+                ops::delete_repo(&mut batch, db, did)?;
+                batch.commit().into_diagnostic()?;
+                return Ok(previous_state); // stop backfill
+            }
+
+            let inactive_status = match e {
+                GetRepoError::RepoDeactivated(_) => Some(RepoStatus::Deactivated),
+                GetRepoError::RepoTakendown(_) => Some(RepoStatus::Takendown),
+                GetRepoError::RepoSuspended(_) => Some(RepoStatus::Suspended),
+                _ => None,
+            };
+
+            if let Some(status) = inactive_status {
+                warn!("repo {did} is {status:?}, stopping backfill");
+
+                emit_identity(&status);
+
+                let resync_state = ResyncState::Gone {
+                    status: status.clone(),
+                };
+                let resync_bytes = rmp_serde::to_vec(&resync_state).into_diagnostic()?;
+
+                let app_state_clone = app_state.clone();
+                app_state
+                    .db
+                    .update_repo_state_async(did, move |state, (key, batch)| {
+                        state.status = status;
+                        batch.insert(&app_state_clone.db.resync, key, resync_bytes);
+                        Ok((true, ()))
+                    })
+                    .await?;
+
+                // return success so wrapper stops retrying
+                return Ok(previous_state);
+            }
+
+            Err(e).into_diagnostic()?
+        }
+        Err(e) => Err(e).into_diagnostic()?,
+    };
+
+    // emit identity event so any consumers know
+    emit_identity(&state.status);
+
+    trace!(
+        "fetched {} bytes for {did} in {:?}",
+        car_bytes.body.len(),
+        start.elapsed()
+    );
+
+    // 3. import repo
+    let start = Instant::now();
+    let parsed = jacquard_repo::car::reader::parse_car_bytes(&car_bytes.body)
+        .await
+        .into_diagnostic()?;
+    trace!("parsed car for {did} in {:?}", start.elapsed());
+
+    let start = Instant::now();
+    let store = Arc::new(MemoryBlockStore::new_from_blocks(parsed.blocks));
+    trace!(
+        "stored {} blocks in memory for {did} in {:?}",
+        store.len(),
+        start.elapsed()
+    );
+
+    // 4. parse root commit to get mst root
+    let root_bytes = store
+        .get(&parsed.root)
+        .await
+        .into_diagnostic()?
+        .ok_or_else(|| miette::miette!("root block missing from CAR"))?;
+
+    let root_commit = jacquard_repo::commit::Commit::from_cbor(&root_bytes).into_diagnostic()?;
+    debug!(
+        "backfilling repo at revision {}, root cid {}",
+        root_commit.rev, root_commit.data
+    );
+
+    // 4.5. verify commit signature
+    if verify_signatures {
+        let pubkey = app_state.resolver.resolve_signing_key(did).await?;
+        root_commit
+            .verify(&pubkey)
+            .map_err(|e| miette::miette!("signature verification failed for {did}: {e}"))?;
+        trace!("signature verified for {did}");
+    }
+
+    // 5. walk mst
+    let start = Instant::now();
+    let mst: Mst<MemoryBlockStore> = Mst::load(store, root_commit.data, None);
+    let leaves = mst.leaves().await.into_diagnostic()?;
+    trace!("walked mst for {did} in {}", start.elapsed().as_secs_f64());
+
+    // 6. insert records into db
+    let start = Instant::now();
+    let (_state, records_cnt_delta, added_blocks, count) = {
+        let app_state = app_state.clone();
+        let did = did.clone();
+        let rev = root_commit.rev;
+
+        tokio::task::spawn_blocking(move || {
+            let mut count = 0;
+            let mut delta = 0;
+            let mut added_blocks = 0;
+            let mut collection_counts: HashMap<SmolStr, u64> = HashMap::new();
+            let mut batch = app_state.db.inner.batch();
+            let store = mst.storage();
+
+            let prefix = keys::record_prefix(&did);
+            let mut existing_cids: HashMap<(SmolStr, DbRkey), SmolStr> = HashMap::new();
+
+            let mut partitions = Vec::new();
+            app_state.db.record_partitions.iter_sync(|col, ks| {
+                partitions.push((col.clone(), ks.clone()));
+                true
+            });
+
+            for (col_name, ks) in partitions {
+                for guard in ks.prefix(&prefix) {
+                    let (key, cid_bytes) = guard.into_inner().into_diagnostic()?;
+                    let rkey: DbRkey =
+                        rmp_serde::from_slice(&key[prefix.len()..]).into_diagnostic()?;
+                    let cid = if let Ok(c) = cid::Cid::read_bytes(cid_bytes.as_ref()) {
+                        c.to_string().to_smolstr()
+                    } else {
+                        error!("invalid cid for {did}: {cid_bytes:?}");
+                        continue;
+                    };
+
+                    existing_cids.insert((col_name.as_str().into(), rkey), cid);
+                }
+            }
+
+            for (key, cid) in leaves {
+                let val_bytes = tokio::runtime::Handle::current()
+                    .block_on(store.get(&cid))
+                    .into_diagnostic()?;
+
+                if let Some(val) = val_bytes {
+                    let (collection, rkey) = ops::parse_path(&key)?;
+                    let rkey = DbRkey::new(rkey);
+                    let path = (collection.to_smolstr(), rkey.clone());
+                    let cid_obj = Cid::ipld(cid);
+                    let partition = app_state.db.record_partition(collection)?;
+
+                    // check if this record already exists with same CID
+                    let (action, is_new) = if let Some(existing_cid) = existing_cids.remove(&path) {
+                        if existing_cid == cid_obj.as_str() {
+                            debug!("skip {did}/{collection}/{rkey} ({cid})");
+                            continue; // skip unchanged record
                         }
+                        (DbAction::Update, false)
+                    } else {
+                        (DbAction::Create, true)
+                    };
+                    debug!("{action} {did}/{collection}/{rkey} ({cid})");
 
-                        let event_id = app_state.db.next_event_id.fetch_add(1, Ordering::SeqCst);
-                        let evt = StoredEvent {
-                            live: false,
-                            did: TrimmedDid::from(&did),
-                            rev: DbTid::from(&rev),
-                            collection: CowStr::Borrowed(collection),
-                            rkey,
-                            action,
-                            cid: Some(cid_obj.to_ipld().expect("valid cid")),
-                        };
-                        let bytes = rmp_serde::to_vec(&evt).into_diagnostic()?;
-                        batch.insert(&app_state.db.events, keys::event_key(event_id), bytes);
+                    // Key is just did|rkey
+                    let db_key = keys::record_key(&did, &rkey);
 
-                        count += 1;
+                    batch.insert(&app_state.db.blocks, cid.to_bytes(), val.as_ref());
+                    batch.insert(&partition, db_key, cid.to_bytes());
+
+                    added_blocks += 1;
+                    if is_new {
+                        delta += 1;
+                        *collection_counts.entry(path.0.clone()).or_default() += 1;
                     }
-                }
-
-                // remove any remaining existing records (they weren't in the new MST)
-                for ((collection, rkey), cid) in existing_cids {
-                    debug!("remove {did}/{collection}/{rkey} ({cid})");
-                    let partition = app_state.db.record_partition(collection.as_str())?;
-
-                    batch.remove(&partition, keys::record_key(&did, &rkey));
 
                     let event_id = app_state.db.next_event_id.fetch_add(1, Ordering::SeqCst);
                     let evt = StoredEvent {
                         live: false,
                         did: TrimmedDid::from(&did),
                         rev: DbTid::from(&rev),
-                        collection: CowStr::Borrowed(&collection),
+                        collection: CowStr::Borrowed(collection),
                         rkey,
-                        action: DbAction::Delete,
-                        cid: None,
+                        action,
+                        cid: Some(cid_obj.to_ipld().expect("valid cid")),
                     };
                     let bytes = rmp_serde::to_vec(&evt).into_diagnostic()?;
                     batch.insert(&app_state.db.events, keys::event_key(event_id), bytes);
 
-                    delta -= 1;
                     count += 1;
                 }
+            }
 
-                // 6. update data, status is updated in worker shard
-                state.rev = Some((&rev).into());
-                state.data = Some(root_commit.data);
-                state.last_updated_at = chrono::Utc::now().timestamp();
+            // remove any remaining existing records (they weren't in the new MST)
+            for ((collection, rkey), cid) in existing_cids {
+                debug!("remove {did}/{collection}/{rkey} ({cid})");
+                let partition = app_state.db.record_partition(collection.as_str())?;
 
-                batch.insert(
-                    &app_state.db.repos,
-                    keys::repo_key(&did),
-                    ser_repo_state(&state)?,
-                );
+                batch.remove(&partition, keys::record_key(&did, &rkey));
 
-                // add the counts
-                for (col, cnt) in collection_counts {
-                    db::set_record_count(&mut batch, &app_state.db, &did, &col, cnt);
-                }
+                let event_id = app_state.db.next_event_id.fetch_add(1, Ordering::SeqCst);
+                let evt = StoredEvent {
+                    live: false,
+                    did: TrimmedDid::from(&did),
+                    rev: DbTid::from(&rev),
+                    collection: CowStr::Borrowed(&collection),
+                    rkey,
+                    action: DbAction::Delete,
+                    cid: None,
+                };
+                let bytes = rmp_serde::to_vec(&evt).into_diagnostic()?;
+                batch.insert(&app_state.db.events, keys::event_key(event_id), bytes);
 
-                batch.commit().into_diagnostic()?;
+                delta -= 1;
+                count += 1;
+            }
 
-                Ok::<_, miette::Report>((state, delta, added_blocks, count))
-            })
-            .await
-            .into_diagnostic()??
-        };
-        trace!("did {count} ops for {did} in {:?}", start.elapsed());
+            // 6. update data, status is updated in worker shard
+            state.rev = Some((&rev).into());
+            state.data = Some(root_commit.data);
+            state.last_updated_at = chrono::Utc::now().timestamp();
 
-        // do the counts
-        if records_cnt_delta > 0 {
-            app_state
-                .db
-                .update_count_async("records", records_cnt_delta)
-                .await;
-            app_state
-                .db
-                .update_count_async("blocks", added_blocks)
-                .await;
-        }
-        trace!(
-            "committed backfill batch for {did} in {:?}",
-            start.elapsed()
-        );
+            batch.insert(
+                &app_state.db.repos,
+                keys::repo_key(&did),
+                ser_repo_state(&state)?,
+            );
 
-        let _ = db.event_tx.send(BroadcastEvent::Persisted(
-            db.next_event_id.load(Ordering::SeqCst) - 1,
-        ));
+            // add the counts
+            for (col, cnt) in collection_counts {
+                db::set_record_count(&mut batch, &app_state.db, &did, &col, cnt);
+            }
 
-        // buffer processing is handled by BufferProcessor when blocked flag is cleared
-        debug!("backfill complete for {did}");
-        Ok(previous_state)
+            batch.commit().into_diagnostic()?;
+
+            Ok::<_, miette::Report>((state, delta, added_blocks, count))
+        })
+        .await
+        .into_diagnostic()??
+    };
+    trace!("did {count} ops for {did} in {:?}", start.elapsed());
+
+    // do the counts
+    if records_cnt_delta > 0 {
+        app_state
+            .db
+            .update_count_async("records", records_cnt_delta)
+            .await;
+        app_state
+            .db
+            .update_count_async("blocks", added_blocks)
+            .await;
     }
+    trace!(
+        "committed backfill batch for {did} in {:?}",
+        start.elapsed()
+    );
+
+    let _ = db.event_tx.send(BroadcastEvent::Persisted(
+        db.next_event_id.load(Ordering::SeqCst) - 1,
+    ));
+
+    // buffer processing is handled by BufferProcessor when blocked flag is cleared
+    debug!("backfill complete for {did}");
+    Ok(previous_state)
 }
