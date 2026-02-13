@@ -19,55 +19,30 @@ use smol_str::ToSmolStr;
 use std::collections::{HashMap, HashSet, hash_map::DefaultHasher};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
+use thiserror::Error;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, trace, warn};
 
-#[derive(Debug)]
-struct KeyFetchError(miette::Report);
+#[derive(Debug, Diagnostic, Error)]
+enum IngestError {
+    #[error("{0}")]
+    Generic(miette::Report),
 
-impl std::fmt::Display for KeyFetchError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
+    #[error("key fetch failed: {0}")]
+    KeyFetch(smol_str::SmolStr),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    Commit(#[from] CommitError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    NoSigningKey(#[from] NoSigningKeyError),
 }
 
-impl std::error::Error for KeyFetchError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        self.0.source()
-    }
-}
-
-impl Diagnostic for KeyFetchError {
-    fn code<'a>(&'a self) -> Option<Box<dyn std::fmt::Display + 'a>> {
-        self.0.code()
-    }
-
-    fn help<'a>(&'a self) -> Option<Box<dyn std::fmt::Display + 'a>> {
-        self.0.help()
-    }
-
-    fn labels(&self) -> Option<Box<dyn Iterator<Item = miette::LabeledSpan> + '_>> {
-        self.0.labels()
-    }
-
-    fn diagnostic_source(&self) -> Option<&dyn Diagnostic> {
-        self.0.diagnostic_source()
-    }
-
-    fn related<'a>(&'a self) -> Option<Box<dyn Iterator<Item = &'a dyn Diagnostic> + 'a>> {
-        self.0.related()
-    }
-
-    fn source_code(&self) -> Option<&dyn miette::SourceCode> {
-        self.0.source_code()
-    }
-
-    fn severity(&self) -> Option<miette::Severity> {
-        self.0.severity()
-    }
-
-    fn url<'a>(&'a self) -> Option<Box<dyn std::fmt::Display + 'a>> {
-        self.0.url()
+impl From<miette::Report> for IngestError {
+    fn from(report: miette::Report) -> Self {
+        IngestError::Generic(report)
     }
 }
 
@@ -280,8 +255,10 @@ impl FirehoseWorker {
                         }
                         Ok(RepoProcessResult::Syncing(None)) => {}
                         Err(e) => {
+                            if let IngestError::Generic(e) = &e {
+                                db::check_poisoned_report(e);
+                            }
                             error!("error processing message for {did}: {e}");
-                            db::check_poisoned_report(&e);
                             if Self::check_if_retriable_failure(&e) {
                                 if let SubscribeReposMessage::Commit(commit) = &msg {
                                     if let Err(e) =
@@ -322,17 +299,18 @@ impl FirehoseWorker {
 
     // dont retry commit or sync on key fetch errors
     // since we'll just try again later if we get commit or sync again
-    fn check_if_retriable_failure(e: &miette::Report) -> bool {
-        e.downcast_ref::<KeyFetchError>().is_none()
-            && e.downcast_ref::<CommitError>().is_none()
-            && e.downcast_ref::<NoSigningKeyError>().is_none()
+    fn check_if_retriable_failure(e: &IngestError) -> bool {
+        !matches!(
+            e,
+            IngestError::KeyFetch(_) | IngestError::Commit(_) | IngestError::NoSigningKey(_)
+        )
     }
 
     fn process_message<'s, 'c>(
         ctx: &mut WorkerContext,
         msg: &'c SubscribeReposMessage<'static>,
         did: &Did,
-    ) -> Result<RepoProcessResult<'s, 'c>> {
+    ) -> Result<RepoProcessResult<'s, 'c>, IngestError> {
         let check_repo_res = Self::check_repo_state(ctx, did, msg)?;
         let mut repo_state = match check_repo_res {
             RepoProcessResult::Syncing(_) | RepoProcessResult::Deleted => {
@@ -486,7 +464,7 @@ impl FirehoseWorker {
         did: &Did,
         repo_state: RepoState<'s>,
         commit: &'c Commit<'c>,
-    ) -> Result<RepoProcessResult<'ns, 'c>> {
+    ) -> Result<RepoProcessResult<'ns, 'c>, IngestError> {
         // check for replayed events (already seen revision)
         if matches!(repo_state.rev, Some(ref rev) if commit.rev.as_str() <= rev.to_tid().as_str()) {
             debug!(
@@ -561,7 +539,7 @@ impl FirehoseWorker {
         ctx: &mut WorkerContext,
         did: &Did<'_>,
         msg: &'c SubscribeReposMessage<'static>,
-    ) -> Result<RepoProcessResult<'s, 'c>> {
+    ) -> Result<RepoProcessResult<'s, 'c>, IngestError> {
         // check if we have this repo
         if let Some(state) = ctx.repo_cache.get(did) {
             return Ok(RepoProcessResult::Ok(state.clone()));
@@ -640,7 +618,7 @@ impl FirehoseWorker {
         ctx: &mut WorkerContext,
         did: &Did,
         mut repo_state: RepoState<'s>,
-    ) -> Result<RepoProcessResult<'s, 'static>> {
+    ) -> Result<RepoProcessResult<'s, 'static>, IngestError> {
         let prefix = keys::resync_buffer_prefix(did);
 
         for guard in ctx.state.db.resync_buffer.prefix(&prefix) {
@@ -675,14 +653,15 @@ impl FirehoseWorker {
         Ok(RepoProcessResult::Ok(repo_state))
     }
 
-    fn fetch_key(ctx: &WorkerContext, did: &Did) -> Result<Option<PublicKey<'static>>> {
+    fn fetch_key(
+        ctx: &WorkerContext,
+        did: &Did,
+    ) -> Result<Option<PublicKey<'static>>, IngestError> {
         if ctx.verify_signatures {
             let key = ctx
                 .handle
                 .block_on(ctx.state.resolver.resolve_signing_key(did))
-                .map_err(|e| {
-                    KeyFetchError(miette::miette!("failed to get pubkey for {did}: {e}"))
-                })?;
+                .map_err(|e| IngestError::KeyFetch(e.to_smolstr()))?;
             Ok(Some(key))
         } else {
             Ok(None)
