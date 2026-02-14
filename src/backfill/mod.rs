@@ -126,12 +126,7 @@ impl BackfillWorker {
 
             let mut spawned = 0;
 
-            // limit the number of active tasks based on adaptive limit
-            // we iterate in reverse to prioritize newer items (LIFO)
-            // effective key comparison: {timestamp}|{did}
-            // older timestamps are smaller, newer are larger.
-            // rev() starts from largest (newest).
-            for guard in self.state.db.pending.iter().rev() {
+            for guard in self.state.db.pending.iter() {
                 if self.in_flight.len() >= limiter.current_limit {
                     break;
                 }
@@ -145,17 +140,12 @@ impl BackfillWorker {
                     }
                 };
 
-                let did = if key.len() > 9 && key[8] == keys::SEP {
-                    match TrimmedDid::try_from(&key[9..]) {
-                        Ok(d) => d.to_did(),
-                        Err(e) => {
-                            error!("invalid did '{key:?}' in pending: {e}");
-                            continue;
-                        }
+                let did = match TrimmedDid::try_from(key.as_ref()) {
+                    Ok(d) => d.to_did(),
+                    Err(e) => {
+                        error!("invalid did '{key:?}' in pending: {e}");
+                        continue;
                     }
-                } else {
-                    error!("invalid did '{key:?}' in pending");
-                    continue;
                 };
 
                 if self.in_flight.contains_sync(&did) {
