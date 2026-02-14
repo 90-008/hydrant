@@ -1,23 +1,24 @@
 use crate::api::AppState;
 use axum::{Json, extract::State, response::Result};
+use ordermap::OrderMap;
 use serde::Serialize;
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
 #[derive(Serialize)]
 pub struct StatsResponse {
-    pub counts: HashMap<&'static str, u64>,
+    pub counts: OrderMap<&'static str, u64>,
 }
 
 pub async fn get_stats(State(state): State<Arc<AppState>>) -> Result<Json<StatsResponse>> {
     let db = &state.db;
 
-    let mut counts: HashMap<&'static str, u64> = futures::future::join_all(
+    let mut counts: OrderMap<&'static str, u64> = futures::future::join_all(
         [
             "repos",
-            "records",
-            "blocks",
             "pending",
             "resync",
+            "records",
+            "blocks",
             "error_ratelimited",
             "error_transport",
             "error_generic",
