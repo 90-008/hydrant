@@ -1,5 +1,6 @@
 use std::ops::Not;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use jacquard::IntoStatic;
@@ -46,7 +47,8 @@ impl From<miette::Report> for ResolverError {
 }
 
 struct ResolverInner {
-    jacquard: JacquardResolver,
+    jacquards: Vec<JacquardResolver>,
+    next_idx: AtomicUsize,
     key_cache: HashCache<Did<'static>, PublicKey<'static>>,
 }
 
@@ -56,24 +58,38 @@ pub struct Resolver {
 }
 
 impl Resolver {
-    pub fn new(plc_url: Url, identity_cache_size: u64) -> Self {
+    pub fn new(plc_urls: Vec<Url>, identity_cache_size: u64) -> Self {
         let http = reqwest::Client::new();
-        let mut opts = ResolverOptions::default();
-        opts.plc_source = PlcSource::PlcDirectory { base: plc_url };
-        opts.request_timeout = Some(Duration::from_secs(3));
+        let mut jacquards = Vec::with_capacity(plc_urls.len());
 
-        // no jacquard cache - we manage our own
-        let jacquard = JacquardResolver::new(http, opts);
+        for url in plc_urls {
+            let mut opts = ResolverOptions::default();
+            opts.plc_source = PlcSource::PlcDirectory { base: url };
+            opts.request_timeout = Some(Duration::from_secs(3));
+
+            // no jacquard cache - we manage our own
+            jacquards.push(JacquardResolver::new(http.clone(), opts));
+        }
+
+        if jacquards.is_empty() {
+            panic!("at least one PLC URL must be provided");
+        }
 
         Self {
             inner: Arc::new(ResolverInner {
-                jacquard,
+                jacquards,
+                next_idx: AtomicUsize::new(0),
                 key_cache: HashCache::with_capacity(
                     std::cmp::min(1000, (identity_cache_size / 100) as usize),
                     identity_cache_size as usize,
                 ),
             }),
         }
+    }
+
+    fn get_jacquard(&self) -> &JacquardResolver {
+        let idx = self.inner.next_idx.fetch_add(1, Ordering::Relaxed) % self.inner.jacquards.len();
+        &self.inner.jacquards[idx]
     }
 
     pub async fn resolve_did(
@@ -83,7 +99,7 @@ impl Resolver {
         match identifier {
             AtIdentifier::Did(did) => Ok(did.clone().into_static()),
             AtIdentifier::Handle(handle) => {
-                let did = self.inner.jacquard.resolve_handle(handle).await?;
+                let did = self.get_jacquard().resolve_handle(handle).await?;
                 Ok(did.into_static())
             }
         }
@@ -93,7 +109,7 @@ impl Resolver {
         &self,
         did: &Did<'_>,
     ) -> Result<(Url, Option<Handle<'_>>), ResolverError> {
-        let doc_resp = self.inner.jacquard.resolve_did_doc(did).await?;
+        let doc_resp = self.get_jacquard().resolve_did_doc(did).await?;
         let doc = doc_resp.parse()?;
 
         let pds = doc
@@ -115,7 +131,7 @@ impl Resolver {
             return Ok(entry.get().clone());
         }
 
-        let doc_resp = self.inner.jacquard.resolve_did_doc(&did).await?;
+        let doc_resp = self.get_jacquard().resolve_did_doc(&did).await?;
         let doc = doc_resp.parse()?;
 
         let key = doc

@@ -33,7 +33,7 @@ async fn main() -> Result<()> {
 
     // Init resolver
     let plc_url = Url::parse("https://plc.directory").into_diagnostic()?;
-    let resolver = Resolver::new(plc_url, 100);
+    let resolver = Resolver::new(vec![plc_url], 100);
 
     // Resolve identity
     info!("Resolving {}...", identifier_str);

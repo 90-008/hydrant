@@ -39,7 +39,7 @@ impl fmt::Display for SignatureVerification {
 pub struct Config {
     pub database_path: PathBuf,
     pub relay_host: Url,
-    pub plc_url: Url,
+    pub plc_urls: Vec<Url>,
     pub full_network: bool,
     pub cursor_save_interval: Duration,
     pub repo_fetch_timeout: Duration,
@@ -84,7 +84,15 @@ impl Config {
             "RELAY_HOST",
             Url::parse("wss://relay.fire.hose.cam").unwrap()
         );
-        let plc_url = cfg!("PLC_URL", Url::parse("https://plc.wtf").unwrap());
+        let plc_urls: Vec<Url> = std::env::var("HYDRANT_PLC_URL")
+            .ok()
+            .map(|s| {
+                s.split(',')
+                    .map(|s| Url::parse(s.trim()))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| miette::miette!("invalid PLC URL: {}", e))
+            })
+            .unwrap_or_else(|| Ok(vec![Url::parse("https://plc.wtf").unwrap()]))?;
 
         let full_network = cfg!("FULL_NETWORK", false);
         let backfill_concurrency_limit = cfg!("BACKFILL_CONCURRENCY_LIMIT", 32usize);
@@ -107,7 +115,7 @@ impl Config {
         Ok(Self {
             database_path,
             relay_host,
-            plc_url,
+            plc_urls,
             full_network,
             cursor_save_interval,
             repo_fetch_timeout,
@@ -132,7 +140,7 @@ impl fmt::Display for Config {
         writeln!(f, "hydrant configuration:")?;
         writeln!(f, "  log level:                {}", self.log_level)?;
         writeln!(f, "  relay host:               {}", self.relay_host)?;
-        writeln!(f, "  plc url:                  {}", self.plc_url)?;
+        writeln!(f, "  plc urls:                 {:?}", self.plc_urls)?;
         writeln!(f, "  full network indexing:    {}", self.full_network)?;
         writeln!(f, "  verify signatures:        {}", self.verify_signatures)?;
         writeln!(
