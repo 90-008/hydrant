@@ -13,6 +13,7 @@ use jacquard_identity::resolver::{
     IdentityError, IdentityErrorKind, IdentityResolver, PlcSource, ResolverOptions,
 };
 use miette::{Diagnostic, IntoDiagnostic};
+use reqwest::StatusCode;
 use scc::HashCache;
 use smol_str::SmolStr;
 use thiserror::Error;
@@ -87,9 +88,35 @@ impl Resolver {
         }
     }
 
-    fn get_jacquard(&self) -> &JacquardResolver {
-        let idx = self.inner.next_idx.fetch_add(1, Ordering::Relaxed) % self.inner.jacquards.len();
-        &self.inner.jacquards[idx]
+    async fn req<'r, T, Fut>(
+        &'r self,
+        is_plc: bool,
+        f: impl Fn(&'r JacquardResolver) -> Fut,
+    ) -> Result<T, ResolverError>
+    where
+        Fut: Future<Output = Result<T, IdentityError>>,
+    {
+        let mut idx =
+            self.inner.next_idx.fetch_add(1, Ordering::Relaxed) % self.inner.jacquards.len();
+        let mut try_count = 0;
+        loop {
+            let res = f(&self.inner.jacquards[idx]).await;
+            try_count += 1;
+            // retry these with the different plc resolvers
+            if is_plc {
+                let is_retriable = matches!(
+                    res.as_ref().map_err(|e| e.kind()),
+                    Err(IdentityErrorKind::HttpStatus(StatusCode::TOO_MANY_REQUESTS)
+                        | IdentityErrorKind::Transport(_))
+                );
+                // check if retriable and we haven't gone through all the plc resolvers
+                if is_retriable && try_count < self.inner.jacquards.len() {
+                    idx = (idx + 1) % self.inner.jacquards.len();
+                    continue;
+                }
+            }
+            return res.map_err(Into::into);
+        }
     }
 
     pub async fn resolve_did(
@@ -99,7 +126,7 @@ impl Resolver {
         match identifier {
             AtIdentifier::Did(did) => Ok(did.clone().into_static()),
             AtIdentifier::Handle(handle) => {
-                let did = self.get_jacquard().resolve_handle(handle).await?;
+                let did = self.req(false, |j| j.resolve_handle(handle)).await?;
                 Ok(did.into_static())
             }
         }
@@ -109,7 +136,9 @@ impl Resolver {
         &self,
         did: &Did<'_>,
     ) -> Result<(Url, Option<Handle<'_>>), ResolverError> {
-        let doc_resp = self.get_jacquard().resolve_did_doc(did).await?;
+        let doc_resp = self
+            .req(did.starts_with("did:plc:"), |j| j.resolve_did_doc(did))
+            .await?;
         let doc = doc_resp.parse()?;
 
         let pds = doc
@@ -131,7 +160,9 @@ impl Resolver {
             return Ok(entry.get().clone());
         }
 
-        let doc_resp = self.get_jacquard().resolve_did_doc(&did).await?;
+        let doc_resp = self
+            .req(did.starts_with("did:plc:"), |j| j.resolve_did_doc(&did))
+            .await?;
         let doc = doc_resp.parse()?;
 
         let key = doc
