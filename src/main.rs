@@ -162,7 +162,7 @@ async fn main() -> miette::Result<()> {
                 tokio::task::spawn_blocking(move || {
                     firehose_worker
                         .join()
-                        .map_err(|e| miette::miette!("buffer processor thread died: {e:?}"))
+                        .map_err(|e| miette::miette!("buffer processor died: {e:?}"))
                 })
                 .map(|r| r.into_diagnostic().flatten().flatten()),
             ) as BoxFuture<_>,

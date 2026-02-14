@@ -616,14 +616,14 @@ async fn process_did<'i>(
                     // check if this record already exists with same CID
                     let (action, is_new) = if let Some(existing_cid) = existing_cids.remove(&path) {
                         if existing_cid == cid_obj.as_str() {
-                            debug!("skip {did}/{collection}/{rkey} ({cid})");
+                            trace!("skip {did}/{collection}/{rkey} ({cid})");
                             continue; // skip unchanged record
                         }
                         (DbAction::Update, false)
                     } else {
                         (DbAction::Create, true)
                     };
-                    debug!("{action} {did}/{collection}/{rkey} ({cid})");
+                    trace!("{action} {did}/{collection}/{rkey} ({cid})");
 
                     // Key is just did|rkey
                     let db_key = keys::record_key(&did, &rkey);
@@ -656,7 +656,7 @@ async fn process_did<'i>(
 
             // remove any remaining existing records (they weren't in the new MST)
             for ((collection, rkey), cid) in existing_cids {
-                debug!("remove {did}/{collection}/{rkey} ({cid})");
+                trace!("remove {did}/{collection}/{rkey} ({cid})");
                 let partition = app_state.db.record_partition(collection.as_str())?;
 
                 batch.remove(&partition, keys::record_key(&did, &rkey));
@@ -724,6 +724,6 @@ async fn process_did<'i>(
     ));
 
     // buffer processing is handled by BufferProcessor when blocked flag is cleared
-    debug!("backfill complete for {did}");
+    trace!("backfill complete for {did}");
     Ok(previous_state)
 }
