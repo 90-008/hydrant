@@ -1,7 +1,7 @@
 use crate::db::{self, keys};
 use crate::ingest::{BufferedMessage, IngestMessage};
 use crate::ops;
-use crate::resolver::NoSigningKeyError;
+use crate::resolver::{NoSigningKeyError, ResolverError};
 use crate::state::AppState;
 use crate::types::{AccountEvt, BroadcastEvent, IdentityEvt, RepoState, RepoStatus};
 use jacquard::api::com_atproto::sync::subscribe_repos::SubscribeReposMessage;
@@ -28,8 +28,9 @@ enum IngestError {
     #[error("{0}")]
     Generic(miette::Report),
 
-    #[error("key fetch failed: {0}")]
-    KeyFetch(smol_str::SmolStr),
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    Resolver(#[from] ResolverError),
 
     #[error(transparent)]
     #[diagnostic(transparent)]
@@ -300,9 +301,11 @@ impl FirehoseWorker {
     // dont retry commit or sync on key fetch errors
     // since we'll just try again later if we get commit or sync again
     fn check_if_retriable_failure(e: &IngestError) -> bool {
-        !matches!(
+        matches!(
             e,
-            IngestError::KeyFetch(_) | IngestError::Commit(_) | IngestError::NoSigningKey(_)
+            IngestError::Generic(_)
+                | IngestError::Resolver(ResolverError::Ratelimited)
+                | IngestError::Resolver(ResolverError::Transport(_))
         )
     }
 
@@ -662,8 +665,7 @@ impl FirehoseWorker {
         if ctx.verify_signatures {
             let key = ctx
                 .handle
-                .block_on(ctx.state.resolver.resolve_signing_key(did))
-                .map_err(|e| IngestError::KeyFetch(e.to_smolstr()))?;
+                .block_on(ctx.state.resolver.resolve_signing_key(did))?;
             Ok(Some(key))
         } else {
             Ok(None)

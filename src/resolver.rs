@@ -8,11 +8,42 @@ use jacquard_common::types::crypto::PublicKey;
 use jacquard_common::types::ident::AtIdentifier;
 use jacquard_common::types::string::Did;
 use jacquard_identity::JacquardResolver;
-use jacquard_identity::resolver::{IdentityResolver, PlcSource, ResolverOptions};
-use miette::{Diagnostic, IntoDiagnostic, Result};
+use jacquard_identity::resolver::{
+    IdentityError, IdentityErrorKind, IdentityResolver, PlcSource, ResolverOptions,
+};
+use miette::{Diagnostic, IntoDiagnostic};
 use scc::HashCache;
+use smol_str::SmolStr;
 use thiserror::Error;
 use url::Url;
+
+#[derive(Debug, Diagnostic, Error)]
+pub enum ResolverError {
+    #[error("{0}")]
+    Generic(miette::Report),
+    #[error("too many requests")]
+    Ratelimited,
+    #[error("transport error: {0}")]
+    Transport(SmolStr),
+}
+
+impl From<IdentityError> for ResolverError {
+    fn from(e: IdentityError) -> Self {
+        match e.kind() {
+            IdentityErrorKind::HttpStatus(reqwest::StatusCode::TOO_MANY_REQUESTS) => {
+                Self::Ratelimited
+            }
+            IdentityErrorKind::Transport(msg) => Self::Transport(msg.clone()),
+            _ => Self::Generic(e.into()),
+        }
+    }
+}
+
+impl From<miette::Report> for ResolverError {
+    fn from(report: miette::Report) -> Self {
+        ResolverError::Generic(report)
+    }
+}
 
 struct ResolverInner {
     jacquard: JacquardResolver,
@@ -45,7 +76,10 @@ impl Resolver {
         }
     }
 
-    pub async fn resolve_did(&self, identifier: &AtIdentifier<'_>) -> Result<Did<'static>> {
+    pub async fn resolve_did(
+        &self,
+        identifier: &AtIdentifier<'_>,
+    ) -> Result<Did<'static>, ResolverError> {
         match identifier {
             AtIdentifier::Did(did) => Ok(did.clone().into_static()),
             AtIdentifier::Handle(handle) => {
@@ -55,7 +89,10 @@ impl Resolver {
         }
     }
 
-    pub async fn resolve_identity_info(&self, did: &Did<'_>) -> Result<(Url, Option<Handle<'_>>)> {
+    pub async fn resolve_identity_info(
+        &self,
+        did: &Did<'_>,
+    ) -> Result<(Url, Option<Handle<'_>>), ResolverError> {
         let doc_resp = self.inner.jacquard.resolve_did_doc(did).await?;
         let doc = doc_resp.parse()?;
 
@@ -69,7 +106,10 @@ impl Resolver {
         Ok((pds, handle))
     }
 
-    pub async fn resolve_signing_key(&self, did: &Did<'_>) -> Result<PublicKey<'static>> {
+    pub async fn resolve_signing_key(
+        &self,
+        did: &Did<'_>,
+    ) -> Result<PublicKey<'static>, ResolverError> {
         let did = did.clone().into_static();
         if let Some(entry) = self.inner.key_cache.get_async(&did).await {
             return Ok(entry.get().clone());
@@ -79,7 +119,8 @@ impl Resolver {
         let doc = doc_resp.parse()?;
 
         let key = doc
-            .atproto_public_key()?
+            .atproto_public_key()
+            .into_diagnostic()?
             .ok_or_else(|| NoSigningKeyError(did.clone()))
             .into_diagnostic()?;
 

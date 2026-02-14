@@ -1,6 +1,7 @@
 use crate::db::types::{DbAction, DbRkey, DbTid, TrimmedDid};
 use crate::db::{self, Db, keys, ser_repo_state};
 use crate::ops;
+use crate::resolver::ResolverError;
 use crate::state::AppState;
 use crate::types::{AccountEvt, BroadcastEvent, RepoState, RepoStatus, ResyncState, StoredEvent};
 
@@ -406,6 +407,16 @@ impl From<ClientError> for BackfillError {
 impl From<miette::Report> for BackfillError {
     fn from(e: miette::Report) -> Self {
         Self::Generic(e)
+    }
+}
+
+impl From<ResolverError> for BackfillError {
+    fn from(e: ResolverError) -> Self {
+        match e {
+            ResolverError::Ratelimited => Self::Ratelimited,
+            ResolverError::Transport(s) => Self::Transport(s),
+            ResolverError::Generic(e) => Self::Generic(e),
+        }
     }
 }
 
