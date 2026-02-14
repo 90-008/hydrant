@@ -96,6 +96,11 @@ impl ResyncState {
         let cap = 3600;
         let mult = 2u64.pow(retry_count.min(10)) as i64;
         let delay = (base * mult).min(cap);
+
+        // add +/- 10% jitter
+        let jitter = (rand::random::<f64>() * 0.2 - 0.1) * delay as f64;
+        let delay = (delay as f64 + jitter) as i64;
+
         chrono::Utc::now().timestamp() + delay
     }
 }
