@@ -12,9 +12,18 @@ pub async fn get_stats(State(state): State<Arc<AppState>>) -> Result<Json<StatsR
     let db = &state.db;
 
     let mut counts: HashMap<&'static str, u64> = futures::future::join_all(
-        ["repos", "records", "blocks", "pending", "resync"]
-            .into_iter()
-            .map(|name| async move { (name, db.get_count(name).await) }),
+        [
+            "repos",
+            "records",
+            "blocks",
+            "pending",
+            "resync",
+            "error_ratelimited",
+            "error_transport",
+            "error_generic",
+        ]
+        .into_iter()
+        .map(|name| async move { (name, db.get_count(name).await) }),
     )
     .await
     .into_iter()
