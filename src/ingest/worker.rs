@@ -357,6 +357,7 @@ impl FirehoseWorker {
                             RepoStatus::Backfilling,
                         )?;
                         ctx.state.db.update_count("pending", 1);
+                        batch.insert(&ctx.state.db.pending, keys::pending_key(did), &[]);
                         batch.commit().into_diagnostic()?;
                         ctx.state.notify_backfill();
                         return Ok(RepoProcessResult::Ok(repo_state));
@@ -502,6 +503,7 @@ impl FirehoseWorker {
                 RepoStatus::Backfilling,
             )?;
             ctx.state.db.update_count("pending", 1);
+            batch.insert(&ctx.state.db.pending, keys::pending_key(did), &[]);
             batch.commit().into_diagnostic()?;
             ctx.repo_cache
                 .insert(did.clone().into_static(), repo_state.clone().into_static());
@@ -562,7 +564,7 @@ impl FirehoseWorker {
                 &repo_key,
                 crate::db::ser_repo_state(&new_state)?,
             );
-            batch.insert(&ctx.state.db.pending, &repo_key, &[]);
+            batch.insert(&ctx.state.db.pending, keys::pending_key(did), &[]);
             ctx.state.db.update_count("repos", 1);
             ctx.state.db.update_count("pending", 1);
             batch.commit().into_diagnostic()?;

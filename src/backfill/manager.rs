@@ -28,7 +28,11 @@ pub fn queue_gone_backfills(state: &Arc<AppState>) -> Result<()> {
                 // move back to pending
                 let mut batch = state.db.inner.batch();
                 batch.remove(&state.db.resync, key.clone());
-                batch.insert(&state.db.pending, key, Vec::new());
+                batch.insert(
+                    &state.db.pending,
+                    crate::db::keys::pending_key(&did),
+                    Vec::new(),
+                );
 
                 // update repo state back to backfilling
                 let repo_key = crate::db::keys::repo_key(&did);
@@ -87,7 +91,10 @@ pub fn retry_worker(state: Arc<AppState>) {
 
                     // move back to pending
                     state.db.update_count("pending", 1);
-                    if let Err(e) = db.pending.insert(key, Vec::new()) {
+                    if let Err(e) = db
+                        .pending
+                        .insert(crate::db::keys::pending_key(&did), Vec::new())
+                    {
                         error!("failed to move {did} to pending: {e}");
                         db::check_poisoned(&e);
                         continue;

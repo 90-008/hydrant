@@ -4,6 +4,7 @@ use crate::ops;
 use crate::state::AppState;
 use crate::types::{AccountEvt, BroadcastEvent, RepoState, RepoStatus, ResyncState, StoredEvent};
 
+use fjall::Slice;
 use jacquard::api::com_atproto::sync::get_repo::{GetRepo, GetRepoError};
 use jacquard::error::{ClientError, ClientErrorKind};
 use jacquard::types::cid::Cid;
@@ -26,6 +27,36 @@ use tracing::{debug, error, info, trace, warn};
 pub mod manager;
 
 use crate::ingest::{BufferTx, IngestMessage};
+
+struct AdaptiveLimiter {
+    current_limit: usize,
+    max_limit: usize,
+    min_limit: usize,
+}
+
+impl AdaptiveLimiter {
+    fn new(start: usize, max: usize) -> Self {
+        Self {
+            current_limit: start,
+            max_limit: max,
+            min_limit: 1,
+        }
+    }
+
+    fn on_success(&mut self) {
+        if self.current_limit < self.max_limit {
+            self.current_limit += 1;
+            debug!("adaptive limiter increased to {}", self.current_limit);
+        }
+    }
+
+    fn on_failure(&mut self) {
+        if self.current_limit > self.min_limit {
+            self.current_limit = (self.current_limit / 2).max(self.min_limit);
+            debug!("adaptive limiter decreased to {}", self.current_limit);
+        }
+    }
+}
 
 pub struct BackfillWorker {
     state: Arc<AppState>,
@@ -75,10 +106,35 @@ impl Drop for InFlightGuard {
 impl BackfillWorker {
     pub async fn run(self) {
         info!("backfill worker started");
+
+        let (feedback_tx, mut feedback_rx) = tokio::sync::mpsc::channel(100);
+        let mut limiter = AdaptiveLimiter::new(
+            self.semaphore.available_permits(),
+            self.semaphore.available_permits(),
+        ); // assume start at max
+
         loop {
+            // apply feedback from finished tasks
+            while let Ok(was_ratelimited) = feedback_rx.try_recv() {
+                if was_ratelimited {
+                    limiter.on_failure();
+                } else {
+                    limiter.on_success();
+                }
+            }
+
             let mut spawned = 0;
 
-            for guard in self.state.db.pending.iter() {
+            // limit the number of active tasks based on adaptive limit
+            // we iterate in reverse to prioritize newer items (LIFO)
+            // effective key comparison: {timestamp}|{did}
+            // older timestamps are smaller, newer are larger.
+            // rev() starts from largest (newest).
+            for guard in self.state.db.pending.iter().rev() {
+                if self.in_flight.len() >= limiter.current_limit {
+                    break;
+                }
+
                 let key = match guard.key() {
                     Ok(k) => k,
                     Err(e) => {
@@ -88,12 +144,17 @@ impl BackfillWorker {
                     }
                 };
 
-                let did = match TrimmedDid::try_from(key.as_ref()) {
-                    Ok(d) => d.to_did(),
-                    Err(e) => {
-                        error!("invalid did in pending: {e}");
-                        continue;
+                let did = if key.len() > 9 && key[8] == keys::SEP {
+                    match TrimmedDid::try_from(&key[9..]) {
+                        Ok(d) => d.to_did(),
+                        Err(e) => {
+                            error!("invalid did '{key:?}' in pending: {e}");
+                            continue;
+                        }
                     }
+                } else {
+                    error!("invalid did '{key:?}' in pending");
+                    continue;
                 };
 
                 if self.in_flight.contains_sync(&did) {
@@ -113,45 +174,59 @@ impl BackfillWorker {
 
                 let state = self.state.clone();
                 let http = self.http.clone();
-                let buffer_tx_clone = self.buffer_tx.clone();
-                let did_clone = did.clone();
+                let did = did.clone();
+                let buffer_tx = self.buffer_tx.clone();
                 let verify = self.verify_signatures;
+                let feedback_tx = feedback_tx.clone();
 
                 tokio::spawn(async move {
                     let _guard = guard;
-                    did_task(
-                        state,
-                        http,
-                        buffer_tx_clone,
-                        did_clone.clone(),
-                        permit,
-                        verify,
-                    )
-                    .await
-                    .inspect_err(move |e| {
-                        error!("backfill process failed for {did_clone}: {e}");
-                        db::check_poisoned_report(e);
-                    })
+                    let res = did_task(&state, http, buffer_tx, &did, key, permit, verify).await;
+
+                    let was_ratelimited = match &res {
+                        Err(e) if matches!(e, BackfillError::Ratelimited) => true,
+                        _ => false,
+                    };
+
+                    if let Err(e) = res {
+                        error!("backfill process failed for {did}: {e}");
+                        if let BackfillError::Generic(report) = &e {
+                            db::check_poisoned_report(report);
+                        }
+                    }
+
+                    // wake worker to pick up more (in case we were sleeping at limit)
+                    state.backfill_notify.notify_one();
+
+                    let _ = feedback_tx.try_send(was_ratelimited);
                 });
 
                 spawned += 1;
             }
 
             if spawned == 0 {
-                self.state.backfill_notify.notified().await;
+                // if we didn't spawn anything, wait for notification OR feedback
+                tokio::select! {
+                    _ = self.state.backfill_notify.notified() => {},
+                    _ = tokio::time::sleep(Duration::from_secs(1)) => {}, // poll for feedback if idle
+                }
+            } else {
+                // if we spawned tasks, yield briefly to let them start and avoid tight loop
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
         }
     }
 }
 
 async fn did_task(
-    state: Arc<AppState>,
+    state: &Arc<AppState>,
     http: reqwest::Client,
     buffer_tx: BufferTx,
-    did: Did<'static>,
+    did: &Did<'static>,
+    pending_key: Slice,
     _permit: tokio::sync::OwnedSemaphorePermit,
     verify_signatures: bool,
-) -> Result<()> {
+) -> Result<(), BackfillError> {
     let db = &state.db;
 
     match process_did(&state, &http, &did, verify_signatures).await {
@@ -170,7 +245,7 @@ async fn did_task(
             let mut batch = db.inner.batch();
             // remove from pending
             if was_pending {
-                batch.remove(&db.pending, &did_key);
+                batch.remove(&db.pending, pending_key);
             }
             // remove from resync
             if was_resync {
@@ -201,6 +276,7 @@ async fn did_task(
             if let Err(e) = buffer_tx.send(IngestMessage::BackfillFinished(did.clone())) {
                 error!("failed to send BackfillFinished for {did}: {e}");
             }
+            Ok(())
         }
         Err(e) => {
             let mut was_ratelimited = false;
@@ -247,9 +323,11 @@ async fn did_task(
             };
 
             // 2. calculate backoff and update the other fields
-            *retry_count += was_ratelimited.then_some(3).unwrap_or(1);
+            *retry_count += was_ratelimited.then_some(1).unwrap_or(1);
             *next_retry = ResyncState::next_backoff(*retry_count);
             *message = e.to_smolstr();
+
+            let error_string = e.to_string();
 
             tokio::task::spawn_blocking({
                 let state = state.clone();
@@ -265,7 +343,7 @@ async fn did_task(
                     {
                         let mut state: RepoState =
                             rmp_serde::from_slice(&state_bytes).into_diagnostic()?;
-                        state.status = RepoStatus::Error(e.to_string().into());
+                        state.status = RepoStatus::Error(error_string.into());
                         Some(rmp_serde::to_vec(&state).into_diagnostic()?)
                     } else {
                         None
@@ -273,7 +351,7 @@ async fn did_task(
 
                     let mut batch = state.db.inner.batch();
                     batch.insert(&state.db.resync, &did_key, serialized_resync_state);
-                    batch.remove(&state.db.pending, &did_key);
+                    batch.remove(&state.db.pending, pending_key);
                     if let Some(state_bytes) = serialized_repo_state {
                         batch.insert(&state.db.repos, &did_key, state_bytes);
                     }
@@ -285,12 +363,18 @@ async fn did_task(
 
             state.db.update_count_async("resync", 1).await;
             state.db.update_count_async("pending", -1).await;
+
+            // add error stats
+            if was_ratelimited {
+                state.db.update_count_async("error_ratelimited", 1).await;
+            } else if let BackfillError::Transport(_) = &e {
+                state.db.update_count_async("error_transport", 1).await;
+            } else {
+                state.db.update_count_async("error_generic", 1).await;
+            }
+            Err(e)
         }
     }
-
-    // wake worker to pick up more
-    state.backfill_notify.notify_one();
-    Ok(())
 }
 
 #[derive(Debug, Diagnostic, Error)]

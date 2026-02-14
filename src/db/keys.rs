@@ -114,3 +114,15 @@ pub fn resync_buffer_prefix(did: &Did) -> Vec<u8> {
     prefix.push(SEP);
     prefix
 }
+
+// key format: {timestamp}|{DID} (DID trimmed)
+// timestamp is big-endian u64 micros
+pub fn pending_key(did: &Did) -> Vec<u8> {
+    let repo = TrimmedDid::from(did);
+    let mut key = Vec::with_capacity(8 + 1 + repo.len());
+    let ts = chrono::Utc::now().timestamp_micros() as u64;
+    key.extend_from_slice(&ts.to_be_bytes());
+    key.push(SEP);
+    repo.write_to_vec(&mut key);
+    key
+}
