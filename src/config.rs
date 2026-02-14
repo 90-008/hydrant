@@ -95,7 +95,7 @@ impl Config {
             .unwrap_or_else(|| Ok(vec![Url::parse("https://plc.wtf").unwrap()]))?;
 
         let full_network = cfg!("FULL_NETWORK", false);
-        let backfill_concurrency_limit = cfg!("BACKFILL_CONCURRENCY_LIMIT", 32usize);
+        let backfill_concurrency_limit = cfg!("BACKFILL_CONCURRENCY_LIMIT", 128usize);
         let cursor_save_interval = cfg!("CURSOR_SAVE_INTERVAL", 10, sec);
         let repo_fetch_timeout = cfg!("REPO_FETCH_TIMEOUT", 300, sec);
 
