@@ -104,7 +104,7 @@ impl Config {
 
         let full_network: bool = cfg!("FULL_NETWORK", false);
         let backfill_concurrency_limit = cfg!("BACKFILL_CONCURRENCY_LIMIT", 128usize);
-        let cursor_save_interval = cfg!("CURSOR_SAVE_INTERVAL", 10, sec);
+        let cursor_save_interval = cfg!("CURSOR_SAVE_INTERVAL", 5, sec);
         let repo_fetch_timeout = cfg!("REPO_FETCH_TIMEOUT", 300, sec);
 
         let database_path = cfg!("DATABASE_PATH", "./hydrant.db");
@@ -115,10 +115,10 @@ impl Config {
         let enable_debug = cfg!("ENABLE_DEBUG", false);
         let debug_port = cfg!("DEBUG_PORT", 3001u16);
         let verify_signatures = cfg!("VERIFY_SIGNATURES", SignatureVerification::Full);
-        let identity_cache_size = cfg!("IDENTITY_CACHE_SIZE", 100_000u64);
+        let identity_cache_size = cfg!("IDENTITY_CACHE_SIZE", 1_000_000u64);
         let disable_firehose = cfg!("DISABLE_FIREHOSE", false);
         let disable_backfill = cfg!("DISABLE_BACKFILL", false);
-        let firehose_workers = cfg!("FIREHOSE_WORKERS", 64usize);
+        let firehose_workers = cfg!("FIREHOSE_WORKERS", 32usize);
 
         let (
             default_db_worker_threads,
@@ -127,8 +127,8 @@ impl Config {
             default_records_memtable_size_mb,
             default_partition_overrides,
         ): (usize, u64, u64, u64, &str) = full_network
-            .then_some((8usize, 2048u64, 192u64, 8u64, "app.bsky.*=64"))
-            .unwrap_or((4usize, 512u64, 64u64, 8u64, ""));
+            .then_some((8usize, 1024u64, 192u64, 8u64, "app.bsky.*=64"))
+            .unwrap_or((4usize, 512u64, 64u64, 16u64, ""));
 
         let db_worker_threads = cfg!("DB_WORKER_THREADS", default_db_worker_threads);
         let db_max_journaling_size_mb = cfg!(
