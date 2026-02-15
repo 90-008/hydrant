@@ -80,19 +80,11 @@ pub fn delete_repo<'batch>(
         batch.remove(&db.resync_buffer, k);
     }
 
-    // 2. delete from records (all partitions)
-    let mut partitions = Vec::new();
-    db.record_partitions.iter_sync(|_, v| {
-        partitions.push(v.clone());
-        true
-    });
-
-    let records_prefix = keys::record_prefix(did);
-    for ks in partitions {
-        for guard in ks.prefix(&records_prefix) {
-            let k = guard.key().into_diagnostic()?;
-            batch.remove(&ks, k);
-        }
+    // 2. delete from records
+    let records_prefix = keys::record_prefix_did(did);
+    for guard in db.records.prefix(&records_prefix) {
+        let k = guard.key().into_diagnostic()?;
+        batch.remove(&db.records, k);
     }
 
     // 3. reset collection counts
@@ -249,8 +241,7 @@ pub fn apply_commit<'batch, 'db, 'commit, 's>(
     for op in &commit.ops {
         let (collection, rkey) = parse_path(&op.path)?;
         let rkey = DbRkey::new(rkey);
-        let partition = db.record_partition(collection)?;
-        let db_key = keys::record_key(did, &rkey);
+        let db_key = keys::record_key(did, collection, &rkey);
 
         let event_id = db.next_event_id.fetch_add(1, Ordering::SeqCst);
 
@@ -261,7 +252,7 @@ pub fn apply_commit<'batch, 'db, 'commit, 's>(
                     continue;
                 };
                 batch.insert(
-                    &partition,
+                    &db.records,
                     db_key.clone(),
                     cid.to_ipld()
                         .into_diagnostic()
@@ -276,7 +267,7 @@ pub fn apply_commit<'batch, 'db, 'commit, 's>(
                 }
             }
             DbAction::Delete => {
-                batch.remove(&partition, db_key);
+                batch.remove(&db.records, db_key);
 
                 // accumulate counts
                 records_delta -= 1;

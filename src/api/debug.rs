@@ -1,6 +1,6 @@
+use crate::api::AppState;
 use crate::db::keys;
 use crate::types::{RepoState, ResyncState, StoredEvent};
-use crate::{api::AppState, db::types::TrimmedDid};
 use axum::{
     Json,
     extract::{Query, State},
@@ -42,14 +42,10 @@ pub async fn handle_debug_count(
         .map_err(|_| StatusCode::BAD_REQUEST)?;
 
     let db = &state.db;
-    let ks = db
-        .record_partition(&req.collection)
-        .map_err(|_| StatusCode::NOT_FOUND)?;
+    let ks = db.records.clone();
 
-    // {TrimmedDid}\x00
-    let mut prefix = Vec::new();
-    TrimmedDid::from(&did).write_to_vec(&mut prefix);
-    prefix.push(keys::SEP);
+    // {TrimmedDid}|{collection}|
+    let prefix = keys::record_prefix_collection(&did, &req.collection);
 
     let count = tokio::task::spawn_blocking(move || {
         let start_key = prefix.clone();
@@ -255,12 +251,7 @@ fn get_keyspace_by_name(db: &crate::db::Db, name: &str) -> Result<fjall::Keyspac
         "resync" => Ok(db.resync.clone()),
         "events" => Ok(db.events.clone()),
         "counts" => Ok(db.counts.clone()),
-        _ => {
-            if let Some(col) = name.strip_prefix(crate::db::RECORDS_PARTITION_PREFIX) {
-                db.record_partition(col).map_err(|_| StatusCode::NOT_FOUND)
-            } else {
-                Err(StatusCode::BAD_REQUEST)
-            }
-        }
+        "records" => Ok(db.records.clone()),
+        _ => Err(StatusCode::BAD_REQUEST),
     }
 }

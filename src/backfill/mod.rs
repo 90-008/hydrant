@@ -29,6 +29,17 @@ pub mod manager;
 
 use crate::ingest::{BufferTx, IngestMessage};
 
+trait SliceSplitExt {
+    fn split_once<'a>(&'a self, delimiter: impl Fn(&u8) -> bool) -> Option<(&'a [u8], &'a [u8])>;
+}
+
+impl SliceSplitExt for [u8] {
+    fn split_once<'a>(&'a self, delimiter: impl Fn(&u8) -> bool) -> Option<(&'a [u8], &'a [u8])> {
+        let idx = self.iter().position(delimiter)?;
+        Some((&self[..idx], &self[idx + 1..]))
+    }
+}
+
 struct AdaptiveLimiter {
     current_limit: usize,
     max_limit: usize,
@@ -608,26 +619,29 @@ async fn process_did<'i>(
             let mut batch = app_state.db.inner.batch();
             let store = mst.storage();
 
-            let prefix = keys::record_prefix(&did);
+            let prefix = keys::record_prefix_did(&did);
             let mut existing_cids: HashMap<(SmolStr, DbRkey), SmolStr> = HashMap::new();
 
-            let mut partitions = Vec::new();
-            app_state.db.record_partitions.iter_sync(|col, ks| {
-                partitions.push((col.clone(), ks.clone()));
-                true
-            });
+            for guard in app_state.db.records.prefix(&prefix) {
+                let (key, cid_bytes) = guard.into_inner().into_diagnostic()?;
+                // key is did|collection|rkey
+                // skip did|
+                let remaining = &key[prefix.len()..];
+                let (collection_bytes, rkey_bytes) =
+                    SliceSplitExt::split_once(remaining, |b| *b == keys::SEP)
+                        .ok_or_else(|| miette::miette!("invalid record key format: {key:?}"))?;
 
-            for (col_name, ks) in partitions {
-                for guard in ks.prefix(&prefix) {
-                    let (key, cid_bytes) = guard.into_inner().into_diagnostic()?;
-                    let rkey = keys::parse_rkey(&key[prefix.len()..])
-                        .map_err(|e| miette::miette!("invalid rkey '{key:?}' for {did}: {e}"))?;
-                    let cid = cid::Cid::read_bytes(cid_bytes.as_ref())
-                        .map_err(|e| miette::miette!("invalid cid '{cid_bytes:?}' for {did}: {e}"))?
-                        .to_smolstr();
+                let collection = std::str::from_utf8(collection_bytes)
+                    .map_err(|e| miette::miette!("invalid collection utf8: {e}"))?;
 
-                    existing_cids.insert((col_name.as_str().into(), rkey), cid);
-                }
+                let rkey = keys::parse_rkey(rkey_bytes)
+                    .map_err(|e| miette::miette!("invalid rkey '{key:?}' for {did}: {e}"))?;
+
+                let cid = cid::Cid::read_bytes(cid_bytes.as_ref())
+                    .map_err(|e| miette::miette!("invalid cid '{cid_bytes:?}' for {did}: {e}"))?
+                    .to_smolstr();
+
+                existing_cids.insert((collection.into(), rkey), cid);
             }
 
             for (key, cid) in leaves {
@@ -640,7 +654,6 @@ async fn process_did<'i>(
                     let rkey = DbRkey::new(rkey);
                     let path = (collection.to_smolstr(), rkey.clone());
                     let cid_obj = Cid::ipld(cid);
-                    let partition = app_state.db.record_partition(collection)?;
 
                     // check if this record already exists with same CID
                     let (action, is_new) = if let Some(existing_cid) = existing_cids.remove(&path) {
@@ -654,11 +667,11 @@ async fn process_did<'i>(
                     };
                     trace!("{action} {did}/{collection}/{rkey} ({cid})");
 
-                    // Key is just did|rkey
-                    let db_key = keys::record_key(&did, &rkey);
+                    // Key is did|collection|rkey
+                    let db_key = keys::record_key(&did, collection, &rkey);
 
                     batch.insert(&app_state.db.blocks, cid.to_bytes(), val.as_ref());
-                    batch.insert(&partition, db_key, cid.to_bytes());
+                    batch.insert(&app_state.db.records, db_key, cid.to_bytes());
 
                     added_blocks += 1;
                     if is_new {
@@ -686,9 +699,11 @@ async fn process_did<'i>(
             // remove any remaining existing records (they weren't in the new MST)
             for ((collection, rkey), cid) in existing_cids {
                 trace!("remove {did}/{collection}/{rkey} ({cid})");
-                let partition = app_state.db.record_partition(collection.as_str())?;
 
-                batch.remove(&partition, keys::record_key(&did, &rkey));
+                batch.remove(
+                    &app_state.db.records,
+                    keys::record_key(&did, &collection, &rkey),
+                );
 
                 let event_id = app_state.db.next_event_id.fetch_add(1, Ordering::SeqCst);
                 let evt = StoredEvent {

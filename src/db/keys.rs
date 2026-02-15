@@ -15,8 +15,8 @@ pub fn repo_key<'a>(did: &'a Did) -> Vec<u8> {
     vec
 }
 
-// prefix format: {DID}\x00
-pub fn record_prefix(did: &Did) -> Vec<u8> {
+// prefix format: {DID}| (DID trimmed)
+pub fn record_prefix_did(did: &Did) -> Vec<u8> {
     let repo = TrimmedDid::from(did);
     let mut prefix = Vec::with_capacity(repo.len() + 1);
     repo.write_to_vec(&mut prefix);
@@ -24,11 +24,24 @@ pub fn record_prefix(did: &Did) -> Vec<u8> {
     prefix
 }
 
-// key format: {DID}\x00{rkey}
-pub fn record_key(did: &Did, rkey: &DbRkey) -> Vec<u8> {
+// prefix format: {DID}|{collection}|
+pub fn record_prefix_collection(did: &Did, collection: &str) -> Vec<u8> {
     let repo = TrimmedDid::from(did);
-    let mut key = Vec::with_capacity(repo.len() + rkey.len() + 1);
+    let mut prefix = Vec::with_capacity(repo.len() + 1 + collection.len() + 1);
+    repo.write_to_vec(&mut prefix);
+    prefix.push(SEP);
+    prefix.extend_from_slice(collection.as_bytes());
+    prefix.push(SEP);
+    prefix
+}
+
+// key format: {DID}|{collection}|{rkey}
+pub fn record_key(did: &Did, collection: &str, rkey: &DbRkey) -> Vec<u8> {
+    let repo = TrimmedDid::from(did);
+    let mut key = Vec::with_capacity(repo.len() + 1 + collection.len() + 1 + rkey.len() + 1);
     repo.write_to_vec(&mut key);
+    key.push(SEP);
+    key.extend_from_slice(collection.as_bytes());
     key.push(SEP);
     write_rkey(&mut key, rkey);
     key

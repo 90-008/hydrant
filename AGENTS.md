@@ -74,7 +74,7 @@ To minimize latency in `apply_commit` and the backfill worker, events are stored
 
 Hydrant uses multiple `fjall` keyspaces:
 - `repos`: Maps `{DID}` -> `RepoState` (MessagePack).
-- `records`: Partitioned by collection. Maps `{DID}|{RKey}` -> `{CID}` (Binary).
+- `records`: Maps `{DID}|{COL}|{RKey}` -> `{CID}` (Binary).
 - `blocks`: Maps `{CID}` -> `Block Data` (Raw CBOR).
 - `events`: Maps `{ID}` (u64) -> `StoredEvent` (MessagePack). This is the source for the JSON stream API.
 - `cursors`: Maps `firehose_cursor` or `crawler_cursor` -> `Value` (u64/i64 BE Bytes).

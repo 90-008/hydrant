@@ -1,4 +1,4 @@
-use miette::{IntoDiagnostic, Result};
+use miette::Result;
 use smol_str::SmolStr;
 use std::fmt;
 use std::path::PathBuf;
@@ -61,8 +61,7 @@ pub struct Config {
     pub db_blocks_memtable_size_mb: u64,
     pub db_repos_memtable_size_mb: u64,
     pub db_events_memtable_size_mb: u64,
-    pub db_records_default_memtable_size_mb: u64,
-    pub db_records_partition_overrides: Vec<(glob::Pattern, u64)>,
+    pub db_records_memtable_size_mb: u64,
     pub crawler_max_pending_repos: usize,
     pub crawler_resume_pending_repos: usize,
 }
@@ -126,11 +125,9 @@ impl Config {
             default_db_worker_threads,
             default_db_max_journaling_size_mb,
             default_db_memtable_size_mb,
-            default_records_memtable_size_mb,
-            default_partition_overrides,
-        ): (usize, u64, u64, u64, &str) = full_network
-            .then_some((8usize, 1024u64, 192u64, 8u64, "app.bsky.*=64"))
-            .unwrap_or((4usize, 512u64, 64u64, 16u64, ""));
+        ): (usize, u64, u64) = full_network
+            .then_some((8usize, 1024u64, 192u64))
+            .unwrap_or((4usize, 512u64, 64u64));
 
         let db_worker_threads = cfg!("DB_WORKER_THREADS", default_db_worker_threads);
         let db_max_journaling_size_mb = cfg!(
@@ -145,32 +142,11 @@ impl Config {
             cfg!("DB_REPOS_MEMTABLE_SIZE_MB", default_db_memtable_size_mb);
         let db_events_memtable_size_mb =
             cfg!("DB_EVENTS_MEMTABLE_SIZE_MB", default_db_memtable_size_mb);
-        let db_records_default_memtable_size_mb = cfg!(
-            "DB_RECORDS_DEFAULT_MEMTABLE_SIZE_MB",
-            default_records_memtable_size_mb
-        );
+        let db_records_memtable_size_mb =
+            cfg!("DB_RECORDS_MEMTABLE_SIZE_MB", default_db_memtable_size_mb);
 
         let crawler_max_pending_repos = cfg!("CRAWLER_MAX_PENDING_REPOS", 2000usize);
         let crawler_resume_pending_repos = cfg!("CRAWLER_RESUME_PENDING_REPOS", 1000usize);
-
-        let db_records_partition_overrides: Vec<(glob::Pattern, u64)> =
-            std::env::var("HYDRANT_DB_RECORDS_PARTITION_OVERRIDES")
-                .unwrap_or_else(|_| default_partition_overrides.to_string())
-                .split(',')
-                .filter(|s| !s.is_empty())
-                .map(|s| {
-                    let mut parts = s.split('=');
-                    let pattern = parts
-                        .next()
-                        .ok_or_else(|| miette::miette!("invalid partition override format"))?;
-                    let size = parts
-                        .next()
-                        .ok_or_else(|| miette::miette!("invalid partition override format"))?
-                        .parse::<u64>()
-                        .into_diagnostic()?;
-                    Ok((glob::Pattern::new(pattern).into_diagnostic()?, size))
-                })
-                .collect::<Result<Vec<_>>>()?;
 
         Ok(Self {
             database_path,
@@ -197,8 +173,7 @@ impl Config {
             db_blocks_memtable_size_mb,
             db_repos_memtable_size_mb,
             db_events_memtable_size_mb,
-            db_records_default_memtable_size_mb,
-            db_records_partition_overrides: db_records_partition_overrides,
+            db_records_memtable_size_mb,
             crawler_max_pending_repos,
             crawler_resume_pending_repos,
         })
@@ -274,8 +249,8 @@ impl fmt::Display for Config {
         )?;
         writeln!(
             f,
-            "  db records def memtable:  {} mb",
-            self.db_records_default_memtable_size_mb
+            "  db records memtable:      {} mb",
+            self.db_records_memtable_size_mb
         )?;
 
         writeln!(

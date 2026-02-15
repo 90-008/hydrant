@@ -78,13 +78,13 @@ pub async fn handle_get_record(
         .await
         .map_err(|e| bad_request(GetRecord::NSID, e))?;
 
-    let partition = db
-        .record_partition(req.collection.as_str())
-        .map_err(|e| internal_error(GetRecord::NSID, e))?;
+    let db_key = keys::record_key(
+        &did,
+        req.collection.as_str(),
+        &DbRkey::new(req.rkey.0.as_str()),
+    );
 
-    let db_key = keys::record_key(&did, &DbRkey::new(req.rkey.0.as_str()));
-
-    let cid_bytes = Db::get(partition, db_key)
+    let cid_bytes = Db::get(db.records.clone(), db_key)
         .await
         .map_err(|e| internal_error(GetRecord::NSID, e))?;
 
@@ -132,11 +132,9 @@ pub async fn handle_list_records(
         .await
         .map_err(|e| bad_request(ListRecords::NSID, e))?;
 
-    let ks = db
-        .record_partition(req.collection.as_str())
-        .map_err(|e| internal_error(ListRecords::NSID, e))?;
+    let ks = db.records.clone();
 
-    let prefix = keys::record_prefix(&did);
+    let prefix = keys::record_prefix_collection(&did, req.collection.as_str());
 
     let limit = req.limit.unwrap_or(50).min(100) as usize;
     let reverse = req.reverse.unwrap_or(false);
