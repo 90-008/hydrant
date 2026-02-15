@@ -5,7 +5,7 @@ use jacquard_common::types::string::Did;
 use miette::{Context, IntoDiagnostic, Result};
 use scc::HashMap;
 use smol_str::{SmolStr, format_smolstr};
-use std::path::Path;
+
 use std::sync::Arc;
 
 pub mod keys;
@@ -19,10 +19,6 @@ pub const RECORDS_PARTITION_PREFIX: &str = "r:";
 
 fn default_opts() -> KeyspaceCreateOptions {
     KeyspaceCreateOptions::default()
-}
-
-fn record_partition_opts() -> KeyspaceCreateOptions {
-    default_opts().max_memtable_size(32 * 2_u64.pow(20))
 }
 
 pub struct Db {
@@ -39,22 +35,22 @@ pub struct Db {
     pub event_tx: broadcast::Sender<BroadcastEvent>,
     pub next_event_id: Arc<AtomicU64>,
     pub counts_map: HashMap<SmolStr, u64>,
+    pub record_partition_overrides: Vec<(glob::Pattern, u64)>,
+    pub record_partition_default_size: u64,
 }
 
 impl Db {
-    pub fn open(
-        path: impl AsRef<Path>,
-        cache_size: u64,
-        disable_lz4_compression: bool,
-    ) -> Result<Self> {
-        let db = Database::builder(path.as_ref())
-            .cache_size(cache_size * 2_u64.pow(20) / 2)
+    pub fn open(cfg: &crate::config::Config) -> Result<Self> {
+        let db = Database::builder(&cfg.database_path)
+            .cache_size(cfg.cache_size * 2_u64.pow(20) / 2)
             .manual_journal_persist(true)
             .journal_compression(
-                disable_lz4_compression
+                cfg.disable_lz4_compression
                     .then_some(fjall::CompressionType::None)
                     .unwrap_or(fjall::CompressionType::Lz4),
             )
+            .worker_threads(cfg.db_worker_threads)
+            .max_journaling_size(cfg.db_max_journaling_size_mb * 1024 * 1024)
             .open()
             .into_diagnostic()?;
         let db = Arc::new(db);
@@ -64,19 +60,30 @@ impl Db {
             db.keyspace(name, move || opts).into_diagnostic()
         };
 
-        let repos = open_ks("repos", opts().expect_point_read_hits(true))?;
+        let repos = open_ks(
+            "repos",
+            opts()
+                .expect_point_read_hits(true)
+                .max_memtable_size(cfg.db_repos_memtable_size_mb * 1024 * 1024),
+        )?;
         let blocks = open_ks(
             "blocks",
             opts()
                 // point reads are used a lot by stream
                 .expect_point_read_hits(true)
-                .max_memtable_size(32 * 2_u64.pow(20)),
+                .max_memtable_size(cfg.db_blocks_memtable_size_mb * 1024 * 1024),
         )?;
         let cursors = open_ks("cursors", opts().expect_point_read_hits(true))?;
-        let pending = open_ks("pending", opts())?;
+        let pending = open_ks(
+            "pending",
+            opts().max_memtable_size(cfg.db_pending_memtable_size_mb * 1024 * 1024),
+        )?;
         let resync = open_ks("resync", opts())?;
         let resync_buffer = open_ks("resync_buffer", opts())?;
-        let events = open_ks("events", opts())?;
+        let events = open_ks(
+            "events",
+            opts().max_memtable_size(cfg.db_events_memtable_size_mb * 1024 * 1024),
+        )?;
         let counts = open_ks("counts", opts().expect_point_read_hits(true))?;
 
         let record_partitions = HashMap::new();
@@ -85,8 +92,8 @@ impl Db {
             for name in names {
                 let name_str: &str = name.as_ref();
                 if let Some(collection) = name_str.strip_prefix(RECORDS_PARTITION_PREFIX) {
-                    let popts = record_partition_opts();
-                    let ks = db.keyspace(name_str, move || popts).into_diagnostic()?;
+                    let opts = Self::get_record_partition_opts(cfg, collection);
+                    let ks = db.keyspace(name_str, move || opts).into_diagnostic()?;
                     let _ = record_partitions.insert_sync(collection.to_string(), ks);
                 }
             }
@@ -132,7 +139,23 @@ impl Db {
             event_tx,
             counts_map,
             next_event_id: Arc::new(AtomicU64::new(last_id + 1)),
+            record_partition_overrides: cfg.db_records_partition_overrides.clone(),
+            record_partition_default_size: cfg.db_records_default_memtable_size_mb,
         })
+    }
+
+    fn get_record_partition_opts(
+        cfg: &crate::config::Config,
+        collection: &str,
+    ) -> KeyspaceCreateOptions {
+        let size = cfg
+            .db_records_partition_overrides
+            .iter()
+            .find(|(p, _)| p.matches(collection))
+            .map(|(_, s)| *s)
+            .unwrap_or(cfg.db_records_default_memtable_size_mb);
+
+        default_opts().max_memtable_size(size * 1024 * 1024)
     }
 
     pub fn record_partition(&self, collection: &str) -> Result<Keyspace> {
@@ -141,9 +164,18 @@ impl Db {
             Entry::Occupied(o) => Ok(o.get().clone()),
             Entry::Vacant(v) => {
                 let name = format_smolstr!("{}{}", RECORDS_PARTITION_PREFIX, collection);
+                let size = self
+                    .record_partition_overrides
+                    .iter()
+                    .find(|(p, _)| p.matches(collection))
+                    .map(|(_, s)| *s)
+                    .unwrap_or(self.record_partition_default_size);
+
                 let ks = self
                     .inner
-                    .keyspace(&name, record_partition_opts)
+                    .keyspace(&name, move || {
+                        default_opts().max_memtable_size(size * 1024 * 1024)
+                    })
                     .into_diagnostic()?;
                 Ok(v.insert_entry(ks).get().clone())
             }

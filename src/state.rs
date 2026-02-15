@@ -14,11 +14,7 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(config: &Config) -> Result<Self> {
-        let db = Db::open(
-            &config.database_path,
-            config.cache_size,
-            config.disable_lz4_compression,
-        )?;
+        let db = Db::open(config)?;
         let resolver = Resolver::new(config.plc_urls.clone(), config.identity_cache_size);
 
         Ok(Self {

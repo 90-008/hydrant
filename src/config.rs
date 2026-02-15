@@ -1,4 +1,4 @@
-use miette::Result;
+use miette::{IntoDiagnostic, Result};
 use smol_str::SmolStr;
 use std::fmt;
 use std::path::PathBuf;
@@ -55,6 +55,14 @@ pub struct Config {
     pub disable_firehose: bool,
     pub disable_backfill: bool,
     pub firehose_workers: usize,
+    pub db_worker_threads: usize,
+    pub db_max_journaling_size_mb: u64,
+    pub db_pending_memtable_size_mb: u64,
+    pub db_blocks_memtable_size_mb: u64,
+    pub db_repos_memtable_size_mb: u64,
+    pub db_events_memtable_size_mb: u64,
+    pub db_records_default_memtable_size_mb: u64,
+    pub db_records_partition_overrides: Vec<(glob::Pattern, u64)>,
 }
 
 impl Config {
@@ -94,7 +102,7 @@ impl Config {
             })
             .unwrap_or_else(|| Ok(vec![Url::parse("https://plc.wtf").unwrap()]))?;
 
-        let full_network = cfg!("FULL_NETWORK", false);
+        let full_network: bool = cfg!("FULL_NETWORK", false);
         let backfill_concurrency_limit = cfg!("BACKFILL_CONCURRENCY_LIMIT", 128usize);
         let cursor_save_interval = cfg!("CURSOR_SAVE_INTERVAL", 10, sec);
         let repo_fetch_timeout = cfg!("REPO_FETCH_TIMEOUT", 300, sec);
@@ -111,6 +119,53 @@ impl Config {
         let disable_firehose = cfg!("DISABLE_FIREHOSE", false);
         let disable_backfill = cfg!("DISABLE_BACKFILL", false);
         let firehose_workers = cfg!("FIREHOSE_WORKERS", 64usize);
+
+        let (
+            default_db_worker_threads,
+            default_db_max_journaling_size_mb,
+            default_db_memtable_size_mb,
+            default_records_memtable_size_mb,
+            default_partition_overrides,
+        ): (usize, u64, u64, u64, &str) = full_network
+            .then_some((8usize, 2048u64, 192u64, 8u64, "app.bsky.*=64"))
+            .unwrap_or((4usize, 512u64, 64u64, 8u64, ""));
+
+        let db_worker_threads = cfg!("DB_WORKER_THREADS", default_db_worker_threads);
+        let db_max_journaling_size_mb = cfg!(
+            "DB_MAX_JOURNALING_SIZE_MB",
+            default_db_max_journaling_size_mb
+        );
+        let db_pending_memtable_size_mb =
+            cfg!("DB_PENDING_MEMTABLE_SIZE_MB", default_db_memtable_size_mb);
+        let db_blocks_memtable_size_mb =
+            cfg!("DB_BLOCKS_MEMTABLE_SIZE_MB", default_db_memtable_size_mb);
+        let db_repos_memtable_size_mb =
+            cfg!("DB_REPOS_MEMTABLE_SIZE_MB", default_db_memtable_size_mb);
+        let db_events_memtable_size_mb =
+            cfg!("DB_EVENTS_MEMTABLE_SIZE_MB", default_db_memtable_size_mb);
+        let db_records_default_memtable_size_mb = cfg!(
+            "DB_RECORDS_DEFAULT_MEMTABLE_SIZE_MB",
+            default_records_memtable_size_mb
+        );
+
+        let db_records_partition_overrides: Vec<(glob::Pattern, u64)> =
+            std::env::var("HYDRANT_DB_RECORDS_PARTITION_OVERRIDES")
+                .unwrap_or_else(|_| default_partition_overrides.to_string())
+                .split(',')
+                .filter(|s| !s.is_empty())
+                .map(|s| {
+                    let mut parts = s.split('=');
+                    let pattern = parts
+                        .next()
+                        .ok_or_else(|| miette::miette!("invalid partition override format"))?;
+                    let size = parts
+                        .next()
+                        .ok_or_else(|| miette::miette!("invalid partition override format"))?
+                        .parse::<u64>()
+                        .into_diagnostic()?;
+                    Ok((glob::Pattern::new(pattern).into_diagnostic()?, size))
+                })
+                .collect::<Result<Vec<_>>>()?;
 
         Ok(Self {
             database_path,
@@ -131,6 +186,14 @@ impl Config {
             disable_firehose,
             disable_backfill,
             firehose_workers,
+            db_worker_threads,
+            db_max_journaling_size_mb,
+            db_pending_memtable_size_mb,
+            db_blocks_memtable_size_mb,
+            db_repos_memtable_size_mb,
+            db_events_memtable_size_mb,
+            db_records_default_memtable_size_mb,
+            db_records_partition_overrides: db_records_partition_overrides,
         })
     }
 }
@@ -176,6 +239,37 @@ impl fmt::Display for Config {
         )?;
         writeln!(f, "  api port:                 {}", self.api_port)?;
         writeln!(f, "  firehose workers:         {}", self.firehose_workers)?;
+        writeln!(f, "  db worker threads:        {}", self.db_worker_threads)?;
+        writeln!(
+            f,
+            "  db journal size:          {} mb",
+            self.db_max_journaling_size_mb
+        )?;
+        writeln!(
+            f,
+            "  db pending memtable:      {} mb",
+            self.db_pending_memtable_size_mb
+        )?;
+        writeln!(
+            f,
+            "  db blocks memtable:       {} mb",
+            self.db_blocks_memtable_size_mb
+        )?;
+        writeln!(
+            f,
+            "  db repos memtable:        {} mb",
+            self.db_repos_memtable_size_mb
+        )?;
+        writeln!(
+            f,
+            "  db events memtable:       {} mb",
+            self.db_events_memtable_size_mb
+        )?;
+        writeln!(
+            f,
+            "  db records def memtable:  {} mb",
+            self.db_records_default_memtable_size_mb
+        )?;
         writeln!(f, "  enable debug:             {}", self.enable_debug)?;
         if self.enable_debug {
             writeln!(f, "  debug port:               {}", self.debug_port)?;
