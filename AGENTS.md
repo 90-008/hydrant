@@ -88,6 +88,7 @@ Hydrant uses multiple `fjall` keyspaces:
 ### Testing
 - `nu tests/repo_sync_integrity.nu` - Runs the full integration test suite using Nushell. This builds the binary, starts a temporary instance, performs a backfill against a real PDS, and verifies record integrity.
 - `nu tests/verify_crawler.nu` - Verifies full-network crawler functionality using a mock relay.
+- `nu tests/throttling_test.nu` - Verifies crawler throttling logic when pending queue is full.
 - `nu tests/stream_test.nu` - Tests WebSocket streaming functionality. Verifies both live event streaming during backfill and historical replay with cursor.
 - `nu tests/authenticated_stream_test.nu` - Tests authenticated event streaming. Verifies that create, update, and delete actions on a real account are correctly streamed by Hydrant in the correct order. Requires `TEST_REPO` and `TEST_PASSWORD` in `.env`.
 - `nu tests/debug_endpoints.nu` - Tests debug/introspection endpoints (`/debug/iter`, `/debug/get`) and verifies DB content and serialization.
