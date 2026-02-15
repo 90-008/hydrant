@@ -8,7 +8,7 @@ use miette::{IntoDiagnostic, Result};
 use smol_str::SmolStr;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, trace};
 use url::Url;
 
 pub struct Crawler {
@@ -73,7 +73,7 @@ impl Crawler {
                 continue;
             }
 
-            info!("crawler fetched {} repos...", output.repos.len());
+            debug!("crawler fetched {} repos...", output.repos.len());
 
             let mut batch = db.inner.batch();
             let mut to_queue = Vec::new();
@@ -84,7 +84,7 @@ impl Crawler {
 
                 // check if known
                 if !Db::contains_key(db.repos.clone(), &did_key).await? {
-                    debug!("crawler found new repo: {}", repo.did);
+                    trace!("crawler found new repo: {}", repo.did);
 
                     let state = RepoState::backfilling(&repo.did);
                     batch.insert(&db.repos, &did_key, ser_repo_state(&state)?);
