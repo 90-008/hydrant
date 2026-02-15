@@ -37,9 +37,9 @@ pub fn queue_gone_backfills(state: &Arc<AppState>) -> Result<()> {
                     batch.insert(&state.db.repos, key, ser_repo_state(&repo_state)?);
                 }
 
+                batch.commit().into_diagnostic()?;
                 state.db.update_count("resync", -1);
                 state.db.update_count("pending", 1);
-                batch.commit().into_diagnostic()?;
 
                 state.notify_backfill();
                 count += 1;
@@ -85,12 +85,12 @@ pub fn retry_worker(state: Arc<AppState>) {
                     debug!("retrying backfill for {did}");
 
                     // move back to pending
-                    state.db.update_count("pending", 1);
                     if let Err(e) = db.pending.insert(keys::repo_key(&did), Vec::new()) {
                         error!("failed to move {did} to pending: {e}");
                         db::check_poisoned(&e);
                         continue;
                     }
+                    state.db.update_count("pending", 1);
 
                     state.notify_backfill();
                     count += 1;
