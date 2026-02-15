@@ -1,6 +1,6 @@
 use crate::api::AppState;
 use crate::db::{Db, keys, ser_repo_state};
-use crate::types::RepoState;
+use crate::types::{GaugeState, RepoState};
 use axum::{Json, Router, extract::State, http::StatusCode, routing::post};
 use jacquard::types::did::Did;
 use serde::Deserialize;
@@ -51,7 +51,10 @@ pub async fn handle_repo_add(
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
         state.db.update_count_async("repos", added).await;
-        state.db.update_count_async("pending", added).await;
+        state
+            .db
+            .update_gauge_diff_async(&GaugeState::Synced, &GaugeState::Pending)
+            .await;
 
         // trigger backfill worker
         state.notify_backfill();
@@ -71,8 +74,6 @@ pub async fn handle_repo_remove(
     let db = &state.db;
     let mut batch = db.inner.batch();
     let mut removed_repos = 0;
-    let mut removed_pending = 0;
-    let mut removed_resync = 0;
 
     for did_str in req.dids {
         let did = Did::new_owned(did_str.as_str())
@@ -95,36 +96,37 @@ pub async fn handle_repo_remove(
                     | crate::types::RepoStatus::Suspended
             );
 
-            batch.remove(&db.repos, &did_key);
-
-            if was_pending {
-                batch.remove(&db.pending, &did_key);
-                removed_pending -= 1;
-            }
-            if let Some(resync_bytes) = Db::get(db.resync.clone(), &did_key)
+            let old_gauge = if was_pending {
+                GaugeState::Pending
+            } else if let Some(resync_bytes) = Db::get(db.resync.clone(), &did_key)
                 .await
                 .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
             {
                 let resync_state: crate::types::ResyncState = rmp_serde::from_slice(&resync_bytes)
                     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-                if let crate::types::ResyncState::Error { kind, .. } = resync_state {
-                    match kind {
-                        crate::types::ResyncErrorKind::Ratelimited => {
-                            state.db.update_count_async("error_ratelimited", -1).await
-                        }
-                        crate::types::ResyncErrorKind::Transport => {
-                            state.db.update_count_async("error_transport", -1).await
-                        }
-                        crate::types::ResyncErrorKind::Generic => {
-                            state.db.update_count_async("error_generic", -1).await
-                        }
-                    }
-                }
+                let kind = if let crate::types::ResyncState::Error { kind, .. } = resync_state {
+                    Some(kind)
+                } else {
+                    None
+                };
+                GaugeState::Resync(kind)
+            } else {
+                GaugeState::Synced
+            };
 
-                batch.remove(&db.resync, &did_key);
-                removed_resync -= 1;
+            batch.remove(&db.repos, &did_key);
+            if was_pending {
+                batch.remove(&db.pending, &did_key);
             }
+            if old_gauge.is_resync() {
+                batch.remove(&db.resync, &did_key);
+            }
+
+            state
+                .db
+                .update_gauge_diff_async(&old_gauge, &GaugeState::Synced)
+                .await;
 
             removed_repos -= 1;
         }
@@ -137,15 +139,6 @@ pub async fn handle_repo_remove(
 
     if removed_repos != 0 {
         state.db.update_count_async("repos", removed_repos).await;
-    }
-    if removed_pending != 0 {
-        state
-            .db
-            .update_count_async("pending", removed_pending)
-            .await;
-    }
-    if removed_resync != 0 {
-        state.db.update_count_async("resync", removed_resync).await;
     }
 
     Ok(StatusCode::OK)

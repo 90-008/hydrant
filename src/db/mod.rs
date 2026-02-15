@@ -35,6 +35,52 @@ pub struct Db {
     pub counts_map: HashMap<SmolStr, u64>,
 }
 
+macro_rules! update_gauge_diff_impl {
+    ($self:ident, $old:ident, $new:ident, $update_method:ident $(, $await:tt)?) => {{
+        use crate::types::GaugeState;
+
+        if $old == $new {
+            return;
+        }
+
+        // pending
+        match ($old, $new) {
+            (GaugeState::Pending, GaugeState::Pending) => {}
+            (GaugeState::Pending, _) => $self.$update_method("pending", -1) $(.$await)?,
+            (_, GaugeState::Pending) => $self.$update_method("pending", 1) $(.$await)?,
+            _ => {}
+        }
+
+        // resync
+        let old_resync = $old.is_resync();
+        let new_resync = $new.is_resync();
+        match (old_resync, new_resync) {
+            (true, false) => $self.$update_method("resync", -1) $(.$await)?,
+            (false, true) => $self.$update_method("resync", 1) $(.$await)?,
+            _ => {}
+        }
+
+        // error kinds
+        if let GaugeState::Resync(Some(kind)) = $old {
+            let key = match kind {
+                crate::types::ResyncErrorKind::Ratelimited => "error_ratelimited",
+                crate::types::ResyncErrorKind::Transport => "error_transport",
+                crate::types::ResyncErrorKind::Generic => "error_generic",
+            };
+            $self.$update_method(key, -1) $(.$await)?;
+        }
+
+        if let GaugeState::Resync(Some(kind)) = $new {
+            let key = match kind {
+                crate::types::ResyncErrorKind::Ratelimited => "error_ratelimited",
+                crate::types::ResyncErrorKind::Transport => "error_transport",
+                crate::types::ResyncErrorKind::Generic => "error_generic",
+            };
+            $self.$update_method(key, 1) $(.$await)?;
+        }
+    }};
+}
+
 impl Db {
     pub fn open(cfg: &crate::config::Config) -> Result<Self> {
         let db = Database::builder(&cfg.database_path)
@@ -189,6 +235,22 @@ impl Db {
             .read_async(key, |_, v| *v)
             .await
             .unwrap_or(0)
+    }
+
+    pub fn update_gauge_diff(
+        &self,
+        old: &crate::types::GaugeState,
+        new: &crate::types::GaugeState,
+    ) {
+        update_gauge_diff_impl!(self, old, new, update_count);
+    }
+
+    pub async fn update_gauge_diff_async(
+        &self,
+        old: &crate::types::GaugeState,
+        new: &crate::types::GaugeState,
+    ) {
+        update_gauge_diff_impl!(self, old, new, update_count_async, await);
     }
 
     pub fn update_repo_state<F, T>(

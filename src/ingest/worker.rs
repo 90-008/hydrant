@@ -3,7 +3,7 @@ use crate::ingest::{BufferedMessage, IngestMessage};
 use crate::ops;
 use crate::resolver::{NoSigningKeyError, ResolverError};
 use crate::state::AppState;
-use crate::types::{AccountEvt, BroadcastEvent, IdentityEvt, RepoState, RepoStatus};
+use crate::types::{AccountEvt, BroadcastEvent, GaugeState, IdentityEvt, RepoState, RepoStatus};
 use jacquard::api::com_atproto::sync::subscribe_repos::SubscribeReposMessage;
 
 use fjall::OwnedWriteBatch;
@@ -361,7 +361,9 @@ impl FirehoseWorker {
                         )?;
                         batch.insert(&ctx.state.db.pending, keys::repo_key(did), &[]);
                         batch.commit().into_diagnostic()?;
-                        ctx.state.db.update_count("pending", 1);
+                        ctx.state
+                            .db
+                            .update_gauge_diff(&GaugeState::Synced, &GaugeState::Pending);
                         ctx.state.notify_backfill();
                         return Ok(RepoProcessResult::Ok(repo_state));
                     }
@@ -507,7 +509,10 @@ impl FirehoseWorker {
             )?;
             batch.insert(&ctx.state.db.pending, keys::repo_key(did), &[]);
             batch.commit().into_diagnostic()?;
-            ctx.state.db.update_count("pending", 1);
+            ctx.state.db.update_gauge_diff(
+                &crate::types::GaugeState::Synced,
+                &crate::types::GaugeState::Pending,
+            );
             ctx.repo_cache
                 .insert(did.clone().into_static(), repo_state.clone().into_static());
             ctx.state.notify_backfill();
@@ -571,7 +576,10 @@ impl FirehoseWorker {
             batch.commit().into_diagnostic()?;
 
             ctx.state.db.update_count("repos", 1);
-            ctx.state.db.update_count("pending", 1);
+            ctx.state.db.update_gauge_diff(
+                &crate::types::GaugeState::Synced,
+                &crate::types::GaugeState::Pending,
+            );
 
             ctx.state.notify_backfill();
 

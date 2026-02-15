@@ -77,7 +77,7 @@ impl<'i> IntoStatic for RepoState<'i> {
 
 // from src/backfill/resync_state.rs
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ResyncErrorKind {
     Ratelimited,
     Transport,
@@ -184,4 +184,17 @@ pub struct StoredEvent<'i> {
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cid: Option<IpldCid>,
+}
+
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum GaugeState {
+    Synced,
+    Pending,
+    Resync(Option<ResyncErrorKind>),
+}
+
+impl GaugeState {
+    pub fn is_resync(&self) -> bool {
+        matches!(self, GaugeState::Resync(_))
+    }
 }

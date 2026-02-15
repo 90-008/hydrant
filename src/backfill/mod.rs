@@ -3,7 +3,9 @@ use crate::db::{self, Db, keys, ser_repo_state};
 use crate::ops;
 use crate::resolver::ResolverError;
 use crate::state::AppState;
-use crate::types::{AccountEvt, BroadcastEvent, RepoState, RepoStatus, ResyncState, StoredEvent};
+use crate::types::{
+    AccountEvt, BroadcastEvent, GaugeState, RepoState, RepoStatus, ResyncState, StoredEvent,
+};
 
 use fjall::Slice;
 use jacquard::api::com_atproto::sync::get_repo::{GetRepo, GetRepoError};
@@ -235,33 +237,50 @@ async fn did_task(
         Ok(previous_state) => {
             let did_key = keys::repo_key(&did);
 
-            let was_pending = matches!(previous_state.status, RepoStatus::Backfilling);
-            let was_resync = matches!(
-                previous_state.status,
+            // determine old gauge state
+            // if it was error/suspended etc, we need to know which error kind it was to decrement correctly.
+            // we have to peek at the resync state. `previous_state` is the repo state, which tells us the Status.
+            // we have to peek at the resync state. `previous_state` is the repo state, which tells us the Status.
+            let old_gauge = match previous_state.status {
+                RepoStatus::Backfilling => GaugeState::Pending,
                 RepoStatus::Error(_)
-                    | RepoStatus::Deactivated
-                    | RepoStatus::Takendown
-                    | RepoStatus::Suspended
-            );
+                | RepoStatus::Deactivated
+                | RepoStatus::Takendown
+                | RepoStatus::Suspended => {
+                    // we need to fetch the resync state to know the kind
+                    // if it's missing, we assume Generic (or handle gracefully)
+                    // this is an extra read, but necessary for accurate gauges.
+                    let resync_state = Db::get(db.resync.clone(), &did_key).await.ok().flatten();
+                    let kind = resync_state.and_then(|b| {
+                        rmp_serde::from_slice::<ResyncState>(&b)
+                            .ok()
+                            .and_then(|s| match s {
+                                ResyncState::Error { kind, .. } => Some(kind),
+                                _ => None,
+                            })
+                    });
+                    GaugeState::Resync(kind)
+                }
+                RepoStatus::Synced => GaugeState::Synced,
+            };
 
             let mut batch = db.inner.batch();
             // remove from pending
-            if was_pending {
+            if old_gauge == GaugeState::Pending {
                 batch.remove(&db.pending, pending_key);
             }
             // remove from resync
-            if was_resync {
+            if old_gauge.is_resync() {
                 batch.remove(&db.resync, &did_key);
             }
             tokio::task::spawn_blocking(move || batch.commit().into_diagnostic())
                 .await
                 .into_diagnostic()??;
-            if was_pending {
-                state.db.update_count_async("pending", -1).await;
-            }
-            if was_resync {
-                state.db.update_count_async("resync", -1).await;
-            }
+
+            state
+                .db
+                .update_gauge_diff_async(&old_gauge, &GaugeState::Synced)
+                .await;
 
             let state = state.clone();
             tokio::task::spawn_blocking(move || {
@@ -349,7 +368,7 @@ async fn did_task(
 
                     let mut batch = state.db.inner.batch();
                     batch.insert(&state.db.resync, &did_key, serialized_resync_state);
-                    batch.remove(&state.db.pending, pending_key);
+                    batch.remove(&state.db.pending, pending_key.clone());
                     if let Some(state_bytes) = serialized_repo_state {
                         batch.insert(&state.db.repos, &did_key, state_bytes);
                     }
@@ -359,50 +378,19 @@ async fn did_task(
             .await
             .into_diagnostic()??;
 
-            state.db.update_count_async("resync", 1).await;
-            state.db.update_count_async("pending", -1).await;
-
-            // update gauges
-            if let Some(prev) = prev_kind {
-                if prev != error_kind {
-                    match prev {
-                        crate::types::ResyncErrorKind::Ratelimited => {
-                            state.db.update_count_async("error_ratelimited", -1).await
-                        }
-                        crate::types::ResyncErrorKind::Transport => {
-                            state.db.update_count_async("error_transport", -1).await
-                        }
-                        crate::types::ResyncErrorKind::Generic => {
-                            state.db.update_count_async("error_generic", -1).await
-                        }
-                    }
-                    match error_kind {
-                        crate::types::ResyncErrorKind::Ratelimited => {
-                            state.db.update_count_async("error_ratelimited", 1).await
-                        }
-                        crate::types::ResyncErrorKind::Transport => {
-                            state.db.update_count_async("error_transport", 1).await
-                        }
-                        crate::types::ResyncErrorKind::Generic => {
-                            state.db.update_count_async("error_generic", 1).await
-                        }
-                    }
-                }
-                // if same, do nothing (count already accurate)
+            let old_gauge = if let Some(k) = prev_kind {
+                GaugeState::Resync(Some(k))
             } else {
-                // new error
-                match error_kind {
-                    crate::types::ResyncErrorKind::Ratelimited => {
-                        state.db.update_count_async("error_ratelimited", 1).await
-                    }
-                    crate::types::ResyncErrorKind::Transport => {
-                        state.db.update_count_async("error_transport", 1).await
-                    }
-                    crate::types::ResyncErrorKind::Generic => {
-                        state.db.update_count_async("error_generic", 1).await
-                    }
-                }
-            }
+                GaugeState::Pending
+            };
+
+            let new_gauge = GaugeState::Resync(Some(error_kind));
+
+            state
+                .db
+                .update_gauge_diff_async(&old_gauge, &new_gauge)
+                .await;
+
             Err(e)
         }
     }
