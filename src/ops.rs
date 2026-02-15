@@ -131,10 +131,10 @@ pub fn update_repo_status<'batch, 's>(
             batch.insert(&db.pending, &key, &[]);
             batch.remove(&db.resync, &key);
         }
-        RepoStatus::Error(msg) => {
+        RepoStatus::Error(_msg) => {
             batch.remove(&db.pending, &key);
-            let resync_state = ResyncState::Error {
-                message: msg.clone(),
+            let resync_state = crate::types::ResyncState::Error {
+                kind: crate::types::ResyncErrorKind::Generic, // ops errors are usually generic logic errors? or transport?
                 retry_count: 0,
                 next_retry: chrono::Utc::now().timestamp(),
             };

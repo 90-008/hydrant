@@ -77,10 +77,17 @@ impl<'i> IntoStatic for RepoState<'i> {
 
 // from src/backfill/resync_state.rs
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ResyncErrorKind {
+    Ratelimited,
+    Transport,
+    Generic,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ResyncState {
     Error {
-        message: SmolStr,
+        kind: ResyncErrorKind,
         retry_count: u32,
         next_retry: i64, // unix timestamp
     },

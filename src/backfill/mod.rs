@@ -270,10 +270,8 @@ async fn did_task(
             Ok(())
         }
         Err(e) => {
-            let mut was_ratelimited = false;
             match &e {
                 BackfillError::Ratelimited => {
-                    was_ratelimited = true;
                     debug!("failed for {did}: too many requests");
                 }
                 BackfillError::Transport(reason) => {
@@ -284,39 +282,37 @@ async fn did_task(
                 }
             }
 
+            let error_kind = match &e {
+                BackfillError::Ratelimited => crate::types::ResyncErrorKind::Ratelimited,
+                BackfillError::Transport(_) => crate::types::ResyncErrorKind::Transport,
+                BackfillError::Generic(_) => crate::types::ResyncErrorKind::Generic,
+            };
+
             let did_key = keys::repo_key(&did);
 
             // 1. get current retry count
-            let mut resync_state = Db::get(db.resync.clone(), &did_key)
-                .await
-                .and_then(|b| {
-                    b.map(|b| rmp_serde::from_slice::<ResyncState>(&b).into_diagnostic())
-                        .transpose()
-                })?
-                .and_then(|s| {
-                    matches!(s, ResyncState::Gone { .. })
-                        .then_some(None)
-                        .unwrap_or(Some(s))
-                })
-                .unwrap_or_else(|| ResyncState::Error {
-                    message: SmolStr::new_static(""),
-                    retry_count: 0,
-                    next_retry: 0,
-                });
+            let existing_state = Db::get(db.resync.clone(), &did_key).await.and_then(|b| {
+                b.map(|b| rmp_serde::from_slice::<ResyncState>(&b).into_diagnostic())
+                    .transpose()
+            })?;
 
-            let ResyncState::Error {
-                message,
-                retry_count,
-                next_retry,
-            } = &mut resync_state
-            else {
-                unreachable!("we handled the gone case above");
+            let (mut retry_count, prev_kind) = match existing_state {
+                Some(ResyncState::Error {
+                    kind, retry_count, ..
+                }) => (retry_count, Some(kind)),
+                Some(ResyncState::Gone { .. }) => return Ok(()), // should handle gone? original code didn't really?
+                None => (0, None),
             };
 
-            // 2. calculate backoff and update the other fields
-            *retry_count += was_ratelimited.then_some(1).unwrap_or(1);
-            *next_retry = ResyncState::next_backoff(*retry_count);
-            *message = e.to_smolstr();
+            // Calculate new stats
+            retry_count += 1;
+            let next_retry = ResyncState::next_backoff(retry_count);
+
+            let resync_state = ResyncState::Error {
+                kind: error_kind.clone(),
+                retry_count,
+                next_retry,
+            };
 
             let error_string = e.to_string();
 
@@ -355,13 +351,46 @@ async fn did_task(
             state.db.update_count_async("resync", 1).await;
             state.db.update_count_async("pending", -1).await;
 
-            // add error stats
-            if was_ratelimited {
-                state.db.update_count_async("error_ratelimited", 1).await;
-            } else if let BackfillError::Transport(_) = &e {
-                state.db.update_count_async("error_transport", 1).await;
+            // update gauges
+            if let Some(prev) = prev_kind {
+                if prev != error_kind {
+                    match prev {
+                        crate::types::ResyncErrorKind::Ratelimited => {
+                            state.db.update_count_async("error_ratelimited", -1).await
+                        }
+                        crate::types::ResyncErrorKind::Transport => {
+                            state.db.update_count_async("error_transport", -1).await
+                        }
+                        crate::types::ResyncErrorKind::Generic => {
+                            state.db.update_count_async("error_generic", -1).await
+                        }
+                    }
+                    match error_kind {
+                        crate::types::ResyncErrorKind::Ratelimited => {
+                            state.db.update_count_async("error_ratelimited", 1).await
+                        }
+                        crate::types::ResyncErrorKind::Transport => {
+                            state.db.update_count_async("error_transport", 1).await
+                        }
+                        crate::types::ResyncErrorKind::Generic => {
+                            state.db.update_count_async("error_generic", 1).await
+                        }
+                    }
+                }
+                // if same, do nothing (count already accurate)
             } else {
-                state.db.update_count_async("error_generic", 1).await;
+                // new error
+                match error_kind {
+                    crate::types::ResyncErrorKind::Ratelimited => {
+                        state.db.update_count_async("error_ratelimited", 1).await
+                    }
+                    crate::types::ResyncErrorKind::Transport => {
+                        state.db.update_count_async("error_transport", 1).await
+                    }
+                    crate::types::ResyncErrorKind::Generic => {
+                        state.db.update_count_async("error_generic", 1).await
+                    }
+                }
             }
             Err(e)
         }
