@@ -15,14 +15,23 @@ pub struct Crawler {
     state: Arc<AppState>,
     relay_host: Url,
     http: reqwest::Client,
+    max_pending: usize,
+    resume_pending: usize,
 }
 
 impl Crawler {
-    pub fn new(state: Arc<AppState>, relay_host: Url) -> Self {
+    pub fn new(
+        state: Arc<AppState>,
+        relay_host: Url,
+        max_pending: usize,
+        resume_pending: usize,
+    ) -> Self {
         Self {
             state,
             relay_host,
             http: reqwest::Client::new(),
+            max_pending,
+            resume_pending,
         }
     }
 
@@ -41,8 +50,48 @@ impl Crawler {
             } else {
                 None
             };
+        let mut was_throttled = false;
 
         loop {
+            // check throttling
+            loop {
+                let pending = self.state.db.get_count("pending").await;
+                if pending > self.max_pending as u64 {
+                    if !was_throttled {
+                        debug!(
+                            "crawler throttling: pending repos {} > max {}, sleeping...",
+                            pending, self.max_pending
+                        );
+                        was_throttled = true;
+                    }
+                    tokio::time::sleep(Duration::from_secs(10)).await;
+                } else if pending > self.resume_pending as u64 {
+                    if !was_throttled {
+                        debug!(
+                            "crawler throttling: pending repos {} > max {}, entering cooldown...",
+                            pending, self.max_pending
+                        );
+                        was_throttled = true;
+                    }
+
+                    while self.state.db.get_count("pending").await > self.resume_pending as u64 {
+                        debug!(
+                            "crawler cooldown: pending repos {} > resume {}, sleeping...",
+                            self.state.db.get_count("pending").await,
+                            self.resume_pending
+                        );
+                        tokio::time::sleep(Duration::from_secs(10)).await;
+                    }
+                    break;
+                } else {
+                    if was_throttled {
+                        info!("crawler resuming: throttling released");
+                        was_throttled = false;
+                    }
+                    break;
+                }
+            }
+
             // 2. fetch listrepos
             let req = ListRepos::new()
                 .limit(1000)
@@ -50,8 +99,13 @@ impl Crawler {
                 .build();
 
             let mut url = self.relay_host.clone();
-            url.set_scheme("https")
-                .map_err(|_| miette::miette!("invalid url: {url}"))?;
+            if url.scheme() == "wss" {
+                url.set_scheme("https")
+                    .map_err(|_| miette::miette!("invalid url: {url}"))?;
+            } else if url.scheme() == "ws" {
+                url.set_scheme("http")
+                    .map_err(|_| miette::miette!("invalid url: {url}"))?;
+            }
             let res_result = self.http.xrpc(url).send(&req).await;
 
             let output: ListReposOutput = match res_result {

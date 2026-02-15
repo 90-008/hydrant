@@ -125,12 +125,17 @@ async fn main() -> miette::Result<()> {
 
     if cfg.full_network {
         tokio::spawn(
-            Crawler::new(state.clone(), cfg.relay_host.clone())
-                .run()
-                .inspect_err(|e| {
-                    error!("crawler died: {e}");
-                    db::check_poisoned_report(&e);
-                }),
+            Crawler::new(
+                state.clone(),
+                cfg.relay_host.clone(),
+                cfg.crawler_max_pending_repos,
+                cfg.crawler_resume_pending_repos,
+            )
+            .run()
+            .inspect_err(|e| {
+                error!("crawler died: {e}");
+                db::check_poisoned_report(&e);
+            }),
         );
     }
 

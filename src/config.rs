@@ -63,6 +63,8 @@ pub struct Config {
     pub db_events_memtable_size_mb: u64,
     pub db_records_default_memtable_size_mb: u64,
     pub db_records_partition_overrides: Vec<(glob::Pattern, u64)>,
+    pub crawler_max_pending_repos: usize,
+    pub crawler_resume_pending_repos: usize,
 }
 
 impl Config {
@@ -148,6 +150,9 @@ impl Config {
             default_records_memtable_size_mb
         );
 
+        let crawler_max_pending_repos = cfg!("CRAWLER_MAX_PENDING_REPOS", 2000usize);
+        let crawler_resume_pending_repos = cfg!("CRAWLER_RESUME_PENDING_REPOS", 1000usize);
+
         let db_records_partition_overrides: Vec<(glob::Pattern, u64)> =
             std::env::var("HYDRANT_DB_RECORDS_PARTITION_OVERRIDES")
                 .unwrap_or_else(|_| default_partition_overrides.to_string())
@@ -194,6 +199,8 @@ impl Config {
             db_events_memtable_size_mb,
             db_records_default_memtable_size_mb,
             db_records_partition_overrides: db_records_partition_overrides,
+            crawler_max_pending_repos,
+            crawler_resume_pending_repos,
         })
     }
 }
@@ -269,6 +276,17 @@ impl fmt::Display for Config {
             f,
             "  db records def memtable:  {} mb",
             self.db_records_default_memtable_size_mb
+        )?;
+
+        writeln!(
+            f,
+            "  crawler max pending:      {}",
+            self.crawler_max_pending_repos
+        )?;
+        writeln!(
+            f,
+            "  crawler resume pending:   {}",
+            self.crawler_resume_pending_repos
         )?;
         writeln!(f, "  enable debug:             {}", self.enable_debug)?;
         if self.enable_debug {
