@@ -14,6 +14,7 @@ use jacquard_api::com_atproto::sync::subscribe_repos::Commit;
 use jacquard_common::types::crypto::PublicKey;
 use jacquard_repo::car::reader::parse_car_bytes;
 use miette::{Context, IntoDiagnostic, Result};
+use rand::{Rng, rng};
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
@@ -65,29 +66,40 @@ pub fn delete_repo<'batch>(
     batch: &'batch mut OwnedWriteBatch,
     db: &Db,
     did: &jacquard::types::did::Did,
+    repo_state: RepoState,
 ) -> Result<()> {
     debug!("deleting repo {did}");
+
     let repo_key = keys::repo_key(did);
+    let pending_key = keys::pending_key(repo_state.index_id);
 
     // 1. delete from repos, pending, resync
     batch.remove(&db.repos, &repo_key);
-    batch.remove(&db.pending, &repo_key);
-    batch.remove(&db.resync, &repo_key);
+    match repo_state.status {
+        RepoStatus::Synced => {}
+        RepoStatus::Backfilling => {
+            batch.remove(&db.pending, &pending_key);
+        }
+        _ => {
+            batch.remove(&db.resync, &repo_key);
+        }
+    }
 
+    // 2. delete from resync buffer
     let resync_prefix = keys::resync_buffer_prefix(did);
     for guard in db.resync_buffer.prefix(&resync_prefix) {
         let k = guard.key().into_diagnostic()?;
         batch.remove(&db.resync_buffer, k);
     }
 
-    // 2. delete from records
+    // 3. delete from records
     let records_prefix = keys::record_prefix_did(did);
     for guard in db.records.prefix(&records_prefix) {
         let k = guard.key().into_diagnostic()?;
         batch.remove(&db.records, k);
     }
 
-    // 3. reset collection counts
+    // 4. reset collection counts
     let mut count_prefix = Vec::new();
     count_prefix.push(b'r');
     count_prefix.push(keys::SEP);
@@ -111,39 +123,54 @@ pub fn update_repo_status<'batch, 's>(
 ) -> Result<RepoState<'s>> {
     debug!("updating repo status for {did} to {new_status:?}");
 
-    let key = keys::repo_key(did);
+    let repo_key = keys::repo_key(did);
+    let pending_key = keys::pending_key(repo_state.index_id);
 
     // manage queues
     match &new_status {
         RepoStatus::Synced => {
-            batch.remove(&db.pending, &key);
-            batch.remove(&db.resync, &key);
+            batch.remove(&db.pending, &pending_key);
+            // we dont have to remove from resync here because it has to transition resync -> pending first
         }
         RepoStatus::Backfilling => {
-            batch.insert(&db.pending, &key, &[]);
-            batch.remove(&db.resync, &key);
+            // if we are coming from an error state, remove from resync
+            if !matches!(repo_state.status, RepoStatus::Synced) {
+                batch.remove(&db.resync, &repo_key);
+            }
+            // remove the old entry
+            batch.remove(&db.pending, &pending_key);
+            // add as new entry
+            repo_state.index_id = rng().next_u64();
+            batch.insert(
+                &db.pending,
+                keys::pending_key(repo_state.index_id),
+                &repo_key,
+            );
         }
         RepoStatus::Error(_msg) => {
-            batch.remove(&db.pending, &key);
+            batch.remove(&db.pending, &pending_key);
+            // TODO: we need to make errors have kind instead of "message" in repo status
+            // and then pass it to resync error kind
             let resync_state = crate::types::ResyncState::Error {
-                kind: crate::types::ResyncErrorKind::Generic, // ops errors are usually generic logic errors? or transport?
+                kind: crate::types::ResyncErrorKind::Generic,
                 retry_count: 0,
                 next_retry: chrono::Utc::now().timestamp(),
             };
             batch.insert(
                 &db.resync,
-                &key,
+                &repo_key,
                 rmp_serde::to_vec(&resync_state).into_diagnostic()?,
             );
         }
         RepoStatus::Deactivated | RepoStatus::Takendown | RepoStatus::Suspended => {
-            batch.remove(&db.pending, &key);
+            // this shouldnt be needed since a repo wont be in a pending state when it gets to any of these states
+            // batch.remove(&db.pending, &pending_key);
             let resync_state = ResyncState::Gone {
                 status: new_status.clone(),
             };
             batch.insert(
                 &db.resync,
-                &key,
+                &repo_key,
                 rmp_serde::to_vec(&resync_state).into_diagnostic()?,
             );
         }
@@ -152,7 +179,7 @@ pub fn update_repo_status<'batch, 's>(
     repo_state.status = new_status;
     repo_state.last_updated_at = chrono::Utc::now().timestamp();
 
-    batch.insert(&db.repos, &key, ser_repo_state(&repo_state)?);
+    batch.insert(&db.repos, &repo_key, ser_repo_state(&repo_state)?);
 
     Ok(repo_state)
 }

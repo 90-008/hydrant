@@ -15,8 +15,9 @@ use jacquard_api::com_atproto::sync::subscribe_repos::Commit;
 use jacquard_common::IntoStatic;
 use jacquard_repo::error::CommitError;
 use miette::{Context, Diagnostic, IntoDiagnostic, Result};
+use rand::Rng;
 use smol_str::ToSmolStr;
-use std::collections::{HashMap, HashSet, hash_map::DefaultHasher};
+use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use thiserror::Error;
@@ -64,7 +65,6 @@ pub struct FirehoseWorker {
 struct WorkerContext<'a> {
     verify_signatures: bool,
     state: &'a AppState,
-    repo_cache: &'a mut HashMap<Did<'static>, RepoState<'static>>,
     batch: &'a mut OwnedWriteBatch,
     added_blocks: &'a mut i64,
     records_delta: &'a mut i64,
@@ -156,14 +156,10 @@ impl FirehoseWorker {
         let _guard = handle.enter();
         debug!("shard {id} started");
 
-        let mut repo_cache = HashMap::new();
-        let mut deleted = HashSet::new();
         let mut broadcast_events = Vec::new();
 
         while let Some(msg) = rx.blocking_recv() {
             let mut batch = state.db.inner.batch();
-            repo_cache.clear();
-            deleted.clear();
             broadcast_events.clear();
 
             let mut added_blocks = 0;
@@ -171,7 +167,6 @@ impl FirehoseWorker {
 
             let mut ctx = WorkerContext {
                 state: &state,
-                repo_cache: &mut repo_cache,
                 batch: &mut batch,
                 added_blocks: &mut added_blocks,
                 records_delta: &mut records_delta,
@@ -197,30 +192,22 @@ impl FirehoseWorker {
                                             // TODO: there might be a race condition here where we get a new commit
                                             // while the resync buffer is being drained, we should handle that probably
                                             // but also it should still be fine since we'll sync eventually anyway
-                                            match ops::update_repo_status(
+                                            let res = ops::update_repo_status(
                                                 &mut batch,
                                                 &state.db,
                                                 &did,
                                                 s,
                                                 RepoStatus::Synced,
-                                            ) {
-                                                Ok(s) => {
-                                                    repo_cache.insert(did.clone(), s.into_static());
-                                                }
-                                                Err(e) => {
-                                                    // this can only fail if serde retry fails which would be really weird
-                                                    error!(
-                                                        "failed to transition {did} to synced: {e}"
-                                                    );
-                                                }
+                                            );
+                                            if let Err(e) = res {
+                                                // this can only fail if serde retry fails which would be really weird
+                                                error!("failed to transition {did} to synced: {e}");
                                             }
-                                        }
-                                        RepoProcessResult::Deleted => {
-                                            deleted.insert(did.clone());
                                         }
                                         // we don't have to handle this since drain_resync_buffer doesn't delete
                                         // the commits from the resync buffer so they will get retried later
                                         RepoProcessResult::Syncing(_) => {}
+                                        RepoProcessResult::Deleted => {}
                                     },
                                     Err(e) => {
                                         error!("failed to drain resync buffer for {did}: {e}")
@@ -240,15 +227,9 @@ impl FirehoseWorker {
                         _ => continue,
                     };
 
-                    if deleted.contains(did) {
-                        continue;
-                    }
-
                     match Self::process_message(&mut ctx, &msg, did) {
                         Ok(RepoProcessResult::Ok(_)) => {}
-                        Ok(RepoProcessResult::Deleted) => {
-                            deleted.insert(did.clone());
-                        }
+                        Ok(RepoProcessResult::Deleted) => {}
                         Ok(RepoProcessResult::Syncing(Some(commit))) => {
                             if let Err(e) = ops::persist_to_resync_buffer(&state.db, did, commit) {
                                 error!("failed to persist commit to resync_buffer for {did}: {e}");
@@ -359,7 +340,6 @@ impl FirehoseWorker {
                             repo_state,
                             RepoStatus::Backfilling,
                         )?;
-                        batch.insert(&ctx.state.db.pending, keys::repo_key(did), &[]);
                         batch.commit().into_diagnostic()?;
                         ctx.state
                             .db
@@ -399,7 +379,7 @@ impl FirehoseWorker {
                     match &account.status {
                         Some(AccountStatus::Deleted) => {
                             debug!("account {did} deleted, wiping data");
-                            ops::delete_repo(ctx.batch, &ctx.state.db, did)?;
+                            ops::delete_repo(ctx.batch, &ctx.state.db, did, repo_state)?;
                             return Ok(RepoProcessResult::Deleted);
                         }
                         status => {
@@ -442,10 +422,9 @@ impl FirehoseWorker {
                                 repo_state,
                                 target_status,
                             )?;
-                            ctx.repo_cache.insert(
-                                did.clone().into_static(),
-                                repo_state.clone().into_static(),
-                            );
+                            ctx.state
+                                .db
+                                .update_gauge_diff(&GaugeState::Synced, &GaugeState::Resync(None));
                         }
                     }
                 } else {
@@ -500,21 +479,18 @@ impl FirehoseWorker {
             );
 
             let mut batch = ctx.state.db.inner.batch();
-            let repo_state = ops::update_repo_status(
+            let _repo_state = ops::update_repo_status(
                 &mut batch,
                 &ctx.state.db,
                 did,
                 repo_state,
                 RepoStatus::Backfilling,
             )?;
-            batch.insert(&ctx.state.db.pending, keys::repo_key(did), &[]);
             batch.commit().into_diagnostic()?;
             ctx.state.db.update_gauge_diff(
                 &crate::types::GaugeState::Synced,
                 &crate::types::GaugeState::Pending,
             );
-            ctx.repo_cache
-                .insert(did.clone().into_static(), repo_state.clone().into_static());
             ctx.state.notify_backfill();
             return Ok(RepoProcessResult::Syncing(Some(commit)));
         }
@@ -527,8 +503,6 @@ impl FirehoseWorker {
             Self::fetch_key(ctx, did)?.as_ref(),
         )?;
         let repo_state = res.repo_state;
-        ctx.repo_cache
-            .insert(did.clone().into_static(), repo_state.clone().into_static());
         *ctx.added_blocks += res.blocks_count;
         *ctx.records_delta += res.records_delta;
         ctx.broadcast_events.push(BroadcastEvent::Persisted(
@@ -550,29 +524,27 @@ impl FirehoseWorker {
         did: &Did<'_>,
         msg: &'c SubscribeReposMessage<'static>,
     ) -> Result<RepoProcessResult<'s, 'c>, IngestError> {
-        // check if we have this repo
-        if let Some(state) = ctx.repo_cache.get(did) {
-            return Ok(RepoProcessResult::Ok(state.clone()));
-        }
-
         let repo_key = keys::repo_key(&did);
         let Some(state_bytes) = ctx.state.db.repos.get(&repo_key).into_diagnostic()? else {
             // we don't know this repo, but we are receiving events for it
             // this means we should backfill it before processing its events
             debug!("discovered new account {did} from firehose, queueing backfill");
 
-            let new_state = RepoState::backfilling(did);
+            let repo_state = RepoState::backfilling(rand::rng().next_u64());
             // using a separate batch here since we want to make it known its being backfilled
             // immediately. we could use the batch for the unit of work we are doing but
             // then we wouldn't be able to start backfilling until the unit of work is done
-
             let mut batch = ctx.state.db.inner.batch();
             batch.insert(
                 &ctx.state.db.repos,
                 &repo_key,
-                crate::db::ser_repo_state(&new_state)?,
+                crate::db::ser_repo_state(&repo_state)?,
             );
-            batch.insert(&ctx.state.db.pending, repo_key, &[]);
+            batch.insert(
+                &ctx.state.db.pending,
+                keys::pending_key(repo_state.index_id),
+                &repo_key,
+            );
             batch.commit().into_diagnostic()?;
 
             ctx.state.db.update_count("repos", 1);
@@ -621,8 +593,10 @@ impl FirehoseWorker {
                     repo_state,
                     RepoStatus::Synced,
                 )?;
-                ctx.repo_cache
-                    .insert(did.clone().into_static(), repo_state.clone());
+                ctx.state.db.update_gauge_diff(
+                    &crate::types::GaugeState::Resync(None),
+                    &crate::types::GaugeState::Synced,
+                );
                 Ok(RepoProcessResult::Ok(repo_state))
             }
         }

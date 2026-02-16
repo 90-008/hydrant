@@ -84,19 +84,19 @@ impl BackfillWorker {
             let mut spawned = 0;
 
             for guard in self.state.db.pending.iter() {
-                let key = match guard.key() {
-                    Ok(k) => k,
+                let (key, value) = match guard.into_inner() {
+                    Ok(kv) => kv,
                     Err(e) => {
-                        error!("failed to read pending key: {e}");
+                        error!("failed to read pending entry: {e}");
                         db::check_poisoned(&e);
                         continue;
                     }
                 };
 
-                let did = match TrimmedDid::try_from(key.as_ref()) {
+                let did = match TrimmedDid::try_from(value.as_ref()) {
                     Ok(d) => d.to_did(),
                     Err(e) => {
-                        error!("invalid did '{key:?}' in pending: {e}");
+                        error!("invalid did in pending value: {e}");
                         continue;
                     }
                 };
@@ -168,7 +168,6 @@ async fn did_task(
 
             // determine old gauge state
             // if it was error/suspended etc, we need to know which error kind it was to decrement correctly.
-            // we have to peek at the resync state. `previous_state` is the repo state, which tells us the Status.
             // we have to peek at the resync state. `previous_state` is the repo state, which tells us the Status.
             let old_gauge = match previous_state.status {
                 RepoStatus::Backfilling => GaugeState::Pending,
@@ -393,9 +392,7 @@ async fn process_did<'i>(
         start.elapsed()
     );
 
-    if let Some(h) = handle {
-        state.handle = Some(h.to_smolstr());
-    }
+    state.handle = handle.map(|h| h.into_static());
 
     let emit_identity = |status: &RepoStatus| {
         let evt = AccountEvt {
@@ -428,7 +425,7 @@ async fn process_did<'i>(
             if matches!(e, GetRepoError::RepoNotFound(_)) {
                 warn!("repo {did} not found, deleting");
                 let mut batch = db.inner.batch();
-                ops::delete_repo(&mut batch, db, did)?;
+                ops::delete_repo(&mut batch, db, did, state)?;
                 batch.commit().into_diagnostic()?;
                 return Ok(previous_state); // stop backfill
             }

@@ -1,8 +1,10 @@
 use crate::api::AppState;
 use crate::db::{Db, keys, ser_repo_state};
+use crate::ops;
 use crate::types::{GaugeState, RepoState};
 use axum::{Json, Router, extract::State, http::StatusCode, routing::post};
 use jacquard::types::did::Did;
+use rand::Rng;
 use serde::Deserialize;
 use std::sync::Arc;
 
@@ -33,12 +35,16 @@ pub async fn handle_repo_add(
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         {
-            let repo_state = RepoState::backfilling(&did);
+            let repo_state = RepoState::backfilling(rand::rng().next_u64());
             let bytes = ser_repo_state(&repo_state)
                 .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
             batch.insert(&db.repos, &did_key, bytes);
-            batch.insert(&db.pending, &did_key, Vec::new());
+            batch.insert(
+                &db.pending,
+                keys::pending_key(repo_state.index_id),
+                &did_key,
+            );
 
             added += 1;
         }
@@ -88,13 +94,14 @@ pub async fn handle_repo_remove(
                 .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
             let was_pending = matches!(repo_state.status, crate::types::RepoStatus::Backfilling);
-            let _was_resync = matches!(
-                repo_state.status,
-                crate::types::RepoStatus::Error(_)
-                    | crate::types::RepoStatus::Deactivated
-                    | crate::types::RepoStatus::Takendown
-                    | crate::types::RepoStatus::Suspended
-            );
+            // todo: idk
+            // let was_resync = matches!(
+            //     repo_state.status,
+            //     crate::types::RepoStatus::Error(_)
+            //         | crate::types::RepoStatus::Deactivated
+            //         | crate::types::RepoStatus::Takendown
+            //         | crate::types::RepoStatus::Suspended
+            // );
 
             let old_gauge = if was_pending {
                 GaugeState::Pending
@@ -115,13 +122,8 @@ pub async fn handle_repo_remove(
                 GaugeState::Synced
             };
 
-            batch.remove(&db.repos, &did_key);
-            if was_pending {
-                batch.remove(&db.pending, &did_key);
-            }
-            if old_gauge.is_resync() {
-                batch.remove(&db.resync, &did_key);
-            }
+            ops::delete_repo(&mut batch, db, &did, repo_state)
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
             state
                 .db

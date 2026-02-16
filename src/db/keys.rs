@@ -15,6 +15,10 @@ pub fn repo_key<'a>(did: &'a Did) -> Vec<u8> {
     vec
 }
 
+pub fn pending_key(id: u64) -> [u8; 8] {
+    id.to_be_bytes()
+}
+
 // prefix format: {DID}| (DID trimmed)
 pub fn record_prefix_did(did: &Did) -> Vec<u8> {
     let repo = TrimmedDid::from(did);

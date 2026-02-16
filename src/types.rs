@@ -1,6 +1,6 @@
 use std::fmt::Display;
 
-use jacquard::{CowStr, IntoStatic};
+use jacquard::{CowStr, IntoStatic, types::string::Handle};
 use jacquard_common::types::string::Did;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -35,26 +35,26 @@ impl Display for RepoStatus {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(bound(deserialize = "'i: 'de"))]
 pub struct RepoState<'i> {
-    #[serde(borrow)]
-    pub did: TrimmedDid<'i>,
     pub status: RepoStatus,
     pub rev: Option<DbTid>,
     pub data: Option<IpldCid>,
     pub last_seq: Option<i64>,
     pub last_updated_at: i64, // unix timestamp
-    pub handle: Option<SmolStr>,
+    #[serde(borrow)]
+    pub handle: Option<Handle<'i>>,
+    pub index_id: u64,
 }
 
 impl<'i> RepoState<'i> {
-    pub fn backfilling(did: &'i Did<'i>) -> Self {
+    pub fn backfilling(index_id: u64) -> Self {
         Self {
-            did: TrimmedDid::from(did),
             status: RepoStatus::Backfilling,
             rev: None,
             data: None,
             last_seq: None,
             last_updated_at: chrono::Utc::now().timestamp(),
             handle: None,
+            index_id,
         }
     }
 }
@@ -64,18 +64,16 @@ impl<'i> IntoStatic for RepoState<'i> {
 
     fn into_static(self) -> Self::Output {
         RepoState {
-            did: self.did.into_static(),
             status: self.status,
             rev: self.rev,
             data: self.data,
             last_seq: self.last_seq,
             last_updated_at: self.last_updated_at,
-            handle: self.handle,
+            handle: self.handle.map(|s| s.into_static()),
+            index_id: self.index_id,
         }
     }
 }
-
-// from src/backfill/resync_state.rs
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ResyncErrorKind {

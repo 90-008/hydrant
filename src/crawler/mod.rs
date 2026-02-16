@@ -5,6 +5,8 @@ use jacquard::api::com_atproto::sync::list_repos::{ListRepos, ListReposOutput};
 use jacquard::prelude::*;
 use jacquard_common::CowStr;
 use miette::{IntoDiagnostic, Result};
+use rand::Rng;
+use rand::rngs::SmallRng;
 use smol_str::SmolStr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -37,6 +39,8 @@ impl Crawler {
 
     pub async fn run(self) -> Result<()> {
         info!("crawler started");
+
+        let mut rng: SmallRng = rand::make_rng();
 
         let db = &self.state.db;
 
@@ -140,9 +144,9 @@ impl Crawler {
                 if !Db::contains_key(db.repos.clone(), &did_key).await? {
                     trace!("crawler found new repo: {}", repo.did);
 
-                    let state = RepoState::backfilling(&repo.did);
+                    let state = RepoState::backfilling(rng.next_u64());
                     batch.insert(&db.repos, &did_key, ser_repo_state(&state)?);
-                    batch.insert(&db.pending, &did_key, Vec::new());
+                    batch.insert(&db.pending, keys::pending_key(state.index_id), &did_key);
                     to_queue.push(repo.did.clone());
                 }
             }
