@@ -31,47 +31,6 @@ pub mod manager;
 
 use crate::ingest::{BufferTx, IngestMessage};
 
-trait SliceSplitExt {
-    fn split_once<'a>(&'a self, delimiter: impl Fn(&u8) -> bool) -> Option<(&'a [u8], &'a [u8])>;
-}
-
-impl SliceSplitExt for [u8] {
-    fn split_once<'a>(&'a self, delimiter: impl Fn(&u8) -> bool) -> Option<(&'a [u8], &'a [u8])> {
-        let idx = self.iter().position(delimiter)?;
-        Some((&self[..idx], &self[idx + 1..]))
-    }
-}
-
-struct AdaptiveLimiter {
-    current_limit: usize,
-    max_limit: usize,
-    min_limit: usize,
-}
-
-impl AdaptiveLimiter {
-    fn new(start: usize, max: usize) -> Self {
-        Self {
-            current_limit: start,
-            max_limit: max,
-            min_limit: 1,
-        }
-    }
-
-    fn on_success(&mut self) {
-        if self.current_limit < self.max_limit {
-            self.current_limit += 1;
-            debug!("adaptive limiter increased to {}", self.current_limit);
-        }
-    }
-
-    fn on_failure(&mut self) {
-        if self.current_limit > self.min_limit {
-            self.current_limit = (self.current_limit / 2).max(self.min_limit);
-            debug!("adaptive limiter decreased to {}", self.current_limit);
-        }
-    }
-}
-
 pub struct BackfillWorker {
     state: Arc<AppState>,
     buffer_tx: BufferTx,
@@ -121,29 +80,10 @@ impl BackfillWorker {
     pub async fn run(self) {
         info!("backfill worker started");
 
-        let (feedback_tx, mut feedback_rx) = tokio::sync::mpsc::channel(100);
-        let mut limiter = AdaptiveLimiter::new(
-            self.semaphore.available_permits(),
-            self.semaphore.available_permits(),
-        ); // assume start at max
-
         loop {
-            // apply feedback from finished tasks
-            while let Ok(was_ratelimited) = feedback_rx.try_recv() {
-                if was_ratelimited {
-                    limiter.on_failure();
-                } else {
-                    limiter.on_success();
-                }
-            }
-
             let mut spawned = 0;
 
             for guard in self.state.db.pending.iter() {
-                if self.in_flight.len() >= limiter.current_limit {
-                    break;
-                }
-
                 let key = match guard.key() {
                     Ok(k) => k,
                     Err(e) => {
@@ -181,16 +121,10 @@ impl BackfillWorker {
                 let did = did.clone();
                 let buffer_tx = self.buffer_tx.clone();
                 let verify = self.verify_signatures;
-                let feedback_tx = feedback_tx.clone();
 
                 tokio::spawn(async move {
                     let _guard = guard;
                     let res = did_task(&state, http, buffer_tx, &did, key, permit, verify).await;
-
-                    let was_ratelimited = match &res {
-                        Err(e) if matches!(e, BackfillError::Ratelimited) => true,
-                        _ => false,
-                    };
 
                     if let Err(e) = res {
                         error!("backfill process failed for {did}: {e}");
@@ -201,19 +135,14 @@ impl BackfillWorker {
 
                     // wake worker to pick up more (in case we were sleeping at limit)
                     state.backfill_notify.notify_one();
-
-                    let _ = feedback_tx.try_send(was_ratelimited);
                 });
 
                 spawned += 1;
             }
 
             if spawned == 0 {
-                // if we didn't spawn anything, wait for notification OR feedback
-                tokio::select! {
-                    _ = self.state.backfill_notify.notified() => {},
-                    _ = tokio::time::sleep(Duration::from_secs(1)) => {}, // poll for feedback if idle
-                }
+                // wait for new tasks
+                self.state.backfill_notify.notified().await;
             } else {
                 // if we spawned tasks, yield briefly to let them start and avoid tight loop
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -614,15 +543,18 @@ async fn process_did<'i>(
                 let (key, cid_bytes) = guard.into_inner().into_diagnostic()?;
                 // key is did|collection|rkey
                 // skip did|
-                let remaining = &key[prefix.len()..];
-                let (collection_bytes, rkey_bytes) =
-                    SliceSplitExt::split_once(remaining, |b| *b == keys::SEP)
-                        .ok_or_else(|| miette::miette!("invalid record key format: {key:?}"))?;
+                let mut remaining = key[prefix.len()..].split(|b| keys::SEP.eq(b));
+                let collection_raw = remaining
+                    .next()
+                    .ok_or_else(|| miette::miette!("invalid record key format: {key:?}"))?;
+                let rkey_raw = remaining
+                    .next()
+                    .ok_or_else(|| miette::miette!("invalid record key format: {key:?}"))?;
 
-                let collection = std::str::from_utf8(collection_bytes)
+                let collection = std::str::from_utf8(collection_raw)
                     .map_err(|e| miette::miette!("invalid collection utf8: {e}"))?;
 
-                let rkey = keys::parse_rkey(rkey_bytes)
+                let rkey = keys::parse_rkey(rkey_raw)
                     .map_err(|e| miette::miette!("invalid rkey '{key:?}' for {did}: {e}"))?;
 
                 let cid = cid::Cid::read_bytes(cid_bytes.as_ref())
