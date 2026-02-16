@@ -12,8 +12,6 @@ pub enum IngestMessage {
     BackfillFinished(Did<'static>),
 }
 
-pub type BufferedMessage = IngestMessage;
-
-pub type BufferTx = mpsc::UnboundedSender<BufferedMessage>;
+pub type BufferTx = mpsc::UnboundedSender<IngestMessage>;
 #[allow(dead_code)]
-pub type BufferRx = mpsc::UnboundedReceiver<BufferedMessage>;
+pub type BufferRx = mpsc::UnboundedReceiver<IngestMessage>;

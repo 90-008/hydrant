@@ -104,7 +104,6 @@ impl Config {
             .unwrap_or_else(|| Ok(vec![Url::parse("https://plc.wtf").unwrap()]))?;
 
         let full_network: bool = cfg!("FULL_NETWORK", false);
-        let backfill_concurrency_limit = cfg!("BACKFILL_CONCURRENCY_LIMIT", 128usize);
         let cursor_save_interval = cfg!("CURSOR_SAVE_INTERVAL", 5, sec);
         let repo_fetch_timeout = cfg!("REPO_FETCH_TIMEOUT", 300, sec);
 
@@ -119,7 +118,12 @@ impl Config {
         let identity_cache_size = cfg!("IDENTITY_CACHE_SIZE", 1_000_000u64);
         let disable_firehose = cfg!("DISABLE_FIREHOSE", false);
         let disable_backfill = cfg!("DISABLE_BACKFILL", false);
-        let firehose_workers = cfg!("FIREHOSE_WORKERS", 32usize);
+
+        let backfill_concurrency_limit = cfg!("BACKFILL_CONCURRENCY_LIMIT", 128usize);
+        let firehose_workers = cfg!(
+            "FIREHOSE_WORKERS",
+            full_network.then_some(32usize).unwrap_or(8usize)
+        );
 
         let (
             default_db_worker_threads,

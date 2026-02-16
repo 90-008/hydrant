@@ -1,5 +1,5 @@
 use crate::db::{self, keys};
-use crate::ingest::{BufferedMessage, IngestMessage};
+use crate::ingest::{BufferRx, IngestMessage};
 use crate::ops;
 use crate::resolver::{NoSigningKeyError, ResolverError};
 use crate::state::AppState;
@@ -56,7 +56,7 @@ enum RepoProcessResult<'s, 'c> {
 
 pub struct FirehoseWorker {
     state: Arc<AppState>,
-    rx: mpsc::UnboundedReceiver<BufferedMessage>,
+    rx: BufferRx,
     verify_signatures: bool,
     num_shards: usize,
 }
@@ -75,7 +75,7 @@ struct WorkerContext<'a> {
 impl FirehoseWorker {
     pub fn new(
         state: Arc<AppState>,
-        rx: mpsc::UnboundedReceiver<BufferedMessage>,
+        rx: BufferRx,
         verify_signatures: bool,
         num_shards: usize,
     ) -> Self {
@@ -148,7 +148,7 @@ impl FirehoseWorker {
     // enters the tokio runtime only when necessary (key resolution)
     fn worker_thread(
         id: usize,
-        mut rx: mpsc::UnboundedReceiver<BufferedMessage>,
+        mut rx: mpsc::UnboundedReceiver<IngestMessage>,
         state: Arc<AppState>,
         verify_signatures: bool,
         handle: tokio::runtime::Handle,
