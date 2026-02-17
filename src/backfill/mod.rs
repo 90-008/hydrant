@@ -540,7 +540,7 @@ async fn process_did<'i>(
                 let (key, cid_bytes) = guard.into_inner().into_diagnostic()?;
                 // key is did|collection|rkey
                 // skip did|
-                let mut remaining = key[prefix.len()..].split(|b| keys::SEP.eq(b));
+                let mut remaining = key[prefix.len()..].splitn(2, |b| keys::SEP.eq(b));
                 let collection_raw = remaining
                     .next()
                     .ok_or_else(|| miette::miette!("invalid record key format: {key:?}"))?;
