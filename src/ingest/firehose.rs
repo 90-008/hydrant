@@ -98,10 +98,16 @@ impl FirehoseIngestor {
             SubscribeReposMessage::Identity(identity) => &identity.did,
             SubscribeReposMessage::Account(account) => &account.did,
             SubscribeReposMessage::Sync(sync) => &sync.did,
+            // todo: handle info and unknowns
             _ => return,
         };
 
-        if !self.should_process(did).await.unwrap_or(false) {
+        if !self
+            .should_process(did)
+            .await
+            .inspect_err(|e| error!("failed to check if we should process {did}: {e}"))
+            .unwrap_or(false)
+        {
             return;
         }
 

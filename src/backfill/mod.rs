@@ -584,7 +584,7 @@ async fn process_did<'i>(
                     };
                     trace!("{action} {did}/{collection}/{rkey} ({cid})");
 
-                    // Key is did|collection|rkey
+                    // key is did|collection|rkey
                     let db_key = keys::record_key(&did, collection, &rkey);
 
                     batch.insert(&app_state.db.blocks, cid.to_bytes(), val.as_ref());
@@ -684,7 +684,6 @@ async fn process_did<'i>(
         db.next_event_id.load(Ordering::SeqCst) - 1,
     ));
 
-    // buffer processing is handled by BufferProcessor when blocked flag is cleared
     trace!("backfill complete for {did}");
     Ok(previous_state)
 }
