@@ -2,7 +2,7 @@ use crate::db::types::TrimmedDid;
 use crate::db::{self, deser_repo_state};
 use crate::ops;
 use crate::state::AppState;
-use crate::types::{RepoStatus, ResyncState};
+use crate::types::{GaugeState, RepoStatus, ResyncState};
 use miette::{IntoDiagnostic, Result};
 use std::sync::Arc;
 use std::time::Duration;
@@ -10,7 +10,7 @@ use tracing::{debug, error, info};
 
 pub fn queue_gone_backfills(state: &Arc<AppState>) -> Result<()> {
     debug!("scanning for deactivated/takendown repos to retry...");
-    let mut count = 0;
+    let mut transitions = Vec::new();
 
     let mut batch = state.db.inner.batch();
 
@@ -43,23 +43,24 @@ pub fn queue_gone_backfills(state: &Arc<AppState>) -> Result<()> {
                     RepoStatus::Backfilling,
                 )?;
 
-                count += 1;
+                transitions.push((GaugeState::Resync(None), GaugeState::Pending));
             }
         }
     }
 
-    if count == 0 {
+    if transitions.is_empty() {
         return Ok(());
     }
 
     batch.commit().into_diagnostic()?;
 
-    state.db.update_count("resync", -count);
-    state.db.update_count("pending", count);
+    for (old_gauge, new_gauge) in &transitions {
+        state.db.update_gauge_diff(old_gauge, new_gauge);
+    }
 
     state.notify_backfill();
 
-    info!("queued {count} gone backfills");
+    info!("queued {} gone backfills", transitions.len());
     Ok(())
 }
 
@@ -71,7 +72,7 @@ pub fn retry_worker(state: Arc<AppState>) {
         std::thread::sleep(Duration::from_secs(60));
 
         let now = chrono::Utc::now().timestamp();
-        let mut count = 0;
+        let mut transitions = Vec::new();
 
         let mut batch = state.db.inner.batch();
 
@@ -93,7 +94,9 @@ pub fn retry_worker(state: Arc<AppState>) {
             };
 
             match rmp_serde::from_slice::<ResyncState>(&value) {
-                Ok(ResyncState::Error { next_retry, .. }) => {
+                Ok(ResyncState::Error {
+                    kind, next_retry, ..
+                }) => {
                     if next_retry <= now {
                         debug!("retrying backfill for {did}");
 
@@ -128,7 +131,7 @@ pub fn retry_worker(state: Arc<AppState>) {
                             continue;
                         }
 
-                        count += 1;
+                        transitions.push((GaugeState::Resync(Some(kind)), GaugeState::Pending));
                     }
                 }
                 Ok(_) => {
@@ -141,7 +144,7 @@ pub fn retry_worker(state: Arc<AppState>) {
             }
         }
 
-        if count == 0 {
+        if transitions.is_empty() {
             continue;
         }
 
@@ -151,9 +154,10 @@ pub fn retry_worker(state: Arc<AppState>) {
             continue;
         }
 
-        state.db.update_count("resync", -count);
-        state.db.update_count("pending", count);
+        for (old_gauge, new_gauge) in &transitions {
+            state.db.update_gauge_diff(old_gauge, new_gauge);
+        }
         state.notify_backfill();
-        info!("queued {count} retries");
+        info!("queued {} retries", transitions.len());
     }
 }
