@@ -57,10 +57,12 @@ pub async fn handle_repo_add(
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
         state.db.update_count_async("repos", added).await;
-        state
-            .db
-            .update_gauge_diff_async(&GaugeState::Synced, &GaugeState::Pending)
-            .await;
+        for _ in 0..added {
+            state
+                .db
+                .update_gauge_diff_async(&GaugeState::Synced, &GaugeState::Pending)
+                .await;
+        }
 
         // trigger backfill worker
         state.notify_backfill();
@@ -80,6 +82,7 @@ pub async fn handle_repo_remove(
     let db = &state.db;
     let mut batch = db.inner.batch();
     let mut removed_repos = 0;
+    let mut old_gauges = Vec::new();
 
     for did_str in req.dids {
         let did = Did::new_owned(did_str.as_str())
@@ -125,10 +128,7 @@ pub async fn handle_repo_remove(
             ops::delete_repo(&mut batch, db, &did, repo_state)
                 .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-            state
-                .db
-                .update_gauge_diff_async(&old_gauge, &GaugeState::Synced)
-                .await;
+            old_gauges.push(old_gauge);
 
             removed_repos -= 1;
         }
@@ -141,6 +141,12 @@ pub async fn handle_repo_remove(
 
     if removed_repos != 0 {
         state.db.update_count_async("repos", removed_repos).await;
+        for old_gauge in old_gauges {
+            state
+                .db
+                .update_gauge_diff_async(&old_gauge, &GaugeState::Synced)
+                .await;
+        }
     }
 
     Ok(StatusCode::OK)
