@@ -1,6 +1,6 @@
 # hydrant
 
-`hydrant` is an AT Protocol indexer built on the `fjall` database. it's meant to be a flexible indexer, supporting both full-network indexing and filtered indexing (e.g., by DID), also allowing querying with XRPC's like `com.atproto.sync.getRepo`, `com.atproto.repo.listRecords`, and so on, which should allow many more usecases compared to just providing an event stream.
+`hydrant` is an AT Protocol indexer built on the `fjall` database. it's meant to be a flexible indexer, supporting both full-network indexing and filtered indexing (e.g., by DID), also allowing querying with XRPCs and providing an ordered event stream with cursor support.
 
 ## configuration
 
@@ -40,18 +40,83 @@
 
 ### management
 
-- `POST /repo/add`: register a DID, start backfilling, and subscribe to updates.
-  - body: `{ "dids": ["did:plc:..."] }`
-- `POST /repo/remove`: unregister a DID and delete all associated data.
-  - body: `{ "dids": ["did:plc:..."] }`
+- `GET /filter`: get the current filter configuration.
+- `PATCH /filter`: update the filter configuration.
+
+#### filter mode
+
+the `mode` field controls what gets indexed:
+
+| mode | behaviour |
+| :--- | :--- |
+| `dids` | only index repositories explicitly listed in `dids`. new accounts seen on the firehose are ignored unless they are in the list. |
+| `signal` | like `dids`, but also auto-discovers and backfills any account whose firehose commit touches a collection matching one of the `signals` patterns. |
+| `full` | index the entire network. `dids` and `signals` are ignored for discovery, but `excludes` and `collections` still apply. |
+
+#### fields
+
+| field | type | description |
+| :--- | :--- | :--- |
+| `mode` | `"dids"` \| `"signal"` \| `"full"` | indexing mode (see above). |
+| `dids` | set update | set of DIDs to explicitly track. in `dids` and `signal` modes, always processed regardless of signal matching. adding an untracked DID enqueues a backfill. |
+| `signals` | set update | NSID patterns (e.g. `app.bsky.feed.post` or `app.bsky.*`) that trigger auto-discovery in `signal` mode. |
+| `collections` | set update | NSID patterns used to filter which records are stored. if empty, all collections are stored. applies in all modes. |
+| `excludes` | set update | set of DIDs to always skip, regardless of mode. checked before any other filter logic. |
+
+#### set updates
+
+each set field accepts one of two forms:
+
+- **replace**: an array replaces the entire set — `["did:plc:abc", "did:plc:xyz"]`
+- **patch**: an object maps items to `true` (add) or `false` (remove) — `{"did:plc:abc": true, "did:plc:xyz": false}`
+
+#### NSID patterns
+
+`signals` and `collections` support an optional `.*` suffix to match an entire namespace:
+
+- `app.bsky.feed.post` — exact match only
+- `app.bsky.feed.*` — matches any collection under `app.bsky.feed`
 
 ### data access (xrpc)
 
-`hydrant` implements some AT Protocol XRPC endpoints for reading data:
+`hydrant` implements the following XRPC endpoints under `/xrpc/`:
 
-- `com.atproto.repo.getRecord`: retrieve a single record by collection and rkey.
-- `com.atproto.repo.listRecords`: list records in a collection, with pagination.
-- `systems.gaze.hydrant.countRecords`: count records in a collection.
+#### `com.atproto.repo.getRecord`
+
+retrieve a single record by its AT-URI components.
+
+| param | required | description |
+| :--- | :--- | :--- |
+| `repo` | yes | DID or handle of the repository. |
+| `collection` | yes | NSID of the collection. |
+| `rkey` | yes | record key. |
+
+returns the record value, its CID, and its AT-URI. responds with `RecordNotFound` if not present.
+
+#### `com.atproto.repo.listRecords`
+
+list records in a collection, newest-first by default.
+
+| param | required | description |
+| :--- | :--- | :--- |
+| `repo` | yes | DID or handle of the repository. |
+| `collection` | yes | NSID of the collection. |
+| `limit` | no | max records to return (default `50`, max `100`). |
+| `cursor` | no | opaque cursor for pagination (from a previous response). |
+| `reverse` | no | if `true`, iterates oldest-first. |
+
+returns `{ records, cursor }`. if `cursor` is present there are more results.
+
+#### `systems.gaze.hydrant.countRecords`
+
+return the total number of stored records in a collection.
+
+| param | required | description |
+| :--- | :--- | :--- |
+| `identifier` | yes | DID or handle of the repository. |
+| `collection` | yes | NSID of the collection. |
+
+returns `{ count }`.
 
 ### event stream
 
