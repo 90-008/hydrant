@@ -570,6 +570,10 @@ async fn process_did<'i>(
             }
 
             let mut signal_seen = filter.mode != FilterMode::Signal;
+            debug!(
+                "backfilling {did}: signal_seen initial={signal_seen}, mode={:?}, signals={:?}",
+                filter.mode, filter.signals
+            );
 
             for (key, cid) in leaves {
                 let val_bytes = tokio::runtime::Handle::current()
@@ -584,6 +588,7 @@ async fn process_did<'i>(
                     }
 
                     if !signal_seen && filter.matches_signal(collection) {
+                        debug!("backfill {did}: signal matched on {collection}");
                         signal_seen = true;
                     }
 
@@ -659,6 +664,7 @@ async fn process_did<'i>(
             }
 
             if !signal_seen {
+                debug!("backfill {did}: no signal-matching records found, discarding repo");
                 return Ok::<_, miette::Report>(None);
             }
 
