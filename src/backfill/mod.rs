@@ -1,5 +1,6 @@
 use crate::db::types::{DbAction, DbRkey, DbTid, TrimmedDid};
 use crate::db::{self, Db, keys, ser_repo_state};
+use crate::filter::FilterMode;
 use crate::ops;
 use crate::resolver::ResolverError;
 use crate::state::AppState;
@@ -163,7 +164,7 @@ async fn did_task(
     let db = &state.db;
 
     match process_did(&state, &http, &did, verify_signatures).await {
-        Ok(previous_state) => {
+        Ok(Some(previous_state)) => {
             let did_key = keys::repo_key(&did);
 
             // determine old gauge state
@@ -225,6 +226,12 @@ async fn did_task(
             if let Err(e) = buffer_tx.send(IngestMessage::BackfillFinished(did.clone())) {
                 error!("failed to send BackfillFinished for {did}: {e}");
             }
+            Ok(())
+        }
+        Ok(None) => {
+            // signal mode: repo had no matching records, was cleaned up by process_did
+            state.db.update_count_async("repos", -1).await;
+            state.db.update_count_async("pending", -1).await;
             Ok(())
         }
         Err(e) => {
@@ -371,7 +378,7 @@ async fn process_did<'i>(
     http: &reqwest::Client,
     did: &Did<'static>,
     verify_signatures: bool,
-) -> Result<RepoState<'static>, BackfillError> {
+) -> Result<Option<RepoState<'static>>, BackfillError> {
     debug!("backfilling {}", did);
 
     let db = &app_state.db;
@@ -427,7 +434,7 @@ async fn process_did<'i>(
                 let mut batch = db.inner.batch();
                 ops::delete_repo(&mut batch, db, did, state)?;
                 batch.commit().into_diagnostic()?;
-                return Ok(previous_state); // stop backfill
+                return Ok(Some(previous_state)); // stop backfill
             }
 
             let inactive_status = match e {
@@ -458,7 +465,7 @@ async fn process_did<'i>(
                     .await?;
 
                 // return success so wrapper stops retrying
-                return Ok(previous_state);
+                return Ok(Some(previous_state));
             }
 
             Err(e).into_diagnostic()?
@@ -520,12 +527,13 @@ async fn process_did<'i>(
 
     // 6. insert records into db
     let start = Instant::now();
-    let (_state, records_cnt_delta, added_blocks, count) = {
+    let result = {
         let app_state = app_state.clone();
         let did = did.clone();
         let rev = root_commit.rev;
 
         tokio::task::spawn_blocking(move || {
+            let filter = app_state.filter.load();
             let mut count = 0;
             let mut delta = 0;
             let mut added_blocks = 0;
@@ -561,6 +569,8 @@ async fn process_did<'i>(
                 existing_cids.insert((collection.into(), rkey), cid);
             }
 
+            let mut signal_seen = filter.mode != FilterMode::Signal;
+
             for (key, cid) in leaves {
                 let val_bytes = tokio::runtime::Handle::current()
                     .block_on(store.get(&cid))
@@ -568,6 +578,15 @@ async fn process_did<'i>(
 
                 if let Some(val) = val_bytes {
                     let (collection, rkey) = ops::parse_path(&key)?;
+
+                    if !filter.matches_collection(collection) {
+                        continue;
+                    }
+
+                    if !signal_seen && filter.matches_signal(collection) {
+                        signal_seen = true;
+                    }
+
                     let rkey = DbRkey::new(rkey);
                     let path = (collection.to_smolstr(), rkey.clone());
                     let cid_obj = Cid::ipld(cid);
@@ -639,6 +658,10 @@ async fn process_did<'i>(
                 count += 1;
             }
 
+            if !signal_seen {
+                return Ok::<_, miette::Report>(None);
+            }
+
             // 6. update data, status is updated in worker shard
             state.rev = Some((&rev).into());
             state.data = Some(root_commit.data);
@@ -657,11 +680,30 @@ async fn process_did<'i>(
 
             batch.commit().into_diagnostic()?;
 
-            Ok::<_, miette::Report>((state, delta, added_blocks, count))
+            Ok::<_, miette::Report>(Some((state, delta, added_blocks, count)))
         })
         .await
         .into_diagnostic()??
     };
+
+    let Some((_state, records_cnt_delta, added_blocks, count)) = result else {
+        // signal mode: no signal-matching records found — clean up the optimistically-added repo
+        let did_key = keys::repo_key(did);
+        let backfill_pending_key = keys::pending_key(previous_state.index_id);
+        let repos_ks = app_state.db.repos.clone();
+        let pending_ks = app_state.db.pending.clone();
+        let db_inner = app_state.db.inner.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut batch = db_inner.batch();
+            batch.remove(&repos_ks, &did_key);
+            batch.remove(&pending_ks, backfill_pending_key);
+            batch.commit().into_diagnostic()
+        })
+        .await
+        .into_diagnostic()??;
+        return Ok(None);
+    };
+
     trace!("did {count} ops for {did} in {:?}", start.elapsed());
 
     // do the counts
@@ -685,5 +727,5 @@ async fn process_did<'i>(
     ));
 
     trace!("backfill complete for {did}");
-    Ok(previous_state)
+    Ok(Some(previous_state))
 }
