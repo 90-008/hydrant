@@ -1,3 +1,54 @@
+export def load-env-file [] {
+    if (".env" | path exists) {
+        let content = (open .env)
+        $content | lines
+        | where { |x| ($x | str trim | is-empty) == false and ($x | str trim | str starts-with "#") == false }
+        | each { |x|
+            let parts = ($x | split row "=" -n 2)
+            { key: ($parts.0 | str trim), value: ($parts.1 | str trim | str trim -c '"' | str trim -c "'") }
+        }
+        | reduce -f {} { |it, acc| $acc | insert $it.key $it.value }
+    } else {
+        {}
+    }
+}
+
+export def resolve-pds [did: string] {
+    let doc = (http get $"https://plc.wtf/($did)" | from json)
+    ($doc.service | where type == "AtprotoPersonalDataServer" | first).serviceEndpoint
+}
+
+export def authenticate [pds_url: string, identifier: string, password: string] {
+    http post -t application/json $"($pds_url)/xrpc/com.atproto.server.createSession" {
+        identifier: $identifier,
+        password: $password
+    }
+}
+
+export def create-record [pds_url: string, jwt: string, repo: string, collection: string, record: any] {
+    http post -t application/json -H ["Authorization" $"Bearer ($jwt)"] $"($pds_url)/xrpc/com.atproto.repo.createRecord" {
+        repo: $repo,
+        collection: $collection,
+        record: $record
+    }
+}
+
+export def delete-record [pds_url: string, jwt: string, repo: string, collection: string, rkey: string] {
+    http post -t application/json -H ["Authorization" $"Bearer ($jwt)"] $"($pds_url)/xrpc/com.atproto.repo.deleteRecord" {
+        repo: $repo,
+        collection: $collection,
+        rkey: $rkey
+    }
+}
+
+export def deactivate-account [pds_url: string, jwt: string] {
+    http post -t application/json -H ["Authorization" $"Bearer ($jwt)"] $"($pds_url)/xrpc/com.atproto.server.deactivateAccount" {}
+}
+
+export def activate-account [pds_url: string, jwt: string] {
+    curl -X POST -H "Content-Type: application/json" -H $"Authorization: Bearer ($jwt)" $"($pds_url)/xrpc/com.atproto.server.activateAccount"
+}
+
 # build the hydrant binary
 export def build-hydrant [] {
     print "building hydrant..."

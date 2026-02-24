@@ -1,65 +1,6 @@
 #!/usr/bin/env nu
 use common.nu *
 
-# simplistic dotenv parser
-def load-env-file [] {
-    if (".env" | path exists) {
-        let content = (open .env)
-        $content | lines 
-        | where { |x| ($x | str trim | is-empty) == false and ($x | str trim | str starts-with "#") == false } 
-        | each { |x| 
-            let parts = ($x | split row "=" -n 2)
-            { key: ($parts.0 | str trim), value: ($parts.1 | str trim | str trim -c '"' | str trim -c "'") } 
-        }
-        | reduce -f {} { |it, acc| $acc | insert $it.key $it.value }
-    } else {
-        {}
-    }
-}
-
-def authenticate [pds_url: string, identifier: string, password: string] {
-    print $"authenticating with ($pds_url) for ($identifier)..."
-    let resp = (http post -t application/json $"($pds_url)/xrpc/com.atproto.server.createSession" {
-        identifier: $identifier,
-        password: $password
-    })
-    return $resp
-}
-
-def create-record [pds_url: string, jwt: string, repo: string, collection: string, record: any] {
-    http post -t application/json -H ["Authorization" $"Bearer ($jwt)"] $"($pds_url)/xrpc/com.atproto.repo.createRecord" {
-        repo: $repo,
-        collection: $collection,
-        record: $record
-    }
-}
-
-def delete-record [pds_url: string, jwt: string, repo: string, collection: string, rkey: string] {
-    http post -t application/json -H ["Authorization" $"Bearer ($jwt)"] $"($pds_url)/xrpc/com.atproto.repo.deleteRecord" {
-        repo: $repo,
-        collection: $collection,
-        rkey: $rkey
-    }
-}
-
-def deactivate-account [pds_url: string, jwt: string] {
-    print "deactivating account..."
-    http post -t application/json -H ["Authorization" $"Bearer ($jwt)"] $"($pds_url)/xrpc/com.atproto.server.deactivateAccount" {}
-}
-
-def activate-account [pds_url: string, jwt: string] {
-    print "activating account..."
-    curl -X POST -H "Content-Type: application/json" -H $"Authorization: Bearer ($jwt)" $"($pds_url)/xrpc/com.atproto.server.activateAccount"
-}
-
-def resolve-pds [did: string] {
-    print $"resolving pds for ($did)..."
-    let doc = (http get $"https://plc.wtf/($did)" | from json)
-    let pds = ($doc.service | where type == "AtprotoPersonalDataServer" | first).serviceEndpoint
-    print $"resolved pds: ($pds)"
-    return $pds
-}
-
 def main [] {
     let env_vars = load-env-file
     let did = ($env_vars | get --optional TEST_REPO)
