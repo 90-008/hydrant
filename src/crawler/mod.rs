@@ -1,4 +1,5 @@
 use crate::db::{Db, keys, ser_repo_state};
+use crate::filter::FilterMode;
 use crate::state::AppState;
 use crate::types::RepoState;
 use jacquard::api::com_atproto::sync::list_repos::{ListRepos, ListReposOutput};
@@ -136,9 +137,25 @@ impl Crawler {
             let mut batch = db.inner.batch();
             let mut to_queue = Vec::new();
 
+            let filter = self.state.filter.load();
+
             // 3. process repos
             for repo in output.repos {
                 let did_key = keys::repo_key(&repo.did);
+
+                let excl_key =
+                    crate::filter::filter_key(crate::filter::EXCLUDE_PREFIX, repo.did.as_str());
+                if db.filter.contains_key(&excl_key).into_diagnostic()? {
+                    continue;
+                }
+
+                if filter.mode != FilterMode::Full {
+                    let did_filter_key =
+                        crate::filter::filter_key(crate::filter::DID_PREFIX, repo.did.as_str());
+                    if !db.filter.contains_key(&did_filter_key).into_diagnostic()? {
+                        continue;
+                    }
+                }
 
                 // check if known
                 if !Db::contains_key(db.repos.clone(), &did_key).await? {
