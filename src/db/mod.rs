@@ -1,4 +1,5 @@
 use crate::types::{BroadcastEvent, RepoState};
+use fjall::config::BlockSizePolicy;
 use fjall::{Database, Keyspace, KeyspaceCreateOptions, OwnedWriteBatch, PersistMode, Slice};
 use jacquard::IntoStatic;
 use jacquard_common::types::string::Did;
@@ -8,6 +9,7 @@ use smol_str::SmolStr;
 
 use std::sync::Arc;
 
+pub mod filter;
 pub mod keys;
 pub mod types;
 
@@ -30,6 +32,7 @@ pub struct Db {
     pub resync_buffer: Keyspace,
     pub events: Keyspace,
     pub counts: Keyspace,
+    pub filter: Keyspace,
     pub event_tx: broadcast::Sender<BroadcastEvent>,
     pub next_event_id: Arc<AtomicU64>,
     pub counts_map: HashMap<SmolStr, u64>,
@@ -83,6 +86,10 @@ macro_rules! update_gauge_diff_impl {
 
 impl Db {
     pub fn open(cfg: &crate::config::Config) -> Result<Self> {
+        const fn kb(v: u32) -> u32 {
+            v * 1024
+        }
+
         let db = Database::builder(&cfg.database_path)
             .cache_size(cfg.cache_size * 2_u64.pow(20) / 2)
             .manual_journal_persist(true)
@@ -105,32 +112,82 @@ impl Db {
         let repos = open_ks(
             "repos",
             opts()
+                // most lookups hit since repo must exist after discovery
+                // we don't hit here if it's not tracked anyway (that happens in filter)
                 .expect_point_read_hits(true)
-                .max_memtable_size(cfg.db_repos_memtable_size_mb * 1024 * 1024),
+                .max_memtable_size(cfg.db_repos_memtable_size_mb * 1024 * 1024)
+                .data_block_size_policy(BlockSizePolicy::all(kb(4))),
         )?;
         let blocks = open_ks(
             "blocks",
             opts()
                 // point reads are used a lot by stream
                 .expect_point_read_hits(true)
-                .max_memtable_size(cfg.db_blocks_memtable_size_mb * 1024 * 1024),
+                .max_memtable_size(cfg.db_blocks_memtable_size_mb * 1024 * 1024)
+                // 32 - 64 kb is probably fine, as the newer blocks will be in the first levels
+                // and any consumers will probably be streaming the newer events...
+                .data_block_size_policy(BlockSizePolicy::new([kb(4), kb(8), kb(32), kb(64)])),
         )?;
-        let cursors = open_ks("cursors", opts().expect_point_read_hits(true))?;
-        let pending = open_ks(
-            "pending",
-            opts().max_memtable_size(cfg.db_pending_memtable_size_mb * 1024 * 1024),
-        )?;
-        let resync = open_ks("resync", opts())?;
-        let resync_buffer = open_ks("resync_buffer", opts())?;
-        let events = open_ks(
-            "events",
-            opts().max_memtable_size(cfg.db_events_memtable_size_mb * 1024 * 1024),
-        )?;
-        let counts = open_ks("counts", opts().expect_point_read_hits(true))?;
-
         let records = open_ks(
             "records",
-            opts().max_memtable_size(cfg.db_records_memtable_size_mb * 1024 * 1024),
+            // point reads might miss when using getRecord
+            // but we assume thats not going to be used much... (todo: should be a config option maybe?)
+            // since this keyspace is big, turning off bloom filters will help a lot
+            opts()
+                .expect_point_read_hits(true)
+                .max_memtable_size(cfg.db_records_memtable_size_mb * 1024 * 1024)
+                .data_block_size_policy(BlockSizePolicy::all(kb(8))),
+        )?;
+        let cursors = open_ks(
+            "cursors",
+            opts()
+                // cursor point reads hit almost 100% of the time
+                .expect_point_read_hits(true)
+                .data_block_size_policy(BlockSizePolicy::all(kb(1))),
+        )?;
+        let pending = open_ks(
+            "pending",
+            opts()
+                // iterated over as a queue, no point reads are used so bloom filters are disabled
+                .expect_point_read_hits(true)
+                .max_memtable_size(cfg.db_pending_memtable_size_mb * 1024 * 1024)
+                .data_block_size_policy(BlockSizePolicy::all(kb(4))),
+        )?;
+        // resync point reads often miss (because most repos aren't resyncing), so keeping the bloom filter helps avoid disk hits
+        let resync = open_ks(
+            "resync",
+            opts().data_block_size_policy(BlockSizePolicy::all(kb(8))),
+        )?;
+        let resync_buffer = open_ks(
+            "resync_buffer",
+            opts()
+                // iterated during backfill, no point reads
+                .expect_point_read_hits(true)
+                .data_block_size_policy(BlockSizePolicy::all(kb(32))),
+        )?;
+        let events = open_ks(
+            "events",
+            opts()
+                // only iterators are used here, no point reads
+                .expect_point_read_hits(true)
+                .max_memtable_size(cfg.db_events_memtable_size_mb * 1024 * 1024)
+                .data_block_size_policy(BlockSizePolicy::new([kb(16), kb(32)])),
+        )?;
+        let counts = open_ks(
+            "counts",
+            opts()
+                // count increments hit because counters are mostly pre-initialized
+                .expect_point_read_hits(true)
+                // the data is very small
+                .data_block_size_policy(BlockSizePolicy::all(kb(1))),
+        )?;
+
+        // filter handles high-volume point reads (checking explicit DID includes and excludes from firehose)
+        // so it needs the bloom filter
+        let filter = open_ks(
+            "filter",
+            // this can be pretty small since the DIDs wont be compressed that well anyhow
+            opts().data_block_size_policy(BlockSizePolicy::all(kb(1))),
         )?;
 
         let mut last_id = 0;
@@ -170,6 +227,7 @@ impl Db {
             resync_buffer,
             events,
             counts,
+            filter,
             event_tx,
             counts_map,
             next_event_id: Arc::new(AtomicU64::new(last_id + 1)),
