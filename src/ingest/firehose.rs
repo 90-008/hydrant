@@ -10,7 +10,7 @@ use n0_future::StreamExt;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
-use tracing::{error, info};
+use tracing::{debug, error, info, trace};
 use url::Url;
 
 pub struct FirehoseIngestor {
@@ -99,14 +99,16 @@ impl FirehoseIngestor {
             _ => return,
         };
 
-        if !self
+        let process = self
             .should_process(did)
             .await
             .inspect_err(|e| error!("failed to check if we should process {did}: {e}"))
-            .unwrap_or(false)
-        {
+            .unwrap_or(false);
+        if !process {
+            trace!("skipping {did}: not in filter");
             return;
         }
+        debug!("forwarding message for {did} to ingest buffer");
 
         if let Err(e) = self.buffer_tx.send(IngestMessage::Firehose(msg)) {
             error!("failed to send message to buffer processor: {e}");
@@ -138,9 +140,20 @@ impl FirehoseIngestor {
                     .contains_key(&did_key)
                     .into_diagnostic()?
                 {
+                    debug!("{did} is in DID allowlist, processing");
                     return Ok(true);
                 }
-                Db::contains_key(self.state.db.repos.clone(), keys::repo_key(did)).await
+                let known =
+                    Db::contains_key(self.state.db.repos.clone(), keys::repo_key(did)).await?;
+                if known {
+                    debug!("{did} is a known repo, processing");
+                } else {
+                    debug!(
+                        "{did} is unknown — passing to worker for signal check (mode={:?})",
+                        filter.mode
+                    );
+                }
+                Ok(known || filter.mode == FilterMode::Signal)
             }
         }
     }

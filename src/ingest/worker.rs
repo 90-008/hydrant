@@ -538,12 +538,21 @@ impl FirehoseWorker {
                 let touches_signal = commit.ops.iter().any(|op| {
                     op.path
                         .split_once('/')
-                        .map(|(col, _)| filter.matches_signal(col))
+                        .map(|(col, _)| {
+                            let m = filter.matches_signal(col);
+                            debug!(
+                                "signal check for {did}: op path={} col={col} signals={:?} -> {m}",
+                                op.path, filter.signals
+                            );
+                            m
+                        })
                         .unwrap_or(false)
                 });
                 if !touches_signal {
+                    debug!("dropping {did}: commit has no signal-matching ops");
                     return Ok(RepoProcessResult::Syncing(None));
                 }
+                debug!("{did}: commit touches a signal, queuing backfill");
             }
 
             debug!("discovered new account {did} from firehose, queueing backfill");
