@@ -144,7 +144,9 @@ async fn main() -> miette::Result<()> {
         }
     });
 
-    if state.filter.load().mode == hydrant::filter::FilterMode::Full {
+    if let hydrant::filter::FilterMode::Full | hydrant::filter::FilterMode::Signal =
+        state.filter.load().mode
+    {
         tokio::spawn(
             Crawler::new(
                 state.clone(),
