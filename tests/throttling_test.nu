@@ -96,16 +96,14 @@ def main [] {
                 
                 # remove 4 repos to drop pending (5) to 1 (<= resume limit 1)
                 # mock repos are did:web:mock1.com ... mock5.com
-                let to_remove = {
-                    dids: [
-                        "did:web:mock1.com",
-                        "did:web:mock2.com",
-                        "did:web:mock3.com",
-                        "did:web:mock4.com"
-                    ]
+                http patch --content-type application/json $"($url)/filter" {
+                    dids: {
+                        "did:web:mock1.com": false,
+                        "did:web:mock2.com": false,
+                        "did:web:mock3.com": false,
+                        "did:web:mock4.com": false
+                    }
                 }
-                
-                http post --content-type application/json $"($url)/repo/remove" $to_remove
                 
                 print "waiting for crawler to wake up (max 10s)..."
                 sleep 15sec

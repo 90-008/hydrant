@@ -7,7 +7,7 @@ use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
 mod debug;
-pub mod repo;
+pub mod filter;
 pub mod stats;
 mod stream;
 pub mod xrpc;
@@ -20,7 +20,7 @@ pub async fn serve(state: Arc<AppState>, port: u16) -> miette::Result<()> {
         .route("/stats", get(stats::get_stats))
         .route("/stream", get(stream::handle_stream))
         .merge(xrpc::router())
-        .merge(repo::router())
+        .merge(filter::router())
         .with_state(state)
         .layer(TraceLayer::new_for_http())
         .layer(CorsLayer::permissive());

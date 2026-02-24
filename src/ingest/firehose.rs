@@ -1,10 +1,11 @@
 use crate::db::{self, Db, keys};
+use crate::filter::{FilterHandle, FilterMode};
 use crate::ingest::{BufferTx, IngestMessage};
 use crate::state::AppState;
 use jacquard::api::com_atproto::sync::subscribe_repos::{SubscribeRepos, SubscribeReposMessage};
 use jacquard::types::did::Did;
 use jacquard_common::xrpc::{SubscriptionClient, TungsteniteSubscriptionClient};
-use miette::Result;
+use miette::{IntoDiagnostic, Result};
 use n0_future::StreamExt;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -16,7 +17,7 @@ pub struct FirehoseIngestor {
     state: Arc<AppState>,
     buffer_tx: BufferTx,
     relay_host: Url,
-    full_network: bool,
+    filter: FilterHandle,
     _verify_signatures: bool,
 }
 
@@ -25,21 +26,20 @@ impl FirehoseIngestor {
         state: Arc<AppState>,
         buffer_tx: BufferTx,
         relay_host: Url,
-        full_network: bool,
+        filter: FilterHandle,
         verify_signatures: bool,
     ) -> Self {
         Self {
             state,
             buffer_tx,
             relay_host,
-            full_network,
+            filter,
             _verify_signatures: verify_signatures,
         }
     }
 
     pub async fn run(mut self) -> Result<()> {
         loop {
-            // 1. load cursor
             let current_cursor = self.state.cur_firehose.load(Ordering::SeqCst);
             let start_cursor = if current_cursor > 0 {
                 Some(current_cursor)
@@ -55,7 +55,6 @@ impl FirehoseIngestor {
                 self.state.cur_firehose.store(c, Ordering::SeqCst);
             }
 
-            // 2. connect
             let client = TungsteniteSubscriptionClient::from_base_uri(self.relay_host.clone());
             let params = SubscribeRepos::new;
             let params = start_cursor
@@ -76,7 +75,6 @@ impl FirehoseIngestor {
 
             info!("firehose connected");
 
-            // 3. process loop
             while let Some(msg_res) = messages.next().await {
                 match msg_res {
                     Ok(msg) => self.handle_message(msg).await,
@@ -98,7 +96,6 @@ impl FirehoseIngestor {
             SubscribeReposMessage::Identity(identity) => &identity.did,
             SubscribeReposMessage::Account(account) => &account.did,
             SubscribeReposMessage::Sync(sync) => &sync.did,
-            // todo: handle info and unknowns
             _ => return,
         };
 
@@ -111,25 +108,40 @@ impl FirehoseIngestor {
             return;
         }
 
-        // pre-warm the key cache for commit events
-        // if self.verify_signatures && matches!(&msg, SubscribeReposMessage::Commit(_)) {
-        //     let state = self.state.clone();
-        //     let did = did.clone();
-        //     tokio::spawn(async move {
-        //         let _ = state.resolver.resolve_signing_key(&did).await;
-        //     });
-        // }
-
         if let Err(e) = self.buffer_tx.send(IngestMessage::Firehose(msg)) {
             error!("failed to send message to buffer processor: {e}");
         }
     }
 
     async fn should_process(&self, did: &Did<'_>) -> Result<bool> {
-        if self.full_network {
-            return Ok(true);
+        let filter = self.filter.load();
+
+        let excl_key = crate::filter::filter_key(crate::filter::EXCLUDE_PREFIX, did.as_str());
+        if self
+            .state
+            .db
+            .filter
+            .contains_key(&excl_key)
+            .into_diagnostic()?
+        {
+            return Ok(false);
         }
-        let did_key = keys::repo_key(did);
-        Db::contains_key(self.state.db.repos.clone(), did_key).await
+
+        match filter.mode {
+            FilterMode::Full => Ok(true),
+            FilterMode::Dids | FilterMode::Signal => {
+                let did_key = crate::filter::filter_key(crate::filter::DID_PREFIX, did.as_str());
+                if self
+                    .state
+                    .db
+                    .filter
+                    .contains_key(&did_key)
+                    .into_diagnostic()?
+                {
+                    return Ok(true);
+                }
+                Db::contains_key(self.state.db.repos.clone(), keys::repo_key(did)).await
+            }
+        }
     }
 }

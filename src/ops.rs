@@ -1,5 +1,6 @@
 use crate::db::types::{DbAction, DbRkey, DbTid, TrimmedDid};
 use crate::db::{self, Db, keys, ser_repo_state};
+use crate::filter::FilterConfig;
 use crate::types::{
     AccountEvt, BroadcastEvent, IdentityEvt, MarshallableEvt, RepoState, RepoStatus, ResyncState,
     StoredEvent,
@@ -222,6 +223,7 @@ pub fn apply_commit<'batch, 'db, 'commit, 's>(
     mut repo_state: RepoState<'s>,
     commit: &'commit Commit<'commit>,
     signing_key: Option<&PublicKey>,
+    filter: &FilterConfig,
 ) -> Result<ApplyCommitResults<'s>> {
     let did = &commit.repo;
     debug!("applying commit {} for {did}", &commit.commit);
@@ -267,6 +269,11 @@ pub fn apply_commit<'batch, 'db, 'commit, 's>(
 
     for op in &commit.ops {
         let (collection, rkey) = parse_path(&op.path)?;
+
+        if !filter.matches_collection(collection) {
+            continue;
+        }
+
         let rkey = DbRkey::new(rkey);
         let db_key = keys::record_key(did, collection, &rkey);
 

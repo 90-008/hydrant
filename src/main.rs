@@ -25,6 +25,27 @@ async fn main() -> miette::Result<()> {
     info!("{cfg}");
 
     let state = AppState::new(&cfg)?;
+
+    if cfg.full_network {
+        let filter_ks = state.db.filter.clone();
+        let inner = state.db.inner.clone();
+        tokio::task::spawn_blocking(move || {
+            use hydrant::filter::{FilterMode, MODE_KEY};
+            let mut batch = inner.batch();
+            batch.insert(
+                &filter_ks,
+                MODE_KEY,
+                rmp_serde::to_vec(&FilterMode::Full).into_diagnostic()?,
+            );
+            batch.commit().into_diagnostic()
+        })
+        .await
+        .into_diagnostic()??;
+
+        let new_filter = hydrant::db::filter::load(&state.db.filter)?;
+        state.filter.store(new_filter.into());
+    }
+
     let (buffer_tx, buffer_rx) = mpsc::unbounded_channel();
     let state = Arc::new(state);
 
@@ -123,7 +144,7 @@ async fn main() -> miette::Result<()> {
         }
     });
 
-    if cfg.full_network {
+    if state.filter.load().mode == hydrant::filter::FilterMode::Full {
         tokio::spawn(
             Crawler::new(
                 state.clone(),
@@ -158,7 +179,7 @@ async fn main() -> miette::Result<()> {
             state.clone(),
             buffer_tx,
             cfg.relay_host,
-            cfg.full_network,
+            state.filter.clone(),
             matches!(cfg.verify_signatures, SignatureVerification::Full),
         );
 

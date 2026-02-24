@@ -3,6 +3,7 @@ pub mod backfill;
 pub mod config;
 pub mod crawler;
 pub mod db;
+pub mod filter;
 pub mod ingest;
 pub mod ops;
 pub mod resolver;

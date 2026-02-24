@@ -1,4 +1,5 @@
 use crate::db::{self, keys};
+use crate::filter::FilterMode;
 use crate::ingest::{BufferRx, IngestMessage};
 use crate::ops;
 use crate::resolver::{NoSigningKeyError, ResolverError};
@@ -501,6 +502,7 @@ impl FirehoseWorker {
             repo_state,
             &commit,
             Self::fetch_key(ctx, did)?.as_ref(),
+            &ctx.state.filter.load(),
         )?;
         let repo_state = res.repo_state;
         *ctx.added_blocks += res.blocks_count;
@@ -526,14 +528,27 @@ impl FirehoseWorker {
     ) -> Result<RepoProcessResult<'s, 'c>, IngestError> {
         let repo_key = keys::repo_key(&did);
         let Some(state_bytes) = ctx.state.db.repos.get(&repo_key).into_diagnostic()? else {
-            // we don't know this repo, but we are receiving events for it
-            // this means we should backfill it before processing its events
+            let filter = ctx.state.filter.load();
+
+            if filter.mode == FilterMode::Signal {
+                let commit = match msg {
+                    SubscribeReposMessage::Commit(c) => c,
+                    _ => return Ok(RepoProcessResult::Syncing(None)),
+                };
+                let touches_signal = commit.ops.iter().any(|op| {
+                    op.path
+                        .split_once('/')
+                        .map(|(col, _)| filter.matches_signal(col))
+                        .unwrap_or(false)
+                });
+                if !touches_signal {
+                    return Ok(RepoProcessResult::Syncing(None));
+                }
+            }
+
             debug!("discovered new account {did} from firehose, queueing backfill");
 
             let repo_state = RepoState::backfilling(rand::rng().next_u64());
-            // using a separate batch here since we want to make it known its being backfilled
-            // immediately. we could use the batch for the unit of work we are doing but
-            // then we wouldn't be able to start backfilling until the unit of work is done
             let mut batch = ctx.state.db.inner.batch();
             batch.insert(
                 &ctx.state.db.repos,

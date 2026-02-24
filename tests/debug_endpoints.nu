@@ -18,7 +18,7 @@ def main [] {
     if (wait-for-api $url) {
         # Trigger backfill to populate some data
         print $"adding repo ($did) to tracking..."
-        http post -t application/json $"($url)/repo/add" { dids: [($did)] }
+        http patch -t application/json $"($url)/filter" { dids: { ($did): true } }
         
         if (wait-for-backfill $url) {
             print "backfill complete, testing debug endpoints"
