@@ -2,6 +2,22 @@
 
 `hydrant` is an AT Protocol indexer built on the `fjall` database. it's meant to be a flexible indexer, supporting both full-network indexing and filtered indexing (e.g., by DID), also allowing querying with XRPCs and providing an ordered event stream with cursor support.
 
+## vs `tap`
+
+while [`tap`](https://github.com/bluesky-social/indigo/tree/main/cmd/tap) is designed primarily as a firehose consumer and relay, `hydrant` is flexible, it allows you to directly query the database for records, and it also provides an ordered view of events, allowing the use of a cursor to fetch events from a specific point in time.
+
+### stream behavior
+
+the `WS /stream` (hydrant) and `WS /channel` (tap) endpoints have different designs:
+
+| aspect | `tap` (`/channel`) | `hydrant` (`/stream`) |
+| :--- | :--- | :--- |
+| distribution | sharded work queue: events are load-balanced across connected clients. If 5 clients connect, each receives ~20% of events. | broadcast: every connected client receives a full copy of the event stream. If 5 clients connect, all 5 receive 100% of events. |
+| cursors | server-managed: clients ACK messages. The server tracks progress and redelivers unacked messages. | client-managed: client provides `?cursor=123`. The server streams from that point. |
+| backfill | integrated queue: backfill events are mixed into the live queue and prioritized by the server. | unified log: backfill simply inserts "historical" events (`live: false`) into the global event log. streaming is just reading this log sequentially. |
+| event types | `record`, `identity` (includes status) | `record`, `identity` (handle), `account` (status) |
+| persistence | **full**: all events are stored and replayable. | **hybrid**: `record` events are persisted/replayable. `identity`/`account` are ephemeral/live-only. |
+
 ## configuration
 
 `hydrant` is configured via environment variables. all variables are prefixed with `HYDRANT_`.
@@ -127,19 +143,3 @@ returns `{ count }`.
 ### stats
 
 - `GET /stats`: get aggregate counts of repos, records, events, and errors.
-
-## vs `tap`
-
-while [`tap`](https://github.com/bluesky-social/indigo/tree/main/cmd/tap) is designed primarily as a firehose consumer and relay, `hydrant` is flexible, it allows you to directly query the database for records, and it also provides an ordered view of events, allowing the use of a cursor to fetch events from a specific point in time.
-
-### stream behavior
-
-the `WS /stream` (hydrant) and `WS /channel` (tap) endpoints have different designs:
-
-| aspect | `tap` (`/channel`) | `hydrant` (`/stream`) |
-| :--- | :--- | :--- |
-| distribution | sharded work queue: events are load-balanced across connected clients. If 5 clients connect, each receives ~20% of events. | broadcast: every connected client receives a full copy of the event stream. If 5 clients connect, all 5 receive 100% of events. |
-| cursors | server-managed: clients ACK messages. The server tracks progress and redelivers unacked messages. | client-managed: client provides `?cursor=123`. The server streams from that point. |
-| backfill | integrated queue: backfill events are mixed into the live queue and prioritized by the server. | unified log: backfill simply inserts "historical" events (`live: false`) into the global event log. streaming is just reading this log sequentially. |
-| event types | `record`, `identity` (includes status) | `record`, `identity` (handle), `account` (status) |
-| persistence | **full**: all events are stored and replayable. | **hybrid**: `record` events are persisted/replayable. `identity`/`account` are ephemeral/live-only. |
