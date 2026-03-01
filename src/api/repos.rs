@@ -47,27 +47,150 @@ pub struct DeleteParams {
     pub delete_data: bool,
 }
 
+#[derive(Deserialize)]
+pub struct GetReposParams {
+    pub limit: Option<usize>,
+    pub cursor: Option<String>,
+    pub partition: Option<String>,
+}
+
 pub async fn handle_get_repos(
     State(state): State<Arc<AppState>>,
+    Query(params): Query<GetReposParams>,
 ) -> Result<Response, (StatusCode, String)> {
-    let repos_ks = state.db.repos.clone();
+    let limit = params.limit.unwrap_or(100).min(1000);
+    let partition = params.partition.unwrap_or_else(|| "all".to_string());
 
-    let stream = futures::stream::iter(repos_ks.prefix(&[]).filter_map(|item| {
-        let (k, v) = item.into_inner().ok()?;
-        let did_str = std::str::from_utf8(&k[2..]).ok()?;
-        let repo_state = crate::db::deser_repo_state(&v).ok()?;
+    let items = tokio::task::spawn_blocking(move || {
+        let db = &state.db;
 
-        let response = RepoResponse {
-            did: did_str.to_string(),
-            status: repo_state.status.to_string(),
-            tracked: repo_state.tracked,
-            rev: repo_state.rev.as_ref().map(|r| r.to_string()),
-            last_updated_at: repo_state.last_updated_at,
-        };
+        let results = match partition.as_str() {
+            "all" => {
+                let start_bound = if let Some(cursor) = params.cursor {
+                    let did = jacquard::types::did::Did::new_owned(&cursor)
+                        .map_err(|_| (StatusCode::BAD_REQUEST, "invalid cursor DID".to_string()))?;
+                    let did_key = keys::repo_key(&did);
+                    std::ops::Bound::Excluded(did_key)
+                } else {
+                    std::ops::Bound::Unbounded
+                };
 
-        let json = serde_json::to_string(&response).ok()?;
+                let mut items = Vec::new();
+                for item in db
+                    .repos
+                    .range((start_bound, std::ops::Bound::Unbounded))
+                    .take(limit)
+                {
+                    let (k, v) = item
+                        .into_inner()
+                        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+                    let repo_state = crate::db::deser_repo_state(&v)
+                        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+                    let did = crate::db::types::TrimmedDid::try_from(k.as_ref())
+                        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+                        .to_did();
+
+                    items.push(RepoResponse {
+                        did: did.to_string(),
+                        status: repo_state.status.to_string(),
+                        tracked: repo_state.tracked,
+                        rev: repo_state.rev.as_ref().map(|r| r.to_string()),
+                        last_updated_at: repo_state.last_updated_at,
+                    });
+                }
+                Ok::<_, (StatusCode, String)>(items)
+            }
+            "resync" => {
+                let start_bound = if let Some(cursor) = params.cursor {
+                    let did = jacquard::types::did::Did::new_owned(&cursor)
+                        .map_err(|_| (StatusCode::BAD_REQUEST, "invalid cursor DID".to_string()))?;
+                    let did_key = keys::repo_key(&did);
+                    std::ops::Bound::Excluded(did_key)
+                } else {
+                    std::ops::Bound::Unbounded
+                };
+
+                let mut items = Vec::new();
+                for item in db
+                    .resync
+                    .range((start_bound, std::ops::Bound::Unbounded))
+                    .take(limit)
+                {
+                    let (k, _) = item
+                        .into_inner()
+                        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+                    if let Ok(Some(v)) = db.repos.get(&k) {
+                        let repo_state = crate::db::deser_repo_state(&v)
+                            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+                        let did = crate::db::types::TrimmedDid::try_from(k.as_ref())
+                            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+                            .to_did();
+
+                        items.push(RepoResponse {
+                            did: did.to_string(),
+                            status: repo_state.status.to_string(),
+                            tracked: repo_state.tracked,
+                            rev: repo_state.rev.as_ref().map(|r| r.to_string()),
+                            last_updated_at: repo_state.last_updated_at,
+                        });
+                    }
+                }
+                Ok(items)
+            }
+            "pending" => {
+                let start_bound = if let Some(cursor) = params.cursor {
+                    let id = cursor
+                        .parse::<u64>()
+                        .map_err(|_| (StatusCode::BAD_REQUEST, "invalid cursor id".to_string()))?;
+                    std::ops::Bound::Excluded(id.to_be_bytes().to_vec())
+                } else {
+                    std::ops::Bound::Unbounded
+                };
+
+                let mut items = Vec::new();
+                for item in db
+                    .pending
+                    .range((start_bound, std::ops::Bound::Unbounded))
+                    .take(limit)
+                {
+                    let (_, did_key) = item
+                        .into_inner()
+                        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+                    if let Ok(Some(v)) = db.repos.get(&did_key) {
+                        let repo_state = crate::db::deser_repo_state(&v)
+                            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+                        let did = crate::db::types::TrimmedDid::try_from(did_key.as_ref())
+                            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+                            .to_did();
+
+                        items.push(RepoResponse {
+                            did: did.to_string(),
+                            status: repo_state.status.to_string(),
+                            tracked: repo_state.tracked,
+                            rev: repo_state.rev.as_ref().map(|r| r.to_string()),
+                            last_updated_at: repo_state.last_updated_at,
+                        });
+                    }
+                }
+                Ok(items)
+            }
+            _ => Err((StatusCode::BAD_REQUEST, "invalid partition".to_string())),
+        }?;
+
+        Ok::<_, (StatusCode, String)>(results)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))??;
+
+    use futures::StreamExt;
+
+    let stream = futures::stream::iter(items.into_iter().map(|item| {
+        let json = serde_json::to_string(&item).ok()?;
         Some(Ok::<_, std::io::Error>(format!("{json}\n")))
-    }));
+    }))
+    .filter_map(|x| futures::future::ready(x));
 
     let body = Body::from_stream(stream);
 

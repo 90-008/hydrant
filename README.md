@@ -94,7 +94,10 @@ each set field accepts one of two forms:
 
 ### repository management
 
-- `GET /repos`: get an NDJSON stream of all repositories and their sync status.
+- `GET /repos`: get an NDJSON stream of repositories and their sync status. Supports pagination and filtering:
+    - `limit`: max results (default 100, max 1000)
+    - `cursor`: DID or u64 index ID depending on partition
+    - `partition`: `all` (default), `pending` (backfill queue), or `resync` (retries)
 - `PUT /repos`: explicitly track repositories. accepts an NDJSON body of `{"did": "..."}` (or JSON array of the same).
 - `DELETE /repos`: untrack repositories. accepts an NDJSON body of `{"did": "..."}` (or JSON array of the same). optionally include `"deleteData": true` to also purge the repository from the database.
 
