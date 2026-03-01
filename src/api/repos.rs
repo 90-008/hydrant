@@ -8,7 +8,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{delete, get, put},
 };
-use jacquard::IntoStatic;
+use jacquard::{IntoStatic, types::did::Did};
 use miette::IntoDiagnostic;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
@@ -64,11 +64,28 @@ pub async fn handle_get_repos(
     let items = tokio::task::spawn_blocking(move || {
         let db = &state.db;
 
+        let to_response = |k: &[u8], v: &[u8]| -> Result<RepoResponse, (StatusCode, String)> {
+            let repo_state = crate::db::deser_repo_state(v).map_err(internal)?;
+            let did = crate::db::types::TrimmedDid::try_from(k)
+                .map_err(internal)?
+                .to_did();
+
+            Ok(RepoResponse {
+                did: did.to_string(),
+                status: repo_state.status.to_string(),
+                tracked: repo_state.tracked,
+                rev: repo_state.rev.as_ref().map(|r| r.to_string()),
+                last_updated_at: repo_state.last_updated_at,
+            })
+        };
+
         let results = match partition.as_str() {
-            "all" => {
+            "all" | "resync" => {
+                let is_all = partition == "all";
+                let ks = if is_all { &db.repos } else { &db.resync };
+
                 let start_bound = if let Some(cursor) = params.cursor {
-                    let did = jacquard::types::did::Did::new_owned(&cursor)
-                        .map_err(|_| (StatusCode::BAD_REQUEST, "invalid cursor DID".to_string()))?;
+                    let did = Did::new_owned(&cursor).map_err(bad_request)?;
                     let did_key = keys::repo_key(&did);
                     std::ops::Bound::Excluded(did_key)
                 } else {
@@ -76,73 +93,27 @@ pub async fn handle_get_repos(
                 };
 
                 let mut items = Vec::new();
-                for item in db
-                    .repos
+                for item in ks
                     .range((start_bound, std::ops::Bound::Unbounded))
                     .take(limit)
                 {
-                    let (k, v) = item
-                        .into_inner()
-                        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-                    let repo_state = crate::db::deser_repo_state(&v)
-                        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-                    let did = crate::db::types::TrimmedDid::try_from(k.as_ref())
-                        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-                        .to_did();
+                    let (k, v) = item.into_inner().map_err(internal)?;
 
-                    items.push(RepoResponse {
-                        did: did.to_string(),
-                        status: repo_state.status.to_string(),
-                        tracked: repo_state.tracked,
-                        rev: repo_state.rev.as_ref().map(|r| r.to_string()),
-                        last_updated_at: repo_state.last_updated_at,
-                    });
+                    let repo_state_bytes = if is_all {
+                        v
+                    } else {
+                        db.repos.get(&k).map_err(internal)?.ok_or_else(|| {
+                            internal(format!("repository state missing for {}", partition))
+                        })?
+                    };
+
+                    items.push(to_response(&k, &repo_state_bytes)?);
                 }
                 Ok::<_, (StatusCode, String)>(items)
             }
-            "resync" => {
-                let start_bound = if let Some(cursor) = params.cursor {
-                    let did = jacquard::types::did::Did::new_owned(&cursor)
-                        .map_err(|_| (StatusCode::BAD_REQUEST, "invalid cursor DID".to_string()))?;
-                    let did_key = keys::repo_key(&did);
-                    std::ops::Bound::Excluded(did_key)
-                } else {
-                    std::ops::Bound::Unbounded
-                };
-
-                let mut items = Vec::new();
-                for item in db
-                    .resync
-                    .range((start_bound, std::ops::Bound::Unbounded))
-                    .take(limit)
-                {
-                    let (k, _) = item
-                        .into_inner()
-                        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-                    if let Ok(Some(v)) = db.repos.get(&k) {
-                        let repo_state = crate::db::deser_repo_state(&v)
-                            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-                        let did = crate::db::types::TrimmedDid::try_from(k.as_ref())
-                            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-                            .to_did();
-
-                        items.push(RepoResponse {
-                            did: did.to_string(),
-                            status: repo_state.status.to_string(),
-                            tracked: repo_state.tracked,
-                            rev: repo_state.rev.as_ref().map(|r| r.to_string()),
-                            last_updated_at: repo_state.last_updated_at,
-                        });
-                    }
-                }
-                Ok(items)
-            }
             "pending" => {
                 let start_bound = if let Some(cursor) = params.cursor {
-                    let id = cursor
-                        .parse::<u64>()
-                        .map_err(|_| (StatusCode::BAD_REQUEST, "invalid cursor id".to_string()))?;
+                    let id = cursor.parse::<u64>().map_err(bad_request)?;
                     std::ops::Bound::Excluded(id.to_be_bytes().to_vec())
                 } else {
                     std::ops::Bound::Unbounded
@@ -154,24 +125,10 @@ pub async fn handle_get_repos(
                     .range((start_bound, std::ops::Bound::Unbounded))
                     .take(limit)
                 {
-                    let (_, did_key) = item
-                        .into_inner()
-                        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+                    let (_, did_key) = item.into_inner().map_err(internal)?;
 
                     if let Ok(Some(v)) = db.repos.get(&did_key) {
-                        let repo_state = crate::db::deser_repo_state(&v)
-                            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-                        let did = crate::db::types::TrimmedDid::try_from(did_key.as_ref())
-                            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-                            .to_did();
-
-                        items.push(RepoResponse {
-                            did: did.to_string(),
-                            status: repo_state.status.to_string(),
-                            tracked: repo_state.tracked,
-                            rev: repo_state.rev.as_ref().map(|r| r.to_string()),
-                            last_updated_at: repo_state.last_updated_at,
-                        });
+                        items.push(to_response(&did_key, &v)?);
                     }
                 }
                 Ok(items)
@@ -182,7 +139,7 @@ pub async fn handle_get_repos(
         Ok::<_, (StatusCode, String)>(results)
     })
     .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))??;
+    .map_err(internal)??;
 
     use futures::StreamExt;
 
@@ -210,32 +167,32 @@ pub async fn handle_put_repos(
         let mut added = 0i64;
         let mut gauge_transitions: Vec<(GaugeState, GaugeState)> = Vec::new();
 
+        let mut rng = rand::rng();
+
         for item in items {
-            let did = match jacquard::types::did::Did::new_owned(&item.did) {
-                Ok(d) => d,
-                Err(_) => continue,
-            };
+            let did = Did::new(&item.did).map_err(bad_request)?;
             let did_key = keys::repo_key(&did);
 
-            let existing_state = if let Ok(Some(bytes)) = db.repos.get(&did_key) {
-                crate::db::deser_repo_state(&bytes)
-                    .ok()
-                    .map(|s| s.into_static())
-            } else {
-                None
-            };
+            let repo_bytes = db.repos.get(&did_key).map_err(internal)?;
+            let existing_state = repo_bytes
+                .as_deref()
+                .map(crate::db::deser_repo_state)
+                .transpose()
+                .map_err(internal)?;
 
             if let Some(mut repo_state) = existing_state {
                 if !repo_state.tracked {
-                    let resync_bytes_opt = db.resync.get(&did_key).ok().flatten();
+                    let resync_bytes = db.resync.get(&did_key).map_err(internal)?;
                     let old_gauge =
-                        crate::db::Db::repo_gauge_state(&repo_state, resync_bytes_opt.as_deref());
+                        crate::db::Db::repo_gauge_state(&repo_state, resync_bytes.as_deref());
 
                     repo_state.tracked = true;
                     // re-enqueue into pending
-                    if let Ok(bytes) = ser_repo_state(&repo_state) {
-                        batch.insert(&db.repos, &did_key, bytes);
-                    }
+                    batch.insert(
+                        &db.repos,
+                        &did_key,
+                        ser_repo_state(&repo_state).map_err(internal)?,
+                    );
                     batch.insert(
                         &db.pending,
                         keys::pending_key(repo_state.index_id),
@@ -245,10 +202,12 @@ pub async fn handle_put_repos(
                     gauge_transitions.push((old_gauge, GaugeState::Pending));
                 }
             } else {
-                let repo_state = RepoState::backfilling(rand::rng().next_u64());
-                if let Ok(bytes) = ser_repo_state(&repo_state) {
-                    batch.insert(&db.repos, &did_key, bytes);
-                }
+                let repo_state = RepoState::backfilling(rng.next_u64());
+                batch.insert(
+                    &db.repos,
+                    &did_key,
+                    ser_repo_state(&repo_state).map_err(internal)?,
+                );
                 batch.insert(
                     &db.pending,
                     keys::pending_key(repo_state.index_id),
@@ -259,15 +218,12 @@ pub async fn handle_put_repos(
             }
         }
 
-        batch
-            .commit()
-            .into_diagnostic()
-            .map_err(|e| e.to_string())?;
-        Ok::<_, String>((added, gauge_transitions))
+        batch.commit().into_diagnostic().map_err(internal)?;
+
+        Ok::<_, (StatusCode, String)>((added, gauge_transitions))
     })
     .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    .map_err(internal)??;
 
     if new_repo_count > 0 {
         state.db.update_count_async("repos", new_repo_count).await;
@@ -297,41 +253,36 @@ pub async fn handle_delete_repos(
         let mut gauge_decrements = Vec::new();
 
         for item in items {
-            let did = match jacquard::types::did::Did::new_owned(&item.did) {
-                Ok(d) => d,
-                Err(_) => continue,
-            };
-
+            let did = Did::new(&item.did).map_err(bad_request)?;
             let delete_data = item.delete_data.unwrap_or(params.delete_data);
             let did_key = keys::repo_key(&did);
 
-            let existing_state = if let Ok(Some(bytes)) = db.repos.get(&did_key) {
-                crate::db::deser_repo_state(&bytes)
-                    .ok()
-                    .map(|s| s.into_static())
-            } else {
-                None
-            };
+            let repo_bytes = db.repos.get(&did_key).map_err(internal)?;
+            let existing_state = repo_bytes
+                .as_deref()
+                .map(crate::db::deser_repo_state)
+                .transpose()
+                .map_err(internal)?;
 
-            if let Some(mut repo_state) = existing_state {
-                let resync_bytes_opt = db.resync.get(&did_key).ok().flatten();
+            if let Some(repo_state) = existing_state {
+                let resync_bytes = db.resync.get(&did_key).map_err(internal)?;
                 let old_gauge =
-                    crate::db::Db::repo_gauge_state(&repo_state, resync_bytes_opt.as_deref());
+                    crate::db::Db::repo_gauge_state(&repo_state, resync_bytes.as_deref());
 
                 if delete_data {
-                    if crate::ops::delete_repo(&mut batch, db, &did, &repo_state).is_ok() {
-                        deleted_count += 1;
-                        if old_gauge != GaugeState::Synced {
-                            gauge_decrements.push(old_gauge);
-                        }
-                    } else {
-                        tracing::error!("failed to apply delete_repo_batch to {}", did);
+                    crate::ops::delete_repo(&mut batch, db, &did, &repo_state).map_err(internal)?;
+                    deleted_count += 1;
+                    if old_gauge != GaugeState::Synced {
+                        gauge_decrements.push(old_gauge);
                     }
                 } else if repo_state.tracked {
+                    let mut repo_state = repo_state.into_static();
                     repo_state.tracked = false;
-                    if let Ok(bytes) = ser_repo_state(&repo_state) {
-                        batch.insert(&db.repos, &did_key, bytes);
-                    }
+                    batch.insert(
+                        &db.repos,
+                        &did_key,
+                        ser_repo_state(&repo_state).map_err(internal)?,
+                    );
                     batch.remove(&db.pending, keys::pending_key(repo_state.index_id));
                     batch.remove(&db.resync, &did_key);
                     if old_gauge != GaugeState::Synced {
@@ -341,16 +292,12 @@ pub async fn handle_delete_repos(
             }
         }
 
-        batch
-            .commit()
-            .into_diagnostic()
-            .map_err(|e| e.to_string())?;
+        batch.commit().into_diagnostic().map_err(internal)?;
 
-        Ok::<_, String>((deleted_count, gauge_decrements))
+        Ok::<_, (StatusCode, String)>((deleted_count, gauge_decrements))
     })
     .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    .map_err(internal)??;
 
     if deleted_count > 0 {
         state.db.update_count_async("repos", -deleted_count).await;
@@ -366,33 +313,39 @@ pub async fn handle_delete_repos(
 }
 
 async fn parse_body(req: axum::extract::Request) -> Result<Vec<RepoRequest>, (StatusCode, String)> {
+    let content_type = req
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+
     let body_bytes = axum::body::to_bytes(req.into_body(), usize::MAX)
         .await
-        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+        .map_err(bad_request)?;
 
-    let text =
-        std::str::from_utf8(&body_bytes).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
-
+    let text = std::str::from_utf8(&body_bytes).map_err(bad_request)?;
     let trimmed = text.trim();
-    if trimmed.starts_with('[') {
-        serde_json::from_str::<Vec<RepoRequest>>(trimmed).map_err(|e| {
-            (
-                StatusCode::BAD_REQUEST,
-                format!("invalid JSON array: {}", e),
-            )
-        })
+
+    if content_type.contains("application/json") {
+        serde_json::from_str::<Vec<RepoRequest>>(trimmed)
+            .map_err(|e| bad_request(format!("invalid JSON array: {e}")))
     } else {
         trimmed
             .lines()
             .filter(|l| !l.trim().is_empty())
             .map(|line| {
-                serde_json::from_str::<RepoRequest>(line).map_err(|e| {
-                    (
-                        StatusCode::BAD_REQUEST,
-                        format!("invalid NDJSON line: {}", e),
-                    )
-                })
+                serde_json::from_str::<RepoRequest>(line)
+                    .map_err(|e| bad_request(format!("invalid NDJSON line: {e}")))
             })
             .collect()
     }
+}
+
+fn bad_request<E: std::fmt::Display>(err: E) -> (StatusCode, String) {
+    (StatusCode::BAD_REQUEST, err.to_string())
+}
+
+fn internal<E: std::fmt::Display>(err: E) -> (StatusCode, String) {
+    (StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
 }
