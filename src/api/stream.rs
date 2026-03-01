@@ -31,8 +31,11 @@ pub async fn handle_stream(
 
 async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, query: StreamQuery) {
     let (tx, mut rx) = mpsc::channel(500);
+    let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
 
-    std::thread::Builder::new()
+    let runtime = tokio::runtime::Handle::current();
+
+    let thread = std::thread::Builder::new()
         .name(format!(
             "stream-handler-{}",
             std::time::SystemTime::UNIX_EPOCH
@@ -41,6 +44,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, query: Strea
                 .as_secs()
         ))
         .spawn(move || {
+            let mut cancel_rx = cancel_rx;
             let db = &state.db;
             let mut event_rx = db.event_tx.subscribe();
             let ks = db.events.clone();
@@ -51,6 +55,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, query: Strea
                     max_id.saturating_sub(1)
                 }
             };
+            let _runtime_guard = runtime.enter();
 
             loop {
                 // 1. catch up from DB
@@ -146,7 +151,18 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, query: Strea
                 }
 
                 // 2. wait for live events
-                match event_rx.blocking_recv() {
+                let next_event = runtime.block_on(async {
+                    tokio::select! {
+                        res = event_rx.recv() => Some(res),
+                        _ = &mut cancel_rx => None,
+                    }
+                });
+
+                let Some(next_event) = next_event else {
+                    break;
+                };
+
+                match next_event {
                     Ok(BroadcastEvent::Persisted(_)) => {
                         // just wake up and run catch-up loop again
                     }
@@ -176,8 +192,14 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, query: Strea
         .expect("failed to spawn stream handler thread");
 
     while let Some(msg) = rx.recv().await {
-        if socket.send(msg).await.is_err() {
+        if let Err(e) = socket.send(msg).await {
+            error!("failed to send ws message: {e}");
             break;
         }
+    }
+
+    let _ = cancel_tx.send(());
+    if let Err(e) = thread.join() {
+        error!("stream handler thread panicked: {e:?}");
     }
 }
