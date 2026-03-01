@@ -1,16 +1,26 @@
 use fjall::{Keyspace, OwnedWriteBatch};
 use miette::{IntoDiagnostic, Result};
 
-use crate::filter::{
-    COLLECTION_PREFIX, DID_PREFIX, EXCLUDE_PREFIX, FilterConfig, FilterMode, MODE_KEY, SEP,
-    SIGNAL_PREFIX, SetUpdate, filter_key,
-};
+use crate::filter::{FilterConfig, FilterMode, SetUpdate};
+
+pub const MODE_KEY: &[u8] = b"m";
+pub const SIGNAL_PREFIX: u8 = b's';
+pub const COLLECTION_PREFIX: u8 = b'c';
+pub const EXCLUDE_PREFIX: u8 = b'x';
+pub const SEP: u8 = b'|';
+
+pub fn filter_key(prefix: u8, val: &str) -> Vec<u8> {
+    let mut key = Vec::with_capacity(2 + val.len());
+    key.push(prefix);
+    key.push(SEP);
+    key.extend_from_slice(val.as_bytes());
+    key
+}
 
 pub fn apply_patch(
     batch: &mut OwnedWriteBatch,
     ks: &Keyspace,
     mode: Option<FilterMode>,
-    dids: Option<SetUpdate>,
     signals: Option<SetUpdate>,
     collections: Option<SetUpdate>,
     excludes: Option<SetUpdate>,
@@ -19,7 +29,6 @@ pub fn apply_patch(
         batch.insert(ks, MODE_KEY, rmp_serde::to_vec(&mode).into_diagnostic()?);
     }
 
-    apply_set_update(batch, ks, DID_PREFIX, dids)?;
     apply_set_update(batch, ks, SIGNAL_PREFIX, signals)?;
     apply_set_update(batch, ks, COLLECTION_PREFIX, collections)?;
     apply_set_update(batch, ks, EXCLUDE_PREFIX, excludes)?;
@@ -62,7 +71,30 @@ fn apply_set_update(
 }
 
 pub fn load(ks: &Keyspace) -> Result<FilterConfig> {
-    FilterConfig::load(ks)
+    let mode = ks
+        .get(MODE_KEY)
+        .into_diagnostic()?
+        .map(|v| rmp_serde::from_slice(&v).into_diagnostic())
+        .transpose()?
+        .unwrap_or(FilterMode::Filter);
+
+    let mut config = FilterConfig::new(mode);
+
+    let signal_prefix = [SIGNAL_PREFIX, SEP];
+    for guard in ks.prefix(signal_prefix) {
+        let (k, _) = guard.into_inner().into_diagnostic()?;
+        let val = std::str::from_utf8(&k[signal_prefix.len()..]).into_diagnostic()?;
+        config.signals.push(smol_str::SmolStr::new(val));
+    }
+
+    let col_prefix = [COLLECTION_PREFIX, SEP];
+    for guard in ks.prefix(col_prefix) {
+        let (k, _) = guard.into_inner().into_diagnostic()?;
+        let val = std::str::from_utf8(&k[col_prefix.len()..]).into_diagnostic()?;
+        config.collections.push(smol_str::SmolStr::new(val));
+    }
+
+    Ok(config)
 }
 
 pub fn read_set(ks: &Keyspace, prefix: u8) -> Result<Vec<String>> {

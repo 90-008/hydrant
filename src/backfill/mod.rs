@@ -5,7 +5,8 @@ use crate::ops;
 use crate::resolver::ResolverError;
 use crate::state::AppState;
 use crate::types::{
-    AccountEvt, BroadcastEvent, GaugeState, RepoState, RepoStatus, ResyncState, StoredEvent,
+    AccountEvt, BroadcastEvent, GaugeState, RepoState, RepoStatus, ResyncErrorKind, ResyncState,
+    StoredEvent,
 };
 
 use fjall::Slice;
@@ -164,34 +165,13 @@ async fn did_task(
     let db = &state.db;
 
     match process_did(&state, &http, &did, verify_signatures).await {
-        Ok(Some(previous_state)) => {
+        Ok(Some(repo_state)) => {
             let did_key = keys::repo_key(&did);
 
             // determine old gauge state
             // if it was error/suspended etc, we need to know which error kind it was to decrement correctly.
-            // we have to peek at the resync state. `previous_state` is the repo state, which tells us the Status.
-            let old_gauge = match previous_state.status {
-                RepoStatus::Backfilling => GaugeState::Pending,
-                RepoStatus::Error(_)
-                | RepoStatus::Deactivated
-                | RepoStatus::Takendown
-                | RepoStatus::Suspended => {
-                    // we need to fetch the resync state to know the kind
-                    // if it's missing, we assume Generic (or handle gracefully)
-                    // this is an extra read, but necessary for accurate gauges.
-                    let resync_state = Db::get(db.resync.clone(), &did_key).await.ok().flatten();
-                    let kind = resync_state.and_then(|b| {
-                        rmp_serde::from_slice::<ResyncState>(&b)
-                            .ok()
-                            .and_then(|s| match s {
-                                ResyncState::Error { kind, .. } => Some(kind),
-                                _ => None,
-                            })
-                    });
-                    GaugeState::Resync(kind)
-                }
-                RepoStatus::Synced => GaugeState::Synced,
-            };
+            // we have to peek at the resync state.
+            let old_gauge = state.db.repo_gauge_state_async(&repo_state, &did_key).await;
 
             let mut batch = db.inner.batch();
             // remove from pending
@@ -248,9 +228,9 @@ async fn did_task(
             }
 
             let error_kind = match &e {
-                BackfillError::Ratelimited => crate::types::ResyncErrorKind::Ratelimited,
-                BackfillError::Transport(_) => crate::types::ResyncErrorKind::Transport,
-                BackfillError::Generic(_) => crate::types::ResyncErrorKind::Generic,
+                BackfillError::Ratelimited => ResyncErrorKind::Ratelimited,
+                BackfillError::Transport(_) => ResyncErrorKind::Transport,
+                BackfillError::Generic(_) => ResyncErrorKind::Generic,
             };
 
             let did_key = keys::repo_key(&did);
@@ -432,7 +412,9 @@ async fn process_did<'i>(
             if matches!(e, GetRepoError::RepoNotFound(_)) {
                 warn!("repo {did} not found, deleting");
                 let mut batch = db.inner.batch();
-                ops::delete_repo(&mut batch, db, did, state)?;
+                if let Err(e) = crate::ops::delete_repo(&mut batch, db, did, &state) {
+                    tracing::error!("failed to wipe repo during backfill: {e}");
+                }
                 batch.commit().into_diagnostic()?;
                 return Ok(Some(previous_state)); // stop backfill
             }
@@ -569,7 +551,8 @@ async fn process_did<'i>(
                 existing_cids.insert((collection.into(), rkey), cid);
             }
 
-            let mut signal_seen = filter.mode != FilterMode::Signal;
+            let mut signal_seen = filter.mode == FilterMode::Full || state.tracked;
+
             debug!(
                 "backfilling {did}: signal_seen initial={signal_seen}, mode={:?}, signals={:?}",
                 filter.mode, filter.signals

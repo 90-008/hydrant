@@ -43,6 +43,12 @@ pub struct RepoState<'i> {
     #[serde(borrow)]
     pub handle: Option<Handle<'i>>,
     pub index_id: u64,
+    #[serde(default = "default_tracked")]
+    pub tracked: bool,
+}
+
+fn default_tracked() -> bool {
+    true
 }
 
 impl<'i> RepoState<'i> {
@@ -55,6 +61,7 @@ impl<'i> RepoState<'i> {
             last_updated_at: chrono::Utc::now().timestamp(),
             handle: None,
             index_id,
+            tracked: true,
         }
     }
 }
@@ -71,6 +78,7 @@ impl<'i> IntoStatic for RepoState<'i> {
             last_updated_at: self.last_updated_at,
             handle: self.handle.map(|s| s.into_static()),
             index_id: self.index_id,
+            tracked: self.tracked,
         }
     }
 }

@@ -40,8 +40,9 @@ the `WS /stream` (hydrant) and `WS /channel` (tap) endpoints have different desi
 | `ENABLE_DEBUG` | `false` | enable debug endpoints. |
 | `DEBUG_PORT` | `3001` | port for debug endpoints (if enabled). |
 | `NO_LZ4_COMPRESSION` | `false` | disable lz4 compression for storage. |
-| `DISABLE_FIREHOSE` | `false` | disable firehose ingestion. |
-| `DISABLE_BACKFILL` | `false` | disable backfill processing. |
+| `ENABLE_FIREHOSE` | `true` | whether to ingest relay subscriptions. |
+| `ENABLE_BACKFILL` | `true` | whether to backfill from PDS instances. |
+| `ENABLE_CRAWLER` | `false` (if Filter), `true` (if Full) | whether to actively query the network for unknown repositories. |
 | `DB_WORKER_THREADS` | `4` (`8` if full network) | database worker threads. |
 | `DB_MAX_JOURNALING_SIZE_MB` | `512` (`1024` if full network) | max database journaling size in MB. |
 | `DB_PENDING_MEMTABLE_SIZE_MB` | `64` (`192` if full network) | pending memtable size in MB. |
@@ -65,17 +66,15 @@ the `mode` field controls what gets indexed:
 
 | mode | behaviour |
 | :--- | :--- |
-| `dids` | only index repositories explicitly listed in `dids`. new accounts seen on the firehose are ignored unless they are in the list. |
-| `signal` | like `dids`, but also auto-discovers and backfills any account whose firehose commit touches a collection matching one of the `signals` patterns. |
-| `full` | index the entire network. `dids` and `signals` are ignored for discovery, but `excludes` and `collections` still apply. |
+| `filter` | auto-discovers and backfills any account whose firehose commit touches a collection matching one of the `signals` patterns. you can also explicitly track individual repositories via the `/repos` endpoint regardless of matching signals. |
+| `full` | index the entire network. `signals` are ignored for discovery, but `excludes` and `collections` still apply. |
 
 #### fields
 
 | field | type | description |
 | :--- | :--- | :--- |
-| `mode` | `"dids"` \| `"signal"` \| `"full"` | indexing mode (see above). |
-| `dids` | set update | set of DIDs to explicitly track. in `dids` and `signal` modes, always processed regardless of signal matching. adding an untracked DID enqueues a backfill. |
-| `signals` | set update | NSID patterns (e.g. `app.bsky.feed.post` or `app.bsky.*`) that trigger auto-discovery in `signal` mode. |
+| `mode` | `"filter"` \| `"full"` | indexing mode (see above). |
+| `signals` | set update | NSID patterns (e.g. `app.bsky.feed.post` or `app.bsky.*`) that trigger auto-discovery in `filter` mode. |
 | `collections` | set update | NSID patterns used to filter which records are stored. if empty, all collections are stored. applies in all modes. |
 | `excludes` | set update | set of DIDs to always skip, regardless of mode. checked before any other filter logic. |
 
@@ -93,13 +92,19 @@ each set field accepts one of two forms:
 - `app.bsky.feed.post` — exact match only
 - `app.bsky.feed.*` — matches any collection under `app.bsky.feed`
 
+### repository management
+
+- `GET /repos`: get an NDJSON stream of all repositories and their sync status.
+- `PUT /repos`: explicitly track repositories. accepts an NDJSON body of `{"did": "..."}` (or JSON array of the same).
+- `DELETE /repos`: untrack repositories. accepts an NDJSON body of `{"did": "..."}` (or JSON array of the same). optionally include `"deleteData": true` to also purge the repository from the database.
+
 ### data access (xrpc)
 
 `hydrant` implements the following XRPC endpoints under `/xrpc/`:
 
 #### `com.atproto.repo.getRecord`
 
-retrieve a single record by its AT-URI components.
+retrieve a single record by its AT URI components.
 
 | param | required | description |
 | :--- | :--- | :--- |
@@ -107,7 +112,7 @@ retrieve a single record by its AT-URI components.
 | `collection` | yes | NSID of the collection. |
 | `rkey` | yes | record key. |
 
-returns the record value, its CID, and its AT-URI. responds with `RecordNotFound` if not present.
+returns the record value, its CID, and its AT URI. responds with `RecordNotFound` if not present.
 
 #### `com.atproto.repo.listRecords`
 

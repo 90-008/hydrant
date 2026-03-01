@@ -1,6 +1,5 @@
-use futures::{FutureExt, TryFutureExt, future::BoxFuture};
+use futures::{FutureExt, future::BoxFuture};
 use hydrant::config::{Config, SignatureVerification};
-use hydrant::crawler::Crawler;
 use hydrant::db::{self, set_firehose_cursor};
 use hydrant::ingest::firehose::FirehoseIngestor;
 use hydrant::state::AppState;
@@ -30,7 +29,8 @@ async fn main() -> miette::Result<()> {
         let filter_ks = state.db.filter.clone();
         let inner = state.db.inner.clone();
         tokio::task::spawn_blocking(move || {
-            use hydrant::filter::{FilterMode, MODE_KEY};
+            use hydrant::db::filter::MODE_KEY;
+            use hydrant::filter::FilterMode;
             let mut batch = inner.batch();
             batch.insert(
                 &filter_ks,
@@ -49,7 +49,7 @@ async fn main() -> miette::Result<()> {
     let (buffer_tx, buffer_rx) = mpsc::unbounded_channel();
     let state = Arc::new(state);
 
-    if !cfg.disable_backfill {
+    if cfg.enable_backfill {
         tokio::spawn({
             let state = state.clone();
             let timeout = cfg.repo_fetch_timeout;
@@ -144,25 +144,37 @@ async fn main() -> miette::Result<()> {
         }
     });
 
-    if let hydrant::filter::FilterMode::Full | hydrant::filter::FilterMode::Signal =
-        state.filter.load().mode
-    {
-        tokio::spawn(
-            Crawler::new(
-                state.clone(),
-                cfg.relay_host.clone(),
-                cfg.crawler_max_pending_repos,
-                cfg.crawler_resume_pending_repos,
-            )
-            .run()
-            .inspect_err(|e| {
-                error!("crawler died: {e}");
+    info!("starting crawler ({:?})", state.filter.load().mode);
+    let state_clone = state.clone();
+    let relay_host_clone = cfg.relay_host.clone();
+    let crawler_max_pending = cfg.crawler_max_pending_repos;
+    let crawler_resume_pending = cfg.crawler_resume_pending_repos;
+
+    let should_run_crawler = match cfg.enable_crawler {
+        Some(true) => true,
+        Some(false) => false,
+        None => state.filter.load().mode == hydrant::filter::FilterMode::Full,
+    };
+
+    if should_run_crawler {
+        tokio::spawn(async move {
+            // the crawler is responsible for finding new repos
+            let crawler = hydrant::crawler::Crawler::new(
+                state_clone,
+                relay_host_clone,
+                crawler_max_pending,
+                crawler_resume_pending,
+            );
+            if let Err(e) = crawler.run().await {
+                error!("crawler error: {e}");
                 db::check_poisoned_report(&e);
-            }),
-        );
+            }
+        });
+    } else {
+        info!("crawler disabled by config or filter mode");
     }
 
-    let mut tasks = if !cfg.disable_firehose {
+    let mut tasks = if cfg.enable_firehose {
         let firehose_worker = std::thread::spawn({
             let state = state.clone();
             let handle = tokio::runtime::Handle::current();

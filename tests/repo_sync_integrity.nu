@@ -112,7 +112,7 @@ def main [] {
     if (wait-for-api $url) {
         # track the repo via API
         print $"adding repo ($did) to tracking..."
-        http patch -t application/json $"($url)/filter" { dids: { ($did): true } }
+        http put -t application/json $"($url)/repos" [ { did: ($did) } ]
 
         if (wait-for-backfill $url) {
             # Run both consistency checks

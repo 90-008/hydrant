@@ -380,7 +380,7 @@ impl FirehoseWorker {
                     match &account.status {
                         Some(AccountStatus::Deleted) => {
                             debug!("account {did} deleted, wiping data");
-                            ops::delete_repo(ctx.batch, &ctx.state.db, did, repo_state)?;
+                            crate::ops::delete_repo(ctx.batch, &ctx.state.db, did, &repo_state)?;
                             return Ok(RepoProcessResult::Deleted);
                         }
                         status => {
@@ -530,7 +530,7 @@ impl FirehoseWorker {
         let Some(state_bytes) = ctx.state.db.repos.get(&repo_key).into_diagnostic()? else {
             let filter = ctx.state.filter.load();
 
-            if filter.mode == FilterMode::Signal {
+            if filter.mode == FilterMode::Filter && !filter.signals.is_empty() {
                 let commit = match msg {
                     SubscribeReposMessage::Commit(c) => c,
                     _ => return Ok(RepoProcessResult::Syncing(None)),
@@ -582,6 +582,11 @@ impl FirehoseWorker {
             return Ok(RepoProcessResult::Syncing(None));
         };
         let mut repo_state = crate::db::deser_repo_state(&state_bytes)?.into_static();
+
+        if !repo_state.tracked {
+            debug!("ignoring active status for {did} as it is explicitly untracked");
+            return Ok(RepoProcessResult::Syncing(None));
+        }
 
         // if we are backfilling or it is new, DON'T mark it as synced yet
         // the backfill worker will do that when it finishes

@@ -96,14 +96,12 @@ def main [] {
                 
                 # remove 4 repos to drop pending (5) to 1 (<= resume limit 1)
                 # mock repos are did:web:mock1.com ... mock5.com
-                http patch --content-type application/json $"($url)/filter" {
-                    dids: {
-                        "did:web:mock1.com": false,
-                        "did:web:mock2.com": false,
-                        "did:web:mock3.com": false,
-                        "did:web:mock4.com": false
-                    }
-                }
+                curl -s -X DELETE -H "Content-Type: application/json" -d '[
+                    {"did": "did:web:mock1.com"},
+                    {"did": "did:web:mock2.com"},
+                    {"did": "did:web:mock3.com"},
+                    {"did": "did:web:mock4.com"}
+                ]' $"($url)/repos"
                 
                 print "waiting for crawler to wake up (max 10s)..."
                 sleep 15sec

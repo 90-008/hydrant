@@ -67,7 +67,7 @@ pub fn delete_repo<'batch>(
     batch: &'batch mut OwnedWriteBatch,
     db: &Db,
     did: &jacquard::types::did::Did,
-    repo_state: RepoState,
+    repo_state: &RepoState,
 ) -> Result<()> {
     debug!("deleting repo {did}");
 

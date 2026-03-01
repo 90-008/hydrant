@@ -52,7 +52,7 @@ export def activate-account [pds_url: string, jwt: string] {
 # build the hydrant binary
 export def build-hydrant [] {
     print "building hydrant..."
-    cargo build --release --quiet
+    cargo build --release
     "target/release/hydrant"
 }
 
@@ -61,18 +61,19 @@ export def start-hydrant [binary: string, db_path: string, port: int] {
     let log_file = $"($db_path)/hydrant.log"
     print $"starting hydrant - logs at ($log_file)..."
     
-    let pid = (
-        with-env {
-            HYDRANT_DATABASE_PATH: ($db_path),
-            HYDRANT_FULL_NETWORK: "false",
-            HYDRANT_API_PORT: ($port | into string),
-            HYDRANT_ENABLE_DEBUG: "true",
-            HYDRANT_DEBUG_PORT: ($port + 1 | into string),
-            HYDRANT_LOG_LEVEL: "debug"
-        } {
-            sh -c $"($binary) >($log_file) 2>&1 & echo $!" | str trim | into int
-        }
-    )
+    let hydrant_vars = ($env | transpose k v | where k =~ "HYDRANT_" | reduce -f {} { |it, acc| $acc | upsert $it.k $it.v })
+    let env_vars = {
+        HYDRANT_DATABASE_PATH: ($db_path),
+        HYDRANT_FULL_NETWORK: "false",
+        HYDRANT_API_PORT: ($port | into string),
+        HYDRANT_ENABLE_DEBUG: "true",
+        HYDRANT_DEBUG_PORT: ($port + 1 | into string),
+        HYDRANT_LOG_LEVEL: "debug"
+    } | merge $hydrant_vars
+
+    let pid = (with-env $env_vars {
+        sh -c $"($binary) >($log_file) 2>&1 & echo $!" | str trim | into int
+    })
     
     print $"hydrant started with pid: ($pid)"
     { pid: $pid, log: $log_file }

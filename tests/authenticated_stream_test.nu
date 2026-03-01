@@ -42,7 +42,7 @@ def main [] {
         # 4. add repo to hydrant (backfill trigger)
         print $"adding repo ($did) to tracking..."
         try {
-            http patch -t application/json $"($url)/filter" { dids: { ($did): true } }
+            http put -t application/json $"($url)/repos" [ { did: ($did) } ]
         } catch {
             print "warning: failed to add repo (might already be tracked), continuing..."
         }

@@ -1,4 +1,4 @@
-use crate::db::{self, Db, keys};
+use crate::db;
 use crate::filter::{FilterHandle, FilterMode};
 use crate::ingest::{BufferTx, IngestMessage};
 use crate::state::AppState;
@@ -118,7 +118,8 @@ impl FirehoseIngestor {
     async fn should_process(&self, did: &Did<'_>) -> Result<bool> {
         let filter = self.filter.load();
 
-        let excl_key = crate::filter::filter_key(crate::filter::EXCLUDE_PREFIX, did.as_str());
+        let excl_key =
+            crate::db::filter::filter_key(crate::db::filter::EXCLUDE_PREFIX, did.as_str());
         if self
             .state
             .db
@@ -131,29 +132,28 @@ impl FirehoseIngestor {
 
         match filter.mode {
             FilterMode::Full => Ok(true),
-            FilterMode::Dids | FilterMode::Signal => {
-                let did_key = crate::filter::filter_key(crate::filter::DID_PREFIX, did.as_str());
-                if self
-                    .state
-                    .db
-                    .filter
-                    .contains_key(&did_key)
-                    .into_diagnostic()?
-                {
-                    debug!("{did} is in DID allowlist, processing");
-                    return Ok(true);
+            FilterMode::Filter => {
+                let repo_key = crate::db::keys::repo_key(did);
+                if let Some(state_bytes) = self.state.db.repos.get(&repo_key).into_diagnostic()? {
+                    let repo_state: crate::types::RepoState =
+                        rmp_serde::from_slice(&state_bytes).into_diagnostic()?;
+
+                    if repo_state.tracked {
+                        debug!("{did} is a tracked repo, processing");
+                        return Ok(true);
+                    } else {
+                        debug!("{did} is known but explicitly untracked, skipping");
+                        return Ok(false);
+                    }
                 }
-                let known =
-                    Db::contains_key(self.state.db.repos.clone(), keys::repo_key(did)).await?;
-                if known {
-                    debug!("{did} is a known repo, processing");
+
+                if !filter.signals.is_empty() {
+                    debug!("{did} is unknown — passing to worker for signal check");
+                    Ok(true)
                 } else {
-                    debug!(
-                        "{did} is unknown — passing to worker for signal check (mode={:?})",
-                        filter.mode
-                    );
+                    debug!("{did} is unknown and no signals configured, skipping");
+                    Ok(false)
                 }
-                Ok(known || filter.mode == FilterMode::Signal)
             }
         }
     }

@@ -36,11 +36,13 @@ Key design goals:
 Hydrant consists of several components:
 - **[`hydrant::ingest::firehose`]**: Connects to an upstream Firehose (Relay) and filters events. It manages the transition between discovery and synchronization.
 - **[`hydrant::ingest::worker`]**: Processes buffered Firehose messages concurrently using sharded workers. Verifies signatures, updates repository state (handling account status events like deactivations), detects gaps for backfill, and persists records.
-- **[`hydrant::crawler`]**: Periodically enumerates the network via `com.atproto.sync.listRepos` to discover new repositories when in full-network mode.
+- **[`hydrant::crawler`]**: Periodically enumerates the network via `com.atproto.sync.listRepos` to discover new repositories. In `Full` mode it is enabled by default; in `Filter` mode it is opt-in via `HYDRANT_ENABLE_CRAWLER`.
 - **[`hydrant::resolver`]**: Manages DID resolution and key lookups. Supports multiple PLC directory sources with failover and caching.
 - **[`hydrant::backfill`]**: A dedicated worker that fetches full repository CAR files. Uses LIFO prioritization and adaptive concurrency to manage backfill load efficiently.
-- **[`hydrant::api`]**: An Axum-based XRPC server implementing repository read methods (`getRecord`, `listRecords`) and system stats. It also provides a WebSocket event stream and a filter management API (`GET`/`PATCH /filter`) for configuring indexing mode, DID lists, signals, and collection patterns.
-- **Persistence worker** (in `src/main.rs`): Manages periodic background flushes of the LSM-tree and cursor state.
+- **[`hydrant::api`]**: An Axum-based XRPC server implementing repository read methods (`getRecord`, `listRecords`) and system stats. It also provides a WebSocket event stream and management APIs:
+    - `/filter` (`GET`/`PATCH`): Configure indexing mode, signals, and collection patterns.
+    - `/repos` (`GET`/`PUT`/`DELETE`): Bulk repository management using NDJSON or JSON arrays.
+- Persistence worker (in `src/main.rs`): Manages periodic background flushes of the LSM-tree and cursor state.
 
 ### Lazy event inflation
 
@@ -82,7 +84,7 @@ Hydrant uses multiple `fjall` keyspaces:
 - `resync`: Maps `{DID}` -> `ResyncState` (MessagePack) for retry logic/tombstones.
 - `resync_buffer`: Maps `{DID}|{Rev}` -> `Commit` (MessagePack). Used to buffer live events during backfill.
 - `counts`: Maps `k|{NAME}` or `r|{DID}|{COL}` -> `Count` (u64 BE Bytes).
-- `filter`: Stores filter config: mode key `m` -> `FilterMode` (MessagePack), and set entries for DIDs (`d|{DID}`), signals (`s|{NSID}`), collections (`c|{NSID}`), and excludes (`x|{DID}`) -> empty value.
+- `filter`: Stores filter config. Handled by the `db::filter` module. Includes mode key `m` -> `FilterMode` (MessagePack), and set entries for signals (`s|{NSID}`), collections (`c|{NSID}`), and excludes (`x|{DID}`) -> empty value.
 
 ## Safe commands
 

@@ -213,6 +213,20 @@ impl Db {
                 u64::from_be_bytes(v.as_ref().try_into().unwrap()),
             );
         }
+        // ensure critical counts are initialized
+        for ks_name in ["repos", "pending", "resync"] {
+            let _ = counts_map
+                .entry_sync(SmolStr::new(ks_name))
+                .or_insert_with(|| {
+                    let ks = match ks_name {
+                        "repos" => &repos,
+                        "pending" => &pending,
+                        "resync" => &resync,
+                        _ => unreachable!(),
+                    };
+                    ks.iter().count() as u64
+                });
+        }
 
         let (event_tx, _) = broadcast::channel(10000);
 
@@ -276,7 +290,11 @@ impl Db {
 
     pub fn update_count(&self, key: &str, delta: i64) {
         let mut entry = self.counts_map.entry_sync(SmolStr::new(key)).or_insert(0);
-        *entry = (*entry as i64).saturating_add(delta) as u64;
+        if delta >= 0 {
+            *entry = entry.saturating_add(delta as u64);
+        } else {
+            *entry = entry.saturating_sub(delta.unsigned_abs());
+        }
     }
 
     pub async fn update_count_async(&self, key: &str, delta: i64) {
@@ -285,7 +303,11 @@ impl Db {
             .entry_async(SmolStr::new(key))
             .await
             .or_insert(0);
-        *entry = (*entry as i64).saturating_add(delta) as u64;
+        if delta >= 0 {
+            *entry = entry.saturating_add(delta as u64);
+        } else {
+            *entry = entry.saturating_sub(delta.unsigned_abs());
+        }
     }
 
     pub async fn get_count(&self, key: &str) -> u64 {
@@ -357,6 +379,50 @@ impl Db {
         })
         .await
         .into_diagnostic()?
+    }
+
+    pub fn repo_gauge_state(
+        repo_state: &RepoState,
+        resync_bytes: Option<&[u8]>,
+    ) -> crate::types::GaugeState {
+        match repo_state.status {
+            crate::types::RepoStatus::Synced => crate::types::GaugeState::Synced,
+            crate::types::RepoStatus::Backfilling => crate::types::GaugeState::Pending,
+            crate::types::RepoStatus::Error(_)
+            | crate::types::RepoStatus::Deactivated
+            | crate::types::RepoStatus::Takendown
+            | crate::types::RepoStatus::Suspended => {
+                if let Some(resync_bytes) = resync_bytes {
+                    if let Ok(crate::types::ResyncState::Error { kind, .. }) =
+                        rmp_serde::from_slice::<crate::types::ResyncState>(resync_bytes)
+                    {
+                        crate::types::GaugeState::Resync(Some(kind))
+                    } else {
+                        crate::types::GaugeState::Resync(None)
+                    }
+                } else {
+                    crate::types::GaugeState::Resync(None)
+                }
+            }
+        }
+    }
+
+    pub async fn repo_gauge_state_async(
+        &self,
+        repo_state: &RepoState<'_>,
+        did_key: &[u8],
+    ) -> crate::types::GaugeState {
+        let repo_state = repo_state.clone().into_static();
+        let did_key = did_key.to_vec();
+
+        let db_resync = self.resync.clone();
+
+        tokio::task::spawn_blocking(move || {
+            let resync_bytes_opt = db_resync.get(&did_key).ok().flatten();
+            Self::repo_gauge_state(&repo_state, resync_bytes_opt.as_deref())
+        })
+        .await
+        .unwrap_or(crate::types::GaugeState::Resync(None))
     }
 }
 
@@ -449,7 +515,11 @@ pub fn update_record_count(
         })
         .transpose()?
         .unwrap_or(0);
-    let new_count = (count as i64).saturating_add(delta) as u64;
+    let new_count = if delta >= 0 {
+        count.saturating_add(delta as u64)
+    } else {
+        count.saturating_sub(delta.unsigned_abs())
+    };
     batch.insert(&db.counts, key, new_count.to_be_bytes());
     Ok(())
 }

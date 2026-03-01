@@ -18,7 +18,7 @@ def main [] {
     if (wait-for-api $url) {
         # Trigger backfill to populate some data
         print $"adding repo ($did) to tracking..."
-        http patch -t application/json $"($url)/filter" { dids: { ($did): true } }
+        http put -t application/json $"($url)/repos" [ { did: ($did) } ]
         
         if (wait-for-backfill $url) {
             print "backfill complete, testing debug endpoints"
@@ -46,7 +46,8 @@ def main [] {
 
             # 2. Test /debug/get with that key (sent as string)
             print "testing /debug/get"
-            let get_res = http get $"($debug_url)/debug/get?partition=records&key=($key_str)"
+            let encoded_key = ($key_str | url encode)
+            let get_res = http get $"($debug_url)/debug/get?partition=records&key=($encoded_key)"
             
             if $get_res.value != $value_cid {
                 print $"FAILED: /debug/get returned different value. expected: ($value_cid), got: ($get_res.value)"

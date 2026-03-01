@@ -11,10 +11,12 @@ def main [] {
         exit 1
     }
 
-    let port = 3007
+    let port = 3011
     let url = $"http://localhost:($port)"
     let db_path = (mktemp -d -t hydrant_signal_test.XXXXXX)
-    let collection = "app.bsky.feed.post"
+    
+    let random_str = (random chars -l 6)
+    let collection = $"systems.hydrant.test.($random_str)"
 
     print $"database path: ($db_path)"
 
@@ -26,15 +28,16 @@ def main [] {
     print "authenticated"
 
     let binary = build-hydrant
+    $env.HYDRANT_RELAY_HOST = "wss://bsky.network/"
     let instance = start-hydrant $binary $db_path $port
 
     mut test_passed = false
 
     if (wait-for-api $url) {
-        # configure signal mode: index app.bsky.feed.post from anyone on the network
-        print "configuring signal mode..."
+        # configure filter mode: index app.bsky.feed.post from anyone on the network
+        print "configuring filter mode..."
         http patch -t application/json $"($url)/filter" {
-            mode: "signal",
+            mode: "filter",
             signals: [$collection]
         }
 
@@ -42,8 +45,8 @@ def main [] {
         let filter = (http get $"($url)/filter")
         print $"filter state: ($filter | to json)"
 
-        if $filter.mode != "signal" {
-            print "FAILED: mode was not set to signal"
+        if $filter.mode != "filter" {
+            print "FAILED: mode was not set to filter"
         } else if not ($filter.signals | any { |s| $s == $collection }) {
             print $"FAILED: ($collection) not in signals"
         } else {
@@ -52,24 +55,25 @@ def main [] {
             # wait a moment for the firehose to connect and the filter to take effect
             sleep 3sec
 
-            let timestamp = (date now | format date "%Y-%m-%dT%H:%M:%SZ")
-            let record_data = {
-                "$type": $collection,
-                text: $"hydrant signal filter test ($timestamp)",
-                createdAt: $timestamp
-            }
+        let timestamp = (date now | format date "%Y-%m-%dT%H:%M:%SZ")
+        let record_data = {
+            "$type": $collection,
+            text: $"hydrant signal filter test ($timestamp) - bsky.network relay",
+            createdAt: $timestamp
+        }
 
             print "creating post..."
             let create_res = (http post -t application/json -H ["Authorization" $"Bearer ($jwt)"] $"($pds_url)/xrpc/com.atproto.repo.createRecord" {
                 repo: $did,
                 collection: $collection,
+                validate: false,
                 record: $record_data
             })
             let rkey = ($create_res.uri | split row "/" | last)
             print $"created: ($create_res.uri)"
 
-            # give hydrant time to receive and process the firehose event
-            sleep 5sec
+            # give hydrant time to receive and process the firehose event and backfill
+            sleep 10sec
 
             # verify the record was indexed
             print "checking indexed record..."

@@ -1,23 +1,27 @@
-use std::sync::Arc;
-
-use arc_swap::ArcSwap;
-use fjall::Keyspace;
-use miette::{IntoDiagnostic, Result};
 use serde::{Deserialize, Serialize};
 use smol_str::SmolStr;
+use std::sync::Arc;
 
-pub const MODE_KEY: &[u8] = b"m";
-pub const DID_PREFIX: u8 = b'd';
-pub const SIGNAL_PREFIX: u8 = b's';
-pub const COLLECTION_PREFIX: u8 = b'c';
-pub const EXCLUDE_PREFIX: u8 = b'x';
-pub const SEP: u8 = b'|';
+pub type FilterHandle = Arc<arc_swap::ArcSwap<FilterConfig>>;
+
+pub fn new_handle(config: FilterConfig) -> FilterHandle {
+    Arc::new(arc_swap::ArcSwap::new(Arc::new(config)))
+}
+
+/// apply a bool patch or set replacement for a single set update.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum SetUpdate {
+    /// replace the entire set with this list
+    Set(Vec<String>),
+    /// patch: true = add, false = remove
+    Patch(std::collections::HashMap<String, bool>),
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FilterMode {
-    Dids = 0,
-    Signal = 1,
+    Filter = 0,
     Full = 2,
 }
 
@@ -37,33 +41,6 @@ impl FilterConfig {
             signals: Vec::new(),
             collections: Vec::new(),
         }
-    }
-
-    pub fn load(ks: &Keyspace) -> Result<Self> {
-        let mode = ks
-            .get(MODE_KEY)
-            .into_diagnostic()?
-            .map(|v| rmp_serde::from_slice(&v).into_diagnostic())
-            .transpose()?
-            .unwrap_or(FilterMode::Dids);
-
-        let mut config = Self::new(mode);
-
-        let signal_prefix = [SIGNAL_PREFIX, SEP];
-        for guard in ks.prefix(signal_prefix) {
-            let (k, _) = guard.into_inner().into_diagnostic()?;
-            let val = std::str::from_utf8(&k[signal_prefix.len()..]).into_diagnostic()?;
-            config.signals.push(SmolStr::new(val));
-        }
-
-        let col_prefix = [COLLECTION_PREFIX, SEP];
-        for guard in ks.prefix(col_prefix) {
-            let (k, _) = guard.into_inner().into_diagnostic()?;
-            let val = std::str::from_utf8(&k[col_prefix.len()..]).into_diagnostic()?;
-            config.collections.push(SmolStr::new(val));
-        }
-
-        Ok(config)
     }
 
     /// returns true if the collection matches the content filter.
@@ -87,28 +64,4 @@ fn nsid_matches(pattern: &str, collection: &str) -> bool {
     } else {
         collection == pattern
     }
-}
-
-pub type FilterHandle = Arc<ArcSwap<FilterConfig>>;
-
-pub fn new_handle(config: FilterConfig) -> FilterHandle {
-    Arc::new(ArcSwap::new(Arc::new(config)))
-}
-
-/// apply a bool patch or set replacement for a single set update.
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-pub enum SetUpdate {
-    /// replace the entire set with this list
-    Set(Vec<String>),
-    /// patch: true = add, false = remove
-    Patch(std::collections::HashMap<String, bool>),
-}
-
-pub fn filter_key(prefix: u8, val: &str) -> Vec<u8> {
-    let mut key = Vec::with_capacity(2 + val.len());
-    key.push(prefix);
-    key.push(SEP);
-    key.extend_from_slice(val.as_bytes());
-    key
 }

@@ -31,7 +31,7 @@ def main [] {
         
         # trigger backfill
         print $"adding repo ($did) to tracking..."
-        http patch -t application/json $"($url)/filter" { dids: { ($did): true } }
+        http put -t application/json $"($url)/repos" [ { did: ($did) } ]
         
         if (wait-for-backfill $url) {
             sleep 2sec
