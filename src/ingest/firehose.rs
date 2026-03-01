@@ -118,8 +118,7 @@ impl FirehoseIngestor {
     async fn should_process(&self, did: &Did<'_>) -> Result<bool> {
         let filter = self.filter.load();
 
-        let excl_key =
-            crate::db::filter::filter_key(crate::db::filter::EXCLUDE_PREFIX, did.as_str());
+        let excl_key = crate::db::filter::exclude_key(did.as_str())?;
         if self
             .state
             .db

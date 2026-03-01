@@ -140,10 +140,7 @@ impl Crawler {
             for repo in output.repos {
                 let did_key = keys::repo_key(&repo.did);
 
-                let excl_key = crate::db::filter::filter_key(
-                    crate::db::filter::EXCLUDE_PREFIX,
-                    repo.did.as_str(),
-                );
+                let excl_key = crate::db::filter::exclude_key(repo.did.as_str())?;
                 if db.filter.contains_key(&excl_key).into_diagnostic()? {
                     continue;
                 }
