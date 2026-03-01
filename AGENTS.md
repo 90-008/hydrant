@@ -41,7 +41,7 @@ Hydrant consists of several components:
 - **[`hydrant::backfill`]**: A dedicated worker that fetches full repository CAR files. Uses LIFO prioritization and adaptive concurrency to manage backfill load efficiently.
 - **[`hydrant::api`]**: An Axum-based XRPC server implementing repository read methods (`getRecord`, `listRecords`) and system stats. It also provides a WebSocket event stream and management APIs:
     - `/filter` (`GET`/`PATCH`): Configure indexing mode, signals, and collection patterns.
-    - `/repos` (`GET`/`PUT`/`DELETE`): Bulk repository management using NDJSON or JSON arrays. Supports pagination and partitioning via query parameters.
+    - `/repos` (`GET`/`PUT`/`DELETE`): Repository management.
 - Persistence worker (in `src/main.rs`): Manages periodic background flushes of the LSM-tree and cursor state.
 
 ### Lazy event inflation

@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
 use axum::{
-    Router,
+    Json, Router,
     body::Body,
-    extract::{Query, State},
+    extract::{Path, Query, State},
     http::{StatusCode, header},
     response::{IntoResponse, Response},
     routing::{delete, get, put},
@@ -20,6 +20,7 @@ use crate::types::{GaugeState, RepoState};
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/repos", get(handle_get_repos))
+        .route("/repos/{did}", get(handle_get_repo))
         .route("/repos", put(handle_put_repos))
         .route("/repos", delete(handle_delete_repos))
 }
@@ -152,6 +153,38 @@ pub async fn handle_get_repos(
     let body = Body::from_stream(stream);
 
     Ok(([(header::CONTENT_TYPE, "application/x-ndjson")], body).into_response())
+}
+
+pub async fn handle_get_repo(
+    State(state): State<Arc<AppState>>,
+    Path(did_str): Path<String>,
+) -> Result<Json<RepoResponse>, (StatusCode, String)> {
+    let did = Did::new(&did_str).map_err(bad_request)?;
+    let did_key = keys::repo_key(&did);
+
+    let item = tokio::task::spawn_blocking(move || {
+        let db = &state.db;
+
+        let repo_bytes = db.repos.get(&did_key).map_err(internal)?;
+        let repo_state = repo_bytes
+            .as_deref()
+            .map(crate::db::deser_repo_state)
+            .transpose()
+            .map_err(internal)?;
+
+        Ok(repo_state.map(|s| RepoResponse {
+            did: did_str,
+            status: s.status.to_string(),
+            tracked: s.tracked,
+            rev: s.rev.as_ref().map(|r| r.to_string()),
+            last_updated_at: s.last_updated_at,
+        }))
+    })
+    .await
+    .map_err(internal)??;
+
+    item.map(Json)
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "repository not found".to_string()))
 }
 
 pub async fn handle_put_repos(

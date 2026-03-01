@@ -98,6 +98,7 @@ each set field accepts one of two forms:
     - `limit`: max results (default 100, max 1000)
     - `cursor`: DID or u64 index ID depending on partition
     - `partition`: `all` (default), `pending` (backfill queue), or `resync` (retries)
+- `GET /repos/{did}`: get the sync status and metadata of a specific repository.
 - `PUT /repos`: explicitly track repositories. accepts an NDJSON body of `{"did": "..."}` (or JSON array of the same).
 - `DELETE /repos`: untrack repositories. accepts an NDJSON body of `{"did": "..."}` (or JSON array of the same). optionally include `"deleteData": true` to also purge the repository from the database.
 
