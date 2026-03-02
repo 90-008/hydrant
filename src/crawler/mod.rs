@@ -1,3 +1,4 @@
+use crate::db::types::TrimmedDid;
 use crate::db::{Db, keys, ser_repo_state};
 use crate::state::AppState;
 use crate::types::RepoState;
@@ -6,15 +7,24 @@ use jacquard_api::com_atproto::sync::list_repos::ListReposOutput;
 use jacquard_common::{IntoStatic, types::string::Did};
 use miette::{IntoDiagnostic, Result};
 use rand::Rng;
+use rand::RngExt;
 use rand::rngs::SmallRng;
 use reqwest_middleware::{ClientBuilder, ClientWithMiddleware};
 use reqwest_retry::Jitter;
 use reqwest_retry::{RetryTransientMiddleware, policies::ExponentialBackoff};
 use smol_str::SmolStr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tracing::{debug, error, info, trace};
 use url::Url;
+
+enum CrawlCheckResult {
+    Signal,
+    NoSignal,
+    Ratelimited,
+    Failed,
+}
 
 pub struct Crawler {
     state: Arc<AppState>,
@@ -22,6 +32,7 @@ pub struct Crawler {
     http: Arc<ClientWithMiddleware>,
     max_pending: usize,
     resume_pending: usize,
+    count: Arc<AtomicUsize>,
 }
 
 impl Crawler {
@@ -55,11 +66,35 @@ impl Crawler {
             http,
             max_pending,
             resume_pending,
+            count: Arc::new(AtomicUsize::new(0)),
         }
     }
 
     pub async fn run(self) -> Result<()> {
         info!("crawler started");
+
+        tokio::spawn({
+            let count = self.count.clone();
+            let mut last_time = std::time::Instant::now();
+            let mut interval = tokio::time::interval(Duration::from_secs(60));
+            async move {
+                loop {
+                    interval.tick().await;
+                    let delta = count.swap(0, Ordering::Relaxed);
+                    if delta == 0 {
+                        continue;
+                    }
+                    let elapsed = last_time.elapsed().as_secs_f64();
+                    let rate = if elapsed > 0.0 {
+                        delta as f64 / elapsed
+                    } else {
+                        0.0
+                    };
+                    info!("crawler: {rate:.2} repos/s ({delta} repos in {elapsed:.1}s)");
+                    last_time = std::time::Instant::now();
+                }
+            }
+        });
 
         let mut api_url = self.relay_host.clone();
         if api_url.scheme() == "wss" {
@@ -82,7 +117,7 @@ impl Crawler {
             .await?
             .map(|bytes| {
                 let s = String::from_utf8_lossy(&bytes);
-                info!("resuming crawler from cursor: {}", s);
+                info!("resuming crawler from cursor: {s}");
                 s.into()
             });
         let mut was_throttled = false;
@@ -181,10 +216,9 @@ impl Crawler {
                 && !filter.has_glob_signals();
 
             // 3. process repos
-            let mut unknown_repos = Vec::new();
+            let mut unknown_dids = Vec::new();
             for repo in output.repos {
-                let parsed_did: Did = repo.did.parse().unwrap();
-                let did_key = keys::repo_key(&parsed_did);
+                let did_key = keys::repo_key(&repo.did);
 
                 let excl_key = crate::db::filter::exclude_key(repo.did.as_str())?;
                 if db.filter.contains_key(&excl_key).into_diagnostic()? {
@@ -193,81 +227,25 @@ impl Crawler {
 
                 // check if known
                 if !Db::contains_key(db.repos.clone(), &did_key).await? {
-                    unknown_repos.push(repo);
+                    unknown_dids.push(repo.did.into_static());
                 }
             }
 
-            let mut valid_repos = Vec::new();
-            if check_signals && !unknown_repos.is_empty() {
-                let mut set = tokio::task::JoinSet::new();
-                for repo in unknown_repos {
-                    let http = self.http.clone();
-                    let api_url = api_url.clone();
-                    let filter = filter.clone();
-                    set.spawn(async move {
-                        let mut found_signal = false;
-                        for signal in filter.signals.iter() {
-                            let mut list_records_url =
-                                api_url.join("/xrpc/com.atproto.repo.listRecords").unwrap();
-                            list_records_url
-                                .query_pairs_mut()
-                                .append_pair("repo", &repo.did)
-                                .append_pair("collection", signal)
-                                .append_pair("limit", "1");
-
-                            match http.get(list_records_url).send().await {
-                                Ok(res) => {
-                                    let Ok(bytes) = res.bytes().await else {
-                                        error!("failed to read bytes from listRecords response for repo {}, signal {signal}", repo.did);
-                                        continue;
-                                    };
-                                    if let Ok(out) = serde_json::from_slice::<ListRecordsOutput>(&bytes) {
-                                        if !out.records.is_empty() {
-                                            found_signal = true;
-                                            break;
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    error!(
-                                        "failed to listRecords for repo {}, signal {signal}: {e}",
-                                        repo.did
-                                    );
-                                    continue;
-                                }
-                            }
-                        }
-
-                        if !found_signal {
-                            trace!(
-                                "crawler skipped repo {}: no records match signals",
-                                repo.did
-                            );
-                        }
-
-                        (repo, found_signal)
-                    });
-                }
-
-                while let Some(res) = set.join_next().await {
-                    let (repo, found_signal) = res.into_diagnostic()?;
-                    if found_signal {
-                        valid_repos.push(repo);
-                    }
-                }
+            let valid_dids = if check_signals && !unknown_dids.is_empty() {
+                self.check_signals_batch(&unknown_dids, &filter, &mut batch)
+                    .await?
             } else {
-                valid_repos = unknown_repos;
-            }
+                unknown_dids
+            };
 
-            for repo in valid_repos {
-                let parsed_did: Did = repo.did.parse().unwrap();
-                let did_key = keys::repo_key(&parsed_did);
-                trace!("crawler found new repo: {}", repo.did);
+            for did in &valid_dids {
+                let did_key = keys::repo_key(did);
+                trace!("crawler found new repo: {did}");
 
                 let state = RepoState::backfilling(rng.next_u64());
                 batch.insert(&db.repos, &did_key, ser_repo_state(&state)?);
                 batch.insert(&db.pending, keys::pending_key(state.index_id), &did_key);
-                to_queue.push(repo.did.clone());
+                to_queue.push(did.clone());
             }
 
             // 4. update cursor
@@ -289,21 +267,221 @@ impl Crawler {
                 .await
                 .into_diagnostic()??;
 
-            // update counts if we found new repos
-            if !to_queue.is_empty() {
-                let count = to_queue.len() as i64;
-                self.state.db.update_count_async("repos", count).await;
-                self.state.db.update_count_async("pending", count).await;
-            }
-
-            // 5. notify backfill worker
-            if !to_queue.is_empty() {
-                self.state.notify_backfill();
-            }
+            self.account_new_repos(to_queue.len()).await;
 
             if cursor.is_none() {
+                // 6. retry previously failed repos before sleeping
+                self.retry_failed_repos(&mut rng).await?;
+
                 tokio::time::sleep(Duration::from_secs(3600)).await;
             }
         }
+    }
+
+    async fn check_signals_batch(
+        &self,
+        dids: &[Did<'static>],
+        filter: &crate::filter::FilterConfig,
+        batch: &mut fjall::OwnedWriteBatch,
+    ) -> Result<Vec<Did<'static>>> {
+        let db = &self.state.db;
+        let mut valid = Vec::new();
+        let mut set = tokio::task::JoinSet::new();
+
+        for did in dids {
+            let did = did.clone();
+            let http = self.http.clone();
+            let resolver = self.state.resolver.clone();
+            let filter = filter.clone();
+            set.spawn(async move {
+                const MAX_RETRIES: u32 = 8;
+                let mut rng: SmallRng = rand::make_rng();
+
+                let pds_url = {
+                    let mut attempt = 0u32;
+                    loop {
+                        match resolver.resolve_identity_info(&did).await {
+                            Ok((url, _)) => break url,
+                            Err(crate::resolver::ResolverError::Ratelimited)
+                                if attempt < MAX_RETRIES =>
+                            {
+                                let base = Duration::from_secs(1 << attempt);
+                                let jitter = Duration::from_millis(rng.random_range(0..2000));
+                                let try_in = base + jitter;
+                                debug!(
+                                    "crawler: rate limited resolving {did}, retry {}/{MAX_RETRIES} in {}s",
+                                    attempt + 1,
+                                    try_in.as_secs_f64()
+                                );
+                                tokio::time::sleep(try_in).await;
+                                attempt += 1;
+                            }
+                            Err(crate::resolver::ResolverError::Ratelimited) => {
+                                error!(
+                                    "crawler: rate limited resolving {did} after {MAX_RETRIES} retries"
+                                );
+                                return (did, CrawlCheckResult::Ratelimited);
+                            }
+                            Err(e) => {
+                                error!("crawler: failed to resolve {did}: {e}");
+                                return (did, CrawlCheckResult::Failed);
+                            }
+                        }
+                    }
+                };
+
+                let mut found_signal = false;
+                for signal in filter.signals.iter() {
+                    let mut list_records_url =
+                        pds_url.join("/xrpc/com.atproto.repo.listRecords").unwrap();
+                    list_records_url
+                        .query_pairs_mut()
+                        .append_pair("repo", &did)
+                        .append_pair("collection", signal)
+                        .append_pair("limit", "1");
+
+                    let res = http
+                        .get(list_records_url)
+                        .send()
+                        .await
+                        .into_diagnostic()
+                        .map(|res| res.error_for_status().into_diagnostic())
+                        .flatten();
+                    match res {
+                        Ok(res) => {
+                            let Ok(bytes) = res.bytes().await else {
+                                error!(
+                                    "failed to read bytes from listRecords response for repo {did}, signal {signal}"
+                                );
+                                return (did, CrawlCheckResult::Failed);
+                            };
+                            match serde_json::from_slice::<ListRecordsOutput>(&bytes) {
+                                Ok(out) => {
+                                    if !out.records.is_empty() {
+                                        found_signal = true;
+                                        break;
+                                    }
+                                }
+                                Err(e) => {
+                                    error!(
+                                        "failed to parse listRecords response for repo {did}, signal {signal}: {e}"
+                                    );
+                                    return (did, CrawlCheckResult::Failed);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            error!(
+                                "failed to listRecords for repo {did}, signal {signal}: {e}"
+                            );
+                            return (did, CrawlCheckResult::Failed);
+                        }
+                    }
+                }
+
+                if found_signal {
+                    (did, CrawlCheckResult::Signal)
+                } else {
+                    trace!("crawler skipped repo {did}: no records match signals");
+                    (did, CrawlCheckResult::NoSignal)
+                }
+            });
+        }
+
+        while let Some(res) = set.join_next().await {
+            let (did, result) = res.into_diagnostic()?;
+            match result {
+                CrawlCheckResult::Signal => {
+                    batch.remove(&db.crawler, keys::crawler_failed_key(&did));
+                    valid.push(did);
+                }
+                CrawlCheckResult::NoSignal => {
+                    batch.remove(&db.crawler, keys::crawler_failed_key(&did));
+                }
+                CrawlCheckResult::Ratelimited | CrawlCheckResult::Failed => {
+                    batch.insert(&db.crawler, keys::crawler_failed_key(&did), []);
+                }
+            }
+        }
+
+        Ok(valid)
+    }
+
+    async fn retry_failed_repos(&self, rng: &mut SmallRng) -> Result<()> {
+        let db = &self.state.db;
+        let filter = self.state.filter.load();
+
+        let check_signals = filter.mode == crate::filter::FilterMode::Filter
+            && !filter.signals.is_empty()
+            && !filter.has_glob_signals();
+
+        if !check_signals {
+            return Ok(());
+        }
+
+        let mut failed_dids = Vec::new();
+        for guard in db.crawler.prefix(keys::CRAWLER_FAILED_PREFIX) {
+            let (key, _) = guard.into_inner().into_diagnostic()?;
+            let did_bytes = &key[keys::CRAWLER_FAILED_PREFIX.len()..];
+            let trimmed = TrimmedDid::try_from(did_bytes)?;
+            failed_dids.push(trimmed.to_did());
+        }
+
+        if failed_dids.is_empty() {
+            return Ok(());
+        }
+
+        info!(
+            "crawler: retrying {} previously failed repos",
+            failed_dids.len()
+        );
+
+        let mut batch = db.inner.batch();
+        let valid_dids = self
+            .check_signals_batch(&failed_dids, &filter, &mut batch)
+            .await?;
+
+        for did in &valid_dids {
+            let did_key = keys::repo_key(did);
+
+            if Db::contains_key(db.repos.clone(), &did_key).await? {
+                continue;
+            }
+
+            let state = RepoState::backfilling(rng.next_u64());
+            batch.insert(&db.repos, &did_key, ser_repo_state(&state)?);
+            batch.insert(&db.pending, keys::pending_key(state.index_id), &did_key);
+        }
+
+        tokio::task::spawn_blocking(move || batch.commit().into_diagnostic())
+            .await
+            .into_diagnostic()??;
+
+        if !valid_dids.is_empty() {
+            info!(
+                "crawler: recovered {} repos from failed retry",
+                valid_dids.len()
+            );
+            self.account_new_repos(valid_dids.len()).await;
+        }
+
+        Ok(())
+    }
+
+    async fn account_new_repos(&self, count: usize) {
+        if count == 0 {
+            return;
+        }
+
+        self.count.fetch_add(count, Ordering::Relaxed);
+        self.state
+            .db
+            .update_count_async("repos", count as i64)
+            .await;
+        self.state
+            .db
+            .update_count_async("pending", count as i64)
+            .await;
+        self.state.notify_backfill();
     }
 }

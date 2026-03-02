@@ -9,7 +9,7 @@ use mimalloc::MiMalloc;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use tokio::{sync::mpsc, task::spawn_blocking};
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
@@ -112,11 +112,10 @@ async fn main() -> miette::Result<()> {
 
     tokio::spawn({
         let state = state.clone();
+        let mut last_id = state.db.next_event_id.load(Ordering::Relaxed);
+        let mut last_time = std::time::Instant::now();
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
         async move {
-            let mut last_id = state.db.next_event_id.load(Ordering::Relaxed);
-            let mut last_time = std::time::Instant::now();
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
-
             loop {
                 interval.tick().await;
 
@@ -124,6 +123,11 @@ async fn main() -> miette::Result<()> {
                 let current_time = std::time::Instant::now();
 
                 let delta = current_id.saturating_sub(last_id);
+                if delta == 0 {
+                    debug!("no new events in 60s");
+                    continue;
+                }
+
                 let elapsed = current_time.duration_since(last_time).as_secs_f64();
                 let rate = if elapsed > 0.0 {
                     delta as f64 / elapsed

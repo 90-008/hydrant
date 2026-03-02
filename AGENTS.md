@@ -85,6 +85,7 @@ Hydrant uses multiple `fjall` keyspaces:
 - `resync_buffer`: Maps `{DID}|{Rev}` -> `Commit` (MessagePack). Used to buffer live events during backfill.
 - `counts`: Maps `k|{NAME}` or `r|{DID}|{COL}` -> `Count` (u64 BE Bytes).
 - `filter`: Stores filter config. Handled by the `db::filter` module. Includes mode key `m` -> `FilterMode` (MessagePack), and set entries for signals (`s|{NSID}`), collections (`c|{NSID}`), and excludes (`x|{DID}`) -> empty value.
+- `crawler`: Stores crawler state with prefixed keys. Failed crawl entries use `f|{DID}` -> empty value, representing repos that failed signal checking during crawl discovery.
 
 ## Safe commands
 

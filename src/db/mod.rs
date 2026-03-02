@@ -33,6 +33,7 @@ pub struct Db {
     pub events: Keyspace,
     pub counts: Keyspace,
     pub filter: Keyspace,
+    pub crawler: Keyspace,
     pub event_tx: broadcast::Sender<BroadcastEvent>,
     pub next_event_id: Arc<AtomicU64>,
     pub counts_map: HashMap<SmolStr, u64>,
@@ -190,6 +191,13 @@ impl Db {
             opts().data_block_size_policy(BlockSizePolicy::all(kb(1))),
         )?;
 
+        let crawler = open_ks(
+            "crawler",
+            opts()
+                .expect_point_read_hits(true)
+                .data_block_size_policy(BlockSizePolicy::all(kb(1))),
+        )?;
+
         let mut last_id = 0;
         if let Some(guard) = events.iter().next_back() {
             let k = guard.key().into_diagnostic()?;
@@ -242,6 +250,7 @@ impl Db {
             events,
             counts,
             filter,
+            crawler,
             event_tx,
             counts_map,
             next_event_id: Arc::new(AtomicU64::new(last_id + 1)),

@@ -131,3 +131,13 @@ pub fn resync_buffer_prefix(did: &Did) -> Vec<u8> {
     prefix.push(SEP);
     prefix
 }
+
+pub const CRAWLER_FAILED_PREFIX: &[u8] = &[b'f', SEP];
+
+pub fn crawler_failed_key(did: &Did) -> Vec<u8> {
+    let repo = TrimmedDid::from(did);
+    let mut key = Vec::with_capacity(CRAWLER_FAILED_PREFIX.len() + repo.len());
+    key.extend_from_slice(CRAWLER_FAILED_PREFIX);
+    repo.write_to_vec(&mut key);
+    key
+}
