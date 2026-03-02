@@ -28,6 +28,8 @@
                 cmake
                 websocat
                 http-nu
+                mold
+                clang
               ];
             };
           };

@@ -1,8 +1,8 @@
 use data_encoding::BASE32_NOPAD;
 use fjall::UserKey;
-use jacquard::{CowStr, IntoStatic};
 use jacquard_common::types::string::Did;
 use jacquard_common::types::tid::Tid;
+use jacquard_common::{CowStr, IntoStatic};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use smol_str::{SmolStr, SmolStrBuilder, format_smolstr};
 use std::fmt::Display;

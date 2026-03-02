@@ -1,10 +1,12 @@
-use jacquard_api::com_atproto::sync::subscribe_repos::SubscribeReposMessage;
 use tokio::sync::mpsc;
 
 pub mod firehose;
+pub mod stream;
 pub mod worker;
 
-use jacquard::types::did::Did;
+use jacquard_common::types::did::Did;
+
+use crate::ingest::stream::SubscribeReposMessage;
 
 #[derive(Debug)]
 pub enum IngestMessage {
@@ -13,5 +15,4 @@ pub enum IngestMessage {
 }
 
 pub type BufferTx = mpsc::UnboundedSender<IngestMessage>;
-#[allow(dead_code)]
 pub type BufferRx = mpsc::UnboundedReceiver<IngestMessage>;

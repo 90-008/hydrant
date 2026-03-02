@@ -1,11 +1,11 @@
 use fjall::{Keyspace, OwnedWriteBatch};
-use jacquard::IntoStatic;
-use jacquard::types::nsid::Nsid;
+use jacquard_common::IntoStatic;
+use jacquard_common::types::nsid::Nsid;
+use jacquard_common::types::string::Did;
 use miette::{IntoDiagnostic, Result};
 
 use crate::db::types::TrimmedDid;
 use crate::filter::{FilterConfig, FilterMode, SetUpdate};
-use jacquard_common::types::string::Did;
 
 pub const MODE_KEY: &[u8] = b"m";
 pub const SIGNAL_PREFIX: u8 = b's';

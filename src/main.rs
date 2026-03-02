@@ -16,8 +16,10 @@ static GLOBAL: MiMalloc = MiMalloc;
 
 #[tokio::main]
 async fn main() -> miette::Result<()> {
-    rustls::crypto::ring::default_provider().install_default().ok();
-    
+    rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .ok();
+
     let cfg = Config::from_env()?;
 
     let env_filter = tracing_subscriber::EnvFilter::new(&cfg.log_level);
@@ -27,7 +29,11 @@ async fn main() -> miette::Result<()> {
 
     let state = AppState::new(&cfg)?;
 
-    if cfg.full_network || cfg.filter_signals.is_some() || cfg.filter_collections.is_some() || cfg.filter_excludes.is_some() {
+    if cfg.full_network
+        || cfg.filter_signals.is_some()
+        || cfg.filter_collections.is_some()
+        || cfg.filter_excludes.is_some()
+    {
         let filter_ks = state.db.filter.clone();
         let inner = state.db.inner.clone();
         let full_network = cfg.full_network;
@@ -38,13 +44,13 @@ async fn main() -> miette::Result<()> {
         tokio::task::spawn_blocking(move || {
             use hydrant::filter::{FilterMode, SetUpdate};
             let mut batch = inner.batch();
-            
+
             let mode = if full_network {
                 Some(FilterMode::Full)
             } else {
                 None
             };
-            
+
             let signals_update = signals.map(SetUpdate::Set);
             let collections_update = collections.map(SetUpdate::Set);
             let excludes_update = excludes.map(SetUpdate::Set);
@@ -57,7 +63,7 @@ async fn main() -> miette::Result<()> {
                 collections_update,
                 excludes_update,
             )?;
-            
+
             batch.commit().into_diagnostic()
         })
         .await

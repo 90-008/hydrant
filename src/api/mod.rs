@@ -1,19 +1,15 @@
 use crate::state::AppState;
 use axum::{Router, routing::get};
-use jacquard::xrpc::GenericXrpcError;
-use jacquard_axum::XrpcErrorResponse;
 use std::{net::SocketAddr, sync::Arc};
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
 mod debug;
 pub mod filter;
-pub mod repos; // Added this line
+pub mod repos;
 pub mod stats;
 mod stream;
 pub mod xrpc;
-
-pub type XrpcResult<T> = Result<T, XrpcErrorResponse<GenericXrpcError>>;
 
 pub async fn serve(state: Arc<AppState>, port: u16) -> miette::Result<()> {
     let app = Router::new()
@@ -22,7 +18,7 @@ pub async fn serve(state: Arc<AppState>, port: u16) -> miette::Result<()> {
         .route("/stream", get(stream::handle_stream))
         .merge(xrpc::router())
         .merge(filter::router())
-        .merge(repos::router()) // Added this line
+        .merge(repos::router())
         .with_state(state)
         .layer(TraceLayer::new_for_http())
         .layer(CorsLayer::permissive());

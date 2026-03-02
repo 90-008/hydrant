@@ -1,4 +1,4 @@
-use jacquard::types::nsid::Nsid;
+use jacquard_common::types::nsid::Nsid;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 

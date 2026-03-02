@@ -10,12 +10,12 @@ use crate::types::{
 };
 
 use fjall::Slice;
-use jacquard::api::com_atproto::sync::get_repo::{GetRepo, GetRepoError};
-use jacquard::error::{ClientError, ClientErrorKind};
-use jacquard::types::cid::Cid;
-use jacquard::types::did::Did;
-use jacquard::{CowStr, IntoStatic, prelude::*};
-use jacquard_common::xrpc::XrpcError;
+use jacquard_api::com_atproto::sync::get_repo::{GetRepo, GetRepoError};
+use jacquard_common::error::{ClientError, ClientErrorKind};
+use jacquard_common::types::cid::Cid;
+use jacquard_common::types::did::Did;
+use jacquard_common::xrpc::{XrpcError, XrpcExt};
+use jacquard_common::{CowStr, IntoStatic};
 use jacquard_repo::mst::Mst;
 use jacquard_repo::{BlockStore, MemoryBlockStore};
 use miette::{Diagnostic, IntoDiagnostic, Result};

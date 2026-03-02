@@ -1,7 +1,7 @@
 use crate::types::{BroadcastEvent, RepoState};
 use fjall::config::BlockSizePolicy;
 use fjall::{Database, Keyspace, KeyspaceCreateOptions, OwnedWriteBatch, PersistMode, Slice};
-use jacquard::IntoStatic;
+use jacquard_common::IntoStatic;
 use jacquard_common::types::string::Did;
 use miette::{Context, IntoDiagnostic, Result};
 use scc::HashMap;

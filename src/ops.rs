@@ -1,18 +1,9 @@
-use crate::db::types::{DbAction, DbRkey, DbTid, TrimmedDid};
-use crate::db::{self, Db, keys, ser_repo_state};
-use crate::filter::FilterConfig;
-use crate::types::{
-    AccountEvt, BroadcastEvent, IdentityEvt, MarshallableEvt, RepoState, RepoStatus, ResyncState,
-    StoredEvent,
-};
 use fjall::OwnedWriteBatch;
-use jacquard::CowStr;
-use jacquard::IntoStatic;
-
-use jacquard::types::cid::Cid;
-use jacquard::types::did::Did;
-use jacquard_api::com_atproto::sync::subscribe_repos::Commit;
+use jacquard_common::CowStr;
+use jacquard_common::IntoStatic;
+use jacquard_common::types::cid::Cid;
 use jacquard_common::types::crypto::PublicKey;
+use jacquard_common::types::did::Did;
 use jacquard_repo::car::reader::parse_car_bytes;
 use miette::{Context, IntoDiagnostic, Result};
 use rand::{Rng, rng};
@@ -20,6 +11,15 @@ use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 use tracing::{debug, trace};
+
+use crate::db::types::{DbAction, DbRkey, DbTid, TrimmedDid};
+use crate::db::{self, Db, keys, ser_repo_state};
+use crate::filter::FilterConfig;
+use crate::ingest::stream::Commit;
+use crate::types::{
+    AccountEvt, BroadcastEvent, IdentityEvt, MarshallableEvt, RepoState, RepoStatus, ResyncState,
+    StoredEvent,
+};
 
 pub fn persist_to_resync_buffer(db: &Db, did: &Did, commit: &Commit) -> Result<()> {
     let key = keys::resync_buffer_key(did, DbTid::from(&commit.rev));
@@ -66,7 +66,7 @@ pub fn make_account_event(db: &Db, evt: AccountEvt<'static>) -> BroadcastEvent {
 pub fn delete_repo<'batch>(
     batch: &'batch mut OwnedWriteBatch,
     db: &Db,
-    did: &jacquard::types::did::Did,
+    did: &Did,
     repo_state: &RepoState,
 ) -> Result<()> {
     debug!("deleting repo {did}");
@@ -118,7 +118,7 @@ pub fn delete_repo<'batch>(
 pub fn update_repo_status<'batch, 's>(
     batch: &'batch mut OwnedWriteBatch,
     db: &Db,
-    did: &jacquard::types::did::Did,
+    did: &Did,
     mut repo_state: RepoState<'s>,
     new_status: RepoStatus,
 ) -> Result<RepoState<'s>> {

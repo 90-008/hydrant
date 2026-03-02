@@ -1,12 +1,11 @@
 use crate::db;
 use crate::filter::{FilterHandle, FilterMode};
+use crate::ingest::stream::{FirehoseStream, SubscribeReposMessage, decode_frame};
 use crate::ingest::{BufferTx, IngestMessage};
 use crate::state::AppState;
-use jacquard::api::com_atproto::sync::subscribe_repos::{SubscribeRepos, SubscribeReposMessage};
-use jacquard::types::did::Did;
-use jacquard_common::xrpc::{SubscriptionClient, TungsteniteSubscriptionClient};
+use jacquard_common::IntoStatic;
+use jacquard_common::types::did::Did;
 use miette::{IntoDiagnostic, Result};
-use n0_future::StreamExt;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -55,28 +54,27 @@ impl FirehoseIngestor {
                 self.state.cur_firehose.store(c, Ordering::SeqCst);
             }
 
-            let client = TungsteniteSubscriptionClient::from_base_uri(self.relay_host.clone());
-            let params = SubscribeRepos::new;
-            let params = start_cursor
-                .map(|c| params().cursor(c))
-                .unwrap_or_else(params)
-                .build();
-
-            let stream = match client.subscribe(&params).await {
-                Ok(s) => s,
-                Err(e) => {
-                    error!("failed to connect to firehose: {e}, retrying in 5s...");
-                    tokio::time::sleep(Duration::from_secs(5)).await;
-                    continue;
-                }
-            };
-
-            let (_sink, mut messages) = stream.into_stream();
+            let mut stream =
+                match FirehoseStream::connect(self.relay_host.clone(), start_cursor).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        error!("failed to connect to firehose: {e}, retrying in 5s...");
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                        continue;
+                    }
+                };
 
             info!("firehose connected");
 
-            while let Some(msg_res) = messages.next().await {
-                match msg_res {
+            while let Some(bytes_res) = stream.next().await {
+                let bytes = match bytes_res {
+                    Ok(b) => b,
+                    Err(e) => {
+                        error!("firehose stream error: {e}");
+                        break;
+                    }
+                };
+                match decode_frame(&bytes) {
                     Ok(msg) => self.handle_message(msg).await,
                     Err(e) => {
                         error!("firehose stream error: {e}");
@@ -90,7 +88,7 @@ impl FirehoseIngestor {
         }
     }
 
-    async fn handle_message(&mut self, msg: SubscribeReposMessage<'static>) {
+    async fn handle_message(&mut self, msg: SubscribeReposMessage<'_>) {
         let did = match &msg {
             SubscribeReposMessage::Commit(commit) => &commit.repo,
             SubscribeReposMessage::Identity(identity) => &identity.did,
@@ -108,9 +106,12 @@ impl FirehoseIngestor {
             trace!("skipping {did}: not in filter");
             return;
         }
-        debug!("forwarding message for {did} to ingest buffer");
+        trace!("forwarding message for {did} to ingest buffer");
 
-        if let Err(e) = self.buffer_tx.send(IngestMessage::Firehose(msg)) {
+        if let Err(e) = self
+            .buffer_tx
+            .send(IngestMessage::Firehose(msg.into_static()))
+        {
             error!("failed to send message to buffer processor: {e}");
         }
     }
@@ -138,7 +139,7 @@ impl FirehoseIngestor {
                         rmp_serde::from_slice(&state_bytes).into_diagnostic()?;
 
                     if repo_state.tracked {
-                        debug!("{did} is a tracked repo, processing");
+                        trace!("{did} is a tracked repo, processing");
                         return Ok(true);
                     } else {
                         debug!("{did} is known but explicitly untracked, skipping");
@@ -147,10 +148,10 @@ impl FirehoseIngestor {
                 }
 
                 if !filter.signals.is_empty() {
-                    debug!("{did} is unknown — passing to worker for signal check");
+                    trace!("{did} is unknown — passing to worker for signal check");
                     Ok(true)
                 } else {
-                    debug!("{did} is unknown and no signals configured, skipping");
+                    trace!("{did} is unknown and no signals configured, skipping");
                     Ok(false)
                 }
             }

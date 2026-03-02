@@ -8,7 +8,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{delete, get, put},
 };
-use jacquard::{IntoStatic, types::did::Did};
+use jacquard_common::{IntoStatic, types::did::Did};
 use miette::IntoDiagnostic;
 use rand::Rng;
 use serde::{Deserialize, Serialize};

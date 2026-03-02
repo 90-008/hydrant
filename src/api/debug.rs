@@ -6,8 +6,8 @@ use axum::{
     extract::{Query, State},
     http::StatusCode,
 };
-use jacquard::types::cid::Cid;
-use jacquard::types::ident::AtIdentifier;
+use jacquard_common::types::cid::Cid;
+use jacquard_common::types::ident::AtIdentifier;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::str::FromStr;

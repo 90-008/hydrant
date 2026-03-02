@@ -8,7 +8,7 @@ use axum::{
     },
     response::IntoResponse,
 };
-use jacquard::CowStr;
+use jacquard_common::CowStr;
 use jacquard_common::types::value::RawData;
 use miette::{Context, IntoDiagnostic};
 use serde::Deserialize;
@@ -123,7 +123,8 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, query: Strea
                                     rkey: CowStr::Owned(rkey.to_smolstr().into()),
                                     action: CowStr::Borrowed(action.as_str()),
                                     record: record_val,
-                                    cid: cid.map(|c| jacquard::types::cid::Cid::ipld(c).into()),
+                                    cid: cid
+                                        .map(|c| jacquard_common::types::cid::Cid::ipld(c).into()),
                                 }),
                                 identity: None,
                                 account: None,

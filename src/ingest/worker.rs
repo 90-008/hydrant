@@ -1,19 +1,18 @@
 use crate::db::{self, keys};
 use crate::filter::FilterMode;
+use crate::ingest::stream::{Commit, SubscribeReposMessage};
 use crate::ingest::{BufferRx, IngestMessage};
 use crate::ops;
 use crate::resolver::{NoSigningKeyError, ResolverError};
 use crate::state::AppState;
 use crate::types::{AccountEvt, BroadcastEvent, GaugeState, IdentityEvt, RepoState, RepoStatus};
-use jacquard::api::com_atproto::sync::subscribe_repos::SubscribeReposMessage;
 
 use fjall::OwnedWriteBatch;
 
-use jacquard::cowstr::ToCowStr;
-use jacquard::types::crypto::PublicKey;
-use jacquard::types::did::Did;
-use jacquard_api::com_atproto::sync::subscribe_repos::Commit;
 use jacquard_common::IntoStatic;
+use jacquard_common::cowstr::ToCowStr;
+use jacquard_common::types::crypto::PublicKey;
+use jacquard_common::types::did::Did;
 use jacquard_repo::error::CommitError;
 use miette::{Context, Diagnostic, IntoDiagnostic, Result};
 use rand::Rng;
@@ -376,7 +375,7 @@ impl FirehoseWorker {
                 };
 
                 if !account.active {
-                    use jacquard::api::com_atproto::sync::subscribe_repos::AccountStatus;
+                    use crate::ingest::stream::AccountStatus;
                     match &account.status {
                         Some(AccountStatus::Deleted) => {
                             debug!("account {did} deleted, wiping data");

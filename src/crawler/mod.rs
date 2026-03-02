@@ -1,10 +1,9 @@
 use crate::db::{Db, keys, ser_repo_state};
 use crate::state::AppState;
 use crate::types::RepoState;
-use jacquard::IntoStatic;
 use jacquard_api::com_atproto::repo::list_records::ListRecordsOutput;
 use jacquard_api::com_atproto::sync::list_repos::ListReposOutput;
-use jacquard_common::types::string::Did;
+use jacquard_common::{IntoStatic, types::string::Did};
 use miette::{IntoDiagnostic, Result};
 use rand::Rng;
 use rand::rngs::SmallRng;
@@ -35,7 +34,7 @@ impl Crawler {
         let retry_policy = ExponentialBackoff::builder()
             .jitter(Jitter::Bounded)
             .build_with_max_retries(8);
-        let reqwest_client = reqwest_client::Client::builder()
+        let reqwest_client = reqwest::Client::builder()
             .user_agent(concat!(
                 env!("CARGO_PKG_NAME"),
                 "/",

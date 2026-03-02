@@ -1,13 +1,13 @@
 use std::fmt::Display;
 
-use jacquard::{CowStr, IntoStatic, types::string::Handle};
+use jacquard_common::types::cid::IpldCid;
 use jacquard_common::types::string::Did;
+use jacquard_common::{CowStr, IntoStatic, types::string::Handle};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use smol_str::SmolStr;
 
 use crate::db::types::{DbAction, DbRkey, DbTid, TrimmedDid};
-use jacquard::types::cid::IpldCid;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum RepoStatus {

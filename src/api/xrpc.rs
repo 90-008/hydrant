@@ -1,20 +1,19 @@
-use crate::api::{AppState, XrpcResult};
+use crate::api::AppState;
 use crate::db::types::DbRkey;
 use crate::db::{self, Db, keys};
+use axum::extract::FromRequest;
+use axum::response::IntoResponse;
 use axum::{Json, Router, extract::State, http::StatusCode};
 use futures::TryFutureExt;
-use jacquard::cowstr::ToCowStr;
-use jacquard::types::ident::AtIdentifier;
-use jacquard::{
-    IntoStatic,
-    api::com_atproto::repo::{
-        get_record::{GetRecordError, GetRecordOutput, GetRecordRequest},
-        list_records::{ListRecordsOutput, ListRecordsRequest, Record as RepoRecord},
-    },
-    xrpc::XrpcRequest,
+use jacquard_api::com_atproto::repo::{
+    get_record::{GetRecordError, GetRecordOutput, GetRecordRequest},
+    list_records::{ListRecordsOutput, ListRecordsRequest, Record as RepoRecord},
 };
-use jacquard_api::com_atproto::repo::{get_record::GetRecord, list_records::ListRecords};
-use jacquard_axum::{ExtractXrpc, IntoRouter, XrpcErrorResponse};
+use jacquard_common::CowStr;
+use jacquard_common::cowstr::ToCowStr;
+use jacquard_common::types::ident::AtIdentifier;
+use jacquard_common::xrpc::{XrpcEndpoint, XrpcMethod};
+use jacquard_common::{IntoStatic, xrpc::XrpcRequest};
 use jacquard_common::{
     types::{
         string::{AtUri, Cid},
@@ -30,9 +29,64 @@ use tokio::task::spawn_blocking;
 
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
-        .merge(GetRecordRequest::into_router(handle_get_record))
-        .merge(ListRecordsRequest::into_router(handle_list_records))
-        .merge(CountRecords::into_router(handle_count_records))
+        .route(
+            GetRecordRequest::PATH,
+            axum::routing::get(handle_get_record),
+        )
+        .route(
+            ListRecordsRequest::PATH,
+            axum::routing::get(handle_list_records),
+        )
+        .route(CountRecords::PATH, axum::routing::get(handle_count_records))
+}
+
+#[derive(Debug)]
+pub struct XrpcErrorResponse<E: IntoStatic + std::error::Error = GenericXrpcError> {
+    pub status: StatusCode,
+    pub error: XrpcError<E>,
+}
+
+impl<E: Serialize + IntoStatic + std::error::Error> IntoResponse for XrpcErrorResponse<E> {
+    fn into_response(self) -> axum::response::Response {
+        (self.status, Json(self.error)).into_response()
+    }
+}
+
+pub type XrpcResult<T, E = GenericXrpcError> = Result<T, XrpcErrorResponse<E>>;
+
+pub struct ExtractXrpc<E: XrpcEndpoint>(pub E::Request<'static>);
+
+impl<S, E> FromRequest<S> for ExtractXrpc<E>
+where
+    S: Send + Sync,
+    E: XrpcEndpoint,
+    E::Request<'static>: Send,
+    for<'de> E::Request<'de>: Deserialize<'de> + IntoStatic<Output = E::Request<'static>>,
+{
+    type Rejection = XrpcErrorResponse<GenericXrpcError>;
+
+    async fn from_request(
+        req: axum::extract::Request,
+        _state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        let nsid = E::Request::<'static>::NSID;
+        match E::METHOD {
+            XrpcMethod::Query => {
+                let query = req.uri().query().unwrap_or("");
+                let res: E::Request<'_> =
+                    serde_urlencoded::from_str(query).map_err(|e| bad_request(nsid, e))?;
+                Ok(ExtractXrpc(res.into_static()))
+            }
+            XrpcMethod::Procedure(_) => {
+                let body = axum::body::to_bytes(req.into_body(), usize::MAX)
+                    .await
+                    .map_err(|e| internal_error(nsid, e))?;
+                let res: E::Request<'_> =
+                    serde_json::from_slice(&body).map_err(|e| bad_request(nsid, e))?;
+                Ok(ExtractXrpc(res.into_static()))
+            }
+        }
+    }
 }
 
 fn internal_error<E: std::error::Error + IntoStatic>(
@@ -76,7 +130,7 @@ pub async fn handle_get_record(
         .resolver
         .resolve_did(&req.repo)
         .await
-        .map_err(|e| bad_request(GetRecord::NSID, e))?;
+        .map_err(|e| bad_request(GetRecordRequest::PATH, e))?;
 
     let db_key = keys::record_key(
         &did,
@@ -86,20 +140,20 @@ pub async fn handle_get_record(
 
     let cid_bytes = Db::get(db.records.clone(), db_key)
         .await
-        .map_err(|e| internal_error(GetRecord::NSID, e))?;
+        .map_err(|e| internal_error(GetRecordRequest::PATH, e))?;
 
     if let Some(cid_bytes) = cid_bytes {
         // lookup block using binary cid
         let block_bytes = Db::get(db.blocks.clone(), &cid_bytes)
             .await
-            .map_err(|e| internal_error(GetRecord::NSID, e))?
-            .ok_or_else(|| internal_error(GetRecord::NSID, "not found"))?;
+            .map_err(|e| internal_error(GetRecordRequest::PATH, e))?
+            .ok_or_else(|| internal_error(GetRecordRequest::PATH, "not found"))?;
 
         let value: Data = serde_ipld_dagcbor::from_slice(&block_bytes)
-            .map_err(|e| internal_error(GetRecord::NSID, e))?;
+            .map_err(|e| internal_error(GetRecordRequest::PATH, e))?;
 
         let cid = Cid::new(&cid_bytes)
-            .map_err(|e| internal_error(GetRecord::NSID, e))?
+            .map_err(|e| internal_error(GetRecordRequest::PATH, e))?
             .into_static();
 
         Ok(Json(GetRecordOutput {
@@ -130,7 +184,7 @@ pub async fn handle_list_records(
         .resolver
         .resolve_did(&req.repo)
         .await
-        .map_err(|e| bad_request(ListRecords::NSID, e))?;
+        .map_err(|e| bad_request(ListRecordsRequest::PATH, e))?;
 
     let ks = db.records.clone();
 
@@ -206,12 +260,12 @@ pub async fn handle_list_records(
         Result::<_, miette::Report>::Ok((results, cursor))
     })
     .await
-    .map_err(|e| internal_error(ListRecords::NSID, e))?
-    .map_err(|e| internal_error(ListRecords::NSID, e))?;
+    .map_err(|e| internal_error(ListRecordsRequest::PATH, e))?
+    .map_err(|e| internal_error(ListRecordsRequest::PATH, e))?;
 
     Ok(Json(ListRecordsOutput {
         records: results,
-        cursor: cursor.map(|c| jacquard::CowStr::Owned(c.to_smolstr())),
+        cursor: cursor.map(|c| CowStr::Owned(c.to_smolstr())),
         extra_data: Default::default(),
     }))
 }
@@ -230,13 +284,13 @@ impl jacquard_common::xrpc::XrpcResp for CountRecordsResponse {
 }
 
 #[derive(Serialize, Deserialize, jacquard_derive::IntoStatic)]
-pub struct CountRecordsRequest<'i> {
+pub struct CountRecordsRequestData<'i> {
     #[serde(borrow)]
     pub identifier: AtIdentifier<'i>,
     pub collection: String,
 }
 
-impl<'a> jacquard_common::xrpc::XrpcRequest for CountRecordsRequest<'a> {
+impl<'a> jacquard_common::xrpc::XrpcRequest for CountRecordsRequestData<'a> {
     const NSID: &'static str = "systems.gaze.hydrant.countRecords";
     const METHOD: jacquard_common::xrpc::XrpcMethod = jacquard_common::xrpc::XrpcMethod::Query;
     type Response = CountRecordsResponse;
@@ -246,11 +300,10 @@ pub struct CountRecords;
 impl jacquard_common::xrpc::XrpcEndpoint for CountRecords {
     const PATH: &'static str = "/xrpc/systems.gaze.hydrant.countRecords";
     const METHOD: jacquard_common::xrpc::XrpcMethod = jacquard_common::xrpc::XrpcMethod::Query;
-    type Request<'de> = CountRecordsRequest<'de>;
+    type Request<'de> = CountRecordsRequestData<'de>;
     type Response = CountRecordsResponse;
 }
 
-#[axum::debug_handler]
 pub async fn handle_count_records(
     State(state): State<Arc<AppState>>,
     ExtractXrpc(req): ExtractXrpc<CountRecords>,
@@ -259,13 +312,13 @@ pub async fn handle_count_records(
         .resolver
         .resolve_did(&req.identifier)
         .await
-        .map_err(|e| bad_request(CountRecordsRequest::NSID, e))?;
+        .map_err(|e| bad_request(CountRecords::PATH, e))?;
 
     let count = spawn_blocking(move || {
         db::get_record_count(&state.db, &did, &req.collection)
-            .map_err(|e| internal_error(CountRecordsRequest::NSID, e))
+            .map_err(|e| internal_error(CountRecords::PATH, e))
     })
-    .map_err(|e| internal_error(CountRecordsRequest::NSID, e))
+    .map_err(|e| internal_error(CountRecords::PATH, e))
     .await??;
 
     Ok(Json(CountRecordsOutput { count }))

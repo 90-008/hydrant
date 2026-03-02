@@ -3,11 +3,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use jacquard::IntoStatic;
-use jacquard::types::string::Handle;
+use jacquard_common::IntoStatic;
 use jacquard_common::types::crypto::PublicKey;
 use jacquard_common::types::ident::AtIdentifier;
 use jacquard_common::types::string::Did;
+use jacquard_common::types::string::Handle;
 use jacquard_identity::JacquardResolver;
 use jacquard_identity::resolver::{
     IdentityError, IdentityErrorKind, IdentityResolver, PlcSource, ResolverOptions,
@@ -69,7 +69,7 @@ impl Resolver {
             opts.request_timeout = Some(Duration::from_secs(3));
 
             // no jacquard cache - we manage our own
-            jacquards.push(JacquardResolver::new(http.clone(), opts));
+            jacquards.push(JacquardResolver::new(http.clone(), opts).with_system_dns());
         }
 
         if jacquards.is_empty() {
