@@ -1,12 +1,16 @@
 use crate::db::{Db, keys, ser_repo_state};
 use crate::state::AppState;
 use crate::types::RepoState;
-use jacquard::api::com_atproto::sync::list_repos::{ListRepos, ListReposOutput};
-use jacquard::prelude::*;
-use jacquard_common::CowStr;
+use jacquard::IntoStatic;
+use jacquard_api::com_atproto::repo::list_records::ListRecordsOutput;
+use jacquard_api::com_atproto::sync::list_repos::ListReposOutput;
+use jacquard_common::types::string::Did;
 use miette::{IntoDiagnostic, Result};
 use rand::Rng;
 use rand::rngs::SmallRng;
+use reqwest_middleware::{ClientBuilder, ClientWithMiddleware};
+use reqwest_retry::Jitter;
+use reqwest_retry::{RetryTransientMiddleware, policies::ExponentialBackoff};
 use smol_str::SmolStr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -16,7 +20,7 @@ use url::Url;
 pub struct Crawler {
     state: Arc<AppState>,
     relay_host: Url,
-    http: reqwest::Client,
+    http: Arc<ClientWithMiddleware>,
     max_pending: usize,
     resume_pending: usize,
 }
@@ -28,10 +32,28 @@ impl Crawler {
         max_pending: usize,
         resume_pending: usize,
     ) -> Self {
+        let retry_policy = ExponentialBackoff::builder()
+            .jitter(Jitter::Bounded)
+            .build_with_max_retries(8);
+        let reqwest_client = reqwest_client::Client::builder()
+            .user_agent(concat!(
+                env!("CARGO_PKG_NAME"),
+                "/",
+                env!("CARGO_PKG_VERSION")
+            ))
+            .gzip(true)
+            .build()
+            .expect("that reqwest will build");
+
+        let http = ClientBuilder::new(reqwest_client)
+            .with(RetryTransientMiddleware::new_with_policy(retry_policy))
+            .build();
+        let http = Arc::new(http);
+
         Self {
             state,
             relay_host,
-            http: reqwest::Client::new(),
+            http,
             max_pending,
             resume_pending,
         }
@@ -40,20 +62,30 @@ impl Crawler {
     pub async fn run(self) -> Result<()> {
         info!("crawler started");
 
+        let mut api_url = self.relay_host.clone();
+        if api_url.scheme() == "wss" {
+            api_url
+                .set_scheme("https")
+                .map_err(|_| miette::miette!("invalid url: {api_url}"))?;
+        } else if api_url.scheme() == "ws" {
+            api_url
+                .set_scheme("http")
+                .map_err(|_| miette::miette!("invalid url: {api_url}"))?;
+        }
+
         let mut rng: SmallRng = rand::make_rng();
 
         let db = &self.state.db;
 
         // 1. load cursor
         let cursor_key = b"crawler_cursor";
-        let mut cursor: Option<SmolStr> =
-            if let Ok(Some(bytes)) = Db::get(db.cursors.clone(), cursor_key.to_vec()).await {
+        let mut cursor: Option<SmolStr> = Db::get(db.cursors.clone(), cursor_key.to_vec())
+            .await?
+            .map(|bytes| {
                 let s = String::from_utf8_lossy(&bytes);
                 info!("resuming crawler from cursor: {}", s);
-                Some(s.into())
-            } else {
-                None
-            };
+                s.into()
+            });
         let mut was_throttled = false;
 
         loop {
@@ -97,33 +129,39 @@ impl Crawler {
             }
 
             // 2. fetch listrepos
-            let req = ListRepos::new()
-                .limit(1000)
-                .maybe_cursor(cursor.clone().map(|c| CowStr::from(c.to_string())))
-                .build();
-
-            let mut url = self.relay_host.clone();
-            if url.scheme() == "wss" {
-                url.set_scheme("https")
-                    .map_err(|_| miette::miette!("invalid url: {url}"))?;
-            } else if url.scheme() == "ws" {
-                url.set_scheme("http")
-                    .map_err(|_| miette::miette!("invalid url: {url}"))?;
+            let mut list_repos_url = api_url
+                .join("/xrpc/com.atproto.sync.listRepos")
+                .into_diagnostic()?;
+            list_repos_url
+                .query_pairs_mut()
+                .append_pair("limit", "1000");
+            if let Some(c) = &cursor {
+                list_repos_url
+                    .query_pairs_mut()
+                    .append_pair("cursor", c.as_str());
             }
-            let res_result = self.http.xrpc(url).send(&req).await;
 
-            let output: ListReposOutput = match res_result {
-                Ok(res) => res.into_output().into_diagnostic()?,
+            let res_result = self.http.get(list_repos_url.clone()).send().await;
+            let bytes = match res_result {
+                Ok(res) => match res.bytes().await {
+                    Ok(b) => b,
+                    Err(e) => {
+                        error!(
+                            "crawler failed to parse list repos response: {e}. retrying in 30s..."
+                        );
+                        tokio::time::sleep(Duration::from_secs(30)).await;
+                        continue;
+                    }
+                },
                 Err(e) => {
-                    let e = e
-                        .source_err()
-                        .map(|e| e.to_string())
-                        .unwrap_or_else(|| e.to_string());
                     error!("crawler failed to list repos: {e}. retrying in 30s...");
                     tokio::time::sleep(Duration::from_secs(30)).await;
                     continue;
                 }
             };
+            let output = serde_json::from_slice::<ListReposOutput>(&bytes)
+                .into_diagnostic()?
+                .into_static();
 
             if output.repos.is_empty() {
                 info!("crawler finished enumeration (or empty page). sleeping for 1 hour.");
@@ -135,10 +173,19 @@ impl Crawler {
 
             let mut batch = db.inner.batch();
             let mut to_queue = Vec::new();
+            let filter = self.state.filter.load();
+            // we can check whether or not to backfill repos faster if we only have to check
+            // certain known signals, since we can just listRecords for those signals
+            // if we have glob signals we cant do this since we dont know what signals to check
+            let check_signals = filter.mode == crate::filter::FilterMode::Filter
+                && !filter.signals.is_empty()
+                && !filter.has_glob_signals();
 
             // 3. process repos
+            let mut unknown_repos = Vec::new();
             for repo in output.repos {
-                let did_key = keys::repo_key(&repo.did);
+                let parsed_did: Did = repo.did.parse().unwrap();
+                let did_key = keys::repo_key(&parsed_did);
 
                 let excl_key = crate::db::filter::exclude_key(repo.did.as_str())?;
                 if db.filter.contains_key(&excl_key).into_diagnostic()? {
@@ -147,13 +194,81 @@ impl Crawler {
 
                 // check if known
                 if !Db::contains_key(db.repos.clone(), &did_key).await? {
-                    trace!("crawler found new repo: {}", repo.did);
-
-                    let state = RepoState::backfilling(rng.next_u64());
-                    batch.insert(&db.repos, &did_key, ser_repo_state(&state)?);
-                    batch.insert(&db.pending, keys::pending_key(state.index_id), &did_key);
-                    to_queue.push(repo.did.clone());
+                    unknown_repos.push(repo);
                 }
+            }
+
+            let mut valid_repos = Vec::new();
+            if check_signals && !unknown_repos.is_empty() {
+                let mut set = tokio::task::JoinSet::new();
+                for repo in unknown_repos {
+                    let http = self.http.clone();
+                    let api_url = api_url.clone();
+                    let filter = filter.clone();
+                    set.spawn(async move {
+                        let mut found_signal = false;
+                        for signal in filter.signals.iter() {
+                            let mut list_records_url =
+                                api_url.join("/xrpc/com.atproto.repo.listRecords").unwrap();
+                            list_records_url
+                                .query_pairs_mut()
+                                .append_pair("repo", &repo.did)
+                                .append_pair("collection", signal)
+                                .append_pair("limit", "1");
+
+                            match http.get(list_records_url).send().await {
+                                Ok(res) => {
+                                    let Ok(bytes) = res.bytes().await else {
+                                        error!("failed to read bytes from listRecords response for repo {}, signal {signal}", repo.did);
+                                        continue;
+                                    };
+                                    if let Ok(out) = serde_json::from_slice::<ListRecordsOutput>(&bytes) {
+                                        if !out.records.is_empty() {
+                                            found_signal = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    error!(
+                                        "failed to listRecords for repo {}, signal {signal}: {e}",
+                                        repo.did
+                                    );
+                                    continue;
+                                }
+                            }
+                        }
+
+                        if !found_signal {
+                            trace!(
+                                "crawler skipped repo {}: no records match signals",
+                                repo.did
+                            );
+                        }
+
+                        (repo, found_signal)
+                    });
+                }
+
+                while let Some(res) = set.join_next().await {
+                    let (repo, found_signal) = res.into_diagnostic()?;
+                    if found_signal {
+                        valid_repos.push(repo);
+                    }
+                }
+            } else {
+                valid_repos = unknown_repos;
+            }
+
+            for repo in valid_repos {
+                let parsed_did: Did = repo.did.parse().unwrap();
+                let did_key = keys::repo_key(&parsed_did);
+                trace!("crawler found new repo: {}", repo.did);
+
+                let state = RepoState::backfilling(rng.next_u64());
+                batch.insert(&db.repos, &did_key, ser_repo_state(&state)?);
+                batch.insert(&db.pending, keys::pending_key(state.index_id), &did_key);
+                to_queue.push(repo.did.clone());
             }
 
             // 4. update cursor

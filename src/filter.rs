@@ -1,5 +1,5 @@
+use jacquard::types::nsid::Nsid;
 use serde::{Deserialize, Serialize};
-use smol_str::SmolStr;
 use std::sync::Arc;
 
 pub type FilterHandle = Arc<arc_swap::ArcSwap<FilterConfig>>;
@@ -25,13 +25,11 @@ pub enum FilterMode {
     Full = 2,
 }
 
-/// hot-path in-memory config: only the small fields needed on every event.
-/// dids and excludes are large sets kept in the filter keyspace only.
 #[derive(Debug, Clone, Serialize)]
 pub struct FilterConfig {
     pub mode: FilterMode,
-    pub signals: Vec<SmolStr>,
-    pub collections: Vec<SmolStr>,
+    pub signals: Vec<Nsid<'static>>,
+    pub collections: Vec<Nsid<'static>>,
 }
 
 impl FilterConfig {
@@ -43,8 +41,6 @@ impl FilterConfig {
         }
     }
 
-    /// returns true if the collection matches the content filter.
-    /// if collections is empty, all collections match.
     pub fn matches_collection(&self, collection: &str) -> bool {
         if self.collections.is_empty() {
             return true;
@@ -52,9 +48,12 @@ impl FilterConfig {
         self.collections.iter().any(|p| nsid_matches(p, collection))
     }
 
-    /// returns true if the commit touches a collection covered by a signal.
     pub fn matches_signal(&self, collection: &str) -> bool {
         self.signals.iter().any(|p| nsid_matches(p, collection))
+    }
+
+    pub fn has_glob_signals(&self) -> bool {
+        self.signals.iter().any(|s| s.ends_with(".*"))
     }
 }
 

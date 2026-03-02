@@ -1,4 +1,6 @@
 use fjall::{Keyspace, OwnedWriteBatch};
+use jacquard::IntoStatic;
+use jacquard::types::nsid::Nsid;
 use miette::{IntoDiagnostic, Result};
 
 use crate::db::types::TrimmedDid;
@@ -111,14 +113,14 @@ pub fn load(ks: &Keyspace) -> Result<FilterConfig> {
     for guard in ks.prefix(signal_prefix) {
         let (k, _) = guard.into_inner().into_diagnostic()?;
         let val = std::str::from_utf8(&k[signal_prefix.len()..]).into_diagnostic()?;
-        config.signals.push(smol_str::SmolStr::new(val));
+        config.signals.push(Nsid::new(val)?.into_static());
     }
 
     let col_prefix = [COLLECTION_PREFIX, SEP];
     for guard in ks.prefix(col_prefix) {
         let (k, _) = guard.into_inner().into_diagnostic()?;
         let val = std::str::from_utf8(&k[col_prefix.len()..]).into_diagnostic()?;
-        config.collections.push(smol_str::SmolStr::new(val));
+        config.collections.push(Nsid::new(val)?.into_static());
     }
 
     Ok(config)
@@ -196,8 +198,14 @@ mod tests {
 
         let config = load(&ks)?;
         assert_eq!(config.mode, FilterMode::Filter);
-        assert_eq!(config.signals, vec!["a.b.c"]);
-        assert_eq!(config.collections, vec!["d.e.f"]);
+        assert_eq!(
+            config.signals,
+            vec![Nsid::new("a.b.c").unwrap().into_static()]
+        );
+        assert_eq!(
+            config.collections,
+            vec![Nsid::new("d.e.f").unwrap().into_static()]
+        );
 
         let excludes = read_set(&ks, EXCLUDE_PREFIX)?;
         assert_eq!(excludes, vec!["did:plc:yk4q3id7id6p5z3bypvshc64"]);

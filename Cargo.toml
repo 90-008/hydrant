@@ -23,6 +23,9 @@ url = "2.5"
 smol_str = "0.3"
 futures = "0.3"
 reqwest = { version = "0.12", features = ["json", "rustls-tls", "stream", "gzip", "brotli", "zstd", "http2"], default-features = false }
+reqwest-client = { package = "reqwest", version = "0.13.2", features = ["json", "rustls", "stream", "gzip", "brotli", "zstd", "http2"], default-features = false }
+reqwest-middleware = { version = "0.5.1", default-features = false, features = ["http2", "rustls"] }
+reqwest-retry = { version = "0.9.1" }
 axum = { version = "0.8.8", features = ["ws", "macros"] }
 tower-http = { version = "0.6.6", features = ["cors", "trace"] }
 tokio-stream = "0.1"
@@ -49,6 +52,7 @@ rand = "0.10.0"
 glob = "0.3"
 ordermap = { version = "1.1.0", features = ["serde"] }
 arc-swap = "1.8.2"
+rustls = { version = "0.23", features = ["ring"] }
 
 [dev-dependencies]
 tempfile = "3.26.0"
