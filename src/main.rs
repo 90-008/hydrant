@@ -16,6 +16,8 @@ static GLOBAL: MiMalloc = MiMalloc;
 
 #[tokio::main]
 async fn main() -> miette::Result<()> {
+    rustls::crypto::ring::default_provider().install_default().ok();
+    
     let cfg = Config::from_env()?;
 
     let env_filter = tracing_subscriber::EnvFilter::new(&cfg.log_level);
@@ -25,18 +27,37 @@ async fn main() -> miette::Result<()> {
 
     let state = AppState::new(&cfg)?;
 
-    if cfg.full_network {
+    if cfg.full_network || cfg.filter_signals.is_some() || cfg.filter_collections.is_some() || cfg.filter_excludes.is_some() {
         let filter_ks = state.db.filter.clone();
         let inner = state.db.inner.clone();
+        let full_network = cfg.full_network;
+        let signals = cfg.filter_signals.clone();
+        let collections = cfg.filter_collections.clone();
+        let excludes = cfg.filter_excludes.clone();
+
         tokio::task::spawn_blocking(move || {
-            use hydrant::db::filter::MODE_KEY;
-            use hydrant::filter::FilterMode;
+            use hydrant::filter::{FilterMode, SetUpdate};
             let mut batch = inner.batch();
-            batch.insert(
+            
+            let mode = if full_network {
+                Some(FilterMode::Full)
+            } else {
+                None
+            };
+            
+            let signals_update = signals.map(SetUpdate::Set);
+            let collections_update = collections.map(SetUpdate::Set);
+            let excludes_update = excludes.map(SetUpdate::Set);
+
+            hydrant::db::filter::apply_patch(
+                &mut batch,
                 &filter_ks,
-                MODE_KEY,
-                rmp_serde::to_vec(&FilterMode::Full).into_diagnostic()?,
-            );
+                mode,
+                signals_update,
+                collections_update,
+                excludes_update,
+            )?;
+            
             batch.commit().into_diagnostic()
         })
         .await

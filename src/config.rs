@@ -65,6 +65,9 @@ pub struct Config {
     pub db_records_memtable_size_mb: u64,
     pub crawler_max_pending_repos: usize,
     pub crawler_resume_pending_repos: usize,
+    pub filter_signals: Option<Vec<String>>,
+    pub filter_collections: Option<Vec<String>>,
+    pub filter_excludes: Option<Vec<String>>,
 }
 
 impl Config {
@@ -156,6 +159,27 @@ impl Config {
         let crawler_max_pending_repos = cfg!("CRAWLER_MAX_PENDING_REPOS", 2000usize);
         let crawler_resume_pending_repos = cfg!("CRAWLER_RESUME_PENDING_REPOS", 1000usize);
 
+        let filter_signals = std::env::var("HYDRANT_FILTER_SIGNALS").ok().map(|s| {
+            s.split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        });
+
+        let filter_collections = std::env::var("HYDRANT_FILTER_COLLECTIONS").ok().map(|s| {
+            s.split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        });
+
+        let filter_excludes = std::env::var("HYDRANT_FILTER_EXCLUDES").ok().map(|s| {
+            s.split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        });
+
         Ok(Self {
             database_path,
             relay_host,
@@ -185,6 +209,9 @@ impl Config {
             db_records_memtable_size_mb,
             crawler_max_pending_repos,
             crawler_resume_pending_repos,
+            filter_signals,
+            filter_collections,
+            filter_excludes,
         })
     }
 }
@@ -272,6 +299,15 @@ impl fmt::Display for Config {
             "  crawler resume pending:   {}",
             self.crawler_resume_pending_repos
         )?;
+        if let Some(signals) = &self.filter_signals {
+            writeln!(f, "  filter signals:           {:?}", signals)?;
+        }
+        if let Some(collections) = &self.filter_collections {
+            writeln!(f, "  filter collections:       {:?}", collections)?;
+        }
+        if let Some(excludes) = &self.filter_excludes {
+            writeln!(f, "  filter excludes:          {:?}", excludes)?;
+        }
         writeln!(f, "  enable debug:             {}", self.enable_debug)?;
         if self.enable_debug {
             writeln!(f, "  debug port:               {}", self.debug_port)?;
