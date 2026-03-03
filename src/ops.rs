@@ -259,13 +259,9 @@ pub fn apply_commit<'batch, 'db, 'commit, 's>(
 
     batch.insert(&db.repos, keys::repo_key(did), ser_repo_state(&repo_state)?);
 
-    // store all blocks in the CAS
-    for (cid, bytes) in &parsed.blocks {
-        batch.insert(&db.blocks, cid.to_bytes(), bytes.to_vec());
-    }
-
     // 2. iterate ops and update records index
     let mut records_delta = 0;
+    let mut blocks_count = 0;
     let mut collection_deltas: HashMap<&str, i64> = HashMap::new();
 
     for op in &commit.ops {
@@ -286,13 +282,19 @@ pub fn apply_commit<'batch, 'db, 'commit, 's>(
                 let Some(cid) = &op.cid else {
                     continue;
                 };
+                let cid_ipld = cid.to_ipld()
+                    .into_diagnostic()
+                    .wrap_err("expected valid cid from relay")?;
+                
+                if let Some(bytes) = parsed.blocks.get(&cid_ipld) {
+                    batch.insert(&db.blocks, cid_ipld.to_bytes(), bytes.to_vec());
+                    blocks_count += 1;
+                }
+                
                 batch.insert(
                     &db.records,
                     db_key.clone(),
-                    cid.to_ipld()
-                        .into_diagnostic()
-                        .wrap_err("expected valid cid from relay")?
-                        .to_bytes(),
+                    cid_ipld.to_bytes(),
                 );
 
                 // accumulate counts
@@ -325,7 +327,6 @@ pub fn apply_commit<'batch, 'db, 'commit, 's>(
     }
 
     // update counts
-    let blocks_count = parsed.blocks.len() as i64;
     for (col, delta) in collection_deltas {
         db::update_record_count(batch, db, did, col, delta)?;
     }

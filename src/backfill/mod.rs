@@ -712,6 +712,8 @@ async fn process_did<'i>(
             .db
             .update_count_async("records", records_cnt_delta)
             .await;
+    }
+    if added_blocks > 0 {
         app_state
             .db
             .update_count_async("blocks", added_blocks)
