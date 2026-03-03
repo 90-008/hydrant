@@ -103,7 +103,7 @@ impl Config {
                 s.split(',')
                     .map(|s| Url::parse(s.trim()))
                     .collect::<Result<Vec<_>, _>>()
-                    .map_err(|e| miette::miette!("invalid PLC URL: {}", e))
+                    .map_err(|e| miette::miette!("invalid PLC URL: {e}"))
             })
             .unwrap_or_else(|| Ok(vec![Url::parse("https://plc.wtf").unwrap()]))?;
 

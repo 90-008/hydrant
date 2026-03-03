@@ -183,18 +183,21 @@ impl Db {
                 .data_block_size_policy(BlockSizePolicy::all(kb(1))),
         )?;
 
-        // filter handles high-volume point reads (checking explicit DID includes and excludes from firehose)
+        // filter handles high-volume point reads (checking excludes from firehose)
         // so it needs the bloom filter
         let filter = open_ks(
             "filter",
             // this can be pretty small since the DIDs wont be compressed that well anyhow
-            opts().data_block_size_policy(BlockSizePolicy::all(kb(1))),
+            opts()
+                .max_memtable_size((kb(1024) * 16) as u64)
+                .data_block_size_policy(BlockSizePolicy::all(kb(1))),
         )?;
 
         let crawler = open_ks(
             "crawler",
             opts()
                 .expect_point_read_hits(true)
+                .max_memtable_size((kb(1024) * 16) as u64)
                 .data_block_size_policy(BlockSizePolicy::all(kb(1))),
         )?;
 
