@@ -202,6 +202,7 @@ pub struct Crawler {
     max_pending: usize,
     resume_pending: usize,
     count: Arc<AtomicUsize>,
+    crawled_count: Arc<AtomicUsize>,
 }
 
 impl Crawler {
@@ -230,6 +231,7 @@ impl Crawler {
             max_pending,
             resume_pending,
             count: Arc::new(AtomicUsize::new(0)),
+            crawled_count: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -237,21 +239,27 @@ impl Crawler {
         tokio::spawn({
             use std::time::Instant;
             let count = self.count.clone();
+            let crawled_count = self.crawled_count.clone();
             let mut last_time = Instant::now();
             let mut interval = tokio::time::interval(Duration::from_secs(60));
             async move {
                 loop {
                     interval.tick().await;
-                    let delta = count.swap(0, Ordering::Relaxed);
-                    if delta == 0 {
-                        debug!("no repos processed in 60s");
+                    let delta_processed = count.swap(0, Ordering::Relaxed);
+                    let delta_crawled = crawled_count.swap(0, Ordering::Relaxed);
+
+                    if delta_processed == 0 && delta_crawled == 0 {
+                        debug!("no repos crawled or processed in 60s");
                         continue;
                     }
+
                     let elapsed = last_time.elapsed().as_secs_f64();
-                    let rate = (elapsed > 0.0)
-                        .then(|| delta as f64 / elapsed)
-                        .unwrap_or(0.0);
-                    info!(rate, delta, elapsed, "crawler progress");
+                    info!(
+                        processed = delta_processed,
+                        crawled = delta_crawled,
+                        elapsed,
+                        "crawler progress"
+                    );
                     last_time = Instant::now();
                 }
             }
@@ -378,6 +386,8 @@ impl Crawler {
             }
 
             debug!(count = output.repos.len(), "fetched repos");
+            self.crawled_count
+                .fetch_add(output.repos.len(), Ordering::Relaxed);
 
             let mut batch = db.inner.batch();
             let mut to_queue = Vec::new();
