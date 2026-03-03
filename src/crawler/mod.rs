@@ -11,12 +11,16 @@ use rand::RngExt;
 use rand::rngs::SmallRng;
 use reqwest_middleware::{ClientBuilder, ClientWithMiddleware};
 use reqwest_retry::Jitter;
-use reqwest_retry::{RetryTransientMiddleware, policies::ExponentialBackoff};
-use smol_str::SmolStr;
+use reqwest_retry::{
+    RetryTransientMiddleware, Retryable, RetryableStrategy, default_on_request_failure,
+    default_on_request_success, policies::ExponentialBackoff,
+};
+use smol_str::{SmolStr, ToSmolStr};
+use std::error::Error;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
-use tracing::{debug, error, info, trace};
+use tracing::{debug, error, info, trace, warn};
 use url::Url;
 
 enum CrawlCheckResult {
@@ -24,6 +28,60 @@ enum CrawlCheckResult {
     NoSignal,
     Ratelimited,
     Failed,
+}
+
+struct NoTlsRetry;
+
+impl RetryableStrategy for NoTlsRetry {
+    fn handle(
+        &self,
+        res: &Result<reqwest::Response, reqwest_middleware::Error>,
+    ) -> Option<Retryable> {
+        match res {
+            Ok(success) => default_on_request_success(success),
+            Err(error) => {
+                if let reqwest_middleware::Error::Reqwest(e) = error {
+                    if e.is_timeout() {
+                        return Some(Retryable::Fatal);
+                    }
+                    let mut src = e.source();
+                    while let Some(s) = src {
+                        if let Some(io_err) = s.downcast_ref::<std::io::Error>() {
+                            if is_tls_cert_error(io_err) {
+                                return Some(Retryable::Fatal);
+                            }
+                        }
+                        src = s.source();
+                    }
+                }
+                let retryable = default_on_request_failure(error);
+                if retryable == Some(Retryable::Transient) {
+                    if let reqwest_middleware::Error::Reqwest(e) = error {
+                        let url = e.url().map(|u| u.as_str()).unwrap_or("unknown url");
+                        let status = e
+                            .status()
+                            .map(|s| s.to_smolstr())
+                            .unwrap_or_else(|| "unknown status".into());
+                        warn!("retrying request {url}: {status}");
+                    }
+                }
+                retryable
+            }
+        }
+    }
+}
+
+fn is_tls_cert_error(io_err: &std::io::Error) -> bool {
+    let Some(inner) = io_err.get_ref() else {
+        return false;
+    };
+    if let Some(rustls_err) = inner.downcast_ref::<rustls::Error>() {
+        return matches!(rustls_err, rustls::Error::InvalidCertificate(_));
+    }
+    if let Some(nested_io) = inner.downcast_ref::<std::io::Error>() {
+        return is_tls_cert_error(nested_io);
+    }
+    false
 }
 
 pub struct Crawler {
@@ -44,7 +102,7 @@ impl Crawler {
     ) -> Self {
         let retry_policy = ExponentialBackoff::builder()
             .jitter(Jitter::Bounded)
-            .build_with_max_retries(8);
+            .build_with_max_retries(5);
         let reqwest_client = reqwest::Client::builder()
             .user_agent(concat!(
                 env!("CARGO_PKG_NAME"),
@@ -56,7 +114,10 @@ impl Crawler {
             .expect("that reqwest will build");
 
         let http = ClientBuilder::new(reqwest_client)
-            .with(RetryTransientMiddleware::new_with_policy(retry_policy))
+            .with(RetryTransientMiddleware::new_with_policy_and_strategy(
+                retry_policy,
+                NoTlsRetry,
+            ))
             .build();
         let http = Arc::new(http);
 
@@ -242,7 +303,7 @@ impl Crawler {
                 let did_key = keys::repo_key(did);
                 trace!("crawler found new repo: {did}");
 
-                let state = RepoState::backfilling(rng.next_u64());
+                let state = RepoState::backfilling_untracked(rng.next_u64());
                 batch.insert(&db.repos, &did_key, ser_repo_state(&state)?);
                 batch.insert(&db.pending, keys::pending_key(state.index_id), &did_key);
                 to_queue.push(did.clone());
@@ -294,7 +355,7 @@ impl Crawler {
             let resolver = self.state.resolver.clone();
             let filter = filter.clone();
             set.spawn(async move {
-                const MAX_RETRIES: u32 = 8;
+                const MAX_RETRIES: u32 = 5;
                 let mut rng: SmallRng = rand::make_rng();
 
                 let pds_url = {
@@ -448,7 +509,7 @@ impl Crawler {
                 continue;
             }
 
-            let state = RepoState::backfilling(rng.next_u64());
+            let state = RepoState::backfilling_untracked(rng.next_u64());
             batch.insert(&db.repos, &did_key, ser_repo_state(&state)?);
             batch.insert(&db.pending, keys::pending_key(state.index_id), &did_key);
         }
