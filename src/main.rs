@@ -101,7 +101,7 @@ async fn main() -> miette::Result<()> {
     .await
     .into_diagnostic()?
     {
-        error!("failed to queue gone backfills: {e}");
+        error!(err = %e, "failed to queue gone backfills");
         db::check_poisoned_report(&e);
     }
 
@@ -155,20 +155,20 @@ async fn main() -> miette::Result<()> {
                 // persist firehose cursor
                 let seq = state.cur_firehose.load(Ordering::SeqCst);
                 if let Err(e) = set_firehose_cursor(&state.db, seq) {
-                    error!("failed to save cursor: {e}");
+                    error!(err = %e, "failed to save cursor");
                     db::check_poisoned_report(&e);
                 }
 
                 // persist counts
                 // TODO: make this more durable
                 if let Err(e) = db::persist_counts(&state.db) {
-                    error!("failed to persist counts: {e}");
+                    error!(err = %e, "failed to persist counts");
                     db::check_poisoned_report(&e);
                 }
 
                 // persist journal
                 if let Err(e) = state.db.persist() {
-                    error!("db persist failed: {e}");
+                    error!(err = %e, "db persist failed");
                     db::check_poisoned_report(&e);
                 }
             }
@@ -197,7 +197,7 @@ async fn main() -> miette::Result<()> {
                 crawler_resume_pending,
             );
             if let Err(e) = crawler.run().await {
-                error!("crawler error: {e}");
+                error!(err = %e, "crawler error");
                 db::check_poisoned_report(&e);
             }
         });
@@ -264,7 +264,7 @@ async fn main() -> miette::Result<()> {
 
     let res = futures::future::select_all(tasks);
     if let (Err(e), _, _) = res.await {
-        error!("critical worker died: {e}");
+        error!(err = %e, "critical worker died");
         db::check_poisoned_report(&e);
     }
 

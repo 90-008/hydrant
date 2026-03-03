@@ -89,7 +89,7 @@ impl BackfillWorker {
                 let (key, value) = match guard.into_inner() {
                     Ok(kv) => kv,
                     Err(e) => {
-                        error!("failed to read pending entry: {e}");
+                        error!(err = %e, "failed to read pending entry");
                         db::check_poisoned(&e);
                         continue;
                     }
@@ -98,7 +98,7 @@ impl BackfillWorker {
                 let did = match TrimmedDid::try_from(value.as_ref()) {
                     Ok(d) => d.to_did(),
                     Err(e) => {
-                        error!("invalid did in pending value: {e}");
+                        error!(err = %e, "invalid did in pending value");
                         continue;
                     }
                 };
@@ -129,7 +129,7 @@ impl BackfillWorker {
                     let res = did_task(&state, http, buffer_tx, &did, key, permit, verify).await;
 
                     if let Err(e) = res {
-                        error!("backfill process failed for {did}: {e}");
+                        error!(did = %did, err = %e, "backfill process failed");
                         if let BackfillError::Generic(report) = &e {
                             db::check_poisoned_report(report);
                         }
@@ -204,7 +204,7 @@ async fn did_task(
 
             // Notify completion to worker shard
             if let Err(e) = buffer_tx.send(IngestMessage::BackfillFinished(did.clone())) {
-                error!("failed to send BackfillFinished for {did}: {e}");
+                error!(did = %did, err = %e, "failed to send BackfillFinished");
             }
             Ok(())
         }
@@ -217,13 +217,13 @@ async fn did_task(
         Err(e) => {
             match &e {
                 BackfillError::Ratelimited => {
-                    debug!("failed for {did}: too many requests");
+                    debug!(did = %did, "too many requests");
                 }
                 BackfillError::Transport(reason) => {
-                    error!("failed for {did}: transport error: {reason}");
+                    error!(did = %did, %reason, "transport error");
                 }
                 BackfillError::Generic(e) => {
-                    error!("failed for {did}: {e}");
+                    error!(did = %did, err = %e, "failed");
                 }
             }
 
@@ -359,7 +359,7 @@ async fn process_did<'i>(
     did: &Did<'static>,
     verify_signatures: bool,
 ) -> Result<Option<RepoState<'static>>, BackfillError> {
-    debug!("backfilling {}", did);
+    debug!(did = %did, "backfilling");
 
     let db = &app_state.db;
     let did_key = keys::repo_key(did);
@@ -375,8 +375,11 @@ async fn process_did<'i>(
     let start = Instant::now();
     let (pds_url, handle) = app_state.resolver.resolve_identity_info(did).await?;
     trace!(
-        "resolved {did} to pds {pds_url} handle {handle:?} in {:?}",
-        start.elapsed()
+        did = %did,
+        pds_url = %pds_url,
+        ?handle,
+        elapsed = ?start.elapsed(),
+        "resolved to pds"
     );
 
     state.handle = handle.map(|h| h.into_static());
@@ -410,10 +413,10 @@ async fn process_did<'i>(
         Ok(o) => o,
         Err(XrpcError::Xrpc(e)) => {
             if matches!(e, GetRepoError::RepoNotFound(_)) {
-                warn!("repo {did} not found, deleting");
+                warn!(did = %did, "repo not found, deleting");
                 let mut batch = db.inner.batch();
                 if let Err(e) = crate::ops::delete_repo(&mut batch, db, did, &state) {
-                    tracing::error!("failed to wipe repo during backfill: {e}");
+                    tracing::error!(err = %e, "failed to wipe repo during backfill");
                 }
                 batch.commit().into_diagnostic()?;
                 return Ok(Some(previous_state)); // stop backfill
@@ -427,7 +430,7 @@ async fn process_did<'i>(
             };
 
             if let Some(status) = inactive_status {
-                warn!("repo {did} is {status:?}, stopping backfill");
+                warn!(did = %did, ?status, "repo is inactive, stopping backfill");
 
                 emit_identity(&status);
 
@@ -459,9 +462,10 @@ async fn process_did<'i>(
     emit_identity(&state.status);
 
     trace!(
-        "fetched {} bytes for {did} in {:?}",
-        car_bytes.body.len(),
-        start.elapsed()
+        did = %did,
+        bytes = car_bytes.body.len(),
+        elapsed = ?start.elapsed(),
+        "fetched car bytes"
     );
 
     // 3. import repo
@@ -469,14 +473,15 @@ async fn process_did<'i>(
     let parsed = jacquard_repo::car::reader::parse_car_bytes(&car_bytes.body)
         .await
         .into_diagnostic()?;
-    trace!("parsed car for {did} in {:?}", start.elapsed());
+    trace!(did = %did, elapsed = ?start.elapsed(), "parsed car");
 
     let start = Instant::now();
     let store = Arc::new(MemoryBlockStore::new_from_blocks(parsed.blocks));
     trace!(
-        "stored {} blocks in memory for {did} in {:?}",
-        store.len(),
-        start.elapsed()
+        did = %did,
+        blocks = store.len(),
+        elapsed = ?start.elapsed(),
+        "stored blocks in memory"
     );
 
     // 4. parse root commit to get mst root
@@ -488,8 +493,10 @@ async fn process_did<'i>(
 
     let root_commit = jacquard_repo::commit::Commit::from_cbor(&root_bytes).into_diagnostic()?;
     debug!(
-        "backfilling repo at revision {}, root cid {}",
-        root_commit.rev, root_commit.data
+        did = %did,
+        rev = %root_commit.rev,
+        cid = %root_commit.data,
+        "backfilling repo at revision"
     );
 
     // 4.5. verify commit signature
@@ -498,14 +505,14 @@ async fn process_did<'i>(
         root_commit
             .verify(&pubkey)
             .map_err(|e| miette::miette!("signature verification failed for {did}: {e}"))?;
-        trace!("signature verified for {did}");
+        trace!(did = %did, "signature verified");
     }
 
     // 5. walk mst
     let start = Instant::now();
     let mst: Mst<MemoryBlockStore> = Mst::load(store, root_commit.data, None);
     let leaves = mst.leaves().await.into_diagnostic()?;
-    trace!("walked mst for {did} in {}", start.elapsed().as_secs_f64());
+    trace!(did = %did, elapsed = ?start.elapsed(), "walked mst");
 
     // 6. insert records into db
     let start = Instant::now();
@@ -554,8 +561,11 @@ async fn process_did<'i>(
             let mut signal_seen = filter.mode == FilterMode::Full || filter.signals.is_empty();
 
             debug!(
-                "backfilling {did}: signal_seen initial={signal_seen}, mode={:?}, signals={:?}",
-                filter.mode, filter.signals
+                did = %did,
+                initial = signal_seen,
+                mode = ?filter.mode,
+                signals = ?filter.signals,
+                "backfilling signal check"
             );
 
             for (key, cid) in leaves {
@@ -571,7 +581,7 @@ async fn process_did<'i>(
                     }
 
                     if !signal_seen && filter.matches_signal(collection) {
-                        debug!("backfill {did}: signal matched on {collection}");
+                        debug!(did = %did, collection = %collection, "signal matched");
                         signal_seen = true;
                     }
 
@@ -582,14 +592,14 @@ async fn process_did<'i>(
                     // check if this record already exists with same CID
                     let (action, is_new) = if let Some(existing_cid) = existing_cids.remove(&path) {
                         if existing_cid == cid_obj.as_str() {
-                            trace!("skip {did}/{collection}/{rkey} ({cid})");
+                            trace!(did = %did, collection = %collection, rkey = %rkey, cid = %cid, "skip unchanged record");
                             continue; // skip unchanged record
                         }
                         (DbAction::Update, false)
                     } else {
                         (DbAction::Create, true)
                     };
-                    trace!("{action} {did}/{collection}/{rkey} ({cid})");
+                    trace!(did = %did, collection = %collection, rkey = %rkey, cid = %cid, ?action, "action record");
 
                     // key is did|collection|rkey
                     let db_key = keys::record_key(&did, collection, &rkey);
@@ -622,7 +632,7 @@ async fn process_did<'i>(
 
             // remove any remaining existing records (they weren't in the new MST)
             for ((collection, rkey), cid) in existing_cids {
-                trace!("remove {did}/{collection}/{rkey} ({cid})");
+                trace!(did = %did, collection = %collection, rkey = %rkey, cid = %cid, "remove existing record");
 
                 batch.remove(
                     &app_state.db.records,
@@ -647,7 +657,7 @@ async fn process_did<'i>(
             }
 
             if !signal_seen {
-                debug!("backfill {did}: no signal-matching records found, discarding repo");
+                debug!(did = %did, "no signal-matching records found, discarding repo");
                 return Ok::<_, miette::Report>(None);
             }
 
@@ -694,7 +704,7 @@ async fn process_did<'i>(
         return Ok(None);
     };
 
-    trace!("did {count} ops for {did} in {:?}", start.elapsed());
+    trace!(did = %did, ops = count, elapsed = ?start.elapsed(), "did ops");
 
     // do the counts
     if records_cnt_delta > 0 {
@@ -708,14 +718,15 @@ async fn process_did<'i>(
             .await;
     }
     trace!(
-        "committed backfill batch for {did} in {:?}",
-        start.elapsed()
+        did = %did,
+        elapsed = ?start.elapsed(),
+        "committed backfill batch"
     );
 
     let _ = db.event_tx.send(BroadcastEvent::Persisted(
         db.next_event_id.load(Ordering::SeqCst) - 1,
     ));
 
-    trace!("backfill complete for {did}");
+    trace!(did = %did, "backfill complete");
     Ok(Some(previous_state))
 }

@@ -132,7 +132,7 @@ impl FirehoseWorker {
             let shard_idx = (hash as usize) % self.num_shards;
 
             if let Err(e) = shards[shard_idx].send(msg) {
-                error!("failed to send message to shard {shard_idx}: {e}");
+                error!(shard = shard_idx, err = %e, "failed to send message to shard");
                 // break if send fails; receiver likely closed
                 break;
             }
@@ -154,7 +154,7 @@ impl FirehoseWorker {
         handle: tokio::runtime::Handle,
     ) {
         let _guard = handle.enter();
-        debug!("shard {id} started");
+        debug!(shard = id, "shard started");
 
         let mut broadcast_events = Vec::new();
 
@@ -177,7 +177,7 @@ impl FirehoseWorker {
 
             match msg {
                 IngestMessage::BackfillFinished(did) => {
-                    debug!("backfill finished for {did}, verifying state and draining buffer");
+                    debug!(did = %did, "backfill finished, verifying state and draining buffer");
 
                     // load repo state to transition status and draining buffer
                     let repo_key = keys::repo_key(&did);
@@ -201,7 +201,7 @@ impl FirehoseWorker {
                                             );
                                             if let Err(e) = res {
                                                 // this can only fail if serde retry fails which would be really weird
-                                                error!("failed to transition {did} to synced: {e}");
+                                                error!(did = %did, err = %e, "failed to transition to synced");
                                             }
                                         }
                                         // we don't have to handle this since drain_resync_buffer doesn't delete
@@ -210,11 +210,11 @@ impl FirehoseWorker {
                                         RepoProcessResult::Deleted => {}
                                     },
                                     Err(e) => {
-                                        error!("failed to drain resync buffer for {did}: {e}")
+                                        error!(did = %did, err = %e, "failed to drain resync buffer")
                                     }
                                 };
                             }
-                            Err(e) => error!("failed to deser repo state for {did}: {e}"),
+                            Err(e) => error!(did = %did, err = %e, "failed to deser repo state"),
                         }
                     }
                 }
@@ -232,7 +232,7 @@ impl FirehoseWorker {
                         Ok(RepoProcessResult::Deleted) => {}
                         Ok(RepoProcessResult::Syncing(Some(commit))) => {
                             if let Err(e) = ops::persist_to_resync_buffer(&state.db, did, commit) {
-                                error!("failed to persist commit to resync_buffer for {did}: {e}");
+                                error!(did = %did, err = %e, "failed to persist commit to resync_buffer");
                             }
                         }
                         Ok(RepoProcessResult::Syncing(None)) => {}
@@ -240,14 +240,15 @@ impl FirehoseWorker {
                             if let IngestError::Generic(e) = &e {
                                 db::check_poisoned_report(e);
                             }
-                            error!("error processing message for {did}: {e}");
+                            error!(did = %did, err = %e, "error processing message");
                             if Self::check_if_retriable_failure(&e) {
                                 if let SubscribeReposMessage::Commit(commit) = &msg {
                                     if let Err(e) =
                                         ops::persist_to_resync_buffer(&state.db, did, commit)
                                     {
                                         error!(
-                                            "failed to persist commit to resync_buffer for {did}: {e}"
+                                            did = %did, err = %e,
+                                            "failed to persist commit to resync_buffer"
                                         );
                                     }
                                 }
@@ -262,7 +263,7 @@ impl FirehoseWorker {
             }
 
             if let Err(e) = batch.commit() {
-                error!("failed to commit batch in shard {id}: {e}");
+                error!(shard = id, err = %e, "failed to commit batch");
             }
 
             if added_blocks > 0 {
@@ -305,12 +306,12 @@ impl FirehoseWorker {
 
         match msg {
             SubscribeReposMessage::Commit(commit) => {
-                trace!("processing buffered commit for {did}");
+                trace!(did = %did, "processing buffered commit");
 
                 return Self::process_commit(ctx, did, repo_state, commit);
             }
             SubscribeReposMessage::Sync(sync) => {
-                debug!("processing buffered sync for {did}");
+                debug!(did = %did, "processing buffered sync");
 
                 match ops::verify_sync_event(
                     sync.blocks.as_ref(),
@@ -319,19 +320,19 @@ impl FirehoseWorker {
                     Ok((root, rev)) => {
                         if let Some(current_data) = &repo_state.data {
                             if current_data == &root.to_ipld().expect("valid cid") {
-                                debug!("skipping noop sync for {did}");
+                                debug!(did = %did, "skipping noop sync");
                                 return Ok(RepoProcessResult::Ok(repo_state));
                             }
                         }
 
                         if let Some(current_rev) = &repo_state.rev {
                             if rev.as_str() <= current_rev.to_tid().as_str() {
-                                debug!("skipping replayed sync for {did}");
+                                debug!(did = %did, "skipping replayed sync");
                                 return Ok(RepoProcessResult::Ok(repo_state));
                             }
                         }
 
-                        warn!("sync event for {did}: triggering backfill");
+                        warn!(did = %did, "sync event, triggering backfill");
                         let mut batch = ctx.state.db.inner.batch();
                         repo_state = ops::update_repo_status(
                             &mut batch,
@@ -348,12 +349,12 @@ impl FirehoseWorker {
                         return Ok(RepoProcessResult::Ok(repo_state));
                     }
                     Err(e) => {
-                        error!("failed to process sync event for {did}: {e}");
+                        error!(did = %did, err = %e, "failed to process sync event");
                     }
                 }
             }
             SubscribeReposMessage::Identity(identity) => {
-                debug!("processing buffered identity for {did}");
+                debug!(did = %did, "processing buffered identity");
                 let handle = identity
                     .handle
                     .as_ref()
@@ -367,7 +368,7 @@ impl FirehoseWorker {
                     .push(ops::make_identity_event(&ctx.state.db, evt));
             }
             SubscribeReposMessage::Account(account) => {
-                debug!("processing buffered account for {did}");
+                debug!(did = %did, "processing buffered account");
                 let evt = AccountEvt {
                     did: did.clone().into_static(),
                     active: account.active,
@@ -378,7 +379,7 @@ impl FirehoseWorker {
                     use crate::ingest::stream::AccountStatus;
                     match &account.status {
                         Some(AccountStatus::Deleted) => {
-                            debug!("account {did} deleted, wiping data");
+                            debug!(did = %did, "account deleted, wiping data");
                             crate::ops::delete_repo(ctx.batch, &ctx.state.db, did, &repo_state)?;
                             return Ok(RepoProcessResult::Deleted);
                         }
@@ -399,19 +400,20 @@ impl FirehoseWorker {
                                     }
                                     AccountStatus::Other(s) => {
                                         warn!(
-                                            "unknown account status for {did}, will put in error state: {s}"
+                                            did = %did, status = %s,
+                                            "unknown account status, will put in error state"
                                         );
                                         RepoStatus::Error(s.to_smolstr())
                                     }
                                 },
                                 None => {
-                                    warn!("account {did} inactive but no status provided");
+                                    warn!(did = %did, "account inactive but no status provided");
                                     RepoStatus::Error("unknown".into())
                                 }
                             };
 
                             if repo_state.status == target_status {
-                                debug!("account status unchanged for {did}: {target_status:?}");
+                                debug!(did = %did, ?target_status, "account status unchanged");
                                 return Ok(RepoProcessResult::Ok(repo_state));
                             }
 
@@ -437,7 +439,7 @@ impl FirehoseWorker {
                     .push(ops::make_account_event(&ctx.state.db, evt));
             }
             _ => {
-                warn!("unknown message type in buffer for {did}");
+                warn!(did = %did, "unknown message type in buffer");
             }
         }
 
@@ -453,14 +455,10 @@ impl FirehoseWorker {
         // check for replayed events (already seen revision)
         if matches!(repo_state.rev, Some(ref rev) if commit.rev.as_str() <= rev.to_tid().as_str()) {
             debug!(
-                "skipping replayed event for {}: {} <= {}",
-                did,
-                commit.rev,
-                repo_state
-                    .rev
-                    .as_ref()
-                    .map(|r| r.to_tid())
-                    .expect("we checked in if")
+                did = %did,
+                commit_rev = %commit.rev,
+                state_rev = %repo_state.rev.as_ref().map(|r| r.to_tid()).expect("we checked in if"),
+                "skipping replayed event"
             );
             return Ok(RepoProcessResult::Ok(repo_state));
         }
@@ -474,8 +472,10 @@ impl FirehoseWorker {
                     .wrap_err("invalid cid from relay")?
         {
             warn!(
-                "gap detected for {}: repo {} != commit prev {}. triggering backfill",
-                did, repo, prev_commit.0
+                did = %did,
+                repo = %repo,
+                prev_commit = %prev_commit.0,
+                "gap detected, triggering backfill"
             );
 
             let mut batch = ctx.state.db.inner.batch();
@@ -540,21 +540,21 @@ impl FirehoseWorker {
                         .map(|(col, _)| {
                             let m = filter.matches_signal(col);
                             debug!(
-                                "signal check for {did}: op path={} col={col} signals={:?} -> {m}",
-                                op.path, filter.signals
+                                did = %did, path = %op.path, col = %col, signals = ?filter.signals, matched = m,
+                                "signal check"
                             );
                             m
                         })
                         .unwrap_or(false)
                 });
                 if !touches_signal {
-                    debug!("dropping {did}: commit has no signal-matching ops");
+                    debug!(did = %did, "dropping commit, no signal-matching ops");
                     return Ok(RepoProcessResult::Syncing(None));
                 }
-                debug!("{did}: commit touches a signal, queuing backfill");
+                debug!(did = %did, "commit touches a signal, queuing backfill");
             }
 
-            debug!("discovered new account {did} from firehose, queueing backfill");
+            debug!(did = %did, "discovered new account from firehose, queueing backfill");
 
             let repo_state = RepoState::backfilling_untracked(rand::rng().next_u64());
             let mut batch = ctx.state.db.inner.batch();
@@ -583,7 +583,7 @@ impl FirehoseWorker {
         let mut repo_state = crate::db::deser_repo_state(&state_bytes)?.into_static();
 
         if !repo_state.tracked && repo_state.status != RepoStatus::Backfilling {
-            debug!("ignoring active status for {did} as it is explicitly untracked");
+            debug!(did = %did, "ignoring active status as it is explicitly untracked");
             return Ok(RepoProcessResult::Syncing(None));
         }
 
@@ -600,8 +600,8 @@ impl FirehoseWorker {
             }
             RepoStatus::Backfilling | RepoStatus::Error(_) => {
                 debug!(
-                    "ignoring active status for {did} as it is {:?}",
-                    repo_state.status
+                    did = %did, status = ?repo_state.status,
+                    "ignoring active status"
                 );
                 Ok(RepoProcessResult::Syncing(None))
             }

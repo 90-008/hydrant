@@ -65,7 +65,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, query: Strea
                         let (k, v) = match item.into_inner() {
                             Ok((k, v)) => (k, v),
                             Err(e) => {
-                                error!("failed to read event from db: {e}");
+                                error!(err = %e, "failed to read event from db");
                                 break;
                             }
                         };
@@ -78,7 +78,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, query: Strea
                         {
                             Ok(id) => id,
                             Err(e) => {
-                                error!("failed to parse event id: {e}");
+                                error!(err = %e, "failed to parse event id");
                                 continue;
                             }
                         };
@@ -95,7 +95,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, query: Strea
                         } = match rmp_serde::from_slice(&v) {
                             Ok(e) => e,
                             Err(e) => {
-                                error!("failed to deserialize stored event: {e}");
+                                error!(err = %e, "failed to deserialize stored event");
                                 continue;
                             }
                         };
@@ -134,13 +134,13 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, query: Strea
                         let json_str = match serde_json::to_string(&marshallable) {
                             Ok(s) => s,
                             Err(e) => {
-                                error!("failed to serialize ws event: {e}");
+                                error!(err = %e, "failed to serialize ws event");
                                 continue;
                             }
                         };
 
                         if let Err(e) = tx.blocking_send(Message::Text(json_str.into())) {
-                            error!("failed to send ws message: {e}");
+                            error!(err = %e, "failed to send ws message");
                             return;
                         }
 
@@ -172,12 +172,12 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, query: Strea
                         let json_str = match serde_json::to_string(&evt) {
                             Ok(s) => s,
                             Err(e) => {
-                                error!("failed to serialize ws event: {e}");
+                                error!(err = %e, "failed to serialize ws event");
                                 continue;
                             }
                         };
                         if let Err(e) = tx.blocking_send(Message::Text(json_str.into())) {
-                            error!("failed to send ws message: {e}");
+                            error!(err = %e, "failed to send ws message");
                             return;
                         }
                     }
@@ -194,13 +194,13 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, query: Strea
 
     while let Some(msg) = rx.recv().await {
         if let Err(e) = socket.send(msg).await {
-            error!("failed to send ws message: {e}");
+            error!(err = %e, "failed to send ws message");
             break;
         }
     }
 
     let _ = cancel_tx.send(());
     if let Err(e) = thread.join() {
-        error!("stream handler thread panicked: {e:?}");
+        error!(err = ?e, "stream handler thread panicked");
     }
 }

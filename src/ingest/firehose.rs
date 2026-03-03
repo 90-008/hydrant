@@ -46,7 +46,7 @@ impl FirehoseIngestor {
                 db::get_firehose_cursor(&self.state.db).await?
             };
             match start_cursor {
-                Some(c) => info!("resuming from cursor: {c}"),
+                Some(c) => info!(cursor = %c, "resuming from cursor"),
                 None => info!("no cursor found, live tailing"),
             }
 
@@ -58,7 +58,7 @@ impl FirehoseIngestor {
                 match FirehoseStream::connect(self.relay_host.clone(), start_cursor).await {
                     Ok(s) => s,
                     Err(e) => {
-                        error!("failed to connect to firehose: {e}, retrying in 5s...");
+                        error!(err = %e, "failed to connect to firehose, retrying in 5s");
                         tokio::time::sleep(Duration::from_secs(5)).await;
                         continue;
                     }
@@ -70,14 +70,14 @@ impl FirehoseIngestor {
                 let bytes = match bytes_res {
                     Ok(b) => b,
                     Err(e) => {
-                        error!("firehose stream error: {e}");
+                        error!(err = %e, "firehose stream error");
                         break;
                     }
                 };
                 match decode_frame(&bytes) {
                     Ok(msg) => self.handle_message(msg).await,
                     Err(e) => {
-                        error!("firehose stream error: {e}");
+                        error!(err = %e, "firehose stream error");
                         break;
                     }
                 }
@@ -100,19 +100,19 @@ impl FirehoseIngestor {
         let process = self
             .should_process(did)
             .await
-            .inspect_err(|e| error!("failed to check if we should process {did}: {e}"))
+            .inspect_err(|e| error!(did = %did, err = %e, "failed to check if we should process"))
             .unwrap_or(false);
         if !process {
-            trace!("skipping {did}: not in filter");
+            trace!(did = %did, "skipping: not in filter");
             return;
         }
-        trace!("forwarding message for {did} to ingest buffer");
+        trace!(did = %did, "forwarding message to ingest buffer");
 
         if let Err(e) = self
             .buffer_tx
             .send(IngestMessage::Firehose(msg.into_static()))
         {
-            error!("failed to send message to buffer processor: {e}");
+            error!(err = %e, "failed to send message to buffer processor");
         }
     }
 
@@ -139,19 +139,19 @@ impl FirehoseIngestor {
                         rmp_serde::from_slice(&state_bytes).into_diagnostic()?;
 
                     if repo_state.tracked {
-                        trace!("{did} is a tracked repo, processing");
+                        trace!(did = %did, "tracked repo, processing");
                         return Ok(true);
                     } else {
-                        debug!("{did} is known but explicitly untracked, skipping");
+                        debug!(did = %did, "known but explicitly untracked, skipping");
                         return Ok(false);
                     }
                 }
 
                 if !filter.signals.is_empty() {
-                    trace!("{did} is unknown — passing to worker for signal check");
+                    trace!(did = %did, "unknown — passing to worker for signal check");
                     Ok(true)
                 } else {
-                    trace!("{did} is unknown and no signals configured, skipping");
+                    trace!(did = %did, "unknown and no signals configured, skipping");
                     Ok(false)
                 }
             }

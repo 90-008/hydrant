@@ -19,17 +19,17 @@ pub fn queue_gone_backfills(state: &Arc<AppState>) -> Result<()> {
         let did = match TrimmedDid::try_from(key.as_ref()) {
             Ok(did) => did.to_did(),
             Err(e) => {
-                error!("invalid did in db, skipping: {e}");
+                error!(err = %e, "invalid did in db, skipping");
                 continue;
             }
         };
 
         if let Ok(resync_state) = rmp_serde::from_slice::<ResyncState>(&val) {
             if matches!(resync_state, ResyncState::Gone { .. }) {
-                debug!("queuing retry for gone repo: {did}");
+                debug!(did = %did, "queuing retry for gone repo");
 
                 let Some(state_bytes) = state.db.repos.get(&key).into_diagnostic()? else {
-                    error!("repo state not found for {did}");
+                    error!(did = %did, "repo state not found");
                     continue;
                 };
 
@@ -60,7 +60,7 @@ pub fn queue_gone_backfills(state: &Arc<AppState>) -> Result<()> {
 
     state.notify_backfill();
 
-    info!("queued {} gone backfills", transitions.len());
+    info!(count = transitions.len(), "queued gone backfills");
     Ok(())
 }
 
@@ -80,7 +80,7 @@ pub fn retry_worker(state: Arc<AppState>) {
             let (key, value) = match guard.into_inner() {
                 Ok(t) => t,
                 Err(e) => {
-                    error!("failed to get resync state: {e}");
+                    error!(err = %e, "failed to get resync state");
                     db::check_poisoned(&e);
                     continue;
                 }
@@ -88,7 +88,7 @@ pub fn retry_worker(state: Arc<AppState>) {
             let did = match TrimmedDid::try_from(key.as_ref()) {
                 Ok(did) => did.to_did(),
                 Err(e) => {
-                    error!("invalid did in db, skipping: {e}");
+                    error!(err = %e, "invalid did in db, skipping");
                     continue;
                 }
             };
@@ -98,24 +98,24 @@ pub fn retry_worker(state: Arc<AppState>) {
                     kind, next_retry, ..
                 }) => {
                     if next_retry <= now {
-                        debug!("retrying backfill for {did}");
+                        debug!(did = %did, "retrying backfill");
 
                         let state_bytes = match state.db.repos.get(&key).into_diagnostic() {
                             Ok(b) => b,
                             Err(err) => {
-                                error!("failed to get repo state for {did}: {err}");
+                                error!(did = %did, err = %err, "failed to get repo state");
                                 continue;
                             }
                         };
                         let Some(state_bytes) = state_bytes else {
-                            error!("repo state not found for {did}");
+                            error!(did = %did, "repo state not found");
                             continue;
                         };
 
                         let repo_state = match deser_repo_state(&state_bytes) {
                             Ok(s) => s,
                             Err(e) => {
-                                error!("failed to deserialize repo state for {did}: {e}");
+                                error!(did = %did, err = %e, "failed to deserialize repo state");
                                 continue;
                             }
                         };
@@ -127,7 +127,7 @@ pub fn retry_worker(state: Arc<AppState>) {
                             RepoStatus::Backfilling,
                         );
                         if let Err(e) = res {
-                            error!("failed to update repo status for {did}: {e}");
+                            error!(did = %did, err = %e, "failed to update repo status");
                             continue;
                         }
 
@@ -138,7 +138,7 @@ pub fn retry_worker(state: Arc<AppState>) {
                     // not an error state, do nothing
                 }
                 Err(e) => {
-                    error!("failed to deserialize resync state for {did}: {e}");
+                    error!(did = %did, err = %e, "failed to deserialize resync state");
                     continue;
                 }
             }
@@ -149,7 +149,7 @@ pub fn retry_worker(state: Arc<AppState>) {
         }
 
         if let Err(e) = batch.commit() {
-            error!("failed to commit batch: {e}");
+            error!(err = %e, "failed to commit batch");
             db::check_poisoned(&e);
             continue;
         }
@@ -158,6 +158,6 @@ pub fn retry_worker(state: Arc<AppState>) {
             state.db.update_gauge_diff(old_gauge, new_gauge);
         }
         state.notify_backfill();
-        info!("queued {} retries", transitions.len());
+        info!(count = transitions.len(), "queued retries");
     }
 }

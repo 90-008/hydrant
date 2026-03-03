@@ -83,7 +83,7 @@ impl FirehoseStream {
                 }
                 Ok(Message::Close(_)) => return None,
                 Ok(x) => {
-                    trace!("relay sent unexpected message: {x:?}");
+                    trace!(msg = ?x, "relay sent unexpected message");
                     continue;
                 }
             }

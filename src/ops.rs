@@ -1,19 +1,19 @@
 use fjall::OwnedWriteBatch;
-use jacquard_common::CowStr;
-use jacquard_common::IntoStatic;
 use jacquard_common::types::cid::Cid;
 use jacquard_common::types::crypto::PublicKey;
 use jacquard_common::types::did::Did;
+use jacquard_common::CowStr;
+use jacquard_common::IntoStatic;
 use jacquard_repo::car::reader::parse_car_bytes;
 use miette::{Context, IntoDiagnostic, Result};
-use rand::{Rng, rng};
+use rand::{rng, Rng};
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 use tracing::{debug, trace};
 
 use crate::db::types::{DbAction, DbRkey, DbTid, TrimmedDid};
-use crate::db::{self, Db, keys, ser_repo_state};
+use crate::db::{self, keys, ser_repo_state, Db};
 use crate::filter::FilterConfig;
 use crate::ingest::stream::Commit;
 use crate::types::{
@@ -26,8 +26,9 @@ pub fn persist_to_resync_buffer(db: &Db, did: &Did, commit: &Commit) -> Result<(
     let value = rmp_serde::to_vec(commit).into_diagnostic()?;
     db.resync_buffer.insert(key, value).into_diagnostic()?;
     debug!(
-        "buffered commit seq {} for {did} to resync_buffer",
-        commit.seq
+        did = %did,
+        seq = commit.seq,
+        "buffered commit to resync_buffer"
     );
     Ok(())
 }
@@ -69,7 +70,7 @@ pub fn delete_repo<'batch>(
     did: &Did,
     repo_state: &RepoState,
 ) -> Result<()> {
-    debug!("deleting repo {did}");
+    debug!(did = %did, "deleting repo");
 
     let repo_key = keys::repo_key(did);
     let pending_key = keys::pending_key(repo_state.index_id);
@@ -122,7 +123,7 @@ pub fn update_repo_status<'batch, 's>(
     mut repo_state: RepoState<'s>,
     new_status: RepoStatus,
 ) -> Result<RepoState<'s>> {
-    debug!("updating repo status for {did} to {new_status:?}");
+    debug!(did = %did, status = ?new_status, "updating repo status");
 
     let repo_key = keys::repo_key(did);
     let pending_key = keys::pending_key(repo_state.index_id);
@@ -226,7 +227,7 @@ pub fn apply_commit<'batch, 'db, 'commit, 's>(
     filter: &FilterConfig,
 ) -> Result<ApplyCommitResults<'s>> {
     let did = &commit.repo;
-    debug!("applying commit {} for {did}", &commit.commit);
+    debug!(did = %did, commit = %commit.commit, "applying commit");
 
     // 1. parse CAR blocks and store them in CAS
     let start = Instant::now();
@@ -236,7 +237,7 @@ pub fn apply_commit<'batch, 'db, 'commit, 's>(
             .into_diagnostic()
     })?;
 
-    trace!("parsed car for {did} in {:?}", start.elapsed());
+    trace!(did = %did, elapsed = ?start.elapsed(), "parsed car");
 
     let root_bytes = parsed
         .blocks
@@ -249,7 +250,7 @@ pub fn apply_commit<'batch, 'db, 'commit, 's>(
         repo_commit
             .verify(key)
             .map_err(|e| miette::miette!("signature verification failed for {did}: {e}"))?;
-        trace!("signature verified for {did}");
+        trace!(did = %did, "signature verified");
     }
 
     repo_state.rev = Some((&commit.rev).into());
