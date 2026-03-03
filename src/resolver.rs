@@ -138,6 +138,7 @@ impl Resolver {
         }
     }
 
+    #[inline]
     async fn resolve_doc(&self, did: &Did<'_>) -> Result<MiniDoc, ResolverError> {
         let did_static = did.clone().into_static();
         if let Some(entry) = self.inner.cache.get_async(&did_static).await {

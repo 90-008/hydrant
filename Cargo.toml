@@ -23,8 +23,6 @@ url = "2.5"
 smol_str = "0.3"
 futures = "0.3"
 reqwest = { version = "0.13.2", features = ["json", "rustls", "stream", "gzip", "brotli", "zstd", "http2"], default-features = false }
-reqwest-middleware = { version = "0.5.1", default-features = false, features = ["http2", "rustls"] }
-reqwest-retry = { version = "0.9.1" }
 axum = { version = "0.8.8", features = ["ws", "macros"] }
 tower-http = { version = "0.6.6", features = ["cors", "trace"] }
 

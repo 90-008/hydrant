@@ -9,85 +9,196 @@ use miette::{IntoDiagnostic, Result};
 use rand::Rng;
 use rand::RngExt;
 use rand::rngs::SmallRng;
-use reqwest_middleware::{ClientBuilder, ClientWithMiddleware};
-use reqwest_retry::Jitter;
-use reqwest_retry::{
-    RetryTransientMiddleware, Retryable, RetryableStrategy, default_on_request_failure,
-    default_on_request_success, policies::ExponentialBackoff,
-};
-use smol_str::{SmolStr, ToSmolStr};
-use std::error::Error;
+use reqwest::StatusCode;
+use smol_str::SmolStr;
+use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
-use tracing::{debug, error, info, trace, warn};
+use tracing::{Instrument, debug, error, info, trace, warn};
 use url::Url;
 
 enum CrawlCheckResult {
     Signal,
     NoSignal,
     Ratelimited,
-    Failed,
+    Failed(Option<u16>),
 }
 
-struct NoTlsRetry;
+/// outcome of [`retry_with_backoff`] when the operation does not succeed.
+enum RetryOutcome<E> {
+    /// ratelimited after exhausting all retries
+    Ratelimited,
+    /// non-ratelimit failure, carrying the last error
+    Failed(E),
+}
 
-impl RetryableStrategy for NoTlsRetry {
-    fn handle(
-        &self,
-        res: &Result<reqwest::Response, reqwest_middleware::Error>,
-    ) -> Option<Retryable> {
-        match res {
-            Ok(success) => default_on_request_success(success),
-            Err(error) => {
-                if let reqwest_middleware::Error::Reqwest(e) = error {
-                    if e.is_timeout() {
-                        return Some(Retryable::Fatal);
-                    }
-                    let mut src = e.source();
-                    while let Some(s) = src {
-                        if let Some(io_err) = s.downcast_ref::<std::io::Error>() {
-                            if is_tls_cert_error(io_err) {
-                                return Some(Retryable::Fatal);
-                            }
-                        }
-                        src = s.source();
-                    }
+/// retries an async operation with exponential backoff when ratelimited.
+///
+/// `op` is called on each attempt and returns `Result<T, E>`.
+/// `is_ratelimited` classifies an error as a ratelimit (triggering a retry)
+/// versus a fatal failure (returning immediately).
+async fn retry_with_backoff<T, E, F, Fut>(
+    rng: &mut SmallRng,
+    max_retries: u32,
+    mut op: F,
+    is_ratelimited: impl Fn(&E) -> bool,
+) -> Result<T, RetryOutcome<E>>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, E>>,
+{
+    let mut attempt = 0u32;
+    loop {
+        match op().await {
+            Ok(val) => return Ok(val),
+            Err(e) if is_ratelimited(&e) => {
+                if attempt < max_retries {
+                    let base = Duration::from_secs(1 << attempt);
+                    let jitter = Duration::from_millis(rng.random_range(0..2000));
+                    tokio::time::sleep(base + jitter).await;
+                    attempt += 1;
+                } else {
+                    return Err(RetryOutcome::Ratelimited);
                 }
-                let retryable = default_on_request_failure(error);
-                if retryable == Some(Retryable::Transient) {
-                    if let reqwest_middleware::Error::Reqwest(e) = error {
-                        let url = e.url().map(|u| u.as_str()).unwrap_or("unknown url");
-                        let status = e
-                            .status()
-                            .map(|s| s.to_smolstr())
-                            .unwrap_or_else(|| "unknown status".into());
-                        warn!("retrying request {url}: {status}");
-                    }
-                }
-                retryable
             }
+            Err(e) => return Err(RetryOutcome::Failed(e)),
         }
     }
 }
 
-fn is_tls_cert_error(io_err: &std::io::Error) -> bool {
-    let Some(inner) = io_err.get_ref() else {
-        return false;
+async fn check_repo_signals(
+    http: Arc<reqwest::Client>,
+    resolver: crate::resolver::Resolver,
+    filter: Arc<crate::filter::FilterConfig>,
+    did: Did<'static>,
+) -> (Did<'static>, CrawlCheckResult) {
+    const MAX_RETRIES: u32 = 5;
+    let mut rng: SmallRng = rand::make_rng();
+
+    let pds_url = retry_with_backoff(
+        &mut rng,
+        MAX_RETRIES,
+        || resolver.resolve_identity_info(&did),
+        |e| matches!(e, crate::resolver::ResolverError::Ratelimited),
+    );
+    let pds_url = match pds_url.await {
+        Ok((url, _)) => url,
+        Err(RetryOutcome::Ratelimited) => {
+            error!(
+                retries = MAX_RETRIES,
+                "rate limited resolving identity, giving up"
+            );
+            return (did, CrawlCheckResult::Ratelimited);
+        }
+        Err(RetryOutcome::Failed(e)) => {
+            error!(err = %e, "failed to resolve identity");
+            return (did, CrawlCheckResult::Failed(None));
+        }
     };
-    if let Some(rustls_err) = inner.downcast_ref::<rustls::Error>() {
-        return matches!(rustls_err, rustls::Error::InvalidCertificate(_));
+
+    let mut found_signal = false;
+    for signal in filter.signals.iter() {
+        let res = async {
+            let mut list_records_url = pds_url.join("/xrpc/com.atproto.repo.listRecords").unwrap();
+            list_records_url
+                .query_pairs_mut()
+                .append_pair("repo", &did)
+                .append_pair("collection", signal)
+                .append_pair("limit", "1");
+
+            let res = retry_with_backoff(
+                &mut rng,
+                MAX_RETRIES,
+                || async {
+                    http.get(list_records_url.clone())
+                        .send()
+                        .await?
+                        .error_for_status()
+                },
+                |e: &reqwest::Error| e.status() == Some(StatusCode::TOO_MANY_REQUESTS),
+            );
+            let res = match res.await {
+                Ok(r) => r,
+                Err(RetryOutcome::Ratelimited) => {
+                    warn!(
+                        retries = MAX_RETRIES,
+                        "rate limited on listRecords, giving up"
+                    );
+                    return CrawlCheckResult::Ratelimited;
+                }
+                Err(RetryOutcome::Failed(e)) => {
+                    match e.status() {
+                        Some(StatusCode::NOT_FOUND | StatusCode::GONE) => {
+                            trace!("repo not found");
+                        }
+                        Some(s) if s.is_client_error() => {
+                            error!(status = %s, "repo unavailable");
+                        }
+                        _ => {
+                            error!(err = %e, "listRecords failed");
+                            return CrawlCheckResult::Failed(e.status().map(|s| s.as_u16()));
+                        }
+                    }
+                    return CrawlCheckResult::NoSignal;
+                }
+            };
+
+            let bytes = match res.bytes().await {
+                Ok(b) => b,
+                Err(e) => {
+                    error!(err = %e, "failed to read listRecords response");
+                    return CrawlCheckResult::Failed(None);
+                }
+            };
+
+            match serde_json::from_slice::<ListRecordsOutput>(&bytes) {
+                Ok(out) => {
+                    if !out.records.is_empty() {
+                        return CrawlCheckResult::Signal;
+                    }
+                }
+                Err(e) => {
+                    error!(err = %e, "failed to parse listRecords response");
+                    return CrawlCheckResult::Failed(None);
+                }
+            }
+
+            CrawlCheckResult::NoSignal
+        }
+        .instrument(tracing::info_span!("signal_check", signal = %signal))
+        .await;
+
+        match res {
+            CrawlCheckResult::Signal => {
+                found_signal = true;
+                break;
+            }
+            CrawlCheckResult::NoSignal => {
+                continue;
+            }
+            other => {
+                return (did, other);
+            }
+        }
     }
-    if let Some(nested_io) = inner.downcast_ref::<std::io::Error>() {
-        return is_tls_cert_error(nested_io);
+
+    if !found_signal {
+        trace!("no signal-matching records found");
     }
-    false
+
+    (
+        did,
+        found_signal
+            .then_some(CrawlCheckResult::Signal)
+            .unwrap_or(CrawlCheckResult::NoSignal),
+    )
 }
 
 pub struct Crawler {
     state: Arc<AppState>,
     relay_host: Url,
-    http: Arc<ClientWithMiddleware>,
+    http: Arc<reqwest::Client>,
     max_pending: usize,
     resume_pending: usize,
     count: Arc<AtomicUsize>,
@@ -100,26 +211,17 @@ impl Crawler {
         max_pending: usize,
         resume_pending: usize,
     ) -> Self {
-        let retry_policy = ExponentialBackoff::builder()
-            .jitter(Jitter::Bounded)
-            .build_with_max_retries(5);
-        let reqwest_client = reqwest::Client::builder()
-            .user_agent(concat!(
-                env!("CARGO_PKG_NAME"),
-                "/",
-                env!("CARGO_PKG_VERSION")
-            ))
-            .gzip(true)
-            .build()
-            .expect("that reqwest will build");
-
-        let http = ClientBuilder::new(reqwest_client)
-            .with(RetryTransientMiddleware::new_with_policy_and_strategy(
-                retry_policy,
-                NoTlsRetry,
-            ))
-            .build();
-        let http = Arc::new(http);
+        let http = Arc::new(
+            reqwest::Client::builder()
+                .user_agent(concat!(
+                    env!("CARGO_PKG_NAME"),
+                    "/",
+                    env!("CARGO_PKG_VERSION")
+                ))
+                .gzip(true)
+                .build()
+                .expect("that reqwest will build"),
+        );
 
         Self {
             state,
@@ -132,40 +234,38 @@ impl Crawler {
     }
 
     pub async fn run(self) -> Result<()> {
-        info!("crawler started");
-
         tokio::spawn({
+            use std::time::Instant;
             let count = self.count.clone();
-            let mut last_time = std::time::Instant::now();
+            let mut last_time = Instant::now();
             let mut interval = tokio::time::interval(Duration::from_secs(60));
             async move {
                 loop {
                     interval.tick().await;
                     let delta = count.swap(0, Ordering::Relaxed);
                     if delta == 0 {
+                        debug!("no repos processed in 60s");
                         continue;
                     }
                     let elapsed = last_time.elapsed().as_secs_f64();
-                    let rate = if elapsed > 0.0 {
-                        delta as f64 / elapsed
-                    } else {
-                        0.0
-                    };
-                    info!("crawler: {rate:.2} repos/s ({delta} repos in {elapsed:.1}s)");
-                    last_time = std::time::Instant::now();
+                    let rate = (elapsed > 0.0)
+                        .then(|| delta as f64 / elapsed)
+                        .unwrap_or(0.0);
+                    info!(rate, delta, elapsed, "crawler progress");
+                    last_time = Instant::now();
                 }
             }
         });
 
-        let mut api_url = self.relay_host.clone();
-        if api_url.scheme() == "wss" {
-            api_url
+        let mut relay_url = self.relay_host.clone();
+        match relay_url.scheme() {
+            "wss" => relay_url
                 .set_scheme("https")
-                .map_err(|_| miette::miette!("invalid url: {api_url}"))?;
-        } else if api_url.scheme() == "ws" {
-            api_url
+                .map_err(|_| miette::miette!("invalid url: {relay_url}"))?,
+            "ws" => relay_url
                 .set_scheme("http")
-                .map_err(|_| miette::miette!("invalid url: {api_url}"))?;
+                .map_err(|_| miette::miette!("invalid url: {relay_url}"))?,
+            _ => {}
         }
 
         let mut rng: SmallRng = rand::make_rng();
@@ -178,7 +278,7 @@ impl Crawler {
             .await?
             .map(|bytes| {
                 let s = String::from_utf8_lossy(&bytes);
-                info!("resuming crawler from cursor: {s}");
+                info!(cursor = %s, "resuming");
                 s.into()
             });
         let mut was_throttled = false;
@@ -190,33 +290,37 @@ impl Crawler {
                 if pending > self.max_pending as u64 {
                     if !was_throttled {
                         debug!(
-                            "crawler throttling: pending repos {} > max {}, sleeping...",
-                            pending, self.max_pending
+                            pending,
+                            max = self.max_pending,
+                            "throttling: above max pending"
                         );
                         was_throttled = true;
                     }
-                    tokio::time::sleep(Duration::from_secs(10)).await;
                 } else if pending > self.resume_pending as u64 {
                     if !was_throttled {
                         debug!(
-                            "crawler throttling: pending repos {} > max {}, entering cooldown...",
-                            pending, self.max_pending
+                            pending,
+                            resume = self.resume_pending,
+                            "throttling: entering cooldown"
                         );
                         was_throttled = true;
                     }
 
-                    while self.state.db.get_count("pending").await > self.resume_pending as u64 {
+                    loop {
+                        let current_pending = self.state.db.get_count("pending").await;
+                        if current_pending <= self.resume_pending as u64 {
+                            break;
+                        }
                         debug!(
-                            "crawler cooldown: pending repos {} > resume {}, sleeping...",
-                            self.state.db.get_count("pending").await,
-                            self.resume_pending
+                            pending = current_pending,
+                            resume = self.resume_pending,
+                            "cooldown, waiting"
                         );
-                        tokio::time::sleep(Duration::from_secs(10)).await;
                     }
                     break;
                 } else {
                     if was_throttled {
-                        info!("crawler resuming: throttling released");
+                        info!("throttling released");
                         was_throttled = false;
                     }
                     break;
@@ -224,7 +328,7 @@ impl Crawler {
             }
 
             // 2. fetch listrepos
-            let mut list_repos_url = api_url
+            let mut list_repos_url = relay_url
                 .join("/xrpc/com.atproto.sync.listRepos")
                 .into_diagnostic()?;
             list_repos_url
@@ -238,19 +342,28 @@ impl Crawler {
 
             let res_result = self.http.get(list_repos_url.clone()).send().await;
             let bytes = match res_result {
-                Ok(res) => match res.bytes().await {
-                    Ok(b) => b,
-                    Err(e) => {
-                        error!(
-                            "crawler failed to parse list repos response: {e}. retrying in 30s..."
-                        );
-                        tokio::time::sleep(Duration::from_secs(30)).await;
-                        continue;
+                Ok(res) => {
+                    match res.status() {
+                        StatusCode::TOO_MANY_REQUESTS => {
+                            warn!("rate limited by relay");
+                            continue;
+                        }
+                        s if !s.is_success() => {
+                            error!(status = %s, "cant crawl");
+                            continue;
+                        }
+                        _ => {}
                     }
-                },
+                    match res.bytes().await {
+                        Ok(b) => b,
+                        Err(e) => {
+                            error!(err = %e, "cant read listRepos");
+                            continue;
+                        }
+                    }
+                }
                 Err(e) => {
-                    error!("crawler failed to list repos: {e}. retrying in 30s...");
-                    tokio::time::sleep(Duration::from_secs(30)).await;
+                    error!(err = %e, "crawler failed to list repos");
                     continue;
                 }
             };
@@ -259,12 +372,12 @@ impl Crawler {
                 .into_static();
 
             if output.repos.is_empty() {
-                info!("crawler finished enumeration (or empty page). sleeping for 1 hour.");
+                info!("finished enumeration (or empty page)");
                 tokio::time::sleep(Duration::from_secs(3600)).await;
                 continue;
             }
 
-            debug!("crawler fetched {} repos...", output.repos.len());
+            debug!(count = output.repos.len(), "fetched repos");
 
             let mut batch = db.inner.batch();
             let mut to_queue = Vec::new();
@@ -301,7 +414,7 @@ impl Crawler {
 
             for did in &valid_dids {
                 let did_key = keys::repo_key(did);
-                trace!("crawler found new repo: {did}");
+                trace!(did = %did, "found new repo");
 
                 let state = RepoState::backfilling_untracked(rng.next_u64());
                 batch.insert(&db.repos, &did_key, ser_repo_state(&state)?);
@@ -320,7 +433,7 @@ impl Crawler {
                 );
             } else {
                 // end of pagination
-                info!("crawler reached end of list.");
+                info!("reached end of list.");
                 cursor = None;
             }
 
@@ -342,7 +455,7 @@ impl Crawler {
     async fn check_signals_batch(
         &self,
         dids: &[Did<'static>],
-        filter: &crate::filter::FilterConfig,
+        filter: &Arc<crate::filter::FilterConfig>,
         batch: &mut fjall::OwnedWriteBatch,
     ) -> Result<Vec<Did<'static>>> {
         let db = &self.state.db;
@@ -354,99 +467,8 @@ impl Crawler {
             let http = self.http.clone();
             let resolver = self.state.resolver.clone();
             let filter = filter.clone();
-            set.spawn(async move {
-                const MAX_RETRIES: u32 = 5;
-                let mut rng: SmallRng = rand::make_rng();
-
-                let pds_url = {
-                    let mut attempt = 0u32;
-                    loop {
-                        match resolver.resolve_identity_info(&did).await {
-                            Ok((url, _)) => break url,
-                            Err(crate::resolver::ResolverError::Ratelimited)
-                                if attempt < MAX_RETRIES =>
-                            {
-                                let base = Duration::from_secs(1 << attempt);
-                                let jitter = Duration::from_millis(rng.random_range(0..2000));
-                                let try_in = base + jitter;
-                                debug!(
-                                    "crawler: rate limited resolving {did}, retry {}/{MAX_RETRIES} in {}s",
-                                    attempt + 1,
-                                    try_in.as_secs_f64()
-                                );
-                                tokio::time::sleep(try_in).await;
-                                attempt += 1;
-                            }
-                            Err(crate::resolver::ResolverError::Ratelimited) => {
-                                error!(
-                                    "crawler: rate limited resolving {did} after {MAX_RETRIES} retries"
-                                );
-                                return (did, CrawlCheckResult::Ratelimited);
-                            }
-                            Err(e) => {
-                                error!("crawler: failed to resolve {did}: {e}");
-                                return (did, CrawlCheckResult::Failed);
-                            }
-                        }
-                    }
-                };
-
-                let mut found_signal = false;
-                for signal in filter.signals.iter() {
-                    let mut list_records_url =
-                        pds_url.join("/xrpc/com.atproto.repo.listRecords").unwrap();
-                    list_records_url
-                        .query_pairs_mut()
-                        .append_pair("repo", &did)
-                        .append_pair("collection", signal)
-                        .append_pair("limit", "1");
-
-                    let res = http
-                        .get(list_records_url)
-                        .send()
-                        .await
-                        .into_diagnostic()
-                        .map(|res| res.error_for_status().into_diagnostic())
-                        .flatten();
-                    match res {
-                        Ok(res) => {
-                            let Ok(bytes) = res.bytes().await else {
-                                error!(
-                                    "failed to read bytes from listRecords response for repo {did}, signal {signal}"
-                                );
-                                return (did, CrawlCheckResult::Failed);
-                            };
-                            match serde_json::from_slice::<ListRecordsOutput>(&bytes) {
-                                Ok(out) => {
-                                    if !out.records.is_empty() {
-                                        found_signal = true;
-                                        break;
-                                    }
-                                }
-                                Err(e) => {
-                                    error!(
-                                        "failed to parse listRecords response for repo {did}, signal {signal}: {e}"
-                                    );
-                                    return (did, CrawlCheckResult::Failed);
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            error!(
-                                "failed to listRecords for repo {did}, signal {signal}: {e}"
-                            );
-                            return (did, CrawlCheckResult::Failed);
-                        }
-                    }
-                }
-
-                if found_signal {
-                    (did, CrawlCheckResult::Signal)
-                } else {
-                    trace!("crawler skipped repo {did}: no records match signals");
-                    (did, CrawlCheckResult::NoSignal)
-                }
-            });
+            let span = tracing::info_span!("check_signals", did = %did);
+            set.spawn(check_repo_signals(http, resolver, filter, did).instrument(span));
         }
 
         while let Some(res) = set.join_next().await {
@@ -459,8 +481,20 @@ impl Crawler {
                 CrawlCheckResult::NoSignal => {
                     batch.remove(&db.crawler, keys::crawler_failed_key(&did));
                 }
-                CrawlCheckResult::Ratelimited | CrawlCheckResult::Failed => {
-                    batch.insert(&db.crawler, keys::crawler_failed_key(&did), []);
+                CrawlCheckResult::Ratelimited => {
+                    batch.insert(
+                        &db.crawler,
+                        keys::crawler_failed_key(&did),
+                        429u16.to_be_bytes().as_ref(),
+                    );
+                }
+                CrawlCheckResult::Failed(status) => {
+                    let code = status.unwrap_or(0);
+                    batch.insert(
+                        &db.crawler,
+                        keys::crawler_failed_key(&did),
+                        code.to_be_bytes().as_ref(),
+                    );
                 }
             }
         }
@@ -482,7 +516,7 @@ impl Crawler {
 
         let mut failed_dids = Vec::new();
         for guard in db.crawler.prefix(keys::CRAWLER_FAILED_PREFIX) {
-            let (key, _) = guard.into_inner().into_diagnostic()?;
+            let key = guard.key().into_diagnostic()?;
             let did_bytes = &key[keys::CRAWLER_FAILED_PREFIX.len()..];
             let trimmed = TrimmedDid::try_from(did_bytes)?;
             failed_dids.push(trimmed.to_did());
@@ -492,10 +526,7 @@ impl Crawler {
             return Ok(());
         }
 
-        info!(
-            "crawler: retrying {} previously failed repos",
-            failed_dids.len()
-        );
+        info!("retrying {} previously failed repos", failed_dids.len());
 
         let mut batch = db.inner.batch();
         let valid_dids = self
@@ -519,10 +550,7 @@ impl Crawler {
             .into_diagnostic()??;
 
         if !valid_dids.is_empty() {
-            info!(
-                "crawler: recovered {} repos from failed retry",
-                valid_dids.len()
-            );
+            info!("recovered {} repos from failed retry", valid_dids.len());
             self.account_new_repos(valid_dids.len()).await;
         }
 
