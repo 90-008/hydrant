@@ -556,7 +556,7 @@ impl FirehoseWorker {
 
             debug!("discovered new account {did} from firehose, queueing backfill");
 
-            let repo_state = RepoState::backfilling(rand::rng().next_u64());
+            let repo_state = RepoState::backfilling_untracked(rand::rng().next_u64());
             let mut batch = ctx.state.db.inner.batch();
             batch.insert(
                 &ctx.state.db.repos,
@@ -582,7 +582,7 @@ impl FirehoseWorker {
         };
         let mut repo_state = crate::db::deser_repo_state(&state_bytes)?.into_static();
 
-        if !repo_state.tracked {
+        if !repo_state.tracked && repo_state.status != RepoStatus::Backfilling {
             debug!("ignoring active status for {did} as it is explicitly untracked");
             return Ok(RepoProcessResult::Syncing(None));
         }

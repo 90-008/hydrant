@@ -64,6 +64,13 @@ impl<'i> RepoState<'i> {
             tracked: true,
         }
     }
+
+    pub fn backfilling_untracked(index_id: u64) -> Self {
+        Self {
+            tracked: false,
+            ..Self::backfilling(index_id)
+        }
+    }
 }
 
 impl<'i> IntoStatic for RepoState<'i> {

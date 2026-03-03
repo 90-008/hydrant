@@ -551,7 +551,7 @@ async fn process_did<'i>(
                 existing_cids.insert((collection.into(), rkey), cid);
             }
 
-            let mut signal_seen = filter.mode == FilterMode::Full || state.tracked;
+            let mut signal_seen = filter.mode == FilterMode::Full || filter.signals.is_empty();
 
             debug!(
                 "backfilling {did}: signal_seen initial={signal_seen}, mode={:?}, signals={:?}",
@@ -652,6 +652,7 @@ async fn process_did<'i>(
             }
 
             // 6. update data, status is updated in worker shard
+            state.tracked = true;
             state.rev = Some((&rev).into());
             state.data = Some(root_commit.data);
             state.last_updated_at = chrono::Utc::now().timestamp();
