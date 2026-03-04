@@ -67,11 +67,72 @@ where
     }
 }
 
+// these two are cloudflare specific
+const CONNECTION_TIMEOUT: StatusCode = unsafe {
+    match StatusCode::from_u16(522) {
+        Ok(s) => s,
+        _ => std::hint::unreachable_unchecked(), // status code is valid
+    }
+};
+const SITE_FROZEN: StatusCode = unsafe {
+    match StatusCode::from_u16(530) {
+        Ok(s) => s,
+        _ => std::hint::unreachable_unchecked(), // status code is valid
+    }
+};
+
+// we ban on:
+// - timeouts
+// - tls cert errors
+// - bad gateway / gateway timeout, service unavailable, 522 and 530
+fn is_ban_worthy(e: &reqwest::Error) -> bool {
+    use std::error::Error;
+
+    if e.is_timeout() {
+        return true;
+    }
+
+    let mut src = e.source();
+    while let Some(s) = src {
+        if let Some(io_err) = s.downcast_ref::<std::io::Error>() {
+            if is_tls_cert_error(io_err) {
+                return true;
+            }
+        }
+        src = s.source();
+    }
+
+    e.status().map_or(false, |s| {
+        matches!(
+            s,
+            StatusCode::BAD_GATEWAY
+                | StatusCode::SERVICE_UNAVAILABLE
+                | StatusCode::GATEWAY_TIMEOUT
+                | CONNECTION_TIMEOUT
+                | SITE_FROZEN
+        )
+    })
+}
+
+fn is_tls_cert_error(io_err: &std::io::Error) -> bool {
+    let Some(inner) = io_err.get_ref() else {
+        return false;
+    };
+    if let Some(rustls_err) = inner.downcast_ref::<rustls::Error>() {
+        return matches!(rustls_err, rustls::Error::InvalidCertificate(_));
+    }
+    if let Some(nested_io) = inner.downcast_ref::<std::io::Error>() {
+        return is_tls_cert_error(nested_io);
+    }
+    false
+}
+
 async fn check_repo_signals(
     http: Arc<reqwest::Client>,
     resolver: crate::resolver::Resolver,
     filter: Arc<crate::filter::FilterConfig>,
     did: Did<'static>,
+    tracker: Arc<BanTracker>,
 ) -> (Did<'static>, CrawlCheckResult) {
     const MAX_RETRIES: u32 = 5;
     let mut rng: SmallRng = rand::make_rng();
@@ -97,6 +158,17 @@ async fn check_repo_signals(
         }
     };
 
+    let pds_handle = tracker.get_handle(&pds_url);
+    if pds_handle.is_banned() {
+        trace!(host = pds_url.host_str(), "skipping banned pds");
+        return (did, CrawlCheckResult::Failed(None));
+    }
+
+    enum RequestError {
+        Reqwest(reqwest::Error),
+        Banned,
+    }
+
     let mut found_signal = false;
     for signal in filter.signals.iter() {
         let res = async {
@@ -111,15 +183,21 @@ async fn check_repo_signals(
                 &mut rng,
                 MAX_RETRIES,
                 || async {
-                    http.get(list_records_url.clone())
-                        .send()
-                        .await?
-                        .error_for_status()
+                    let req = http.get(list_records_url.clone()).send();
+                    tokio::select! {
+                        res = req => res.and_then(|r| r.error_for_status()).map_err(RequestError::Reqwest),
+                        _ = pds_handle.wait_for_ban() => Err(RequestError::Banned),
+                    }
                 },
-                |e: &reqwest::Error| e.status() == Some(StatusCode::TOO_MANY_REQUESTS),
+                |e: &RequestError| {
+                    matches!(e, RequestError::Reqwest(e) if matches!(e.status(), Some(StatusCode::TOO_MANY_REQUESTS)))
+                },
             );
             let res = match res.await {
-                Ok(r) => r,
+                Ok(r) => {
+                    pds_handle.record_success();
+                    r
+                }
                 Err(RetryOutcome::Ratelimited) => {
                     warn!(
                         retries = MAX_RETRIES,
@@ -127,21 +205,31 @@ async fn check_repo_signals(
                     );
                     return CrawlCheckResult::Ratelimited;
                 }
-                Err(RetryOutcome::Failed(e)) => {
-                    match e.status() {
-                        Some(StatusCode::NOT_FOUND | StatusCode::GONE) => {
-                            trace!("repo not found");
-                        }
-                        Some(s) if s.is_client_error() => {
-                            error!(status = %s, "repo unavailable");
-                        }
-                        _ => {
-                            error!(err = %e, "listRecords failed");
+                Err(RetryOutcome::Failed(e)) => match e {
+                    RequestError::Banned => return CrawlCheckResult::Failed(None),
+                    RequestError::Reqwest(e) => {
+                        if is_ban_worthy(&e) {
+                            if let Some(mins) = pds_handle.record_failure() {
+                                tracing::warn!(url = %pds_url, mins, "banned pds");
+                            }
                             return CrawlCheckResult::Failed(e.status().map(|s| s.as_u16()));
                         }
+
+                        match e.status() {
+                            Some(StatusCode::NOT_FOUND | StatusCode::GONE) => {
+                                trace!("repo not found");
+                            }
+                            Some(s) if s.is_client_error() => {
+                                error!(status = %s, "repo unavailable");
+                            }
+                            _ => {
+                                error!(err = %e, "listRecords failed");
+                                return CrawlCheckResult::Failed(e.status().map(|s| s.as_u16()));
+                            }
+                        }
+                        return CrawlCheckResult::NoSignal;
                     }
-                    return CrawlCheckResult::NoSignal;
-                }
+                },
             };
 
             let bytes = match res.bytes().await {
@@ -195,6 +283,9 @@ async fn check_repo_signals(
     )
 }
 
+pub mod ban;
+use ban::BanTracker;
+
 pub struct Crawler {
     state: Arc<AppState>,
     relay_host: Url,
@@ -203,6 +294,7 @@ pub struct Crawler {
     resume_pending: usize,
     count: Arc<AtomicUsize>,
     crawled_count: Arc<AtomicUsize>,
+    tracker: Arc<BanTracker>,
 }
 
 impl Crawler {
@@ -232,6 +324,7 @@ impl Crawler {
             resume_pending,
             count: Arc::new(AtomicUsize::new(0)),
             crawled_count: Arc::new(AtomicUsize::new(0)),
+            tracker: Arc::new(BanTracker::new()),
         }
     }
 
@@ -477,8 +570,9 @@ impl Crawler {
             let http = self.http.clone();
             let resolver = self.state.resolver.clone();
             let filter = filter.clone();
+            let tracker = self.tracker.clone();
             let span = tracing::info_span!("check_signals", did = %did);
-            set.spawn(check_repo_signals(http, resolver, filter, did).instrument(span));
+            set.spawn(check_repo_signals(http, resolver, filter, did, tracker).instrument(span));
         }
 
         while let Some(res) = set.join_next().await {

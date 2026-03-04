@@ -1,19 +1,19 @@
 use fjall::OwnedWriteBatch;
+use jacquard_common::CowStr;
+use jacquard_common::IntoStatic;
 use jacquard_common::types::cid::Cid;
 use jacquard_common::types::crypto::PublicKey;
 use jacquard_common::types::did::Did;
-use jacquard_common::CowStr;
-use jacquard_common::IntoStatic;
 use jacquard_repo::car::reader::parse_car_bytes;
 use miette::{Context, IntoDiagnostic, Result};
-use rand::{rng, Rng};
+use rand::{Rng, rng};
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 use tracing::{debug, trace};
 
 use crate::db::types::{DbAction, DbRkey, DbTid, TrimmedDid};
-use crate::db::{self, keys, ser_repo_state, Db};
+use crate::db::{self, Db, keys, ser_repo_state};
 use crate::filter::FilterConfig;
 use crate::ingest::stream::Commit;
 use crate::types::{
@@ -282,20 +282,17 @@ pub fn apply_commit<'batch, 'db, 'commit, 's>(
                 let Some(cid) = &op.cid else {
                     continue;
                 };
-                let cid_ipld = cid.to_ipld()
+                let cid_ipld = cid
+                    .to_ipld()
                     .into_diagnostic()
                     .wrap_err("expected valid cid from relay")?;
-                
+
                 if let Some(bytes) = parsed.blocks.get(&cid_ipld) {
                     batch.insert(&db.blocks, cid_ipld.to_bytes(), bytes.to_vec());
                     blocks_count += 1;
                 }
-                
-                batch.insert(
-                    &db.records,
-                    db_key.clone(),
-                    cid_ipld.to_bytes(),
-                );
+
+                batch.insert(&db.records, db_key.clone(), cid_ipld.to_bytes());
 
                 // accumulate counts
                 if action == DbAction::Create {
