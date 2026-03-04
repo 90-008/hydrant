@@ -2,6 +2,7 @@ use crate::db::types::TrimmedDid;
 use crate::db::{Db, keys, ser_repo_state};
 use crate::state::AppState;
 use crate::types::RepoState;
+use futures::TryFutureExt;
 use jacquard_api::com_atproto::repo::list_records::ListRecordsOutput;
 use jacquard_api::com_atproto::sync::list_repos::ListReposOutput;
 use jacquard_common::{IntoStatic, types::string::Did};
@@ -13,7 +14,7 @@ use reqwest::StatusCode;
 use smol_str::SmolStr;
 use std::future::Future;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 use tracing::{Instrument, debug, error, info, trace, warn};
 use url::Url;
@@ -25,7 +26,7 @@ enum CrawlCheckResult {
     Failed(Option<u16>),
 }
 
-/// outcome of [`retry_with_backoff`] when the operation does not succeed.
+/// outcome of [`RetryWithBackoff::retry_with_backoff`] when the operation does not succeed.
 enum RetryOutcome<E> {
     /// ratelimited after exhausting all retries
     Ratelimited,
@@ -33,39 +34,53 @@ enum RetryOutcome<E> {
     Failed(E),
 }
 
-/// retries an async operation with exponential backoff when ratelimited.
-///
-/// `op` is called on each attempt and returns `Result<T, E>`.
-/// `is_ratelimited` classifies an error as a ratelimit (triggering a retry)
-/// versus a fatal failure (returning immediately).
-async fn retry_with_backoff<T, E, F, Fut>(
-    rng: &mut SmallRng,
-    max_retries: u32,
-    mut op: F,
-    is_ratelimited: impl Fn(&E) -> bool,
-) -> Result<T, RetryOutcome<E>>
+/// extension trait that adds `retry_with_backoff` to async `FnMut` closures.
+trait RetryWithBackoff<T, E, Fut>: FnMut() -> Fut
+where
+    Fut: Future<Output = Result<T, E>>,
+{
+    async fn retry(
+        &mut self,
+        max_retries: u32,
+        is_ratelimited: impl Fn(&E) -> bool,
+    ) -> Result<T, RetryOutcome<E>> {
+        let mut attempt = 0u32;
+        loop {
+            match self().await {
+                Ok(val) => return Ok(val),
+                Err(e) if is_ratelimited(&e) => {
+                    if attempt >= max_retries {
+                        return Err(RetryOutcome::Ratelimited);
+                    }
+                    let base = Duration::from_secs(1 << attempt);
+                    let jitter = Duration::from_millis(rand::rng().random_range(0..2000));
+                    tokio::time::sleep(base + jitter).await;
+                    attempt += 1;
+                }
+                Err(e) => return Err(RetryOutcome::Failed(e)),
+            }
+        }
+    }
+}
+
+impl<T, E, F, Fut> RetryWithBackoff<T, E, Fut> for F
 where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<T, E>>,
 {
-    let mut attempt = 0u32;
-    loop {
-        match op().await {
-            Ok(val) => return Ok(val),
-            Err(e) if is_ratelimited(&e) => {
-                if attempt < max_retries {
-                    let base = Duration::from_secs(1 << attempt);
-                    let jitter = Duration::from_millis(rng.random_range(0..2000));
-                    tokio::time::sleep(base + jitter).await;
-                    attempt += 1;
-                } else {
-                    return Err(RetryOutcome::Ratelimited);
-                }
-            }
-            Err(e) => return Err(RetryOutcome::Failed(e)),
-        }
+}
+
+/// extension trait that adds `.error_for_status()` to futures returning a reqwest `Response`.
+trait ErrorForStatus: Future<Output = Result<reqwest::Response, reqwest::Error>> {
+    fn error_for_status(self) -> impl Future<Output = Result<reqwest::Response, reqwest::Error>>
+    where
+        Self: Sized,
+    {
+        futures::FutureExt::map(self, |r| r.and_then(|r| r.error_for_status()))
     }
 }
+
+impl<F: Future<Output = Result<reqwest::Response, reqwest::Error>>> ErrorForStatus for F {}
 
 // these two are cloudflare specific
 const CONNECTION_TIMEOUT: StatusCode = unsafe {
@@ -135,15 +150,13 @@ async fn check_repo_signals(
     tracker: Arc<BanTracker>,
 ) -> (Did<'static>, CrawlCheckResult) {
     const MAX_RETRIES: u32 = 5;
-    let mut rng: SmallRng = rand::make_rng();
 
-    let pds_url = retry_with_backoff(
-        &mut rng,
-        MAX_RETRIES,
-        || resolver.resolve_identity_info(&did),
-        |e| matches!(e, crate::resolver::ResolverError::Ratelimited),
-    );
-    let pds_url = match pds_url.await {
+    let pds_url = (|| resolver.resolve_identity_info(&did))
+        .retry(MAX_RETRIES, |e| {
+            matches!(e, crate::resolver::ResolverError::Ratelimited)
+        })
+        .await;
+    let pds_url = match pds_url {
         Ok((url, _)) => url,
         Err(RetryOutcome::Ratelimited) => {
             error!(
@@ -179,21 +192,16 @@ async fn check_repo_signals(
                 .append_pair("collection", signal)
                 .append_pair("limit", "1");
 
-            let res = retry_with_backoff(
-                &mut rng,
-                MAX_RETRIES,
-                || async {
-                    let req = http.get(list_records_url.clone()).send();
-                    tokio::select! {
-                        res = req => res.and_then(|r| r.error_for_status()).map_err(RequestError::Reqwest),
-                        _ = pds_handle.wait_for_ban() => Err(RequestError::Banned),
-                    }
-                },
-                |e: &RequestError| {
+            let res = (|| http.get(list_records_url.clone())
+                    .send()
+                    .error_for_status()
+                    .map_err(RequestError::Reqwest)
+                    .or_ban(&pds_handle, || RequestError::Banned))
+                .retry(MAX_RETRIES, |e: &RequestError| {
                     matches!(e, RequestError::Reqwest(e) if matches!(e.status(), Some(StatusCode::TOO_MANY_REQUESTS)))
-                },
-            );
-            let res = match res.await {
+                })
+                .await;
+            let res = match res {
                 Ok(r) => {
                     pds_handle.record_success();
                     r
@@ -284,7 +292,7 @@ async fn check_repo_signals(
 }
 
 pub mod ban;
-use ban::BanTracker;
+use ban::{BanTracker, OrBan};
 
 pub struct Crawler {
     state: Arc<AppState>,
@@ -294,6 +302,7 @@ pub struct Crawler {
     resume_pending: usize,
     count: Arc<AtomicUsize>,
     crawled_count: Arc<AtomicUsize>,
+    throttled: Arc<AtomicBool>,
     tracker: Arc<BanTracker>,
 }
 
@@ -324,6 +333,7 @@ impl Crawler {
             resume_pending,
             count: Arc::new(AtomicUsize::new(0)),
             crawled_count: Arc::new(AtomicUsize::new(0)),
+            throttled: Arc::new(AtomicBool::new(false)),
             tracker: Arc::new(BanTracker::new()),
         }
     }
@@ -333,6 +343,7 @@ impl Crawler {
             use std::time::Instant;
             let count = self.count.clone();
             let crawled_count = self.crawled_count.clone();
+            let throttled = self.throttled.clone();
             let mut last_time = Instant::now();
             let mut interval = tokio::time::interval(Duration::from_secs(60));
             async move {
@@ -340,9 +351,14 @@ impl Crawler {
                     interval.tick().await;
                     let delta_processed = count.swap(0, Ordering::Relaxed);
                     let delta_crawled = crawled_count.swap(0, Ordering::Relaxed);
+                    let is_throttled = throttled.load(Ordering::Relaxed);
 
                     if delta_processed == 0 && delta_crawled == 0 {
-                        debug!("no repos crawled or processed in 60s");
+                        if is_throttled {
+                            info!("crawler throttled: pending queue full");
+                        } else {
+                            debug!("no repos crawled or processed in 60s");
+                        }
                         continue;
                     }
 
@@ -396,7 +412,9 @@ impl Crawler {
                             "throttling: above max pending"
                         );
                         was_throttled = true;
+                        self.throttled.store(true, Ordering::Relaxed);
                     }
+                    tokio::time::sleep(Duration::from_secs(5)).await;
                 } else if pending > self.resume_pending as u64 {
                     if !was_throttled {
                         debug!(
@@ -405,6 +423,7 @@ impl Crawler {
                             "throttling: entering cooldown"
                         );
                         was_throttled = true;
+                        self.throttled.store(true, Ordering::Relaxed);
                     }
 
                     loop {
@@ -417,12 +436,14 @@ impl Crawler {
                             resume = self.resume_pending,
                             "cooldown, waiting"
                         );
+                        tokio::time::sleep(Duration::from_secs(5)).await;
                     }
                     break;
                 } else {
                     if was_throttled {
                         info!("throttling released");
                         was_throttled = false;
+                        self.throttled.store(false, Ordering::Relaxed);
                     }
                     break;
                 }
@@ -441,36 +462,44 @@ impl Crawler {
                     .append_pair("cursor", c.as_str());
             }
 
-            let res_result = self.http.get(list_repos_url.clone()).send().await;
-            let bytes = match res_result {
-                Ok(res) => {
-                    match res.status() {
-                        StatusCode::TOO_MANY_REQUESTS => {
-                            warn!("rate limited by relay");
-                            continue;
-                        }
-                        s if !s.is_success() => {
-                            error!(status = %s, "cant crawl");
-                            continue;
-                        }
-                        _ => {}
-                    }
-                    match res.bytes().await {
-                        Ok(b) => b,
-                        Err(e) => {
-                            error!(err = %e, "cant read listRepos");
-                            continue;
-                        }
-                    }
+            let fetch_result = (|| {
+                self.http
+                    .get(list_repos_url.clone())
+                    .send()
+                    .error_for_status()
+            })
+            .retry(5, |e: &reqwest::Error| {
+                matches!(e.status(), Some(StatusCode::TOO_MANY_REQUESTS))
+            })
+            .await;
+
+            let res = match fetch_result {
+                Ok(r) => r,
+                Err(RetryOutcome::Ratelimited) => {
+                    warn!("rate limited by relay after retries");
+                    continue;
                 }
-                Err(e) => {
-                    error!(err = %e, "crawler failed to list repos");
+                Err(RetryOutcome::Failed(e)) => {
+                    error!(err = %e, "crawler failed to fetch listRepos");
                     continue;
                 }
             };
-            let output = serde_json::from_slice::<ListReposOutput>(&bytes)
-                .into_diagnostic()?
-                .into_static();
+
+            let bytes = match res.bytes().await {
+                Ok(b) => b,
+                Err(e) => {
+                    error!(err = %e, "cant read listRepos response");
+                    continue;
+                }
+            };
+
+            let output = match serde_json::from_slice::<ListReposOutput>(&bytes) {
+                Ok(out) => out.into_static(),
+                Err(e) => {
+                    error!(err = %e, "failed to parse listRepos response");
+                    continue;
+                }
+            };
 
             if output.repos.is_empty() {
                 info!("finished enumeration (or empty page)");

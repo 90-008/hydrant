@@ -1,4 +1,5 @@
 use scc::HashMap;
+use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use tokio::sync::Notify;
@@ -96,3 +97,21 @@ impl BanHandle {
         }
     }
 }
+
+/// extension trait that adds `.or_ban()` to any future returning `Result<T, E>`.
+#[allow(async_fn_in_trait)]
+pub trait OrBan<T, E>: Future<Output = Result<T, E>> {
+    /// races the future against a ban notification.
+    /// if the pds is banned before the future completes, returns `on_ban()` immediately.
+    async fn or_ban(self, handle: &BanHandle, on_ban: impl FnOnce() -> E) -> Result<T, E>
+    where
+        Self: Sized,
+    {
+        tokio::select! {
+            res = self => res,
+            _ = handle.wait_for_ban() => Err(on_ban()),
+        }
+    }
+}
+
+impl<T, E, F: Future<Output = Result<T, E>>> OrBan<T, E> for F {}
