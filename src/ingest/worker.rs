@@ -556,7 +556,7 @@ impl FirehoseWorker {
 
             debug!(did = %did, "discovered new account from firehose, queueing backfill");
 
-            let repo_state = RepoState::backfilling_untracked(rand::rng().next_u64());
+            let repo_state = RepoState::untracked(rand::rng().next_u64());
             let mut batch = ctx.state.db.inner.batch();
             batch.insert(
                 &ctx.state.db.repos,

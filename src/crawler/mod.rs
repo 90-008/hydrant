@@ -1,8 +1,7 @@
-use crate::db::types::TrimmedDid;
 use crate::db::{Db, keys, ser_repo_state};
 use crate::state::AppState;
 use crate::types::RepoState;
-use futures::TryFutureExt;
+use futures::FutureExt;
 use jacquard_api::com_atproto::repo::list_records::ListRecordsOutput;
 use jacquard_api::com_atproto::sync::list_repos::ListReposOutput;
 use jacquard_common::{IntoStatic, types::string::Did};
@@ -13,6 +12,7 @@ use rand::rngs::SmallRng;
 use reqwest::StatusCode;
 use smol_str::SmolStr;
 use std::future::Future;
+use std::ops::Mul;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
@@ -22,11 +22,15 @@ use url::Url;
 enum CrawlCheckResult {
     Signal,
     NoSignal,
-    Ratelimited,
-    Failed(Option<u16>),
+    /// task could not complete; should be retried at `retry_after` (unix timestamp).
+    /// `status` is the HTTP status that triggered this (0 for non-HTTP failures).
+    Retry {
+        retry_after: i64,
+        status: u16,
+    },
 }
 
-/// outcome of [`RetryWithBackoff::retry_with_backoff`] when the operation does not succeed.
+/// outcome of [`RetryWithBackoff::retry`] when the operation does not succeed.
 enum RetryOutcome<E> {
     /// ratelimited after exhausting all retries
     Ratelimited,
@@ -34,7 +38,11 @@ enum RetryOutcome<E> {
     Failed(E),
 }
 
-/// extension trait that adds `retry_with_backoff` to async `FnMut` closures.
+/// extension trait that adds `.retry()` to async `FnMut` closures.
+///
+/// `on_ratelimit` receives the error and current attempt number.
+/// returning `Some(duration)` signals a transient failure and provides the backoff;
+/// returning `None` signals a terminal failure.
 trait RetryWithBackoff<T, E, Fut>: FnMut() -> Fut
 where
     Fut: Future<Output = Result<T, E>>,
@@ -42,22 +50,21 @@ where
     async fn retry(
         &mut self,
         max_retries: u32,
-        is_ratelimited: impl Fn(&E) -> bool,
+        on_ratelimit: impl Fn(&E, u32) -> Option<Duration>,
     ) -> Result<T, RetryOutcome<E>> {
         let mut attempt = 0u32;
         loop {
             match self().await {
                 Ok(val) => return Ok(val),
-                Err(e) if is_ratelimited(&e) => {
-                    if attempt >= max_retries {
-                        return Err(RetryOutcome::Ratelimited);
+                Err(e) => match on_ratelimit(&e, attempt) {
+                    Some(_) if attempt >= max_retries => return Err(RetryOutcome::Ratelimited),
+                    Some(backoff) => {
+                        let jitter = Duration::from_millis(rand::rng().random_range(0..2000));
+                        tokio::time::sleep(backoff + jitter).await;
+                        attempt += 1;
                     }
-                    let base = Duration::from_secs(1 << attempt);
-                    let jitter = Duration::from_millis(rand::rng().random_range(0..2000));
-                    tokio::time::sleep(base + jitter).await;
-                    attempt += 1;
-                }
-                Err(e) => return Err(RetryOutcome::Failed(e)),
+                    None => return Err(RetryOutcome::Failed(e)),
+                },
             }
         }
     }
@@ -82,25 +89,46 @@ trait ErrorForStatus: Future<Output = Result<reqwest::Response, reqwest::Error>>
 
 impl<F: Future<Output = Result<reqwest::Response, reqwest::Error>>> ErrorForStatus for F {}
 
-// these two are cloudflare specific
+/// extracts a retry delay in seconds from rate limit response headers.
+///
+/// checks in priority order:
+/// - `retry-after: <seconds>` (relative)
+/// - `ratelimit-reset: <unix timestamp>` (absolute) (ref pds sends this)
+fn parse_retry_after(resp: &reqwest::Response) -> Option<u64> {
+    let headers = resp.headers();
+
+    let retry_after = headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok());
+
+    let rate_limit_reset = headers
+        .get("ratelimit-reset")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<i64>().ok())
+        .map(|ts| {
+            let now = chrono::Utc::now().timestamp();
+            (ts - now).max(1) as u64
+        });
+
+    retry_after.or(rate_limit_reset)
+}
+
+// cloudflare-specific status codes
 const CONNECTION_TIMEOUT: StatusCode = unsafe {
     match StatusCode::from_u16(522) {
         Ok(s) => s,
-        _ => std::hint::unreachable_unchecked(), // status code is valid
+        _ => std::hint::unreachable_unchecked(),
     }
 };
 const SITE_FROZEN: StatusCode = unsafe {
     match StatusCode::from_u16(530) {
         Ok(s) => s,
-        _ => std::hint::unreachable_unchecked(), // status code is valid
+        _ => std::hint::unreachable_unchecked(),
     }
 };
 
-// we ban on:
-// - timeouts
-// - tls cert errors
-// - bad gateway / gateway timeout, service unavailable, 522 and 530
-fn is_ban_worthy(e: &reqwest::Error) -> bool {
+fn is_throttle_worthy(e: &reqwest::Error) -> bool {
     use std::error::Error;
 
     if e.is_timeout() {
@@ -147,15 +175,17 @@ async fn check_repo_signals(
     resolver: crate::resolver::Resolver,
     filter: Arc<crate::filter::FilterConfig>,
     did: Did<'static>,
-    tracker: Arc<BanTracker>,
+    throttler: Arc<Throttler>,
 ) -> (Did<'static>, CrawlCheckResult) {
     const MAX_RETRIES: u32 = 5;
 
     let pds_url = (|| resolver.resolve_identity_info(&did))
-        .retry(MAX_RETRIES, |e| {
+        .retry(MAX_RETRIES, |e, attempt| {
             matches!(e, crate::resolver::ResolverError::Ratelimited)
+                .then(|| Duration::from_secs(1 << attempt.min(5)))
         })
         .await;
+
     let pds_url = match pds_url {
         Ok((url, _)) => url,
         Err(RetryOutcome::Ratelimited) => {
@@ -163,23 +193,61 @@ async fn check_repo_signals(
                 retries = MAX_RETRIES,
                 "rate limited resolving identity, giving up"
             );
-            return (did, CrawlCheckResult::Ratelimited);
+            // no pds handle to read retry_after from; use a short default
+            let retry_after = chrono::Utc::now().timestamp() + 60;
+            return (
+                did,
+                CrawlCheckResult::Retry {
+                    retry_after,
+                    status: 429,
+                },
+            );
         }
         Err(RetryOutcome::Failed(e)) => {
             error!(err = %e, "failed to resolve identity");
-            return (did, CrawlCheckResult::Failed(None));
+            let retry_after = chrono::Utc::now().timestamp() + 60;
+            return (
+                did,
+                CrawlCheckResult::Retry {
+                    retry_after,
+                    status: 0,
+                },
+            );
         }
     };
 
-    let pds_handle = tracker.get_handle(&pds_url);
-    if pds_handle.is_banned() {
-        trace!(host = pds_url.host_str(), "skipping banned pds");
-        return (did, CrawlCheckResult::Failed(None));
+    let throttle = throttler.get_handle(&pds_url).await;
+    if throttle.is_throttled() {
+        trace!(host = pds_url.host_str(), "skipping throttled pds");
+        return (
+            did,
+            CrawlCheckResult::Retry {
+                retry_after: throttle.throttled_until(),
+                status: 0,
+            },
+        );
     }
+
+    let _permit = throttle.acquire().unit_error().or_failure(&throttle, || ());
+    let Ok(_permit) = _permit.await else {
+        trace!(
+            host = pds_url.host_str(),
+            "pds failed while waiting for permit"
+        );
+        return (
+            did,
+            CrawlCheckResult::Retry {
+                retry_after: throttle.throttled_until(),
+                status: 0,
+            },
+        );
+    };
 
     enum RequestError {
         Reqwest(reqwest::Error),
-        Banned,
+        RateLimited(Option<u64>),
+        /// hard failure notification from another task on this PDS
+        Throttled,
     }
 
     let mut found_signal = false;
@@ -192,77 +260,98 @@ async fn check_repo_signals(
                 .append_pair("collection", signal)
                 .append_pair("limit", "1");
 
-            let res = (|| http.get(list_records_url.clone())
+            let resp = async {
+                let resp = http
+                    .get(list_records_url.clone())
                     .send()
-                    .error_for_status()
-                    .map_err(RequestError::Reqwest)
-                    .or_ban(&pds_handle, || RequestError::Banned))
-                .retry(MAX_RETRIES, |e: &RequestError| {
-                    matches!(e, RequestError::Reqwest(e) if matches!(e.status(), Some(StatusCode::TOO_MANY_REQUESTS)))
-                })
-                .await;
-            let res = match res {
+                    .await
+                    .map_err(RequestError::Reqwest)?;
+
+                // dont retry ratelimits since we will just put it in a queue to be tried again later
+                if resp.status() == StatusCode::TOO_MANY_REQUESTS {
+                    return Err(RequestError::RateLimited(parse_retry_after(&resp)));
+                }
+
+                resp.error_for_status().map_err(RequestError::Reqwest)
+            }
+            .or_failure(&throttle, || RequestError::Throttled)
+            .await;
+
+            let resp = match resp {
                 Ok(r) => {
-                    pds_handle.record_success();
+                    throttle.record_success();
                     r
                 }
-                Err(RetryOutcome::Ratelimited) => {
-                    warn!(
-                        retries = MAX_RETRIES,
-                        "rate limited on listRecords, giving up"
-                    );
-                    return CrawlCheckResult::Ratelimited;
+                Err(RequestError::RateLimited(secs)) => {
+                    throttle.record_ratelimit(secs);
+                    return CrawlCheckResult::Retry {
+                        retry_after: throttle.throttled_until(),
+                        status: 429,
+                    };
                 }
-                Err(RetryOutcome::Failed(e)) => match e {
-                    RequestError::Banned => return CrawlCheckResult::Failed(None),
-                    RequestError::Reqwest(e) => {
-                        if is_ban_worthy(&e) {
-                            if let Some(mins) = pds_handle.record_failure() {
-                                tracing::warn!(url = %pds_url, mins, "banned pds");
-                            }
-                            return CrawlCheckResult::Failed(e.status().map(|s| s.as_u16()));
+                Err(RequestError::Throttled) => {
+                    return CrawlCheckResult::Retry {
+                        retry_after: throttle.throttled_until(),
+                        status: 0,
+                    };
+                }
+                Err(RequestError::Reqwest(e)) => {
+                    if is_throttle_worthy(&e) {
+                        if let Some(mins) = throttle.record_failure() {
+                            warn!(url = %pds_url, mins, "throttling pds due to hard failure");
                         }
-
-                        match e.status() {
-                            Some(StatusCode::NOT_FOUND | StatusCode::GONE) => {
-                                trace!("repo not found");
-                            }
-                            Some(s) if s.is_client_error() => {
-                                error!(status = %s, "repo unavailable");
-                            }
-                            _ => {
-                                error!(err = %e, "listRecords failed");
-                                return CrawlCheckResult::Failed(e.status().map(|s| s.as_u16()));
-                            }
-                        }
-                        return CrawlCheckResult::NoSignal;
+                        return CrawlCheckResult::Retry {
+                            retry_after: throttle.throttled_until(),
+                            status: e.status().map_or(0, |s| s.as_u16()),
+                        };
                     }
-                },
+
+                    match e.status() {
+                        Some(StatusCode::NOT_FOUND | StatusCode::GONE) => {
+                            trace!("repo not found");
+                            return CrawlCheckResult::NoSignal;
+                        }
+                        Some(s) if s.is_client_error() => {
+                            error!(status = %s, "repo unavailable");
+                            return CrawlCheckResult::NoSignal;
+                        }
+                        _ => {
+                            error!(err = %e, "repo errored");
+                            return CrawlCheckResult::Retry {
+                                retry_after: chrono::Utc::now().timestamp() + 60,
+                                status: e.status().map_or(0, |s| s.as_u16()),
+                            };
+                        }
+                    }
+                }
             };
 
-            let bytes = match res.bytes().await {
+            let bytes = match resp.bytes().await {
                 Ok(b) => b,
                 Err(e) => {
                     error!(err = %e, "failed to read listRecords response");
-                    return CrawlCheckResult::Failed(None);
+                    return CrawlCheckResult::Retry {
+                        retry_after: chrono::Utc::now().timestamp() + 60,
+                        status: 0,
+                    };
                 }
             };
 
             match serde_json::from_slice::<ListRecordsOutput>(&bytes) {
-                Ok(out) => {
-                    if !out.records.is_empty() {
-                        return CrawlCheckResult::Signal;
-                    }
-                }
+                Ok(out) if !out.records.is_empty() => return CrawlCheckResult::Signal,
+                Ok(_) => {}
                 Err(e) => {
                     error!(err = %e, "failed to parse listRecords response");
-                    return CrawlCheckResult::Failed(None);
+                    return CrawlCheckResult::Retry {
+                        retry_after: chrono::Utc::now().timestamp() + 60,
+                        status: 0,
+                    };
                 }
             }
 
             CrawlCheckResult::NoSignal
         }
-        .instrument(tracing::info_span!("signal_check", signal = %signal))
+        .instrument(tracing::info_span!("check", signal = %signal))
         .await;
 
         match res {
@@ -270,12 +359,8 @@ async fn check_repo_signals(
                 found_signal = true;
                 break;
             }
-            CrawlCheckResult::NoSignal => {
-                continue;
-            }
-            other => {
-                return (did, other);
-            }
+            CrawlCheckResult::NoSignal => continue,
+            other => return (did, other),
         }
     }
 
@@ -291,8 +376,8 @@ async fn check_repo_signals(
     )
 }
 
-pub mod ban;
-use ban::{BanTracker, OrBan};
+pub mod throttle;
+use throttle::{OrThrottle, Throttler};
 
 pub struct Crawler {
     state: Arc<AppState>,
@@ -303,7 +388,7 @@ pub struct Crawler {
     count: Arc<AtomicUsize>,
     crawled_count: Arc<AtomicUsize>,
     throttled: Arc<AtomicBool>,
-    tracker: Arc<BanTracker>,
+    pds_throttler: Arc<Throttler>,
 }
 
 impl Crawler {
@@ -334,16 +419,18 @@ impl Crawler {
             count: Arc::new(AtomicUsize::new(0)),
             crawled_count: Arc::new(AtomicUsize::new(0)),
             throttled: Arc::new(AtomicBool::new(false)),
-            tracker: Arc::new(BanTracker::new()),
+            pds_throttler: Arc::new(Throttler::new()),
         }
     }
 
     pub async fn run(self) -> Result<()> {
+        // stats ticker
         tokio::spawn({
             use std::time::Instant;
             let count = self.count.clone();
             let crawled_count = self.crawled_count.clone();
             let throttled = self.throttled.clone();
+            let pds_throttler = self.pds_throttler.clone();
             let mut last_time = Instant::now();
             let mut interval = tokio::time::interval(Duration::from_secs(60));
             async move {
@@ -352,6 +439,8 @@ impl Crawler {
                     let delta_processed = count.swap(0, Ordering::Relaxed);
                     let delta_crawled = crawled_count.swap(0, Ordering::Relaxed);
                     let is_throttled = throttled.load(Ordering::Relaxed);
+
+                    pds_throttler.evict_clean().await;
 
                     if delta_processed == 0 && delta_crawled == 0 {
                         if is_throttled {
@@ -374,7 +463,34 @@ impl Crawler {
             }
         });
 
-        let mut relay_url = self.relay_host.clone();
+        let crawler = Arc::new(self);
+        std::thread::spawn({
+            let crawler = crawler.clone();
+            let handle = tokio::runtime::Handle::current();
+            move || {
+                use std::thread::sleep;
+
+                let _g = handle.enter();
+
+                loop {
+                    match crawler.process_retry_queue() {
+                        Ok(Some(next_ts)) => {
+                            let secs = (next_ts - chrono::Utc::now().timestamp()).max(1) as u64;
+                            sleep(Duration::from_secs(secs));
+                        }
+                        Ok(None) => {
+                            sleep(Duration::from_secs(60));
+                        }
+                        Err(e) => {
+                            error!(err = %e, "retry loop failed");
+                            sleep(Duration::from_secs(60));
+                        }
+                    }
+                }
+            }
+        });
+
+        let mut relay_url = crawler.relay_host.clone();
         match relay_url.scheme() {
             "wss" => relay_url
                 .set_scheme("https")
@@ -386,10 +502,8 @@ impl Crawler {
         }
 
         let mut rng: SmallRng = rand::make_rng();
+        let db = &crawler.state.db;
 
-        let db = &self.state.db;
-
-        // 1. load cursor
         let cursor_key = b"crawler_cursor";
         let mut cursor: Option<SmolStr> = Db::get(db.cursors.clone(), cursor_key.to_vec())
             .await?
@@ -401,39 +515,39 @@ impl Crawler {
         let mut was_throttled = false;
 
         loop {
-            // check throttling
+            // throttle check
             loop {
-                let pending = self.state.db.get_count("pending").await;
-                if pending > self.max_pending as u64 {
+                let pending = crawler.state.db.get_count("pending").await;
+                if pending > crawler.max_pending as u64 {
                     if !was_throttled {
                         debug!(
                             pending,
-                            max = self.max_pending,
+                            max = crawler.max_pending,
                             "throttling: above max pending"
                         );
                         was_throttled = true;
-                        self.throttled.store(true, Ordering::Relaxed);
+                        crawler.throttled.store(true, Ordering::Relaxed);
                     }
                     tokio::time::sleep(Duration::from_secs(5)).await;
-                } else if pending > self.resume_pending as u64 {
+                } else if pending > crawler.resume_pending as u64 {
                     if !was_throttled {
                         debug!(
                             pending,
-                            resume = self.resume_pending,
+                            resume = crawler.resume_pending,
                             "throttling: entering cooldown"
                         );
                         was_throttled = true;
-                        self.throttled.store(true, Ordering::Relaxed);
+                        crawler.throttled.store(true, Ordering::Relaxed);
                     }
 
                     loop {
-                        let current_pending = self.state.db.get_count("pending").await;
-                        if current_pending <= self.resume_pending as u64 {
+                        let current_pending = crawler.state.db.get_count("pending").await;
+                        if current_pending <= crawler.resume_pending as u64 {
                             break;
                         }
                         debug!(
                             pending = current_pending,
-                            resume = self.resume_pending,
+                            resume = crawler.resume_pending,
                             "cooldown, waiting"
                         );
                         tokio::time::sleep(Duration::from_secs(5)).await;
@@ -443,13 +557,12 @@ impl Crawler {
                     if was_throttled {
                         info!("throttling released");
                         was_throttled = false;
-                        self.throttled.store(false, Ordering::Relaxed);
+                        crawler.throttled.store(false, Ordering::Relaxed);
                     }
                     break;
                 }
             }
 
-            // 2. fetch listrepos
             let mut list_repos_url = relay_url
                 .join("/xrpc/com.atproto.sync.listRepos")
                 .into_diagnostic()?;
@@ -463,13 +576,15 @@ impl Crawler {
             }
 
             let fetch_result = (|| {
-                self.http
+                crawler
+                    .http
                     .get(list_repos_url.clone())
                     .send()
                     .error_for_status()
             })
-            .retry(5, |e: &reqwest::Error| {
+            .retry(5, |e: &reqwest::Error, attempt| {
                 matches!(e.status(), Some(StatusCode::TOO_MANY_REQUESTS))
+                    .then(|| Duration::from_secs(1 << attempt.min(5)))
             })
             .await;
 
@@ -508,20 +623,14 @@ impl Crawler {
             }
 
             debug!(count = output.repos.len(), "fetched repos");
-            self.crawled_count
+            crawler
+                .crawled_count
                 .fetch_add(output.repos.len(), Ordering::Relaxed);
 
             let mut batch = db.inner.batch();
             let mut to_queue = Vec::new();
-            let filter = self.state.filter.load();
-            // we can check whether or not to backfill repos faster if we only have to check
-            // certain known signals, since we can just listRecords for those signals
-            // if we have glob signals we cant do this since we dont know what signals to check
-            let check_signals = filter.mode == crate::filter::FilterMode::Filter
-                && !filter.signals.is_empty()
-                && !filter.has_glob_signals();
+            let filter = crawler.state.filter.load();
 
-            // 3. process repos
             let mut unknown_dids = Vec::new();
             for repo in output.repos {
                 let did_key = keys::repo_key(&repo.did);
@@ -531,14 +640,14 @@ impl Crawler {
                     continue;
                 }
 
-                // check if known
                 if !Db::contains_key(db.repos.clone(), &did_key).await? {
                     unknown_dids.push(repo.did.into_static());
                 }
             }
 
-            let valid_dids = if check_signals && !unknown_dids.is_empty() {
-                self.check_signals_batch(&unknown_dids, &filter, &mut batch)
+            let valid_dids = if filter.check_signals() && !unknown_dids.is_empty() {
+                crawler
+                    .check_signals_batch(&unknown_dids, &filter, &mut batch)
                     .await?
             } else {
                 unknown_dids
@@ -548,23 +657,20 @@ impl Crawler {
                 let did_key = keys::repo_key(did);
                 trace!(did = %did, "found new repo");
 
-                let state = RepoState::backfilling_untracked(rng.next_u64());
+                let state = RepoState::untracked(rng.next_u64());
                 batch.insert(&db.repos, &did_key, ser_repo_state(&state)?);
                 batch.insert(&db.pending, keys::pending_key(state.index_id), &did_key);
                 to_queue.push(did.clone());
             }
 
-            // 4. update cursor
             if let Some(new_cursor) = output.cursor {
                 cursor = Some(new_cursor.as_str().into());
-
                 batch.insert(
                     &db.cursors,
                     cursor_key.to_vec(),
                     new_cursor.as_bytes().to_vec(),
                 );
             } else {
-                // end of pagination
                 info!("reached end of list.");
                 cursor = None;
             }
@@ -573,15 +679,79 @@ impl Crawler {
                 .await
                 .into_diagnostic()??;
 
-            self.account_new_repos(to_queue.len()).await;
+            crawler.account_new_repos(to_queue.len()).await;
 
             if cursor.is_none() {
-                // 6. retry previously failed repos before sleeping
-                self.retry_failed_repos(&mut rng).await?;
-
                 tokio::time::sleep(Duration::from_secs(3600)).await;
             }
         }
+    }
+
+    /// scan the retry queue for entries whose `retry_after` timestamp has passed,
+    /// retry them, and return the earliest still-pending timestamp (if any) so the
+    /// caller knows when to wake up next.
+    fn process_retry_queue(&self) -> Result<Option<i64>> {
+        let db = &self.state.db;
+        let now = chrono::Utc::now().timestamp();
+
+        let mut ready: Vec<Did> = Vec::new();
+        let mut next_retry: Option<i64> = None;
+
+        let mut rng: SmallRng = rand::make_rng();
+
+        for guard in db.crawler.prefix(keys::CRAWLER_RETRY_PREFIX) {
+            let (key, val) = guard.into_inner().into_diagnostic()?;
+            let (retry_after, _) = keys::crawler_retry_parse_value(&val)?;
+            let did = keys::crawler_retry_parse_key(&key)?.to_did();
+
+            // we check an extra backoff of 1 - 7% just to make it less likely for
+            // many requests to coincide with each other
+            let backoff =
+                ((retry_after - now).max(0) as f64).mul(rng.random_range(0.01..0.07)) as i64;
+            if retry_after + backoff > now {
+                next_retry = Some(
+                    next_retry
+                        .map(|earliest| earliest.min(retry_after))
+                        .unwrap_or(retry_after),
+                );
+                continue;
+            }
+
+            ready.push(did);
+        }
+
+        if ready.is_empty() {
+            return Ok(next_retry);
+        }
+
+        info!(count = ready.len(), "retrying pending repos");
+
+        let handle = tokio::runtime::Handle::current();
+        let mut batch = db.inner.batch();
+        let filter = self.state.filter.load();
+        let valid_dids = handle.block_on(self.check_signals_batch(&ready, &filter, &mut batch))?;
+
+        let mut rng: SmallRng = rand::make_rng();
+        for did in &valid_dids {
+            let did_key = keys::repo_key(did);
+
+            if db.repos.contains_key(&did_key).into_diagnostic()? {
+                continue;
+            }
+
+            let state = RepoState::untracked(rng.next_u64());
+            batch.insert(&db.repos, &did_key, ser_repo_state(&state)?);
+            batch.insert(&db.pending, keys::pending_key(state.index_id), &did_key);
+        }
+
+        batch.commit().into_diagnostic()?;
+
+        if !valid_dids.is_empty() {
+            info!(count = valid_dids.len(), "recovered from retry queue");
+            handle.block_on(self.account_new_repos(valid_dids.len()));
+        }
+
+        Ok(next_retry)
     }
 
     async fn check_signals_batch(
@@ -599,95 +769,32 @@ impl Crawler {
             let http = self.http.clone();
             let resolver = self.state.resolver.clone();
             let filter = filter.clone();
-            let tracker = self.tracker.clone();
-            let span = tracing::info_span!("check_signals", did = %did);
-            set.spawn(check_repo_signals(http, resolver, filter, did, tracker).instrument(span));
+            let throttler = self.pds_throttler.clone();
+            let span = tracing::info_span!("signals", did = %did);
+            set.spawn(check_repo_signals(http, resolver, filter, did, throttler).instrument(span));
         }
 
         while let Some(res) = set.join_next().await {
             let (did, result) = res.into_diagnostic()?;
             match result {
                 CrawlCheckResult::Signal => {
-                    batch.remove(&db.crawler, keys::crawler_failed_key(&did));
                     valid.push(did);
                 }
-                CrawlCheckResult::NoSignal => {
-                    batch.remove(&db.crawler, keys::crawler_failed_key(&did));
-                }
-                CrawlCheckResult::Ratelimited => {
+                CrawlCheckResult::NoSignal => {}
+                CrawlCheckResult::Retry {
+                    retry_after,
+                    status,
+                } => {
                     batch.insert(
                         &db.crawler,
-                        keys::crawler_failed_key(&did),
-                        429u16.to_be_bytes().as_ref(),
-                    );
-                }
-                CrawlCheckResult::Failed(status) => {
-                    let code = status.unwrap_or(0);
-                    batch.insert(
-                        &db.crawler,
-                        keys::crawler_failed_key(&did),
-                        code.to_be_bytes().as_ref(),
+                        keys::crawler_retry_key(&did),
+                        keys::crawler_retry_value(retry_after, status),
                     );
                 }
             }
         }
 
         Ok(valid)
-    }
-
-    async fn retry_failed_repos(&self, rng: &mut SmallRng) -> Result<()> {
-        let db = &self.state.db;
-        let filter = self.state.filter.load();
-
-        let check_signals = filter.mode == crate::filter::FilterMode::Filter
-            && !filter.signals.is_empty()
-            && !filter.has_glob_signals();
-
-        if !check_signals {
-            return Ok(());
-        }
-
-        let mut failed_dids = Vec::new();
-        for guard in db.crawler.prefix(keys::CRAWLER_FAILED_PREFIX) {
-            let key = guard.key().into_diagnostic()?;
-            let did_bytes = &key[keys::CRAWLER_FAILED_PREFIX.len()..];
-            let trimmed = TrimmedDid::try_from(did_bytes)?;
-            failed_dids.push(trimmed.to_did());
-        }
-
-        if failed_dids.is_empty() {
-            return Ok(());
-        }
-
-        info!("retrying {} previously failed repos", failed_dids.len());
-
-        let mut batch = db.inner.batch();
-        let valid_dids = self
-            .check_signals_batch(&failed_dids, &filter, &mut batch)
-            .await?;
-
-        for did in &valid_dids {
-            let did_key = keys::repo_key(did);
-
-            if Db::contains_key(db.repos.clone(), &did_key).await? {
-                continue;
-            }
-
-            let state = RepoState::backfilling_untracked(rng.next_u64());
-            batch.insert(&db.repos, &did_key, ser_repo_state(&state)?);
-            batch.insert(&db.pending, keys::pending_key(state.index_id), &did_key);
-        }
-
-        tokio::task::spawn_blocking(move || batch.commit().into_diagnostic())
-            .await
-            .into_diagnostic()??;
-
-        if !valid_dids.is_empty() {
-            info!("recovered {} repos from failed retry", valid_dids.len());
-            self.account_new_repos(valid_dids.len()).await;
-        }
-
-        Ok(())
     }
 
     async fn account_new_repos(&self, count: usize) {

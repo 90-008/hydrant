@@ -65,7 +65,8 @@ impl<'i> RepoState<'i> {
         }
     }
 
-    pub fn backfilling_untracked(index_id: u64) -> Self {
+    /// backfilling, but not tracked yet
+    pub fn untracked(index_id: u64) -> Self {
         Self {
             tracked: false,
             ..Self::backfilling(index_id)

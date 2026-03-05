@@ -52,8 +52,12 @@ impl FilterConfig {
         self.signals.iter().any(|p| nsid_matches(p, collection))
     }
 
-    pub fn has_glob_signals(&self) -> bool {
+    fn has_glob_signals(&self) -> bool {
         self.signals.iter().any(|s| s.ends_with(".*"))
+    }
+
+    pub fn check_signals(&self) -> bool {
+        self.mode == FilterMode::Filter && !self.signals.is_empty() && !self.has_glob_signals()
     }
 }
 

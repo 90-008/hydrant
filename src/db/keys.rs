@@ -132,12 +132,32 @@ pub fn resync_buffer_prefix(did: &Did) -> Vec<u8> {
     prefix
 }
 
-pub const CRAWLER_FAILED_PREFIX: &[u8] = &[b'f', SEP];
+/// key format: `ret|<did bytes>`
+pub const CRAWLER_RETRY_PREFIX: &[u8] = b"ret|";
 
-pub fn crawler_failed_key(did: &Did) -> Vec<u8> {
+pub fn crawler_retry_key(did: &Did) -> Vec<u8> {
     let repo = TrimmedDid::from(did);
-    let mut key = Vec::with_capacity(CRAWLER_FAILED_PREFIX.len() + repo.len());
-    key.extend_from_slice(CRAWLER_FAILED_PREFIX);
+    let mut key = Vec::with_capacity(CRAWLER_RETRY_PREFIX.len() + repo.len());
+    key.extend_from_slice(CRAWLER_RETRY_PREFIX);
     repo.write_to_vec(&mut key);
     key
+}
+
+/// value format: `<retry_after: i64 BE><status: u16 BE>`
+pub fn crawler_retry_value(retry_after: i64, status: u16) -> [u8; 10] {
+    let mut buf = [0u8; 10];
+    buf[..8].copy_from_slice(&retry_after.to_be_bytes());
+    buf[8..].copy_from_slice(&status.to_be_bytes());
+    buf
+}
+
+pub fn crawler_retry_parse_value(val: &[u8]) -> miette::Result<(i64, u16)> {
+    miette::ensure!(val.len() >= 10, "crawler retry value too short");
+    let retry_after = i64::from_be_bytes(val[..8].try_into().unwrap());
+    let status = u16::from_be_bytes(val[8..10].try_into().unwrap());
+    Ok((retry_after, status))
+}
+
+pub fn crawler_retry_parse_key(key: &[u8]) -> miette::Result<TrimmedDid<'_>> {
+    TrimmedDid::try_from(&key[CRAWLER_RETRY_PREFIX.len()..])
 }
