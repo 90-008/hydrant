@@ -10,6 +10,7 @@ use rand::Rng;
 use rand::RngExt;
 use rand::rngs::SmallRng;
 use reqwest::StatusCode;
+use serde::{Deserialize, Serialize};
 use smol_str::SmolStr;
 use std::future::Future;
 use std::ops::Mul;
@@ -376,8 +377,14 @@ async fn check_repo_signals(
     )
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+enum Cursor {
+    Done,
+    Next(Option<SmolStr>),
+}
+
 pub mod throttle;
-use throttle::{OrThrottle, Throttler};
+use throttle::{OrFailure, Throttler};
 
 pub struct Crawler {
     state: Arc<AppState>,
@@ -505,13 +512,13 @@ impl Crawler {
         let db = &crawler.state.db;
 
         let cursor_key = b"crawler_cursor";
-        let mut cursor: Option<SmolStr> = Db::get(db.cursors.clone(), cursor_key.to_vec())
-            .await?
-            .map(|bytes| {
-                let s = String::from_utf8_lossy(&bytes);
-                info!(cursor = %s, "resuming");
-                s.into()
-            });
+        let cursor_bytes = Db::get(db.cursors.clone(), cursor_key.to_vec()).await?;
+        let mut cursor: Cursor = cursor_bytes
+            .as_deref()
+            .map(rmp_serde::from_slice)
+            .transpose()
+            .into_diagnostic()?
+            .unwrap_or(Cursor::Next(None));
         let mut was_throttled = false;
 
         loop {
@@ -569,7 +576,7 @@ impl Crawler {
             list_repos_url
                 .query_pairs_mut()
                 .append_pair("limit", "1000");
-            if let Some(c) = &cursor {
+            if let Cursor::Next(Some(c)) = &cursor {
                 list_repos_url
                     .query_pairs_mut()
                     .append_pair("cursor", c.as_str());
@@ -664,7 +671,7 @@ impl Crawler {
             }
 
             if let Some(new_cursor) = output.cursor {
-                cursor = Some(new_cursor.as_str().into());
+                cursor = Cursor::Next(Some(new_cursor.as_str().into()));
                 batch.insert(
                     &db.cursors,
                     cursor_key.to_vec(),
@@ -672,7 +679,7 @@ impl Crawler {
                 );
             } else {
                 info!("reached end of list.");
-                cursor = None;
+                cursor = Cursor::Done;
             }
 
             tokio::task::spawn_blocking(move || batch.commit().into_diagnostic())
@@ -681,7 +688,7 @@ impl Crawler {
 
             crawler.account_new_repos(to_queue.len()).await;
 
-            if cursor.is_none() {
+            if matches!(cursor, Cursor::Done) {
                 tokio::time::sleep(Duration::from_secs(3600)).await;
             }
         }
@@ -699,9 +706,23 @@ impl Crawler {
 
         let mut rng: SmallRng = rand::make_rng();
 
+        let mut batch = db.inner.batch();
         for guard in db.crawler.prefix(keys::CRAWLER_RETRY_PREFIX) {
             let (key, val) = guard.into_inner().into_diagnostic()?;
-            let (retry_after, _) = keys::crawler_retry_parse_value(&val)?;
+            let (retry_after, _) = match keys::crawler_retry_parse_value(&val) {
+                Ok(x) => x,
+                Err(_) => {
+                    // this handles the old db format
+                    // todo: remove this later!! its just for testing...
+                    let retry_after = now + 60 * 5;
+                    batch.insert(
+                        &db.crawler,
+                        key.clone(),
+                        keys::crawler_retry_value(retry_after, 0),
+                    );
+                    (retry_after, 0)
+                }
+            };
             let did = keys::crawler_retry_parse_key(&key)?.to_did();
 
             // we check an extra backoff of 1 - 7% just to make it less likely for
@@ -727,7 +748,6 @@ impl Crawler {
         info!(count = ready.len(), "retrying pending repos");
 
         let handle = tokio::runtime::Handle::current();
-        let mut batch = db.inner.batch();
         let filter = self.state.filter.load();
         let valid_dids = handle.block_on(self.check_signals_batch(&ready, &filter, &mut batch))?;
 

@@ -148,12 +148,9 @@ impl ThrottleHandle {
     }
 }
 
-/// extension trait that adds `.or_throttle()` to any future returning `Result<T, E>`.
-///
-/// races the future against a hard-failure notification. soft ratelimits (429) do NOT
-/// trigger cancellation — those are handled by the background retry loop.
+/// adds a method for racing the future against a hard-failure notification.
 #[allow(async_fn_in_trait)]
-pub trait OrThrottle<T, E>: Future<Output = Result<T, E>> {
+pub trait OrFailure<T, E>: Future<Output = Result<T, E>> {
     async fn or_failure(
         self,
         handle: &ThrottleHandle,
@@ -169,4 +166,4 @@ pub trait OrThrottle<T, E>: Future<Output = Result<T, E>> {
     }
 }
 
-impl<T, E, F: Future<Output = Result<T, E>>> OrThrottle<T, E> for F {}
+impl<T, E, F: Future<Output = Result<T, E>>> OrFailure<T, E> for F {}
