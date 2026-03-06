@@ -54,7 +54,7 @@ impl RetryState {
         if attempts >= MAX_RETRY_ATTEMPTS {
             return None;
         }
-        let duration = self.duration * 2i32.pow(self.attempts.min(4));
+        let duration = self.duration * 2;
         Some(Self {
             after: Utc::now().add(duration),
             duration,
@@ -396,13 +396,8 @@ impl Crawler {
 
                 loop {
                     match crawler.process_retry_queue() {
-                        Ok(Some(next)) => {
-                            let secs = next.signed_duration_since(Utc::now());
-                            sleep(secs.to_std().expect("that time delta was positive"));
-                        }
-                        Ok(None) => {
-                            sleep(Duration::from_secs(60));
-                        }
+                        Ok(Some(dur)) => sleep(dur),
+                        Ok(None) => sleep(Duration::from_secs(60)),
                         Err(e) => {
                             error!(err = %e, "retry loop failed");
                             sleep(Duration::from_secs(60));
@@ -628,13 +623,13 @@ impl Crawler {
         }
     }
 
-    fn process_retry_queue(&self) -> Result<Option<DateTime<Utc>>> {
+    fn process_retry_queue(&self) -> Result<Option<Duration>> {
         let db = &self.state.db;
         let now = Utc::now();
 
         let mut ready: Vec<Did> = Vec::new();
         let mut existing: HashMap<Did<'static>, RetryState> = HashMap::new();
-        let mut next_retry: Option<DateTime<Utc>> = None;
+        let mut next_wake: Option<Duration> = None;
         let mut had_more = false;
 
         let mut rng: SmallRng = rand::make_rng();
@@ -657,11 +652,8 @@ impl Crawler {
                     .mul(rng.random_range(0.01..0.07)) as i64,
             );
             if state.after + backoff > now {
-                next_retry = Some(
-                    next_retry
-                        .map(|earliest| earliest.min(state.after))
-                        .unwrap_or(state.after),
-                );
+                let wake = (state.after - now).to_std().unwrap_or(Duration::ZERO);
+                next_wake = Some(next_wake.map(|w| w.min(wake)).unwrap_or(wake));
                 continue;
             }
 
@@ -675,7 +667,7 @@ impl Crawler {
         }
 
         if ready.is_empty() {
-            return Ok(next_retry);
+            return Ok(next_wake);
         }
 
         info!(count = ready.len(), "retrying pending repos");
@@ -706,7 +698,7 @@ impl Crawler {
         }
 
         // if we hit the batch cap there are more ready entries, loop back immediately
-        Ok(had_more.then(Utc::now).or(next_retry))
+        Ok(had_more.then_some(Duration::ZERO).or(next_wake))
     }
 
     async fn check_signals_batch(
