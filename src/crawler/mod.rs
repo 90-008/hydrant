@@ -23,12 +23,7 @@ use url::Url;
 enum CrawlCheckResult {
     Signal,
     NoSignal,
-    /// task could not complete; should be retried at `retry_after` (unix timestamp).
-    /// `status` is the HTTP status that triggered this (0 for non-HTTP failures).
-    Retry {
-        retry_after: i64,
-        status: u16,
-    },
+    Retry { retry_after: i64, status: u16 },
 }
 
 /// outcome of [`RetryWithBackoff::retry`] when the operation does not succeed.
@@ -431,13 +426,15 @@ impl Crawler {
     }
 
     pub async fn run(self) -> Result<()> {
+        let crawler = Arc::new(self);
+
         // stats ticker
         tokio::spawn({
             use std::time::Instant;
-            let count = self.count.clone();
-            let crawled_count = self.crawled_count.clone();
-            let throttled = self.throttled.clone();
-            let pds_throttler = self.pds_throttler.clone();
+            let count = crawler.count.clone();
+            let crawled_count = crawler.crawled_count.clone();
+            let throttled = crawler.throttled.clone();
+            let pds_throttler = crawler.pds_throttler.clone();
             let mut last_time = Instant::now();
             let mut interval = tokio::time::interval(Duration::from_secs(60));
             async move {
@@ -451,7 +448,7 @@ impl Crawler {
 
                     if delta_processed == 0 && delta_crawled == 0 {
                         if is_throttled {
-                            info!("crawler throttled: pending queue full");
+                            info!("throttled: pending queue full");
                         } else {
                             debug!("no repos crawled or processed in 60s");
                         }
@@ -463,14 +460,14 @@ impl Crawler {
                         processed = delta_processed,
                         crawled = delta_crawled,
                         elapsed,
-                        "crawler progress"
+                        "progress"
                     );
                     last_time = Instant::now();
                 }
             }
         });
 
-        let crawler = Arc::new(self);
+        // retry thread
         std::thread::spawn({
             let crawler = crawler.clone();
             let handle = tokio::runtime::Handle::current();
@@ -497,6 +494,15 @@ impl Crawler {
             }
         });
 
+        loop {
+            if let Err(e) = Self::crawl(crawler.clone()).await {
+                error!(err = %e, "fatal error, restarting in 30s");
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            }
+        }
+    }
+
+    async fn crawl(crawler: Arc<Self>) -> Result<()> {
         let mut relay_url = crawler.relay_host.clone();
         match relay_url.scheme() {
             "wss" => relay_url
