@@ -785,17 +785,18 @@ impl Crawler {
                         attempts: prev_attempts,
                         ..state
                     };
-                    if let Some(next) = carried.next_attempt() {
-                        batch.insert(
-                            &db.crawler,
-                            keys::crawler_retry_key(&did),
-                            rmp_serde::to_vec(&next)
-                                .into_diagnostic()
-                                .wrap_err("cant ser retry state")?,
-                        );
-                    }
-                    // next_attempt() == None means we've hit the cap;
-                    // leave the existing entry untouched for API inspection
+                    let next = match carried.next_attempt() {
+                        Some(next) => next,
+                        None => RetryState {
+                            attempts: MAX_RETRY_ATTEMPTS,
+                            ..state
+                        },
+                    };
+                    batch.insert(
+                        &db.crawler,
+                        keys::crawler_retry_key(&did),
+                        rmp_serde::to_vec(&next).into_diagnostic()?,
+                    );
                 }
             }
         }
