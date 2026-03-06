@@ -96,7 +96,7 @@ each set field accepts one of two forms:
     - `limit`: max results (default 100, max 1000)
     - `cursor`: opaque key for paginating.
     - `partition`: `all` (default), `pending` (backfill queue), or `resync` (retries)
-- `GET /repos/{did}`: get the sync status and metadata of a specific repository.
+- `GET /repos/{did}`: get the sync status and metadata of a specific repository. also returns the handle, PDS URL and the atproto signing key (these won't be available before the repo has been backfilled once at least).
 - `PUT /repos`: explicitly track repositories. accepts an NDJSON body of `{"did": "..."}` (or JSON array of the same).
 - `DELETE /repos`: untrack repositories. accepts an NDJSON body of `{"did": "..."}` (or JSON array of the same). optionally include `"deleteData": true` to also purge the repository from the database.
 

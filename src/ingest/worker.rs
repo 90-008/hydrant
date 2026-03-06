@@ -311,7 +311,7 @@ impl FirehoseWorker {
             SubscribeReposMessage::Sync(sync) => {
                 debug!(did = %did, "processing buffered sync");
 
-                ctx.state.resolver.invalidate_sync(did);
+                Self::refresh_doc(ctx, &mut repo_state, did)?;
 
                 match ops::verify_sync_event(
                     sync.blocks.as_ref(),
@@ -360,10 +360,8 @@ impl FirehoseWorker {
                     // we invalidate only if no handle is sent since its like a
                     // "invalidate your caches" message then basically
                     ctx.state.resolver.invalidate_sync(did);
-                    let (_, handle) = ctx
-                        .handle
-                        .block_on(ctx.state.resolver.resolve_identity_info(did))?;
-                    repo_state.handle = handle;
+                    let doc = ctx.handle.block_on(ctx.state.resolver.resolve_doc(did))?;
+                    repo_state.update_from_doc(doc);
                 }
 
                 let handle = identity.handle.as_ref().map(|h| h.clone());
@@ -389,7 +387,7 @@ impl FirehoseWorker {
                     status: account.status.as_ref().map(|s| s.to_cowstr().into_static()),
                 };
 
-                ctx.state.resolver.invalidate_sync(did);
+                Self::refresh_doc(ctx, &mut repo_state, did)?;
 
                 if !account.active {
                     use crate::ingest::stream::AccountStatus;
@@ -683,6 +681,23 @@ impl FirehoseWorker {
         }
 
         Ok(RepoProcessResult::Ok(repo_state))
+    }
+
+    // refreshes the handle, pds url and signing key of a did
+    fn refresh_doc(
+        ctx: &mut WorkerContext,
+        repo_state: &mut RepoState,
+        did: &Did,
+    ) -> Result<(), IngestError> {
+        ctx.state.resolver.invalidate_sync(did);
+        let doc = ctx.handle.block_on(ctx.state.resolver.resolve_doc(did))?;
+        repo_state.update_from_doc(doc);
+        ctx.batch.insert(
+            &ctx.state.db.repos,
+            keys::repo_key(did),
+            crate::db::ser_repo_state(&repo_state)?,
+        );
+        Ok(())
     }
 
     fn fetch_key(

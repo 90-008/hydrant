@@ -5,9 +5,10 @@ use jacquard_common::types::string::Did;
 use jacquard_common::{CowStr, IntoStatic, types::string::Handle};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use smol_str::SmolStr;
+use smol_str::{SmolStr, ToSmolStr};
 
-use crate::db::types::{DbAction, DbRkey, DbTid, TrimmedDid};
+use crate::db::types::{DbAction, DbRkey, DbTid, DidKey, TrimmedDid};
+use crate::resolver::MiniDoc;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum RepoStatus {
@@ -45,6 +46,10 @@ pub struct RepoState<'i> {
     pub index_id: u64,
     #[serde(default = "default_tracked")]
     pub tracked: bool,
+    #[serde(default)]
+    pub signing_key: Option<DidKey<'i>>,
+    #[serde(default)]
+    pub pds: Option<CowStr<'i>>,
 }
 
 fn default_tracked() -> bool {
@@ -59,9 +64,12 @@ impl<'i> RepoState<'i> {
             data: None,
             last_seq: None,
             last_updated_at: chrono::Utc::now().timestamp(),
-            handle: None,
+
             index_id,
             tracked: true,
+            handle: None,
+            pds: None,
+            signing_key: None,
         }
     }
 
@@ -71,6 +79,12 @@ impl<'i> RepoState<'i> {
             tracked: false,
             ..Self::backfilling(index_id)
         }
+    }
+
+    pub fn update_from_doc(&mut self, doc: MiniDoc) {
+        self.pds = Some(CowStr::Owned(doc.pds.to_smolstr()));
+        self.handle = doc.handle;
+        self.signing_key = doc.key.map(From::from);
     }
 }
 
@@ -84,9 +98,11 @@ impl<'i> IntoStatic for RepoState<'i> {
             data: self.data,
             last_seq: self.last_seq,
             last_updated_at: self.last_updated_at,
-            handle: self.handle.map(|s| s.into_static()),
             index_id: self.index_id,
             tracked: self.tracked,
+            handle: self.handle.map(IntoStatic::into_static),
+            pds: self.pds.map(IntoStatic::into_static),
+            signing_key: self.signing_key.map(IntoStatic::into_static),
         }
     }
 }

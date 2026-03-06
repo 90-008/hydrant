@@ -39,6 +39,13 @@ pub struct RepoResponse {
     pub tracked: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rev: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub handle: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pds: Option<String>,
+    // this does not have the did:key: prefix
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signing_key: Option<String>,
     pub last_updated_at: i64,
 }
 
@@ -71,13 +78,7 @@ pub async fn handle_get_repos(
                 .map_err(internal)?
                 .to_did();
 
-            Ok(RepoResponse {
-                did: did.to_string(),
-                status: repo_state.status.to_string(),
-                tracked: repo_state.tracked,
-                rev: repo_state.rev.as_ref().map(|r| r.to_string()),
-                last_updated_at: repo_state.last_updated_at,
-            })
+            Ok(repo_state_to_response(did.to_string(), repo_state))
         };
 
         let results = match partition.as_str() {
@@ -172,13 +173,7 @@ pub async fn handle_get_repo(
             .transpose()
             .map_err(internal)?;
 
-        Ok(repo_state.map(|s| RepoResponse {
-            did: did_str,
-            status: s.status.to_string(),
-            tracked: s.tracked,
-            rev: s.rev.as_ref().map(|r| r.to_string()),
-            last_updated_at: s.last_updated_at,
-        }))
+        Ok(repo_state.map(|s| repo_state_to_response(did_str, s)))
     })
     .await
     .map_err(internal)??;
@@ -343,6 +338,19 @@ pub async fn handle_delete_repos(
     }
 
     Ok(StatusCode::OK)
+}
+
+fn repo_state_to_response(did: String, s: RepoState<'_>) -> RepoResponse {
+    RepoResponse {
+        did,
+        status: s.status.to_string(),
+        tracked: s.tracked,
+        rev: s.rev.as_ref().map(|r| r.to_string()),
+        handle: s.handle.map(|h| h.to_string()),
+        pds: s.pds.map(|p| p.to_string()),
+        signing_key: s.signing_key.map(|k| k.encode()),
+        last_updated_at: s.last_updated_at,
+    }
 }
 
 async fn parse_body(req: axum::extract::Request) -> Result<Vec<RepoRequest>, (StatusCode, String)> {

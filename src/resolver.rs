@@ -49,9 +49,9 @@ impl From<miette::Report> for ResolverError {
 
 #[derive(Clone)]
 pub struct MiniDoc {
-    pds: Url,
-    handle: Option<Handle<'static>>,
-    key: Option<PublicKey<'static>>,
+    pub pds: Url,
+    pub handle: Option<Handle<'static>>,
+    pub key: Option<PublicKey<'static>>,
 }
 
 struct ResolverInner {

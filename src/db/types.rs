@@ -1,10 +1,13 @@
 use data_encoding::BASE32_NOPAD;
 use fjall::UserKey;
+use jacquard_common::types::crypto::{PublicKey, code_of, encode_uvarint};
 use jacquard_common::types::string::Did;
 use jacquard_common::types::tid::Tid;
 use jacquard_common::{CowStr, IntoStatic};
+use miette::{Context, IntoDiagnostic};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use smol_str::{SmolStr, SmolStrBuilder, format_smolstr};
+use std::borrow::Cow;
 use std::fmt::Display;
 
 const S32_CHAR: &str = "234567abcdefghijklmnopqrstuvwxyz";
@@ -353,6 +356,45 @@ impl From<SmolStr> for DbRkey {
 impl Display for DbRkey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.to_smolstr())
+    }
+}
+
+/// did:key:z... → raw multicodec public key bytes
+#[derive(Debug, Clone, Serialize, Deserialize, jacquard_derive::IntoStatic)]
+pub struct DidKey<'b>(
+    #[serde(borrow)]
+    #[serde(with = "serde_bytes")]
+    pub Cow<'b, [u8]>,
+);
+
+impl DidKey<'_> {
+    pub fn from_did_key(s: &str) -> miette::Result<Self> {
+        let multibase_str = s
+            .strip_prefix("did:key:")
+            .ok_or_else(|| miette::miette!("missing did:key: prefix in {s}"))?;
+        let (_base, bytes) = multibase::decode(multibase_str)
+            .into_diagnostic()
+            .wrap_err("invalid multibase in did:key")?;
+        Ok(Self(Cow::Owned(bytes)))
+    }
+
+    pub fn encode(&self) -> String {
+        multibase::encode(multibase::Base::Base58Btc, &self.0)
+    }
+}
+
+impl std::fmt::Display for DidKey<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "did:key:{}", self.encode())
+    }
+}
+
+impl From<PublicKey<'_>> for DidKey<'static> {
+    fn from(value: PublicKey<'_>) -> Self {
+        let mut bytes = Vec::with_capacity(8 + value.bytes.len());
+        bytes.append(&mut encode_uvarint(code_of(value.codec)));
+        bytes.extend_from_slice(&value.bytes);
+        Self(bytes.into())
     }
 }
 

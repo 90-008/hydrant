@@ -45,6 +45,7 @@ glob = "0.3"
 arc-swap = "1.8.2"
 rustls = { version = "0.23", features = ["aws-lc-rs"] }
 tokio-tungstenite = { version = "0.28.0", features = ["rustls-tls-native-roots"] }
+multibase = "0.9.2"
 
 [dev-dependencies]
 tempfile = "3.26.0"

@@ -376,16 +376,16 @@ async fn process_did<'i>(
 
     // 1. resolve pds
     let start = Instant::now();
-    let (pds_url, handle) = app_state.resolver.resolve_identity_info(did).await?;
+    let doc = app_state.resolver.resolve_doc(did).await?;
+    let pds = doc.pds.clone();
     trace!(
         did = %did,
-        pds_url = %pds_url,
-        ?handle,
+        pds = %doc.pds,
+        handle = ?doc.handle,
         elapsed = ?start.elapsed(),
         "resolved to pds"
     );
-
-    state.handle = handle.map(|h| h.into_static());
+    state.update_from_doc(doc);
 
     let emit_identity = |status: &RepoStatus| {
         let evt = AccountEvt {
@@ -410,7 +410,7 @@ async fn process_did<'i>(
     // 2. fetch repo (car)
     let start = Instant::now();
     let req = GetRepo::new().did(did.clone()).build();
-    let resp = http.xrpc(pds_url).send(&req).await?;
+    let resp = http.xrpc(pds).send(&req).await?;
 
     let car_bytes = match resp.into_output() {
         Ok(o) => o,
