@@ -80,8 +80,8 @@ the `mode` field controls what gets indexed:
 
 each set field accepts one of two forms:
 
-- **replace**: an array replaces the entire set — `["did:plc:abc", "did:plc:xyz"]`
-- **patch**: an object maps items to `true` (add) or `false` (remove) — `{"did:plc:abc": true, "did:plc:xyz": false}`
+- **replace**: an array replaces the entire set — `["did:plc:abc", "did:web:example.org"]`
+- **patch**: an object maps items to `true` (add) or `false` (remove) — `{"did:plc:abc": true, "did:web:example.org": false}`
 
 #### NSID patterns
 
