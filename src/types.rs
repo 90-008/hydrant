@@ -39,7 +39,6 @@ pub struct RepoState<'i> {
     pub status: RepoStatus,
     pub rev: Option<DbTid>,
     pub data: Option<IpldCid>,
-    pub last_seq: Option<i64>,
     pub last_updated_at: i64, // unix timestamp
     #[serde(borrow)]
     pub handle: Option<Handle<'i>>,
@@ -62,7 +61,6 @@ impl<'i> RepoState<'i> {
             status: RepoStatus::Backfilling,
             rev: None,
             data: None,
-            last_seq: None,
             last_updated_at: chrono::Utc::now().timestamp(),
 
             index_id,
@@ -96,7 +94,6 @@ impl<'i> IntoStatic for RepoState<'i> {
             status: self.status,
             rev: self.rev,
             data: self.data,
-            last_seq: self.last_seq,
             last_updated_at: self.last_updated_at,
             index_id: self.index_id,
             tracked: self.tracked,
