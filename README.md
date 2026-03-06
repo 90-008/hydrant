@@ -2,6 +2,8 @@
 
 `hydrant` is an AT Protocol indexer built on the `fjall` database. it's meant to be a flexible indexer, supporting both full-network indexing and filtered indexing (e.g., by DID), also allowing querying with XRPCs and providing an ordered event stream with cursor support.
 
+you can see [random.wisp.place](https://tangled.org/did:plc:dfl62fgb7wtjj3fcbb72naae/random.wisp.place) for an example on how to use hydrant.
+
 ## vs `tap`
 
 while [`tap`](https://github.com/bluesky-social/indigo/tree/main/cmd/tap) is designed primarily as a firehose consumer and relay, `hydrant` is flexible, it allows you to directly query the database for records, and it also provides an ordered view of events, allowing the use of a cursor to fetch events from a specific point in time.
