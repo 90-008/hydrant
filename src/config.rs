@@ -138,7 +138,7 @@ impl Config {
             default_db_memtable_size_mb,
         ): (usize, u64, u64) = full_network
             .then_some((8usize, 1024u64, 192u64))
-            .unwrap_or((4usize, 512u64, 64u64));
+            .unwrap_or((4usize, 400u64, 32u64));
 
         let db_worker_threads = cfg!("DB_WORKER_THREADS", default_db_worker_threads);
         let db_max_journaling_size_mb = cfg!(
