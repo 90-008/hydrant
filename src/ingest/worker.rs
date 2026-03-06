@@ -355,11 +355,28 @@ impl FirehoseWorker {
             }
             SubscribeReposMessage::Identity(identity) => {
                 debug!(did = %did, "processing buffered identity");
-                let handle = identity.handle.as_ref().map(|h| h.clone().into_static());
+
+                if identity.handle.is_none() {
+                    // we invalidate only if no handle is sent since its like a
+                    // "invalidate your caches" message then basically
+                    ctx.state.resolver.invalidate_sync(did);
+                    let (_, handle) = ctx
+                        .handle
+                        .block_on(ctx.state.resolver.resolve_identity_info(did))?;
+                    repo_state.handle = handle;
+                }
+
+                let handle = identity.handle.as_ref().map(|h| h.clone());
+                repo_state.handle = handle.or(repo_state.handle);
+                ctx.batch.insert(
+                    &ctx.state.db.repos,
+                    keys::repo_key(did),
+                    crate::db::ser_repo_state(&repo_state)?,
+                );
 
                 let evt = IdentityEvt {
                     did: did.clone().into_static(),
-                    handle,
+                    handle: repo_state.handle.clone(),
                 };
                 ctx.broadcast_events
                     .push(ops::make_identity_event(&ctx.state.db, evt));
