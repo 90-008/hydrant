@@ -45,7 +45,7 @@ the `WS /stream` (hydrant) and `WS /channel` (tap) endpoints have different desi
 | `NO_LZ4_COMPRESSION` | `false` | disable lz4 compression for storage. |
 | `ENABLE_FIREHOSE` | `true` | whether to ingest relay subscriptions. |
 | `ENABLE_BACKFILL` | `true` | whether to backfill from PDS instances. |
-| `ENABLE_CRAWLER` | `false` (if Filter), `true` (if Full) | whether to actively query the network for unknown repositories. when in `Filter` mode without wildcard (`*`) signals, the crawler uses `com.atproto.repo.listRecords` to verify if a discovered repository has matching records before queuing it for backfill, this will be a lot faster usually since most repos will get filtered out faster. |
+| `ENABLE_CRAWLER` | `false` (if Filter), `true` (if Full) | whether to actively query the network for unknown repositories. |
 | `DB_WORKER_THREADS` | `4` (`8` if full network) | database worker threads. |
 | `DB_MAX_JOURNALING_SIZE_MB` | `512` (`1024` if full network) | max database journaling size in MB. |
 | `DB_PENDING_MEMTABLE_SIZE_MB` | `64` (`192` if full network) | pending memtable size in MB. |

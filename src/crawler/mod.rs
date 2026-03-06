@@ -285,7 +285,10 @@ async fn check_repo_signals(
         }
     };
 
-    let found_signal = filter.signals.iter().any(|s| out.collections.contains(s));
+    let found_signal = out
+        .collections
+        .iter()
+        .any(|col| filter.matches_signal(col.as_str()));
 
     if !found_signal {
         trace!("no signal-matching collections found");
