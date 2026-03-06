@@ -144,7 +144,7 @@ pub async fn handle_get_record(
 
     if let Some(cid_bytes) = cid_bytes {
         // lookup block using binary cid
-        let block_bytes = Db::get(db.blocks.clone(), &cid_bytes)
+        let block_bytes = Db::get(db.blocks.clone(), cid_bytes.clone())
             .await
             .map_err(|e| internal_error(GetRecordRequest::PATH, e))?
             .ok_or_else(|| internal_error(GetRecordRequest::PATH, "not found"))?;

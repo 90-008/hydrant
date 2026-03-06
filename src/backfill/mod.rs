@@ -214,6 +214,13 @@ async fn did_task(
             state.db.update_count_async("pending", -1).await;
             Ok(())
         }
+        Err(BackfillError::Deleted) => {
+            warn!(did = %did, "orphaned pending entry, cleaning up");
+            // orphaned pending entry, clean it up
+            Db::remove(db.pending.clone(), pending_key).await?;
+            state.db.update_count_async("pending", -1).await;
+            Ok(())
+        }
         Err(e) => {
             match &e {
                 BackfillError::Ratelimited => {
@@ -225,12 +232,14 @@ async fn did_task(
                 BackfillError::Generic(e) => {
                     error!(did = %did, err = %e, "failed");
                 }
+                BackfillError::Deleted => unreachable!("already handled"),
             }
 
             let error_kind = match &e {
                 BackfillError::Ratelimited => ResyncErrorKind::Ratelimited,
                 BackfillError::Transport(_) => ResyncErrorKind::Transport,
                 BackfillError::Generic(_) => ResyncErrorKind::Generic,
+                BackfillError::Deleted => unreachable!("already handled"),
             };
 
             let did_key = keys::repo_key(&did);
@@ -293,11 +302,9 @@ async fn did_task(
             .await
             .into_diagnostic()??;
 
-            let old_gauge = if let Some(k) = prev_kind {
-                GaugeState::Resync(Some(k))
-            } else {
-                GaugeState::Pending
-            };
+            let old_gauge = prev_kind
+                .map(|k| GaugeState::Resync(Some(k)))
+                .unwrap_or(GaugeState::Pending);
 
             let new_gauge = GaugeState::Resync(Some(error_kind));
 
@@ -319,6 +326,8 @@ enum BackfillError {
     Ratelimited,
     #[error("transport error: {0}")]
     Transport(SmolStr),
+    #[error("repo was concurrently deleted")]
+    Deleted,
 }
 
 impl From<ClientError> for BackfillError {
@@ -366,9 +375,9 @@ async fn process_did<'i>(
 
     let db = &app_state.db;
     let did_key = keys::repo_key(did);
-    let state_bytes = Db::get(db.repos.clone(), did_key)
-        .await?
-        .ok_or_else(|| miette::miette!("!!!THIS IS A BUG!!! repo state for {did} missing"))?;
+    let Some(state_bytes) = Db::get(db.repos.clone(), did_key).await? else {
+        return Err(BackfillError::Deleted);
+    };
     let mut state: RepoState<'static> = rmp_serde::from_slice::<RepoState>(&state_bytes)
         .into_diagnostic()?
         .into_static();

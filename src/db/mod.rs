@@ -263,8 +263,8 @@ impl Db {
         Ok(())
     }
 
-    pub async fn get(ks: Keyspace, key: impl AsRef<[u8]>) -> Result<Option<Slice>> {
-        let key = key.as_ref().to_vec();
+    pub async fn get(ks: Keyspace, key: impl Into<Slice>) -> Result<Option<Slice>> {
+        let key = key.into();
         tokio::task::spawn_blocking(move || ks.get(key).into_diagnostic())
             .await
             .into_diagnostic()?
@@ -273,26 +273,26 @@ impl Db {
     #[allow(dead_code)]
     pub async fn insert(
         ks: Keyspace,
-        key: impl AsRef<[u8]>,
-        value: impl AsRef<[u8]>,
+        key: impl Into<Slice>,
+        value: impl Into<Slice>,
     ) -> Result<()> {
-        let key = key.as_ref().to_vec();
-        let value = value.as_ref().to_vec();
+        let key = key.into();
+        let value = value.into();
         tokio::task::spawn_blocking(move || ks.insert(key, value).into_diagnostic())
             .await
             .into_diagnostic()?
     }
 
     #[allow(dead_code)]
-    pub async fn remove(ks: Keyspace, key: impl AsRef<[u8]>) -> Result<()> {
-        let key = key.as_ref().to_vec();
+    pub async fn remove(ks: Keyspace, key: impl Into<Slice>) -> Result<()> {
+        let key = key.into();
         tokio::task::spawn_blocking(move || ks.remove(key).into_diagnostic())
             .await
             .into_diagnostic()?
     }
 
-    pub async fn contains_key(ks: Keyspace, key: impl AsRef<[u8]>) -> Result<bool> {
-        let key = key.as_ref().to_vec();
+    pub async fn contains_key(ks: Keyspace, key: impl Into<Slice>) -> Result<bool> {
+        let key = key.into();
         tokio::task::spawn_blocking(move || ks.contains_key(key).into_diagnostic())
             .await
             .into_diagnostic()?

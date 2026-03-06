@@ -6,7 +6,7 @@ use crate::types::{GaugeState, RepoStatus, ResyncState};
 use miette::{IntoDiagnostic, Result};
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 pub fn queue_gone_backfills(state: &Arc<AppState>) -> Result<()> {
     debug!("scanning for deactivated/takendown repos to retry...");
@@ -29,7 +29,7 @@ pub fn queue_gone_backfills(state: &Arc<AppState>) -> Result<()> {
                 debug!(did = %did, "queuing retry for gone repo");
 
                 let Some(state_bytes) = state.db.repos.get(&key).into_diagnostic()? else {
-                    error!(did = %did, "repo state not found");
+                    warn!(did = %did, "repo state not found");
                     continue;
                 };
 

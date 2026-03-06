@@ -148,7 +148,6 @@ async fn main() -> miette::Result<()> {
         let persist_interval = cfg.cursor_save_interval;
 
         move || {
-            info!("persistence worker started");
             loop {
                 std::thread::sleep(persist_interval);
 
