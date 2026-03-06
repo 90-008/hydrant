@@ -24,7 +24,7 @@ use tracing::{Instrument, debug, error, info, trace, warn};
 use url::Url;
 
 const MAX_RETRY_ATTEMPTS: u32 = 5;
-const MAX_RETRY_BATCH: usize = 500;
+const MAX_RETRY_BATCH: usize = 512;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct RetryState {
@@ -408,7 +408,7 @@ impl Crawler {
 
                 loop {
                     match crawler.process_retry_queue() {
-                        Ok(Some(dur)) => sleep(dur),
+                        Ok(Some(dur)) => sleep(dur.max(Duration::from_secs(1))),
                         Ok(None) => sleep(Duration::from_secs(60)),
                         Err(e) => {
                             error!(err = %e, "retry loop failed");
