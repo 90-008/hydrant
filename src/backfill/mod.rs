@@ -361,6 +361,9 @@ async fn process_did<'i>(
 ) -> Result<Option<RepoState<'static>>, BackfillError> {
     debug!(did = %did, "backfilling");
 
+    // always invalidate doc before backfilling
+    app_state.resolver.invalidate(did).await;
+
     let db = &app_state.db;
     let did_key = keys::repo_key(did);
     let state_bytes = Db::get(db.repos.clone(), did_key)

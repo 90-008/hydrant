@@ -88,8 +88,8 @@ impl FirehoseWorker {
     }
 
     // starts the worker threads and the main dispatch loop
-    // the dispatch loop reads from the firehose channel and distributes messages to shards
-    // based on the consistent hash of the DID
+    // the dispatch loop reads from the firehose channel and
+    // distributes messages to shards based on the hash of the DID
     pub fn run(mut self, handle: tokio::runtime::Handle) -> Result<()> {
         let mut shards = Vec::with_capacity(self.num_shards);
 
@@ -102,9 +102,9 @@ impl FirehoseWorker {
             let handle = handle.clone();
 
             std::thread::Builder::new()
-                .name(format!("ingest-shard-{}", i))
+                .name(format!("ingest-shard-{i}"))
                 .spawn(move || {
-                    Self::worker_thread(i, rx, state, verify, handle);
+                    Self::shard(i, rx, state, verify, handle);
                 })
                 .into_diagnostic()?;
         }
@@ -143,10 +143,8 @@ impl FirehoseWorker {
         Ok(())
     }
 
-    // synchronous worker loop running on a dedicated thread
-    // pulls messages from the channel, builds batches, and processes them
-    // enters the tokio runtime only when necessary (key resolution)
-    fn worker_thread(
+    #[inline(always)]
+    fn shard(
         id: usize,
         mut rx: mpsc::UnboundedReceiver<IngestMessage>,
         state: Arc<AppState>,
@@ -313,6 +311,8 @@ impl FirehoseWorker {
             SubscribeReposMessage::Sync(sync) => {
                 debug!(did = %did, "processing buffered sync");
 
+                ctx.state.resolver.invalidate_sync(did);
+
                 match ops::verify_sync_event(
                     sync.blocks.as_ref(),
                     Self::fetch_key(ctx, did)?.as_ref(),
@@ -355,10 +355,7 @@ impl FirehoseWorker {
             }
             SubscribeReposMessage::Identity(identity) => {
                 debug!(did = %did, "processing buffered identity");
-                let handle = identity
-                    .handle
-                    .as_ref()
-                    .map(|h| h.to_cowstr().into_static());
+                let handle = identity.handle.as_ref().map(|h| h.clone().into_static());
 
                 let evt = IdentityEvt {
                     did: did.clone().into_static(),
@@ -374,6 +371,8 @@ impl FirehoseWorker {
                     active: account.active,
                     status: account.status.as_ref().map(|s| s.to_cowstr().into_static()),
                 };
+
+                ctx.state.resolver.invalidate_sync(did);
 
                 if !account.active {
                     use crate::ingest::stream::AccountStatus;

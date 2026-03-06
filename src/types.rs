@@ -171,7 +171,7 @@ pub struct IdentityEvt<'i> {
     #[serde(borrow)]
     pub did: Did<'i>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub handle: Option<CowStr<'i>>,
+    pub handle: Option<Handle<'i>>,
 }
 
 #[derive(Debug, Serialize, Clone)]

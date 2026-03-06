@@ -48,7 +48,7 @@ impl From<miette::Report> for ResolverError {
 }
 
 #[derive(Clone)]
-struct MiniDoc {
+pub struct MiniDoc {
     pds: Url,
     handle: Option<Handle<'static>>,
     key: Option<PublicKey<'static>>,
@@ -92,6 +92,17 @@ impl Resolver {
                 ),
             }),
         }
+    }
+
+    pub async fn invalidate(&self, did: &Did<'_>) {
+        self.inner
+            .cache
+            .remove_async(&did.clone().into_static())
+            .await;
+    }
+
+    pub fn invalidate_sync(&self, did: &Did<'_>) {
+        self.inner.cache.remove_sync(&did.clone().into_static());
     }
 
     async fn req<'r, T, Fut>(
@@ -138,8 +149,7 @@ impl Resolver {
         }
     }
 
-    #[inline]
-    async fn resolve_doc(&self, did: &Did<'_>) -> Result<MiniDoc, ResolverError> {
+    pub async fn resolve_doc(&self, did: &Did<'_>) -> Result<MiniDoc, ResolverError> {
         let did_static = did.clone().into_static();
         if let Some(entry) = self.inner.cache.get_async(&did_static).await {
             return Ok(entry.get().clone());
