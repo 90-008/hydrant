@@ -9,12 +9,11 @@ use axum::{
     response::IntoResponse,
 };
 use jacquard_common::CowStr;
-use jacquard_common::types::value::RawData;
 use miette::{Context, IntoDiagnostic};
 use serde::Deserialize;
 use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc};
-use tracing::error;
+use tracing::{error, info_span, warn};
 
 #[derive(Deserialize)]
 pub struct StreamQuery {
@@ -34,14 +33,15 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, query: Strea
     let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
 
     let runtime = tokio::runtime::Handle::current();
+    let id = std::time::SystemTime::UNIX_EPOCH
+        .elapsed()
+        .unwrap()
+        .as_secs();
 
     let thread = std::thread::Builder::new()
         .name(format!(
-            "stream-handler-{}",
-            std::time::SystemTime::UNIX_EPOCH
-                .elapsed()
-                .unwrap()
-                .as_secs()
+            "stream-handler-{id}",
+
         ))
         .spawn(move || {
             let mut cancel_rx = cancel_rx;
@@ -56,6 +56,8 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, query: Strea
                 }
             };
             let _runtime_guard = runtime.enter();
+            let span = info_span!("stream", id);
+            let _entered_span = span.enter();
 
             loop {
                 // 1. catch up from DB
@@ -100,15 +102,30 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, query: Strea
                             }
                         };
 
+                        let _entered = info_span!("record", cid = ?cid.map(|c| c.to_string())).entered();
+
                         let marshallable = {
-                            let mut record_val = None;
-                            if let Some(cid) = &cid {
-                                if let Ok(Some(block_bytes)) = db.blocks.get(&cid.to_bytes()) {
-                                    if let Ok(raw_data) =
-                                        serde_ipld_dagcbor::from_slice::<RawData>(&block_bytes)
-                                    {
-                                        record_val = serde_json::to_value(raw_data).ok();
+                            let record_val;
+                            let block_bytes = cid
+                                .map(|cid| db.blocks.get(&cid.to_bytes()))
+                                .transpose()
+                                .map(Option::flatten);
+                            match block_bytes {
+                                Ok(Some(block_bytes)) => match serde_ipld_dagcbor::from_slice::<serde_json::Value>(&block_bytes) {
+                                    Ok(val) => record_val = val,
+                                    Err(e) => {
+                                        error!(err = %e, "cant parse block, must be corrupted?");
+                                        return;
                                     }
+                                }
+                                Ok(None) => {
+                                    warn!("block not found, possibly repo deleted but events not evicted yet?");
+                                    continue;
+                                }
+                                Err(e) => {
+                                    error!(err = %e, "can't get block");
+                                    crate::db::check_poisoned(&e);
+                                    return;
                                 }
                             }
 
@@ -122,7 +139,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, query: Strea
                                     collection,
                                     rkey: CowStr::Owned(rkey.to_smolstr().into()),
                                     action: CowStr::Borrowed(action.as_str()),
-                                    record: record_val,
+                                    record: Some(record_val),
                                     cid: cid
                                         .map(|c| jacquard_common::types::cid::Cid::ipld(c).into()),
                                 }),
