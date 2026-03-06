@@ -225,6 +225,7 @@ pub struct RepoOp<'a> {
     pub path: jacquard_common::CowStr<'a>,
     /// For updates and deletes, the previous record CID (required for inductive firehose). For creations, field should not be defined.
     #[serde(skip_serializing_if = "std::option::Option::is_none")]
+    #[serde(default)]
     #[serde(borrow)]
     pub prev: Option<CidLink<'a>>,
 }
@@ -241,6 +242,7 @@ pub struct Commit<'a> {
     #[serde(borrow)]
     pub ops: Vec<RepoOp<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     #[serde(borrow)]
     pub prev_data: Option<CidLink<'a>>,
     pub rebase: bool,
@@ -259,6 +261,7 @@ pub struct Identity<'a> {
     #[serde(borrow)]
     pub did: Did<'a>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     #[serde(borrow)]
     pub handle: Option<Handle<'a>>,
     pub seq: i64,
