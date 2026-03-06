@@ -97,9 +97,9 @@ each set field accepts one of two forms:
 
 ### repository management
 
-- `GET /repos`: get an NDJSON stream of repositories and their sync status. Supports pagination and filtering:
+- `GET /repos`: get an NDJSON stream of repositories and their sync status. supports pagination and filtering:
     - `limit`: max results (default 100, max 1000)
-    - `cursor`: DID or u64 index ID depending on partition
+    - `cursor`: opaque key for paginating.
     - `partition`: `all` (default), `pending` (backfill queue), or `resync` (retries)
 - `GET /repos/{did}`: get the sync status and metadata of a specific repository.
 - `PUT /repos`: explicitly track repositories. accepts an NDJSON body of `{"did": "..."}` (or JSON array of the same).
@@ -109,33 +109,15 @@ each set field accepts one of two forms:
 
 `hydrant` implements the following XRPC endpoints under `/xrpc/`:
 
-#### `com.atproto.repo.getRecord`
+#### `com.atproto.*`
 
-retrieve a single record by its AT URI components.
+the following are implemented currently:
+- `com.atproto.repo.getRecord`
+- `com.atproto.repo.listRecords`
 
-| param | required | description |
-| :--- | :--- | :--- |
-| `repo` | yes | DID or handle of the repository. |
-| `collection` | yes | NSID of the collection. |
-| `rkey` | yes | record key. |
+#### `systems.gaze.hydrant.*`
 
-returns the record value, its CID, and its AT URI. responds with `RecordNotFound` if not present.
-
-#### `com.atproto.repo.listRecords`
-
-list records in a collection, newest-first by default.
-
-| param | required | description |
-| :--- | :--- | :--- |
-| `repo` | yes | DID or handle of the repository. |
-| `collection` | yes | NSID of the collection. |
-| `limit` | no | max records to return (default `50`, max `100`). |
-| `cursor` | no | opaque cursor for pagination (from a previous response). |
-| `reverse` | no | if `true`, iterates oldest-first. |
-
-returns `{ records, cursor }`. if `cursor` is present there are more results.
-
-#### `systems.gaze.hydrant.countRecords`
+##### `systems.gaze.hydrant.countRecords`
 
 return the total number of stored records in a collection.
 
