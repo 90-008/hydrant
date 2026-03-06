@@ -1,6 +1,9 @@
+use crate::crawler::throttle::ThrottleHandle;
 use crate::db::{Db, keys, ser_repo_state};
 use crate::state::AppState;
 use crate::types::RepoState;
+use crate::util::{ErrorForStatus, RetryOutcome, RetryWithBackoff, parse_retry_after};
+use chrono::{DateTime, TimeDelta, Utc};
 use futures::FutureExt;
 use jacquard_api::com_atproto::repo::list_records::ListRecordsOutput;
 use jacquard_api::com_atproto::sync::list_repos::ListReposOutput;
@@ -12,117 +15,64 @@ use rand::rngs::SmallRng;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use smol_str::SmolStr;
-use std::future::Future;
-use std::ops::Mul;
+use std::ops::{Add, Mul, Sub};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 use tracing::{Instrument, debug, error, info, trace, warn};
 use url::Url;
 
-enum CrawlCheckResult {
-    Signal,
-    NoSignal,
-    Retry { retry_after: i64, status: u16 },
+#[derive(Debug, Serialize, Deserialize)]
+struct RetryState {
+    after: DateTime<Utc>, // seconds
+    duration: TimeDelta,  // banned for in seconds
+    #[serde(serialize_with = "crate::util::ser_status_code")]
+    #[serde(deserialize_with = "crate::util::deser_status_code")]
+    status: Option<StatusCode>,
 }
 
-/// outcome of [`RetryWithBackoff::retry`] when the operation does not succeed.
-enum RetryOutcome<E> {
-    /// ratelimited after exhausting all retries
-    Ratelimited,
-    /// non-ratelimit failure, carrying the last error
-    Failed(E),
+impl RetryState {
+    fn new(secs: i64) -> Self {
+        let duration = TimeDelta::seconds(secs);
+        Self {
+            duration,
+            after: Utc::now().add(duration),
+            status: None,
+        }
+    }
+
+    fn with_status(mut self, code: StatusCode) -> Self {
+        self.status = Some(code);
+        self
+    }
 }
 
-/// extension trait that adds `.retry()` to async `FnMut` closures.
-///
-/// `on_ratelimit` receives the error and current attempt number.
-/// returning `Some(duration)` signals a transient failure and provides the backoff;
-/// returning `None` signals a terminal failure.
-trait RetryWithBackoff<T, E, Fut>: FnMut() -> Fut
-where
-    Fut: Future<Output = Result<T, E>>,
-{
-    async fn retry(
-        &mut self,
-        max_retries: u32,
-        on_ratelimit: impl Fn(&E, u32) -> Option<Duration>,
-    ) -> Result<T, RetryOutcome<E>> {
-        let mut attempt = 0u32;
-        loop {
-            match self().await {
-                Ok(val) => return Ok(val),
-                Err(e) => match on_ratelimit(&e, attempt) {
-                    Some(_) if attempt >= max_retries => return Err(RetryOutcome::Ratelimited),
-                    Some(backoff) => {
-                        let jitter = Duration::from_millis(rand::rng().random_range(0..2000));
-                        tokio::time::sleep(backoff + jitter).await;
-                        attempt += 1;
-                    }
-                    None => return Err(RetryOutcome::Failed(e)),
-                },
-            }
+trait ToRetryState {
+    fn to_retry_state(&self) -> RetryState;
+}
+
+impl ToRetryState for ThrottleHandle {
+    fn to_retry_state(&self) -> RetryState {
+        let after = chrono::DateTime::from_timestamp_secs(self.throttled_until()).unwrap();
+        RetryState {
+            duration: after.sub(Utc::now()),
+            after,
+            status: None,
         }
     }
 }
 
-impl<T, E, F, Fut> RetryWithBackoff<T, E, Fut> for F
-where
-    F: FnMut() -> Fut,
-    Fut: Future<Output = Result<T, E>>,
-{
+enum CrawlCheckResult {
+    Signal,
+    NoSignal,
+    Retry(RetryState),
 }
 
-/// extension trait that adds `.error_for_status()` to futures returning a reqwest `Response`.
-trait ErrorForStatus: Future<Output = Result<reqwest::Response, reqwest::Error>> {
-    fn error_for_status(self) -> impl Future<Output = Result<reqwest::Response, reqwest::Error>>
-    where
-        Self: Sized,
-    {
-        futures::FutureExt::map(self, |r| r.and_then(|r| r.error_for_status()))
+impl From<RetryState> for CrawlCheckResult {
+    fn from(value: RetryState) -> Self {
+        Self::Retry(value)
     }
 }
-
-impl<F: Future<Output = Result<reqwest::Response, reqwest::Error>>> ErrorForStatus for F {}
-
-/// extracts a retry delay in seconds from rate limit response headers.
-///
-/// checks in priority order:
-/// - `retry-after: <seconds>` (relative)
-/// - `ratelimit-reset: <unix timestamp>` (absolute) (ref pds sends this)
-fn parse_retry_after(resp: &reqwest::Response) -> Option<u64> {
-    let headers = resp.headers();
-
-    let retry_after = headers
-        .get(reqwest::header::RETRY_AFTER)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.parse::<u64>().ok());
-
-    let rate_limit_reset = headers
-        .get("ratelimit-reset")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.parse::<i64>().ok())
-        .map(|ts| {
-            let now = chrono::Utc::now().timestamp();
-            (ts - now).max(1) as u64
-        });
-
-    retry_after.or(rate_limit_reset)
-}
-
-// cloudflare-specific status codes
-const CONNECTION_TIMEOUT: StatusCode = unsafe {
-    match StatusCode::from_u16(522) {
-        Ok(s) => s,
-        _ => std::hint::unreachable_unchecked(),
-    }
-};
-const SITE_FROZEN: StatusCode = unsafe {
-    match StatusCode::from_u16(530) {
-        Ok(s) => s,
-        _ => std::hint::unreachable_unchecked(),
-    }
-};
 
 fn is_throttle_worthy(e: &reqwest::Error) -> bool {
     use std::error::Error;
@@ -147,8 +97,8 @@ fn is_throttle_worthy(e: &reqwest::Error) -> bool {
             StatusCode::BAD_GATEWAY
                 | StatusCode::SERVICE_UNAVAILABLE
                 | StatusCode::GATEWAY_TIMEOUT
-                | CONNECTION_TIMEOUT
-                | SITE_FROZEN
+                | crate::util::CONNECTION_TIMEOUT
+                | crate::util::SITE_FROZEN
         )
     })
 }
@@ -190,38 +140,18 @@ async fn check_repo_signals(
                 "rate limited resolving identity, giving up"
             );
             // no pds handle to read retry_after from; use a short default
-            let retry_after = chrono::Utc::now().timestamp() + 60;
-            return (
-                did,
-                CrawlCheckResult::Retry {
-                    retry_after,
-                    status: 429,
-                },
-            );
+            return (did, RetryState::new(60).into());
         }
         Err(RetryOutcome::Failed(e)) => {
             error!(err = %e, "failed to resolve identity");
-            let retry_after = chrono::Utc::now().timestamp() + 60;
-            return (
-                did,
-                CrawlCheckResult::Retry {
-                    retry_after,
-                    status: 0,
-                },
-            );
+            return (did, RetryState::new(60).into());
         }
     };
 
     let throttle = throttler.get_handle(&pds_url).await;
     if throttle.is_throttled() {
         trace!(host = pds_url.host_str(), "skipping throttled pds");
-        return (
-            did,
-            CrawlCheckResult::Retry {
-                retry_after: throttle.throttled_until(),
-                status: 0,
-            },
-        );
+        return (did, throttle.to_retry_state().into());
     }
 
     let _permit = throttle.acquire().unit_error().or_failure(&throttle, || ());
@@ -230,13 +160,7 @@ async fn check_repo_signals(
             host = pds_url.host_str(),
             "pds failed while waiting for permit"
         );
-        return (
-            did,
-            CrawlCheckResult::Retry {
-                retry_after: throttle.throttled_until(),
-                status: 0,
-            },
-        );
+        return (did, throttle.to_retry_state().into());
     };
 
     enum RequestError {
@@ -280,26 +204,22 @@ async fn check_repo_signals(
                 }
                 Err(RequestError::RateLimited(secs)) => {
                     throttle.record_ratelimit(secs);
-                    return CrawlCheckResult::Retry {
-                        retry_after: throttle.throttled_until(),
-                        status: 429,
-                    };
+                    return throttle
+                        .to_retry_state()
+                        .with_status(StatusCode::TOO_MANY_REQUESTS)
+                        .into();
                 }
                 Err(RequestError::Throttled) => {
-                    return CrawlCheckResult::Retry {
-                        retry_after: throttle.throttled_until(),
-                        status: 0,
-                    };
+                    return throttle.to_retry_state().into();
                 }
                 Err(RequestError::Reqwest(e)) => {
                     if is_throttle_worthy(&e) {
                         if let Some(mins) = throttle.record_failure() {
                             warn!(url = %pds_url, mins, "throttling pds due to hard failure");
                         }
-                        return CrawlCheckResult::Retry {
-                            retry_after: throttle.throttled_until(),
-                            status: e.status().map_or(0, |s| s.as_u16()),
-                        };
+                        let mut retry_state = throttle.to_retry_state();
+                        retry_state.status = e.status();
+                        return retry_state.into();
                     }
 
                     match e.status() {
@@ -313,10 +233,9 @@ async fn check_repo_signals(
                         }
                         _ => {
                             error!(err = %e, "repo errored");
-                            return CrawlCheckResult::Retry {
-                                retry_after: chrono::Utc::now().timestamp() + 60,
-                                status: e.status().map_or(0, |s| s.as_u16()),
-                            };
+                            let mut retry_state = RetryState::new(60 * 15);
+                            retry_state.status = e.status();
+                            return retry_state.into();
                         }
                     }
                 }
@@ -326,10 +245,7 @@ async fn check_repo_signals(
                 Ok(b) => b,
                 Err(e) => {
                     error!(err = %e, "failed to read listRecords response");
-                    return CrawlCheckResult::Retry {
-                        retry_after: chrono::Utc::now().timestamp() + 60,
-                        status: 0,
-                    };
+                    return RetryState::new(60 * 5).into();
                 }
             };
 
@@ -338,10 +254,7 @@ async fn check_repo_signals(
                 Ok(_) => {}
                 Err(e) => {
                     error!(err = %e, "failed to parse listRecords response");
-                    return CrawlCheckResult::Retry {
-                        retry_after: chrono::Utc::now().timestamp() + 60,
-                        status: 0,
-                    };
+                    return RetryState::new(60 * 10).into();
                 }
             }
 
@@ -478,9 +391,9 @@ impl Crawler {
 
                 loop {
                     match crawler.process_retry_queue() {
-                        Ok(Some(next_ts)) => {
-                            let secs = (next_ts - chrono::Utc::now().timestamp()).max(1) as u64;
-                            sleep(Duration::from_secs(secs));
+                        Ok(Some(next)) => {
+                            let secs = next.signed_duration_since(Utc::now());
+                            sleep(secs.to_std().expect("that time delta was positive"));
                         }
                         Ok(None) => {
                             sleep(Duration::from_secs(60));
@@ -706,30 +619,33 @@ impl Crawler {
     /// scan the retry queue for entries whose `retry_after` timestamp has passed,
     /// retry them, and return the earliest still-pending timestamp (if any) so the
     /// caller knows when to wake up next.
-    fn process_retry_queue(&self) -> Result<Option<i64>> {
+    fn process_retry_queue(&self) -> Result<Option<DateTime<Utc>>> {
         let db = &self.state.db;
-        let now = chrono::Utc::now().timestamp();
+        let now = Utc::now();
 
         let mut ready: Vec<Did> = Vec::new();
-        let mut next_retry: Option<i64> = None;
+        let mut next_retry: Option<DateTime<Utc>> = None;
 
         let mut rng: SmallRng = rand::make_rng();
 
         let mut batch = db.inner.batch();
         for guard in db.crawler.prefix(keys::CRAWLER_RETRY_PREFIX) {
             let (key, val) = guard.into_inner().into_diagnostic()?;
-            let (retry_after, _) = keys::crawler_retry_parse_value(&val)?;
+            let RetryState {
+                after, duration, ..
+            }: RetryState = rmp_serde::from_slice(&val).into_diagnostic()?;
             let did = keys::crawler_retry_parse_key(&key)?.to_did();
 
             // we check an extra backoff of 1 - 7% just to make it less likely for
             // many requests to coincide with each other
-            let backoff =
-                ((retry_after - now).max(0) as f64).mul(rng.random_range(0.01..0.07)) as i64;
-            if retry_after + backoff > now {
+            let backoff = TimeDelta::seconds(
+                duration.as_seconds_f64().mul(rng.random_range(0.01..0.07)) as i64,
+            );
+            if after + backoff > now {
                 next_retry = Some(
                     next_retry
-                        .map(|earliest| earliest.min(retry_after))
-                        .unwrap_or(retry_after),
+                        .map(|earliest| earliest.min(after))
+                        .unwrap_or(after),
                 );
                 continue;
             }
@@ -797,14 +713,13 @@ impl Crawler {
                     valid.push(did);
                 }
                 CrawlCheckResult::NoSignal => {}
-                CrawlCheckResult::Retry {
-                    retry_after,
-                    status,
-                } => {
+                CrawlCheckResult::Retry(state) => {
                     batch.insert(
                         &db.crawler,
                         keys::crawler_retry_key(&did),
-                        keys::crawler_retry_value(retry_after, status),
+                        rmp_serde::to_vec(&state)
+                            .into_diagnostic()
+                            .wrap_err("cant ser retry state")?,
                     );
                 }
             }
