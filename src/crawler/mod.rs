@@ -5,7 +5,7 @@ use futures::FutureExt;
 use jacquard_api::com_atproto::repo::list_records::ListRecordsOutput;
 use jacquard_api::com_atproto::sync::list_repos::ListReposOutput;
 use jacquard_common::{IntoStatic, types::string::Did};
-use miette::{IntoDiagnostic, Result};
+use miette::{Context, IntoDiagnostic, Result};
 use rand::Rng;
 use rand::RngExt;
 use rand::rngs::SmallRng;
@@ -496,7 +496,7 @@ impl Crawler {
 
         loop {
             if let Err(e) = Self::crawl(crawler.clone()).await {
-                error!(err = %e, "fatal error, restarting in 30s");
+                error!(err = ?e, "fatal error, restarting in 30s");
                 tokio::time::sleep(Duration::from_secs(30)).await;
             }
         }
@@ -518,12 +518,13 @@ impl Crawler {
         let db = &crawler.state.db;
 
         let cursor_key = b"crawler_cursor";
-        let cursor_bytes = Db::get(db.cursors.clone(), cursor_key.to_vec()).await?;
+        let cursor_bytes = Db::get(db.cursors.clone(), cursor_key).await?;
         let mut cursor: Cursor = cursor_bytes
             .as_deref()
             .map(rmp_serde::from_slice)
             .transpose()
-            .into_diagnostic()?
+            .into_diagnostic()
+            .wrap_err("can't parse cursor")?
             .unwrap_or(Cursor::Next(None));
         let mut was_throttled = false;
 
@@ -678,15 +679,17 @@ impl Crawler {
 
             if let Some(new_cursor) = output.cursor {
                 cursor = Cursor::Next(Some(new_cursor.as_str().into()));
-                batch.insert(
-                    &db.cursors,
-                    cursor_key.to_vec(),
-                    new_cursor.as_bytes().to_vec(),
-                );
             } else {
                 info!("reached end of list.");
                 cursor = Cursor::Done;
             }
+            batch.insert(
+                &db.cursors,
+                cursor_key,
+                rmp_serde::to_vec(&cursor)
+                    .into_diagnostic()
+                    .wrap_err("cant serialize cursor")?,
+            );
 
             tokio::task::spawn_blocking(move || batch.commit().into_diagnostic())
                 .await
@@ -715,20 +718,7 @@ impl Crawler {
         let mut batch = db.inner.batch();
         for guard in db.crawler.prefix(keys::CRAWLER_RETRY_PREFIX) {
             let (key, val) = guard.into_inner().into_diagnostic()?;
-            let (retry_after, _) = match keys::crawler_retry_parse_value(&val) {
-                Ok(x) => x,
-                Err(_) => {
-                    // this handles the old db format
-                    // todo: remove this later!! its just for testing...
-                    let retry_after = now + 60 * 5;
-                    batch.insert(
-                        &db.crawler,
-                        key.clone(),
-                        keys::crawler_retry_value(retry_after, 0),
-                    );
-                    (retry_after, 0)
-                }
-            };
+            let (retry_after, _) = keys::crawler_retry_parse_value(&val)?;
             let did = keys::crawler_retry_parse_key(&key)?.to_did();
 
             // we check an extra backoff of 1 - 7% just to make it less likely for
