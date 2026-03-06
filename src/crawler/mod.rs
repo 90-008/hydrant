@@ -5,7 +5,7 @@ use crate::types::RepoState;
 use crate::util::{ErrorForStatus, RetryOutcome, RetryWithBackoff, parse_retry_after};
 use chrono::{DateTime, TimeDelta, Utc};
 use futures::FutureExt;
-use jacquard_api::com_atproto::repo::list_records::ListRecordsOutput;
+use jacquard_api::com_atproto::repo::describe_repo::DescribeRepoOutput;
 use jacquard_api::com_atproto::sync::list_repos::ListReposOutput;
 use jacquard_common::{IntoStatic, types::string::Did};
 use miette::{Context, IntoDiagnostic, Result};
@@ -193,111 +193,93 @@ async fn check_repo_signals(
         Throttled,
     }
 
-    let mut found_signal = false;
-    for signal in filter.signals.iter() {
-        let res = async {
-            let mut list_records_url = pds_url.join("/xrpc/com.atproto.repo.listRecords").unwrap();
-            list_records_url
-                .query_pairs_mut()
-                .append_pair("repo", &did)
-                .append_pair("collection", signal)
-                .append_pair("limit", "1");
+    let mut describe_url = pds_url.join("/xrpc/com.atproto.repo.describeRepo").unwrap();
+    describe_url.query_pairs_mut().append_pair("repo", &did);
 
-            let resp = async {
-                let resp = http
-                    .get(list_records_url.clone())
-                    .send()
-                    .await
-                    .map_err(RequestError::Reqwest)?;
+    let resp = async {
+        let resp = http
+            .get(describe_url)
+            .send()
+            .await
+            .map_err(RequestError::Reqwest)?;
 
-                // dont retry ratelimits since we will just put it in a queue to be tried again later
-                if resp.status() == StatusCode::TOO_MANY_REQUESTS {
-                    return Err(RequestError::RateLimited(parse_retry_after(&resp)));
-                }
-
-                resp.error_for_status().map_err(RequestError::Reqwest)
-            }
-            .or_failure(&throttle, || RequestError::Throttled)
-            .await;
-
-            let resp = match resp {
-                Ok(r) => {
-                    throttle.record_success();
-                    r
-                }
-                Err(RequestError::RateLimited(secs)) => {
-                    throttle.record_ratelimit(secs);
-                    return throttle
-                        .to_retry_state()
-                        .with_status(StatusCode::TOO_MANY_REQUESTS)
-                        .into();
-                }
-                Err(RequestError::Throttled) => {
-                    return throttle.to_retry_state().into();
-                }
-                Err(RequestError::Reqwest(e)) => {
-                    if is_throttle_worthy(&e) {
-                        if let Some(mins) = throttle.record_failure() {
-                            warn!(url = %pds_url, mins, "throttling pds due to hard failure");
-                        }
-                        let mut retry_state = throttle.to_retry_state();
-                        retry_state.status = e.status();
-                        return retry_state.into();
-                    }
-
-                    match e.status() {
-                        Some(StatusCode::NOT_FOUND | StatusCode::GONE) => {
-                            trace!("repo not found");
-                            return CrawlCheckResult::NoSignal;
-                        }
-                        Some(s) if s.is_client_error() => {
-                            error!(status = %s, "repo unavailable");
-                            return CrawlCheckResult::NoSignal;
-                        }
-                        _ => {
-                            error!(err = %e, "repo errored");
-                            let mut retry_state = RetryState::new(60 * 15);
-                            retry_state.status = e.status();
-                            return retry_state.into();
-                        }
-                    }
-                }
-            };
-
-            let bytes = match resp.bytes().await {
-                Ok(b) => b,
-                Err(e) => {
-                    error!(err = %e, "failed to read listRecords response");
-                    return RetryState::new(60 * 5).into();
-                }
-            };
-
-            match serde_json::from_slice::<ListRecordsOutput>(&bytes) {
-                Ok(out) if !out.records.is_empty() => return CrawlCheckResult::Signal,
-                Ok(_) => {}
-                Err(e) => {
-                    error!(err = %e, "failed to parse listRecords response");
-                    return RetryState::new(60 * 10).into();
-                }
-            }
-
-            CrawlCheckResult::NoSignal
+        // dont retry ratelimits since we will just put it in a queue to be tried again later
+        if resp.status() == StatusCode::TOO_MANY_REQUESTS {
+            return Err(RequestError::RateLimited(parse_retry_after(&resp)));
         }
-        .instrument(tracing::info_span!("check", signal = %signal))
-        .await;
 
-        match res {
-            CrawlCheckResult::Signal => {
-                found_signal = true;
-                break;
-            }
-            CrawlCheckResult::NoSignal => continue,
-            other => return (did, other),
-        }
+        resp.error_for_status().map_err(RequestError::Reqwest)
     }
+    .or_failure(&throttle, || RequestError::Throttled)
+    .await;
+
+    let resp = match resp {
+        Ok(r) => {
+            throttle.record_success();
+            r
+        }
+        Err(RequestError::RateLimited(secs)) => {
+            throttle.record_ratelimit(secs);
+            return (
+                did,
+                throttle
+                    .to_retry_state()
+                    .with_status(StatusCode::TOO_MANY_REQUESTS)
+                    .into(),
+            );
+        }
+        Err(RequestError::Throttled) => {
+            return (did, throttle.to_retry_state().into());
+        }
+        Err(RequestError::Reqwest(e)) => {
+            if is_throttle_worthy(&e) {
+                if let Some(mins) = throttle.record_failure() {
+                    warn!(url = %pds_url, mins, "throttling pds due to hard failure");
+                }
+                let mut retry_state = throttle.to_retry_state();
+                retry_state.status = e.status();
+                return (did, retry_state.into());
+            }
+
+            match e.status() {
+                Some(StatusCode::NOT_FOUND | StatusCode::GONE) => {
+                    trace!("repo not found");
+                    return (did, CrawlCheckResult::NoSignal);
+                }
+                Some(s) if s.is_client_error() => {
+                    error!(status = %s, "repo unavailable");
+                    return (did, CrawlCheckResult::NoSignal);
+                }
+                _ => {
+                    error!(err = %e, "repo errored");
+                    let mut retry_state = RetryState::new(60 * 15);
+                    retry_state.status = e.status();
+                    return (did, retry_state.into());
+                }
+            }
+        }
+    };
+
+    let bytes = match resp.bytes().await {
+        Ok(b) => b,
+        Err(e) => {
+            error!(err = %e, "failed to read describeRepo response");
+            return (did, RetryState::new(60 * 5).into());
+        }
+    };
+
+    let out = match serde_json::from_slice::<DescribeRepoOutput>(&bytes) {
+        Ok(out) => out,
+        Err(e) => {
+            error!(err = %e, "failed to parse describeRepo response");
+            return (did, RetryState::new(60 * 10).into());
+        }
+    };
+
+    let found_signal = filter.signals.iter().any(|s| out.collections.contains(s));
 
     if !found_signal {
-        trace!("no signal-matching records found");
+        trace!("no signal-matching collections found");
     }
 
     (
