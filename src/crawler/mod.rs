@@ -15,6 +15,7 @@ use rand::rngs::SmallRng;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use smol_str::SmolStr;
+use std::collections::HashMap;
 use std::ops::{Add, Mul, Sub};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -22,10 +23,14 @@ use std::time::Duration;
 use tracing::{Instrument, debug, error, info, trace, warn};
 use url::Url;
 
+const MAX_RETRY_ATTEMPTS: u32 = 5;
+const MAX_RETRY_BATCH: usize = 500;
+
 #[derive(Debug, Serialize, Deserialize)]
 struct RetryState {
-    after: DateTime<Utc>, // seconds
-    duration: TimeDelta,  // banned for in seconds
+    after: DateTime<Utc>,
+    duration: TimeDelta,
+    attempts: u32,
     #[serde(serialize_with = "crate::util::ser_status_code")]
     #[serde(deserialize_with = "crate::util::deser_status_code")]
     status: Option<StatusCode>,
@@ -37,8 +42,25 @@ impl RetryState {
         Self {
             duration,
             after: Utc::now().add(duration),
+            attempts: 0,
             status: None,
         }
+    }
+
+    /// returns the next retry state with doubled duration and incremented attempt count,
+    /// or `None` if the attempt count would reach the cap (entry left in db as-is).
+    fn next_attempt(self) -> Option<Self> {
+        let attempts = self.attempts + 1;
+        if attempts >= MAX_RETRY_ATTEMPTS {
+            return None;
+        }
+        let duration = self.duration * 2i32.pow(self.attempts.min(4));
+        Some(Self {
+            after: Utc::now().add(duration),
+            duration,
+            attempts,
+            status: None,
+        })
     }
 
     fn with_status(mut self, code: StatusCode) -> Self {
@@ -57,6 +79,7 @@ impl ToRetryState for ThrottleHandle {
         RetryState {
             duration: after.sub(Utc::now()),
             after,
+            attempts: 0,
             status: None,
         }
     }
@@ -567,14 +590,21 @@ impl Crawler {
                     continue;
                 }
 
+                // already in retry queue — let the retry thread handle it
+                let retry_key = keys::crawler_retry_key(&repo.did);
+                if db.crawler.contains_key(&retry_key).into_diagnostic()? {
+                    continue;
+                }
+
                 if !Db::contains_key(db.repos.clone(), &did_key).await? {
                     unknown_dids.push(repo.did.into_static());
                 }
             }
 
             let valid_dids = if filter.check_signals() && !unknown_dids.is_empty() {
+                // we dont need to pass any existing since we have none; we are crawling after all
                 crawler
-                    .check_signals_batch(&unknown_dids, &filter, &mut batch)
+                    .check_signals_batch(&unknown_dids, &filter, &mut batch, &HashMap::new())
                     .await?
             } else {
                 unknown_dids
@@ -616,41 +646,50 @@ impl Crawler {
         }
     }
 
-    /// scan the retry queue for entries whose `retry_after` timestamp has passed,
-    /// retry them, and return the earliest still-pending timestamp (if any) so the
-    /// caller knows when to wake up next.
     fn process_retry_queue(&self) -> Result<Option<DateTime<Utc>>> {
         let db = &self.state.db;
         let now = Utc::now();
 
         let mut ready: Vec<Did> = Vec::new();
+        let mut existing: HashMap<Did<'static>, RetryState> = HashMap::new();
         let mut next_retry: Option<DateTime<Utc>> = None;
+        let mut had_more = false;
 
         let mut rng: SmallRng = rand::make_rng();
 
         let mut batch = db.inner.batch();
         for guard in db.crawler.prefix(keys::CRAWLER_RETRY_PREFIX) {
             let (key, val) = guard.into_inner().into_diagnostic()?;
-            let RetryState {
-                after, duration, ..
-            }: RetryState = rmp_serde::from_slice(&val).into_diagnostic()?;
+            let state: RetryState = rmp_serde::from_slice(&val).into_diagnostic()?;
             let did = keys::crawler_retry_parse_key(&key)?.to_did();
 
-            // we check an extra backoff of 1 - 7% just to make it less likely for
-            // many requests to coincide with each other
+            // leave capped entries alone for API inspection
+            if state.attempts >= MAX_RETRY_ATTEMPTS {
+                continue;
+            }
+
             let backoff = TimeDelta::seconds(
-                duration.as_seconds_f64().mul(rng.random_range(0.01..0.07)) as i64,
+                state
+                    .duration
+                    .as_seconds_f64()
+                    .mul(rng.random_range(0.01..0.07)) as i64,
             );
-            if after + backoff > now {
+            if state.after + backoff > now {
                 next_retry = Some(
                     next_retry
-                        .map(|earliest| earliest.min(after))
-                        .unwrap_or(after),
+                        .map(|earliest| earliest.min(state.after))
+                        .unwrap_or(state.after),
                 );
                 continue;
             }
 
-            ready.push(did);
+            if ready.len() >= MAX_RETRY_BATCH {
+                had_more = true;
+                break;
+            }
+
+            ready.push(did.clone());
+            existing.insert(did, state);
         }
 
         if ready.is_empty() {
@@ -661,7 +700,8 @@ impl Crawler {
 
         let handle = tokio::runtime::Handle::current();
         let filter = self.state.filter.load();
-        let valid_dids = handle.block_on(self.check_signals_batch(&ready, &filter, &mut batch))?;
+        let valid_dids =
+            handle.block_on(self.check_signals_batch(&ready, &filter, &mut batch, &existing))?;
 
         let mut rng: SmallRng = rand::make_rng();
         for did in &valid_dids {
@@ -683,7 +723,8 @@ impl Crawler {
             handle.block_on(self.account_new_repos(valid_dids.len()));
         }
 
-        Ok(next_retry)
+        // if we hit the batch cap there are more ready entries, loop back immediately
+        Ok(had_more.then(Utc::now).or(next_retry))
     }
 
     async fn check_signals_batch(
@@ -691,6 +732,7 @@ impl Crawler {
         dids: &[Did<'static>],
         filter: &Arc<crate::filter::FilterConfig>,
         batch: &mut fjall::OwnedWriteBatch,
+        existing: &HashMap<Did<'static>, RetryState>,
     ) -> Result<Vec<Did<'static>>> {
         let db = &self.state.db;
         let mut valid = Vec::new();
@@ -710,17 +752,29 @@ impl Crawler {
             let (did, result) = res.into_diagnostic()?;
             match result {
                 CrawlCheckResult::Signal => {
+                    batch.remove(&db.crawler, keys::crawler_retry_key(&did));
                     valid.push(did);
                 }
-                CrawlCheckResult::NoSignal => {}
+                CrawlCheckResult::NoSignal => {
+                    batch.remove(&db.crawler, keys::crawler_retry_key(&did));
+                }
                 CrawlCheckResult::Retry(state) => {
-                    batch.insert(
-                        &db.crawler,
-                        keys::crawler_retry_key(&did),
-                        rmp_serde::to_vec(&state)
-                            .into_diagnostic()
-                            .wrap_err("cant ser retry state")?,
-                    );
+                    let prev_attempts = existing.get(&did).map(|s| s.attempts).unwrap_or(0);
+                    let carried = RetryState {
+                        attempts: prev_attempts,
+                        ..state
+                    };
+                    if let Some(next) = carried.next_attempt() {
+                        batch.insert(
+                            &db.crawler,
+                            keys::crawler_retry_key(&did),
+                            rmp_serde::to_vec(&next)
+                                .into_diagnostic()
+                                .wrap_err("cant ser retry state")?,
+                        );
+                    }
+                    // next_attempt() == None means we've hit the cap;
+                    // leave the existing entry untouched for API inspection
                 }
             }
         }
