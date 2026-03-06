@@ -6,7 +6,7 @@ you can see [random.wisp.place](https://tangled.org/did:plc:dfl62fgb7wtjj3fcbb72
 
 ## vs `tap`
 
-while [`tap`](https://github.com/bluesky-social/indigo/tree/main/cmd/tap) is designed primarily as a firehose consumer and relay, `hydrant` is flexible, it allows you to directly query the database for records, and it also provides an ordered view of events, allowing the use of a cursor to fetch events from a specific point in time.
+while [`tap`](https://github.com/bluesky-social/indigo/tree/main/cmd/tap) is designed as a firehose consumer and simply just propagates events while handling sync, `hydrant` is flexible, it allows you to directly query the database for records, and it also provides an ordered view of events, allowing the use of a cursor to fetch events from a specific point in time.
 
 ### stream behavior
 
@@ -111,15 +111,17 @@ each set field accepts one of two forms:
 
 `hydrant` implements the following XRPC endpoints under `/xrpc/`:
 
-#### `com.atproto.*`
+#### com.atproto.*
 
 the following are implemented currently:
 - `com.atproto.repo.getRecord`
 - `com.atproto.repo.listRecords`
 
-#### `systems.gaze.hydrant.*`
+#### systems.gaze.hydrant.*
 
-##### `systems.gaze.hydrant.countRecords`
+these are some non-standard XRPCs that might be useful.
+
+##### systems.gaze.hydrant.countRecords
 
 return the total number of stored records in a collection.
 
