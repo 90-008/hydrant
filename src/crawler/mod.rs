@@ -199,6 +199,7 @@ async fn check_repo_signals(
     let resp = async {
         let resp = http
             .get(describe_url)
+            .timeout(throttle.timeout())
             .send()
             .await
             .map_err(RequestError::Reqwest)?;
@@ -232,6 +233,14 @@ async fn check_repo_signals(
             return (did, throttle.to_retry_state().into());
         }
         Err(RequestError::Reqwest(e)) => {
+            if e.is_timeout() && !throttle.record_timeout() {
+                // first or second timeout, just requeue
+                let mut retry_state = RetryState::new(60);
+                retry_state.status = e.status();
+                return (did, retry_state.into());
+            }
+            // third timeout, if timeout fail is_throttle_worthy will ban the pds
+
             if is_throttle_worthy(&e) {
                 if let Some(mins) = throttle.record_failure() {
                     warn!(url = %pds_url, mins, "throttling pds due to hard failure");
@@ -282,12 +291,12 @@ async fn check_repo_signals(
         trace!("no signal-matching collections found");
     }
 
-    (
+    return (
         did,
         found_signal
             .then_some(CrawlCheckResult::Signal)
             .unwrap_or(CrawlCheckResult::NoSignal),
-    )
+    );
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -439,8 +448,14 @@ impl Crawler {
             .into_diagnostic()
             .wrap_err("can't parse cursor")?
             .unwrap_or(Cursor::Next(None));
-        let mut was_throttled = false;
 
+        match cursor {
+            Cursor::Next(Some(ref cursor)) => info!(cursor = %cursor, "resuming"),
+            Cursor::Next(None) => info!("starting from scratch"),
+            Cursor::Done => info!("was done, resuming"),
+        }
+
+        let mut was_throttled = false;
         loop {
             // throttle check
             loop {
@@ -535,48 +550,77 @@ impl Crawler {
                 }
             };
 
-            let output = match serde_json::from_slice::<ListReposOutput>(&bytes) {
-                Ok(out) => out.into_static(),
-                Err(e) => {
-                    error!(err = %e, "failed to parse listRepos response");
-                    continue;
-                }
-            };
-
-            if output.repos.is_empty() {
-                info!("finished enumeration (or empty page)");
-                tokio::time::sleep(Duration::from_secs(3600)).await;
-                continue;
-            }
-
-            debug!(count = output.repos.len(), "fetched repos");
-            crawler
-                .crawled_count
-                .fetch_add(output.repos.len(), Ordering::Relaxed);
-
             let mut batch = db.inner.batch();
             let mut to_queue = Vec::new();
             let filter = crawler.state.filter.load();
 
-            let mut unknown_dids = Vec::new();
-            for repo in output.repos {
-                let did_key = keys::repo_key(&repo.did);
-
-                let excl_key = crate::db::filter::exclude_key(repo.did.as_str())?;
-                if db.filter.contains_key(&excl_key).into_diagnostic()? {
-                    continue;
-                }
-
-                // already in retry queue — let the retry thread handle it
-                let retry_key = keys::crawler_retry_key(&repo.did);
-                if db.crawler.contains_key(&retry_key).into_diagnostic()? {
-                    continue;
-                }
-
-                if !Db::contains_key(db.repos.clone(), &did_key).await? {
-                    unknown_dids.push(repo.did.into_static());
-                }
+            struct ParseResult {
+                unknown_dids: Vec<Did<'static>>,
+                cursor: Option<smol_str::SmolStr>,
+                count: usize,
             }
+
+            let parse_result = {
+                let repos = db.repos.clone();
+                let filter_ks = db.filter.clone();
+                let crawler_ks = db.crawler.clone();
+                tokio::task::spawn_blocking(move || -> miette::Result<Option<ParseResult>> {
+                    let output = match serde_json::from_slice::<ListReposOutput>(&bytes) {
+                        Ok(out) => out.into_static(),
+                        Err(e) => {
+                            error!(err = %e, "failed to parse listRepos response");
+                            return Ok(None);
+                        }
+                    };
+
+                    if output.repos.is_empty() {
+                        return Ok(None);
+                    }
+
+                    let count = output.repos.len();
+                    let next_cursor = output.cursor.map(|c| c.as_str().into());
+                    let mut unknown = Vec::new();
+                    for repo in output.repos {
+                        let excl_key = crate::db::filter::exclude_key(repo.did.as_str())?;
+                        if filter_ks.contains_key(&excl_key).into_diagnostic()? {
+                            continue;
+                        }
+
+                        // already in retry queue — let the retry thread handle it
+                        let retry_key = keys::crawler_retry_key(&repo.did);
+                        if crawler_ks.contains_key(&retry_key).into_diagnostic()? {
+                            continue;
+                        }
+
+                        let did_key = keys::repo_key(&repo.did);
+                        if !repos.contains_key(&did_key).into_diagnostic()? {
+                            unknown.push(repo.did.into_static());
+                        }
+                    }
+
+                    Ok(Some(ParseResult {
+                        unknown_dids: unknown,
+                        cursor: next_cursor,
+                        count,
+                    }))
+                })
+                .await
+                .into_diagnostic()??
+            };
+
+            let Some(ParseResult {
+                unknown_dids,
+                cursor: next_cursor,
+                count,
+            }) = parse_result
+            else {
+                info!("finished enumeration (or empty page)");
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+                continue;
+            };
+
+            debug!(count, "fetched repos");
+            crawler.crawled_count.fetch_add(count, Ordering::Relaxed);
 
             let valid_dids = if filter.check_signals() && !unknown_dids.is_empty() {
                 // we dont need to pass any existing since we have none; we are crawling after all
@@ -597,7 +641,7 @@ impl Crawler {
                 to_queue.push(did.clone());
             }
 
-            if let Some(new_cursor) = output.cursor {
+            if let Some(new_cursor) = next_cursor {
                 cursor = Cursor::Next(Some(new_cursor.as_str().into()));
             } else {
                 info!("reached end of list.");

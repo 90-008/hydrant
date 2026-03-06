@@ -113,9 +113,8 @@ impl Db {
         let repos = open_ks(
             "repos",
             opts()
-                // most lookups hit since repo must exist after discovery
-                // we don't hit here if it's not tracked anyway (that happens in filter)
-                .expect_point_read_hits(true)
+                // crawler checks if a repo doesn't exist
+                .expect_point_read_hits(false)
                 .max_memtable_size(cfg.db_repos_memtable_size_mb * 1024 * 1024)
                 .data_block_size_policy(BlockSizePolicy::all(kb(4))),
         )?;
@@ -196,7 +195,6 @@ impl Db {
         let crawler = open_ks(
             "crawler",
             opts()
-                .expect_point_read_hits(true)
                 .max_memtable_size((kb(1024) * 16) as u64)
                 .data_block_size_policy(BlockSizePolicy::all(kb(1))),
         )?;

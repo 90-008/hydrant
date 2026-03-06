@@ -2,6 +2,7 @@ use scc::HashMap;
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
+use std::time::Duration;
 use tokio::sync::{Notify, Semaphore, SemaphorePermit};
 use url::Url;
 
@@ -47,6 +48,7 @@ impl Throttler {
 struct State {
     throttled_until: AtomicI64,
     consecutive_failures: AtomicUsize,
+    consecutive_timeouts: AtomicUsize,
     /// only fires on hard failures (timeout, TLS, bad gateway, etc).
     /// ratelimits do NOT fire this — they just store `throttled_until` and
     /// let tasks exit naturally, deferring to the background retry loop.
@@ -59,6 +61,7 @@ impl State {
         Self {
             throttled_until: AtomicI64::new(0),
             consecutive_failures: AtomicUsize::new(0),
+            consecutive_timeouts: AtomicUsize::new(0),
             failure_notify: Notify::new(),
             semaphore: Semaphore::new(PER_PDS_CONCURRENCY),
         }
@@ -82,6 +85,7 @@ impl ThrottleHandle {
 
     pub fn record_success(&self) {
         self.state.consecutive_failures.store(0, Ordering::Release);
+        self.state.consecutive_timeouts.store(0, Ordering::Release);
         self.state.throttled_until.store(0, Ordering::Release);
     }
 
@@ -123,6 +127,21 @@ impl ThrottleHandle {
         self.state.failure_notify.notify_waiters();
 
         Some(minutes)
+    }
+
+    /// returns current timeout duration — 3s, 6s, or 12s depending on prior timeouts.
+    pub fn timeout(&self) -> Duration {
+        let n = self.state.consecutive_timeouts.load(Ordering::Acquire);
+        Duration::from_secs(3 * 2u64.pow(n.min(2) as u32))
+    }
+
+    pub fn record_timeout(&self) -> bool {
+        let timeouts = self
+            .state
+            .consecutive_timeouts
+            .fetch_add(1, Ordering::AcqRel)
+            + 1;
+        timeouts > 2
     }
 
     /// acquire a concurrency slot for this PDS. hold the returned permit
