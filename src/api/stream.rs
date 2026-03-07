@@ -11,7 +11,7 @@ use axum::{
     },
     response::IntoResponse,
 };
-use jacquard_common::CowStr;
+use jacquard_common::{CowStr, RawData};
 use miette::{Context, IntoDiagnostic};
 use serde::Deserialize;
 use std::sync::Arc;
@@ -177,9 +177,8 @@ fn stream(
                         .map(Option::flatten);
                     match block_bytes {
                         Ok(Some(block_bytes)) => {
-                            match serde_ipld_dagcbor::from_slice::<serde_json::Value>(&block_bytes)
-                            {
-                                Ok(val) => record_val = val,
+                            match serde_ipld_dagcbor::from_slice::<RawData>(&block_bytes) {
+                                Ok(val) => record_val = serde_json::to_value(val).ok(),
                                 Err(e) => {
                                     error!(err = %e, "cant parse block, must be corrupted?");
                                     return;
@@ -209,7 +208,7 @@ fn stream(
                             collection,
                             rkey: CowStr::Owned(rkey.to_smolstr().into()),
                             action: CowStr::Borrowed(action.as_str()),
-                            record: Some(record_val),
+                            record: record_val,
                             cid: cid.map(|c| jacquard_common::types::cid::Cid::ipld(c).into()),
                         }),
                         identity: None,
