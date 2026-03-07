@@ -14,7 +14,7 @@ use rand::RngExt;
 use rand::rngs::SmallRng;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
-use smol_str::SmolStr;
+use smol_str::{SmolStr, ToSmolStr};
 use std::collections::HashMap;
 use std::ops::{Add, Mul, Sub};
 use std::sync::Arc;
@@ -139,168 +139,7 @@ fn is_tls_cert_error(io_err: &std::io::Error) -> bool {
     false
 }
 
-async fn check_repo_signals(
-    http: Arc<reqwest::Client>,
-    resolver: crate::resolver::Resolver,
-    filter: Arc<crate::filter::FilterConfig>,
-    did: Did<'static>,
-    throttler: Arc<Throttler>,
-) -> (Did<'static>, CrawlCheckResult) {
-    const MAX_RETRIES: u32 = 5;
-
-    let pds_url = (|| resolver.resolve_identity_info(&did))
-        .retry(MAX_RETRIES, |e, attempt| {
-            matches!(e, crate::resolver::ResolverError::Ratelimited)
-                .then(|| Duration::from_secs(1 << attempt.min(5)))
-        })
-        .await;
-
-    let pds_url = match pds_url {
-        Ok((url, _)) => url,
-        Err(RetryOutcome::Ratelimited) => {
-            error!(
-                retries = MAX_RETRIES,
-                "rate limited resolving identity, giving up"
-            );
-            // no pds handle to read retry_after from; use a short default
-            return (did, RetryState::new(60).into());
-        }
-        Err(RetryOutcome::Failed(e)) => {
-            error!(err = %e, "failed to resolve identity");
-            return (did, RetryState::new(60).into());
-        }
-    };
-
-    let throttle = throttler.get_handle(&pds_url).await;
-    if throttle.is_throttled() {
-        trace!(host = pds_url.host_str(), "skipping throttled pds");
-        return (did, throttle.to_retry_state().into());
-    }
-
-    let _permit = throttle.acquire().unit_error().or_failure(&throttle, || ());
-    let Ok(_permit) = _permit.await else {
-        trace!(
-            host = pds_url.host_str(),
-            "pds failed while waiting for permit"
-        );
-        return (did, throttle.to_retry_state().into());
-    };
-
-    enum RequestError {
-        Reqwest(reqwest::Error),
-        RateLimited(Option<u64>),
-        /// hard failure notification from another task on this PDS
-        Throttled,
-    }
-
-    let mut describe_url = pds_url.join("/xrpc/com.atproto.repo.describeRepo").unwrap();
-    describe_url.query_pairs_mut().append_pair("repo", &did);
-
-    let resp = async {
-        let resp = http
-            .get(describe_url)
-            .timeout(throttle.timeout())
-            .send()
-            .await
-            .map_err(RequestError::Reqwest)?;
-
-        // dont retry ratelimits since we will just put it in a queue to be tried again later
-        if resp.status() == StatusCode::TOO_MANY_REQUESTS {
-            return Err(RequestError::RateLimited(parse_retry_after(&resp)));
-        }
-
-        resp.error_for_status().map_err(RequestError::Reqwest)
-    }
-    .or_failure(&throttle, || RequestError::Throttled)
-    .await;
-
-    let resp = match resp {
-        Ok(r) => {
-            throttle.record_success();
-            r
-        }
-        Err(RequestError::RateLimited(secs)) => {
-            throttle.record_ratelimit(secs);
-            return (
-                did,
-                throttle
-                    .to_retry_state()
-                    .with_status(StatusCode::TOO_MANY_REQUESTS)
-                    .into(),
-            );
-        }
-        Err(RequestError::Throttled) => {
-            return (did, throttle.to_retry_state().into());
-        }
-        Err(RequestError::Reqwest(e)) => {
-            if e.is_timeout() && !throttle.record_timeout() {
-                // first or second timeout, just requeue
-                let mut retry_state = RetryState::new(60);
-                retry_state.status = e.status();
-                return (did, retry_state.into());
-            }
-            // third timeout, if timeout fail is_throttle_worthy will ban the pds
-
-            if is_throttle_worthy(&e) {
-                if let Some(mins) = throttle.record_failure() {
-                    warn!(url = %pds_url, mins, "throttling pds due to hard failure");
-                }
-                let mut retry_state = throttle.to_retry_state();
-                retry_state.status = e.status();
-                return (did, retry_state.into());
-            }
-
-            match e.status() {
-                Some(StatusCode::NOT_FOUND | StatusCode::GONE) => {
-                    trace!("repo not found");
-                    return (did, CrawlCheckResult::NoSignal);
-                }
-                Some(s) if s.is_client_error() => {
-                    error!(status = %s, "repo unavailable");
-                    return (did, CrawlCheckResult::NoSignal);
-                }
-                _ => {
-                    error!(err = %e, "repo errored");
-                    let mut retry_state = RetryState::new(60 * 15);
-                    retry_state.status = e.status();
-                    return (did, retry_state.into());
-                }
-            }
-        }
-    };
-
-    let bytes = match resp.bytes().await {
-        Ok(b) => b,
-        Err(e) => {
-            error!(err = %e, "failed to read describeRepo response");
-            return (did, RetryState::new(60 * 5).into());
-        }
-    };
-
-    let out = match serde_json::from_slice::<DescribeRepoOutput>(&bytes) {
-        Ok(out) => out,
-        Err(e) => {
-            error!(err = %e, "failed to parse describeRepo response");
-            return (did, RetryState::new(60 * 10).into());
-        }
-    };
-
-    let found_signal = out
-        .collections
-        .iter()
-        .any(|col| filter.matches_signal(col.as_str()));
-
-    if !found_signal {
-        trace!("no signal-matching collections found");
-    }
-
-    return (
-        did,
-        found_signal
-            .then_some(CrawlCheckResult::Signal)
-            .unwrap_or(CrawlCheckResult::NoSignal),
-    );
-}
+const CURSOR_KEY: &[u8] = b"crawler_cursor";
 
 #[derive(Debug, Serialize, Deserialize)]
 enum Cursor {
@@ -314,13 +153,13 @@ use throttle::{OrFailure, Throttler};
 pub struct Crawler {
     state: Arc<AppState>,
     relay_host: Url,
-    http: Arc<reqwest::Client>,
+    http: reqwest::Client,
     max_pending: usize,
     resume_pending: usize,
-    count: Arc<AtomicUsize>,
-    crawled_count: Arc<AtomicUsize>,
-    throttled: Arc<AtomicBool>,
-    pds_throttler: Arc<Throttler>,
+    count: AtomicUsize,
+    crawled_count: AtomicUsize,
+    throttled: AtomicBool,
+    pds_throttler: Throttler,
 }
 
 impl Crawler {
@@ -330,17 +169,15 @@ impl Crawler {
         max_pending: usize,
         resume_pending: usize,
     ) -> Self {
-        let http = Arc::new(
-            reqwest::Client::builder()
-                .user_agent(concat!(
-                    env!("CARGO_PKG_NAME"),
-                    "/",
-                    env!("CARGO_PKG_VERSION")
-                ))
-                .gzip(true)
-                .build()
-                .expect("that reqwest will build"),
-        );
+        let http = reqwest::Client::builder()
+            .user_agent(concat!(
+                env!("CARGO_PKG_NAME"),
+                "/",
+                env!("CARGO_PKG_VERSION")
+            ))
+            .gzip(true)
+            .build()
+            .expect("that reqwest will build");
 
         Self {
             state,
@@ -348,11 +185,23 @@ impl Crawler {
             http,
             max_pending,
             resume_pending,
-            count: Arc::new(AtomicUsize::new(0)),
-            crawled_count: Arc::new(AtomicUsize::new(0)),
-            throttled: Arc::new(AtomicBool::new(false)),
-            pds_throttler: Arc::new(Throttler::new()),
+            count: AtomicUsize::new(0),
+            crawled_count: AtomicUsize::new(0),
+            throttled: AtomicBool::new(false),
+            pds_throttler: Throttler::new(),
         }
+    }
+
+    async fn get_cursor(crawler: &Self) -> Result<Cursor> {
+        let cursor_bytes = Db::get(crawler.state.db.cursors.clone(), CURSOR_KEY).await?;
+        let cursor: Cursor = cursor_bytes
+            .as_deref()
+            .map(rmp_serde::from_slice)
+            .transpose()
+            .into_diagnostic()
+            .wrap_err("can't parse cursor")?
+            .unwrap_or(Cursor::Next(None));
+        Ok(cursor)
     }
 
     pub async fn run(self) -> Result<()> {
@@ -361,20 +210,17 @@ impl Crawler {
         // stats ticker
         tokio::spawn({
             use std::time::Instant;
-            let count = crawler.count.clone();
-            let crawled_count = crawler.crawled_count.clone();
-            let throttled = crawler.throttled.clone();
-            let pds_throttler = crawler.pds_throttler.clone();
+            let crawler = crawler.clone();
             let mut last_time = Instant::now();
             let mut interval = tokio::time::interval(Duration::from_secs(60));
             async move {
                 loop {
                     interval.tick().await;
-                    let delta_processed = count.swap(0, Ordering::Relaxed);
-                    let delta_crawled = crawled_count.swap(0, Ordering::Relaxed);
-                    let is_throttled = throttled.load(Ordering::Relaxed);
+                    let delta_processed = crawler.count.swap(0, Ordering::Relaxed);
+                    let delta_crawled = crawler.crawled_count.swap(0, Ordering::Relaxed);
+                    let is_throttled = crawler.throttled.load(Ordering::Relaxed);
 
-                    pds_throttler.evict_clean().await;
+                    crawler.pds_throttler.evict_clean().await;
 
                     if delta_processed == 0 && delta_crawled == 0 {
                         if is_throttled {
@@ -386,7 +232,16 @@ impl Crawler {
                     }
 
                     let elapsed = last_time.elapsed().as_secs_f64();
+                    let cursor = Self::get_cursor(&crawler).await.map_or_else(
+                        |e| e.to_smolstr(),
+                        |c| match c {
+                            Cursor::Done => "done".to_smolstr(),
+                            Cursor::Next(None) => "none".to_smolstr(),
+                            Cursor::Next(Some(c)) => c.to_smolstr(),
+                        },
+                    );
                     info!(
+                        %cursor,
                         processed = delta_processed,
                         crawled = delta_crawled,
                         elapsed,
@@ -442,15 +297,7 @@ impl Crawler {
         let mut rng: SmallRng = rand::make_rng();
         let db = &crawler.state.db;
 
-        let cursor_key = b"crawler_cursor";
-        let cursor_bytes = Db::get(db.cursors.clone(), cursor_key).await?;
-        let mut cursor: Cursor = cursor_bytes
-            .as_deref()
-            .map(rmp_serde::from_slice)
-            .transpose()
-            .into_diagnostic()
-            .wrap_err("can't parse cursor")?
-            .unwrap_or(Cursor::Next(None));
+        let mut cursor = Self::get_cursor(&crawler).await?;
 
         match cursor {
             Cursor::Next(Some(ref cursor)) => info!(cursor = %cursor, "resuming"),
@@ -652,7 +499,7 @@ impl Crawler {
             }
             batch.insert(
                 &db.cursors,
-                cursor_key,
+                CURSOR_KEY,
                 rmp_serde::to_vec(&cursor)
                     .into_diagnostic()
                     .wrap_err("cant serialize cursor")?,
@@ -748,6 +595,172 @@ impl Crawler {
         Ok(had_more.then_some(Duration::ZERO).or(next_wake))
     }
 
+    fn check_repo_signals(
+        &self,
+        filter: Arc<crate::filter::FilterConfig>,
+        did: Did<'static>,
+    ) -> impl Future<Output = (Did<'static>, CrawlCheckResult)> + Send + 'static {
+        let resolver = self.state.resolver.clone();
+        let http = self.http.clone();
+        let throttler = self.pds_throttler.clone();
+        async move {
+            const MAX_RETRIES: u32 = 5;
+
+            let pds_url = (|| resolver.resolve_identity_info(&did))
+                .retry(MAX_RETRIES, |e, attempt| {
+                    matches!(e, crate::resolver::ResolverError::Ratelimited)
+                        .then(|| Duration::from_secs(1 << attempt.min(5)))
+                })
+                .await;
+
+            let pds_url = match pds_url {
+                Ok((url, _)) => url,
+                Err(RetryOutcome::Ratelimited) => {
+                    error!(
+                        retries = MAX_RETRIES,
+                        "rate limited resolving identity, giving up"
+                    );
+                    // no pds handle to read retry_after from; use a short default
+                    return (did, RetryState::new(60).into());
+                }
+                Err(RetryOutcome::Failed(e)) => {
+                    error!(err = %e, "failed to resolve identity");
+                    return (did, RetryState::new(60).into());
+                }
+            };
+
+            let throttle = throttler.get_handle(&pds_url).await;
+            if throttle.is_throttled() {
+                trace!(host = pds_url.host_str(), "skipping throttled pds");
+                return (did, throttle.to_retry_state().into());
+            }
+
+            let _permit = throttle.acquire().unit_error().or_failure(&throttle, || ());
+            let Ok(_permit) = _permit.await else {
+                trace!(
+                    host = pds_url.host_str(),
+                    "pds failed while waiting for permit"
+                );
+                return (did, throttle.to_retry_state().into());
+            };
+
+            enum RequestError {
+                Reqwest(reqwest::Error),
+                RateLimited(Option<u64>),
+                /// hard failure notification from another task on this PDS
+                Throttled,
+            }
+
+            let mut describe_url = pds_url.join("/xrpc/com.atproto.repo.describeRepo").unwrap();
+            describe_url.query_pairs_mut().append_pair("repo", &did);
+
+            let resp = async {
+                let resp = http
+                    .get(describe_url)
+                    .timeout(throttle.timeout())
+                    .send()
+                    .await
+                    .map_err(RequestError::Reqwest)?;
+
+                // dont retry ratelimits since we will just put it in a queue to be tried again later
+                if resp.status() == StatusCode::TOO_MANY_REQUESTS {
+                    return Err(RequestError::RateLimited(parse_retry_after(&resp)));
+                }
+
+                resp.error_for_status().map_err(RequestError::Reqwest)
+            }
+            .or_failure(&throttle, || RequestError::Throttled)
+            .await;
+
+            let resp = match resp {
+                Ok(r) => {
+                    throttle.record_success();
+                    r
+                }
+                Err(RequestError::RateLimited(secs)) => {
+                    throttle.record_ratelimit(secs);
+                    return (
+                        did,
+                        throttle
+                            .to_retry_state()
+                            .with_status(StatusCode::TOO_MANY_REQUESTS)
+                            .into(),
+                    );
+                }
+                Err(RequestError::Throttled) => {
+                    return (did, throttle.to_retry_state().into());
+                }
+                Err(RequestError::Reqwest(e)) => {
+                    if e.is_timeout() && !throttle.record_timeout() {
+                        // first or second timeout, just requeue
+                        let mut retry_state = RetryState::new(60);
+                        retry_state.status = e.status();
+                        return (did, retry_state.into());
+                    }
+                    // third timeout, if timeout fail is_throttle_worthy will ban the pds
+
+                    if is_throttle_worthy(&e) {
+                        if let Some(mins) = throttle.record_failure() {
+                            warn!(url = %pds_url, mins, "throttling pds due to hard failure");
+                        }
+                        let mut retry_state = throttle.to_retry_state();
+                        retry_state.status = e.status();
+                        return (did, retry_state.into());
+                    }
+
+                    match e.status() {
+                        Some(StatusCode::NOT_FOUND | StatusCode::GONE) => {
+                            trace!("repo not found");
+                            return (did, CrawlCheckResult::NoSignal);
+                        }
+                        Some(s) if s.is_client_error() => {
+                            error!(status = %s, "repo unavailable");
+                            return (did, CrawlCheckResult::NoSignal);
+                        }
+                        _ => {
+                            error!(err = %e, "repo errored");
+                            let mut retry_state = RetryState::new(60 * 15);
+                            retry_state.status = e.status();
+                            return (did, retry_state.into());
+                        }
+                    }
+                }
+            };
+
+            let bytes = match resp.bytes().await {
+                Ok(b) => b,
+                Err(e) => {
+                    error!(err = %e, "failed to read describeRepo response");
+                    return (did, RetryState::new(60 * 5).into());
+                }
+            };
+
+            let out = match serde_json::from_slice::<DescribeRepoOutput>(&bytes) {
+                Ok(out) => out,
+                Err(e) => {
+                    error!(err = %e, "failed to parse describeRepo response");
+                    return (did, RetryState::new(60 * 10).into());
+                }
+            };
+
+            let found_signal = out
+                .collections
+                .iter()
+                .any(|col| filter.matches_signal(col.as_str()));
+
+            if !found_signal {
+                trace!("no signal-matching collections found");
+            }
+
+            return (
+                did,
+                found_signal
+                    .then_some(CrawlCheckResult::Signal)
+                    .unwrap_or(CrawlCheckResult::NoSignal),
+            );
+        }
+    }
+
     async fn check_signals_batch(
         &self,
         dids: &[Did<'static>],
@@ -761,12 +774,9 @@ impl Crawler {
 
         for did in dids {
             let did = did.clone();
-            let http = self.http.clone();
-            let resolver = self.state.resolver.clone();
             let filter = filter.clone();
-            let throttler = self.pds_throttler.clone();
             let span = tracing::info_span!("signals", did = %did);
-            set.spawn(check_repo_signals(http, resolver, filter, did, throttler).instrument(span));
+            set.spawn(self.check_repo_signals(filter, did).instrument(span));
         }
 
         while let Some(res) = set.join_next().await {
