@@ -5,17 +5,17 @@ use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
 mod debug;
-pub mod filter;
-pub mod repos;
-pub mod stats;
+mod filter;
+mod repos;
+mod stats;
 mod stream;
-pub mod xrpc;
+mod xrpc;
 
 pub async fn serve(state: Arc<AppState>, port: u16) -> miette::Result<()> {
     let app = Router::new()
         .route("/health", get(|| async { "OK" }))
         .route("/stats", get(stats::get_stats))
-        .route("/stream", get(stream::handle_stream))
+        .merge(stream::router())
         .merge(xrpc::router())
         .merge(filter::router())
         .merge(repos::router())

@@ -1,6 +1,9 @@
 use crate::api::AppState;
 use crate::db::keys;
 use crate::types::{BroadcastEvent, MarshallableEvt, RecordEvt, StoredEvent};
+use axum::Router;
+use axum::http::StatusCode;
+use axum::routing::get;
 use axum::{
     extract::{
         Query, State,
@@ -14,6 +17,46 @@ use serde::Deserialize;
 use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tracing::{error, info_span, warn};
+
+pub fn router() -> Router<Arc<AppState>> {
+    Router::new().route("/", get(handle_stream))
+    // .route("/ack", post(handle_ack))
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize)]
+pub struct AckBody {
+    pub ids: Vec<u64>,
+}
+
+#[allow(dead_code)]
+pub async fn handle_ack(
+    State(state): State<Arc<AppState>>,
+    axum::Json(body): axum::Json<AckBody>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    if body.ids.is_empty() {
+        return Ok(StatusCode::OK);
+    }
+
+    let state = state.clone();
+    let ids = body.ids;
+    tokio::task::spawn_blocking(move || {
+        let mut batch = state.db.inner.batch();
+        for &id in &ids {
+            batch.remove(&state.db.events, keys::event_key(id));
+        }
+        batch
+            .commit()
+            .into_diagnostic()
+            .wrap_err("failed to delete events")
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        Ok(StatusCode::OK)
+    })
+    .await
+    .into_diagnostic()
+    .wrap_err("panicked while deleting events")
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+}
 
 #[derive(Deserialize)]
 pub struct StreamQuery {
