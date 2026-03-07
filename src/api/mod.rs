@@ -15,7 +15,7 @@ pub async fn serve(state: Arc<AppState>, port: u16) -> miette::Result<()> {
     let app = Router::new()
         .route("/health", get(|| async { "OK" }))
         .route("/stats", get(stats::get_stats))
-        .merge(stream::router())
+        .nest("/stream", stream::router())
         .merge(xrpc::router())
         .merge(filter::router())
         .merge(repos::router())
