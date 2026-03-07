@@ -12,7 +12,7 @@ use jacquard_common::CowStr;
 use miette::{Context, IntoDiagnostic};
 use serde::Deserialize;
 use std::sync::Arc;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, oneshot};
 use tracing::{error, info_span, warn};
 
 #[derive(Deserialize)]
@@ -30,7 +30,7 @@ pub async fn handle_stream(
 
 async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, query: StreamQuery) {
     let (tx, mut rx) = mpsc::channel(500);
-    let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+    let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
 
     let runtime = tokio::runtime::Handle::current();
     let id = std::time::SystemTime::UNIX_EPOCH
@@ -39,173 +39,10 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, query: Strea
         .as_secs();
 
     let thread = std::thread::Builder::new()
-        .name(format!(
-            "stream-handler-{id}",
-
-        ))
+        .name(format!("stream-handler-{id}"))
         .spawn(move || {
-            let mut cancel_rx = cancel_rx;
-            let db = &state.db;
-            let mut event_rx = db.event_tx.subscribe();
-            let ks = db.events.clone();
-            let mut current_id = match query.cursor {
-                Some(cursor) => cursor.saturating_sub(1),
-                None => {
-                    let max_id = db.next_event_id.load(std::sync::atomic::Ordering::SeqCst);
-                    max_id.saturating_sub(1)
-                }
-            };
             let _runtime_guard = runtime.enter();
-            let span = info_span!("stream", id);
-            let _entered_span = span.enter();
-
-            loop {
-                // 1. catch up from DB
-                loop {
-                    let mut found = false;
-                    for item in ks.range(keys::event_key(current_id + 1)..) {
-                        let (k, v) = match item.into_inner() {
-                            Ok((k, v)) => (k, v),
-                            Err(e) => {
-                                error!(err = %e, "failed to read event from db");
-                                break;
-                            }
-                        };
-                        let id = match k
-                            .as_ref()
-                            .try_into()
-                            .into_diagnostic()
-                            .wrap_err("expected event id to be 8 bytes")
-                            .map(u64::from_be_bytes)
-                        {
-                            Ok(id) => id,
-                            Err(e) => {
-                                error!(err = %e, "failed to parse event id");
-                                continue;
-                            }
-                        };
-                        current_id = id;
-
-                        let StoredEvent {
-                            live,
-                            did,
-                            rev,
-                            collection,
-                            rkey,
-                            action,
-                            cid,
-                        } = match rmp_serde::from_slice(&v) {
-                            Ok(e) => e,
-                            Err(e) => {
-                                error!(err = %e, "failed to deserialize stored event");
-                                continue;
-                            }
-                        };
-
-                        let _entered = info_span!("record", cid = ?cid.map(|c| c.to_string())).entered();
-
-                        let marshallable = {
-                            let record_val;
-                            let block_bytes = cid
-                                .map(|cid| db.blocks.get(&cid.to_bytes()))
-                                .transpose()
-                                .map(Option::flatten);
-                            match block_bytes {
-                                Ok(Some(block_bytes)) => match serde_ipld_dagcbor::from_slice::<serde_json::Value>(&block_bytes) {
-                                    Ok(val) => record_val = val,
-                                    Err(e) => {
-                                        error!(err = %e, "cant parse block, must be corrupted?");
-                                        return;
-                                    }
-                                }
-                                Ok(None) => {
-                                    warn!("block not found, possibly repo deleted but events not evicted yet?");
-                                    continue;
-                                }
-                                Err(e) => {
-                                    error!(err = %e, "can't get block");
-                                    crate::db::check_poisoned(&e);
-                                    return;
-                                }
-                            }
-
-                            MarshallableEvt {
-                                id,
-                                event_type: "record".into(),
-                                record: Some(RecordEvt {
-                                    live,
-                                    did: did.to_did(),
-                                    rev: CowStr::Owned(rev.to_tid().into()),
-                                    collection,
-                                    rkey: CowStr::Owned(rkey.to_smolstr().into()),
-                                    action: CowStr::Borrowed(action.as_str()),
-                                    record: Some(record_val),
-                                    cid: cid
-                                        .map(|c| jacquard_common::types::cid::Cid::ipld(c).into()),
-                                }),
-                                identity: None,
-                                account: None,
-                            }
-                        };
-
-                        let json_str = match serde_json::to_string(&marshallable) {
-                            Ok(s) => s,
-                            Err(e) => {
-                                error!(err = %e, "failed to serialize ws event");
-                                continue;
-                            }
-                        };
-
-                        if let Err(e) = tx.blocking_send(Message::Text(json_str.into())) {
-                            error!(err = %e, "failed to send ws message");
-                            return;
-                        }
-
-                        found = true;
-                    }
-                    if !found {
-                        break;
-                    }
-                }
-
-                // 2. wait for live events
-                let next_event = runtime.block_on(async {
-                    tokio::select! {
-                        res = event_rx.recv() => Some(res),
-                        _ = &mut cancel_rx => None,
-                    }
-                });
-
-                let Some(next_event) = next_event else {
-                    break;
-                };
-
-                match next_event {
-                    Ok(BroadcastEvent::Persisted(_)) => {
-                        // just wake up and run catch-up loop again
-                    }
-                    Ok(BroadcastEvent::Ephemeral(evt)) => {
-                        // send ephemeral event directly
-                        let json_str = match serde_json::to_string(&evt) {
-                            Ok(s) => s,
-                            Err(e) => {
-                                error!(err = %e, "failed to serialize ws event");
-                                continue;
-                            }
-                        };
-                        if let Err(e) = tx.blocking_send(Message::Text(json_str.into())) {
-                            error!(err = %e, "failed to send ws message");
-                            return;
-                        }
-                    }
-                    Err(broadcast::error::RecvError::Lagged(_)) => {
-                        // continue to catch up
-                    }
-                    Err(broadcast::error::RecvError::Closed) => {
-                        break;
-                    }
-                }
-            }
+            stream(state, cancel_rx, tx, query, id);
         })
         .expect("failed to spawn stream handler thread");
 
@@ -219,5 +56,180 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, query: Strea
     let _ = cancel_tx.send(());
     if let Err(e) = thread.join() {
         error!(err = ?e, "stream handler thread panicked");
+    }
+}
+
+fn stream(
+    state: Arc<AppState>,
+    mut cancel: oneshot::Receiver<()>,
+    tx: mpsc::Sender<Message>,
+    query: StreamQuery,
+    id: u64,
+) {
+    let db = &state.db;
+    let mut event_rx = db.event_tx.subscribe();
+    let ks = db.events.clone();
+    let mut current_id = match query.cursor {
+        Some(cursor) => cursor.saturating_sub(1),
+        None => {
+            let max_id = db.next_event_id.load(std::sync::atomic::Ordering::SeqCst);
+            max_id.saturating_sub(1)
+        }
+    };
+    let runtime = tokio::runtime::Handle::current();
+
+    let span = info_span!("stream", id);
+    let _entered_span = span.enter();
+
+    loop {
+        // 1. catch up from DB
+        loop {
+            let mut found = false;
+            for item in ks.range(keys::event_key(current_id + 1)..) {
+                let (k, v) = match item.into_inner() {
+                    Ok((k, v)) => (k, v),
+                    Err(e) => {
+                        error!(err = %e, "failed to read event from db");
+                        break;
+                    }
+                };
+                let id = match k
+                    .as_ref()
+                    .try_into()
+                    .into_diagnostic()
+                    .wrap_err("expected event id to be 8 bytes")
+                    .map(u64::from_be_bytes)
+                {
+                    Ok(id) => id,
+                    Err(e) => {
+                        error!(err = %e, "failed to parse event id");
+                        continue;
+                    }
+                };
+                current_id = id;
+
+                let StoredEvent {
+                    live,
+                    did,
+                    rev,
+                    collection,
+                    rkey,
+                    action,
+                    cid,
+                } = match rmp_serde::from_slice(&v) {
+                    Ok(e) => e,
+                    Err(e) => {
+                        error!(err = %e, "failed to deserialize stored event");
+                        continue;
+                    }
+                };
+
+                let _entered = info_span!("record", cid = ?cid.map(|c| c.to_string())).entered();
+
+                let marshallable = {
+                    let record_val;
+                    let block_bytes = cid
+                        .map(|cid| db.blocks.get(&cid.to_bytes()))
+                        .transpose()
+                        .map(Option::flatten);
+                    match block_bytes {
+                        Ok(Some(block_bytes)) => {
+                            match serde_ipld_dagcbor::from_slice::<serde_json::Value>(&block_bytes)
+                            {
+                                Ok(val) => record_val = val,
+                                Err(e) => {
+                                    error!(err = %e, "cant parse block, must be corrupted?");
+                                    return;
+                                }
+                            }
+                        }
+                        Ok(None) => {
+                            warn!(
+                                "block not found, possibly repo deleted but events not evicted yet?"
+                            );
+                            continue;
+                        }
+                        Err(e) => {
+                            error!(err = %e, "can't get block");
+                            crate::db::check_poisoned(&e);
+                            return;
+                        }
+                    }
+
+                    MarshallableEvt {
+                        id,
+                        event_type: "record".into(),
+                        record: Some(RecordEvt {
+                            live,
+                            did: did.to_did(),
+                            rev: CowStr::Owned(rev.to_tid().into()),
+                            collection,
+                            rkey: CowStr::Owned(rkey.to_smolstr().into()),
+                            action: CowStr::Borrowed(action.as_str()),
+                            record: Some(record_val),
+                            cid: cid.map(|c| jacquard_common::types::cid::Cid::ipld(c).into()),
+                        }),
+                        identity: None,
+                        account: None,
+                    }
+                };
+
+                let json_str = match serde_json::to_string(&marshallable) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        error!(err = %e, "failed to serialize ws event");
+                        continue;
+                    }
+                };
+
+                if let Err(e) = tx.blocking_send(Message::Text(json_str.into())) {
+                    error!(err = %e, "failed to send ws message");
+                    return;
+                }
+
+                found = true;
+            }
+            if !found {
+                break;
+            }
+        }
+
+        // 2. wait for live events
+        let next_event = runtime.block_on(async {
+            tokio::select! {
+                res = event_rx.recv() => Some(res),
+                _ = &mut cancel => None,
+            }
+        });
+
+        let Some(next_event) = next_event else {
+            break;
+        };
+
+        match next_event {
+            Ok(BroadcastEvent::Persisted(_)) => {
+                // just wake up and run catch-up loop again
+            }
+            Ok(BroadcastEvent::Ephemeral(evt)) => {
+                // send ephemeral event directly
+                let json_str = match serde_json::to_string(&evt) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        error!(err = %e, "failed to serialize ws event");
+                        continue;
+                    }
+                };
+                if let Err(e) = tx.blocking_send(Message::Text(json_str.into())) {
+                    error!(err = %e, "failed to send ws message");
+                    return;
+                }
+            }
+            Err(broadcast::error::RecvError::Lagged(_)) => {
+                // continue to catch up
+            }
+            Err(broadcast::error::RecvError::Closed) => {
+                break;
+            }
+        }
     }
 }
