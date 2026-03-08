@@ -5,3 +5,5 @@ result
 .env
 mock_debug.log
 hydrant.log
+.gitnexus
+.claude
