@@ -410,59 +410,74 @@ impl Crawler {
                 count: usize,
             }
 
+            const BLOCKING_TASK_TIMEOUT: Duration = Duration::from_secs(30);
+
             let parse_result = {
                 let repos = db.repos.clone();
                 let filter_ks = db.filter.clone();
                 let crawler_ks = db.crawler.clone();
-                tokio::task::spawn_blocking(move || -> miette::Result<Option<ParseResult>> {
-                    let output = match serde_json::from_slice::<ListReposOutput>(&bytes) {
-                        Ok(out) => out.into_static(),
-                        Err(e) => {
-                            error!(err = %e, "failed to parse listRepos response");
+
+                // this wont actually cancel the task since spawn_blocking isnt cancel safe
+                // but at least we'll see whats going on?
+                tokio::time::timeout(
+                    BLOCKING_TASK_TIMEOUT,
+                    tokio::task::spawn_blocking(move || -> miette::Result<Option<ParseResult>> {
+                        let output = match serde_json::from_slice::<ListReposOutput>(&bytes) {
+                            Ok(out) => out.into_static(),
+                            Err(e) => {
+                                error!(err = %e, "failed to parse listRepos response");
+                                return Ok(None);
+                            }
+                        };
+
+                        if output.repos.is_empty() {
                             return Ok(None);
                         }
-                    };
 
-                    if output.repos.is_empty() {
-                        return Ok(None);
-                    }
+                        let count = output.repos.len();
+                        let next_cursor = output.cursor.map(|c| c.as_str().into());
+                        let mut unknown = Vec::new();
+                        for repo in output.repos {
+                            let excl_key = crate::db::filter::exclude_key(repo.did.as_str())?;
+                            if filter_ks.contains_key(&excl_key).into_diagnostic()? {
+                                continue;
+                            }
 
-                    let count = output.repos.len();
-                    let next_cursor = output.cursor.map(|c| c.as_str().into());
-                    let mut unknown = Vec::new();
-                    for repo in output.repos {
-                        let excl_key = crate::db::filter::exclude_key(repo.did.as_str())?;
-                        if filter_ks.contains_key(&excl_key).into_diagnostic()? {
-                            continue;
+                            // already in retry queue — let the retry thread handle it
+                            let retry_key = keys::crawler_retry_key(&repo.did);
+                            if crawler_ks.contains_key(&retry_key).into_diagnostic()? {
+                                continue;
+                            }
+
+                            let did_key = keys::repo_key(&repo.did);
+                            if !repos.contains_key(&did_key).into_diagnostic()? {
+                                unknown.push(repo.did.into_static());
+                            }
                         }
 
-                        // already in retry queue — let the retry thread handle it
-                        let retry_key = keys::crawler_retry_key(&repo.did);
-                        if crawler_ks.contains_key(&retry_key).into_diagnostic()? {
-                            continue;
-                        }
-
-                        let did_key = keys::repo_key(&repo.did);
-                        if !repos.contains_key(&did_key).into_diagnostic()? {
-                            unknown.push(repo.did.into_static());
-                        }
-                    }
-
-                    Ok(Some(ParseResult {
-                        unknown_dids: unknown,
-                        cursor: next_cursor,
-                        count,
-                    }))
-                })
+                        Ok(Some(ParseResult {
+                            unknown_dids: unknown,
+                            cursor: next_cursor,
+                            count,
+                        }))
+                    }),
+                )
                 .await
-                .into_diagnostic()??
-            };
+            }
+            .into_diagnostic()?
+            .map_err(|_| {
+                error!(
+                    "spawn_blocking task for parsing listRepos timed out after {}",
+                    BLOCKING_TASK_TIMEOUT.as_secs()
+                );
+                miette::miette!("spawn_blocking task for parsing listRepos timed out")
+            })?;
 
-            let Some(ParseResult {
+            let Ok(Some(ParseResult {
                 unknown_dids,
                 cursor: next_cursor,
                 count,
-            }) = parse_result
+            })) = parse_result
             else {
                 info!("finished enumeration (or empty page)");
                 tokio::time::sleep(Duration::from_secs(3600)).await;
@@ -505,9 +520,23 @@ impl Crawler {
                     .wrap_err("cant serialize cursor")?,
             );
 
-            tokio::task::spawn_blocking(move || batch.commit().into_diagnostic())
-                .await
-                .into_diagnostic()??;
+            tokio::time::timeout(
+                BLOCKING_TASK_TIMEOUT,
+                tokio::task::spawn_blocking(move || batch.commit().into_diagnostic()),
+            )
+            .await
+            .into_diagnostic()?
+            .map_err(|_| {
+                error!(
+                    "spawn_blocking task for batch commit timed out after {}",
+                    BLOCKING_TASK_TIMEOUT.as_secs()
+                );
+                miette::miette!("spawn_blocking task for batch commit timed out")
+            })?
+            .inspect_err(|e| {
+                error!(err = ?e, "batch commit failed");
+            })
+            .ok();
 
             crawler.account_new_repos(to_queue.len()).await;
 
@@ -779,8 +808,22 @@ impl Crawler {
             set.spawn(self.check_repo_signals(filter, did).instrument(span));
         }
 
-        while let Some(res) = set.join_next().await {
-            let (did, result) = res.into_diagnostic()?;
+        while let Some(res) = tokio::time::timeout(Duration::from_secs(60), set.join_next())
+            .await
+            .into_diagnostic()
+            .map_err(|_| {
+                error!("signal check task timed out after 60s");
+                miette::miette!("signal check task timed out")
+            })?
+        {
+            let (did, result) = match res {
+                Ok(inner) => inner,
+                Err(e) => {
+                    error!(err = ?e, "signal check task failed or panicked");
+                    continue;
+                }
+            };
+
             match result {
                 CrawlCheckResult::Signal => {
                     batch.remove(&db.crawler, keys::crawler_retry_key(&did));
