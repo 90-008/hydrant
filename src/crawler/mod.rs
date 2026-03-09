@@ -14,7 +14,7 @@ use rand::RngExt;
 use rand::rngs::SmallRng;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
-use smol_str::{SmolStr, ToSmolStr};
+use smol_str::{SmolStr, ToSmolStr, format_smolstr};
 use std::collections::HashMap;
 use std::ops::{Add, Mul, Sub};
 use std::sync::Arc;
@@ -143,7 +143,7 @@ const CURSOR_KEY: &[u8] = b"crawler_cursor";
 
 #[derive(Debug, Serialize, Deserialize)]
 enum Cursor {
-    Done,
+    Done(SmolStr),
     Next(Option<SmolStr>),
 }
 
@@ -235,7 +235,7 @@ impl Crawler {
                     let cursor = Self::get_cursor(&crawler).await.map_or_else(
                         |e| e.to_smolstr(),
                         |c| match c {
-                            Cursor::Done => "done".to_smolstr(),
+                            Cursor::Done(c) => format_smolstr!("done({c})"),
                             Cursor::Next(None) => "none".to_smolstr(),
                             Cursor::Next(Some(c)) => c.to_smolstr(),
                         },
@@ -299,10 +299,10 @@ impl Crawler {
 
         let mut cursor = Self::get_cursor(&crawler).await?;
 
-        match cursor {
-            Cursor::Next(Some(ref cursor)) => info!(cursor = %cursor, "resuming"),
+        match &cursor {
+            Cursor::Next(Some(c)) => info!(cursor = %c, "resuming"),
             Cursor::Next(None) => info!("starting from scratch"),
-            Cursor::Done => info!("was done, resuming"),
+            Cursor::Done(c) => info!(cursor = %c, "was done, resuming"),
         }
 
         let mut was_throttled = false;
@@ -473,15 +473,22 @@ impl Crawler {
                 miette::miette!("spawn_blocking task for parsing listRepos timed out")
             })?;
 
-            let Ok(Some(ParseResult {
+            let ParseResult {
                 unknown_dids,
                 cursor: next_cursor,
                 count,
-            })) = parse_result
-            else {
-                info!("finished enumeration (or empty page)");
-                tokio::time::sleep(Duration::from_secs(3600)).await;
-                continue;
+            } = match parse_result {
+                Ok(Some(res)) => res,
+                Ok(None) => {
+                    info!("finished enumeration (or empty page)");
+                    if let Cursor::Next(Some(c)) = cursor {
+                        info!("reached end of list.");
+                        cursor = Cursor::Done(c);
+                    }
+                    tokio::time::sleep(Duration::from_secs(3600)).await;
+                    continue;
+                }
+                Err(e) => return Err(e).wrap_err("error while crawling"),
             };
 
             debug!(count, "fetched repos");
@@ -508,9 +515,9 @@ impl Crawler {
 
             if let Some(new_cursor) = next_cursor {
                 cursor = Cursor::Next(Some(new_cursor.as_str().into()));
-            } else {
+            } else if let Cursor::Next(Some(c)) = cursor {
                 info!("reached end of list.");
-                cursor = Cursor::Done;
+                cursor = Cursor::Done(c);
             }
             batch.insert(
                 &db.cursors,
@@ -540,7 +547,7 @@ impl Crawler {
 
             crawler.account_new_repos(to_queue.len()).await;
 
-            if matches!(cursor, Cursor::Done) {
+            if matches!(cursor, Cursor::Done(_)) {
                 tokio::time::sleep(Duration::from_secs(3600)).await;
             }
         }
