@@ -41,6 +41,7 @@ pub struct Config {
     pub relay_host: Url,
     pub plc_urls: Vec<Url>,
     pub full_network: bool,
+    pub ephemeral: bool,
     pub cursor_save_interval: Duration,
     pub repo_fetch_timeout: Duration,
     pub log_level: SmolStr,
@@ -111,6 +112,7 @@ impl Config {
         let cursor_save_interval = cfg!("CURSOR_SAVE_INTERVAL", 5, sec);
         let repo_fetch_timeout = cfg!("REPO_FETCH_TIMEOUT", 300, sec);
 
+        let ephemeral: bool = cfg!("EPHEMERAL", false);
         let database_path = cfg!("DATABASE_PATH", "./hydrant.db");
         let cache_size = cfg!("CACHE_SIZE", 256u64);
         let disable_lz4_compression = cfg!("NO_LZ4_COMPRESSION", false);
@@ -184,6 +186,7 @@ impl Config {
             database_path,
             relay_host,
             plc_urls,
+            ephemeral,
             full_network,
             cursor_save_interval,
             repo_fetch_timeout,
@@ -216,101 +219,89 @@ impl Config {
     }
 }
 
+macro_rules! config_line {
+    ($f:expr, $label:expr, $value:expr) => {
+        writeln!($f, "  {:<width$}{}", $label, $value, width = LABEL_WIDTH)
+    };
+}
+
 impl fmt::Display for Config {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        writeln!(f, "hydrant configuration:")?;
-        writeln!(f, "  log level:                {}", self.log_level)?;
-        writeln!(f, "  relay host:               {}", self.relay_host)?;
-        writeln!(f, "  plc urls:                 {:?}", self.plc_urls)?;
-        writeln!(f, "  full network indexing:    {}", self.full_network)?;
-        writeln!(f, "  verify signatures:        {}", self.verify_signatures)?;
-        writeln!(
-            f,
-            "  backfill concurrency:     {}",
-            self.backfill_concurrency_limit
-        )?;
-        writeln!(
-            f,
-            "  identity cache size:      {}",
-            self.identity_cache_size
-        )?;
-        writeln!(
-            f,
-            "  cursor save interval:     {}sec",
-            self.cursor_save_interval.as_secs()
-        )?;
-        writeln!(
-            f,
-            "  repo fetch timeout:       {}sec",
-            self.repo_fetch_timeout.as_secs()
-        )?;
-        writeln!(
-            f,
-            "  database path:            {}",
-            self.database_path.to_string_lossy()
-        )?;
-        writeln!(f, "  cache size:               {} mb", self.cache_size)?;
-        writeln!(
-            f,
-            "  disable lz4 compression:  {}",
-            self.disable_lz4_compression
-        )?;
-        writeln!(f, "  api port:                 {}", self.api_port)?;
-        writeln!(f, "  firehose workers:         {}", self.firehose_workers)?;
-        writeln!(f, "  db worker threads:        {}", self.db_worker_threads)?;
-        writeln!(
-            f,
-            "  db journal size:          {} mb",
-            self.db_max_journaling_size_mb
-        )?;
-        writeln!(
-            f,
-            "  db pending memtable:      {} mb",
-            self.db_pending_memtable_size_mb
-        )?;
-        writeln!(
-            f,
-            "  db blocks memtable:       {} mb",
-            self.db_blocks_memtable_size_mb
-        )?;
-        writeln!(
-            f,
-            "  db repos memtable:        {} mb",
-            self.db_repos_memtable_size_mb
-        )?;
-        writeln!(
-            f,
-            "  db events memtable:       {} mb",
-            self.db_events_memtable_size_mb
-        )?;
-        writeln!(
-            f,
-            "  db records memtable:      {} mb",
-            self.db_records_memtable_size_mb
-        )?;
+        const LABEL_WIDTH: usize = 27;
 
-        writeln!(
+        writeln!(f, "hydrant configuration:")?;
+        config_line!(f, "log level", self.log_level)?;
+        config_line!(f, "relay host", self.relay_host)?;
+        config_line!(f, "plc urls", format_args!("{:?}", self.plc_urls))?;
+        config_line!(f, "full network indexing", self.full_network)?;
+        config_line!(f, "verify signatures", self.verify_signatures)?;
+        config_line!(f, "backfill concurrency", self.backfill_concurrency_limit)?;
+        config_line!(f, "identity cache size", self.identity_cache_size)?;
+        config_line!(
             f,
-            "  crawler max pending:      {}",
-            self.crawler_max_pending_repos
+            "cursor save interval",
+            format_args!("{}sec", self.cursor_save_interval.as_secs())
         )?;
-        writeln!(
+        config_line!(
             f,
-            "  crawler resume pending:   {}",
+            "repo fetch timeout",
+            format_args!("{}sec", self.repo_fetch_timeout.as_secs())
+        )?;
+        config_line!(f, "ephemeral", self.ephemeral)?;
+        config_line!(f, "database path", self.database_path.to_string_lossy())?;
+        config_line!(f, "cache size", format_args!("{} mb", self.cache_size))?;
+        config_line!(f, "disable lz4 compression", self.disable_lz4_compression)?;
+        config_line!(f, "api port", self.api_port)?;
+        config_line!(f, "firehose workers", self.firehose_workers)?;
+        config_line!(f, "db worker threads", self.db_worker_threads)?;
+        config_line!(
+            f,
+            "db journal size",
+            format_args!("{} mb", self.db_max_journaling_size_mb)
+        )?;
+        config_line!(
+            f,
+            "db pending memtable",
+            format_args!("{} mb", self.db_pending_memtable_size_mb)
+        )?;
+        config_line!(
+            f,
+            "db blocks memtable",
+            format_args!("{} mb", self.db_blocks_memtable_size_mb)
+        )?;
+        config_line!(
+            f,
+            "db repos memtable",
+            format_args!("{} mb", self.db_repos_memtable_size_mb)
+        )?;
+        config_line!(
+            f,
+            "db events memtable",
+            format_args!("{} mb", self.db_events_memtable_size_mb)
+        )?;
+        config_line!(
+            f,
+            "db records memtable",
+            format_args!("{} mb", self.db_records_memtable_size_mb)
+        )?;
+        config_line!(f, "crawler max pending", self.crawler_max_pending_repos)?;
+        config_line!(
+            f,
+            "crawler resume pending",
             self.crawler_resume_pending_repos
         )?;
         if let Some(signals) = &self.filter_signals {
-            writeln!(f, "  filter signals:           {:?}", signals)?;
+            config_line!(f, "filter signals", format_args!("{:?}", signals))?;
         }
         if let Some(collections) = &self.filter_collections {
-            writeln!(f, "  filter collections:       {:?}", collections)?;
+            config_line!(f, "filter collections", format_args!("{:?}", collections))?;
         }
         if let Some(excludes) = &self.filter_excludes {
-            writeln!(f, "  filter excludes:          {:?}", excludes)?;
+            config_line!(f, "filter excludes", format_args!("{:?}", excludes))?;
         }
-        writeln!(f, "  enable debug:             {}", self.enable_debug)?;
+        config_line!(f, "enable debug", self.enable_debug)?;
         if self.enable_debug {
-            writeln!(f, "  debug port:               {}", self.debug_port)?;
+            config_line!(f, "debug port", self.debug_port)?;
         }
         Ok(())
     }

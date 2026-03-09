@@ -45,6 +45,7 @@ the `WS /stream` (hydrant) and `WS /channel` (tap) endpoints have different desi
 | `ENABLE_DEBUG` | `false` | enable debug endpoints. |
 | `DEBUG_PORT` | `3001` | port for debug endpoints (if enabled). |
 | `NO_LZ4_COMPRESSION` | `false` | disable lz4 compression for storage. |
+| `EPHEMERAL` | `false` | if enabled, no records are stored (XRPCs won't be reliable). events are only stored up to an hour for playback. |
 | `ENABLE_FIREHOSE` | `true` | whether to ingest relay subscriptions. |
 | `ENABLE_BACKFILL` | `true` | whether to backfill from PDS instances. |
 | `ENABLE_CRAWLER` | `false` (if Filter), `true` (if Full) | whether to actively query the network for unknown repositories. |

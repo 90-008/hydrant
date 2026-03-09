@@ -24,7 +24,7 @@ use tracing::{Instrument, debug, error, info, trace, warn};
 use url::Url;
 
 const MAX_RETRY_ATTEMPTS: u32 = 5;
-const MAX_RETRY_BATCH: usize = 512;
+const MAX_RETRY_BATCH: usize = 1000;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct RetryState {
@@ -192,8 +192,8 @@ impl Crawler {
         }
     }
 
-    async fn get_cursor(crawler: &Self) -> Result<Cursor> {
-        let cursor_bytes = Db::get(crawler.state.db.cursors.clone(), CURSOR_KEY).await?;
+    async fn get_cursor(&self) -> Result<Cursor> {
+        let cursor_bytes = Db::get(self.state.db.cursors.clone(), CURSOR_KEY).await?;
         let cursor: Cursor = cursor_bytes
             .as_deref()
             .map(rmp_serde::from_slice)
@@ -297,7 +297,7 @@ impl Crawler {
         let mut rng: SmallRng = rand::make_rng();
         let db = &crawler.state.db;
 
-        let mut cursor = Self::get_cursor(&crawler).await?;
+        let mut cursor = crawler.get_cursor().await?;
 
         match &cursor {
             Cursor::Next(Some(c)) => info!(cursor = %c, "resuming"),
@@ -401,7 +401,6 @@ impl Crawler {
             };
 
             let mut batch = db.inner.batch();
-            let mut to_queue = Vec::new();
             let filter = crawler.state.filter.load();
 
             struct ParseResult {
@@ -510,7 +509,6 @@ impl Crawler {
                 let state = RepoState::untracked(rng.next_u64());
                 batch.insert(&db.repos, &did_key, ser_repo_state(&state)?);
                 batch.insert(&db.pending, keys::pending_key(state.index_id), &did_key);
-                to_queue.push(did.clone());
             }
 
             if let Some(new_cursor) = next_cursor {
@@ -545,7 +543,7 @@ impl Crawler {
             })
             .ok();
 
-            crawler.account_new_repos(to_queue.len()).await;
+            crawler.account_new_repos(valid_dids.len()).await;
 
             if matches!(cursor, Cursor::Done(_)) {
                 tokio::time::sleep(Duration::from_secs(3600)).await;

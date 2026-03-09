@@ -1,14 +1,18 @@
+use crate::db::compaction::{DropAllFilterFactory, DropPrefixFilterFactory};
 use crate::types::{BroadcastEvent, RepoState};
+use fjall::compaction::{Fifo, Levelled};
 use fjall::config::BlockSizePolicy;
 use fjall::{Database, Keyspace, KeyspaceCreateOptions, OwnedWriteBatch, PersistMode, Slice};
 use jacquard_common::IntoStatic;
 use jacquard_common::types::string::Did;
+use lsm_tree::compaction::Factory;
 use miette::{Context, IntoDiagnostic, Result};
 use scc::HashMap;
 use smol_str::SmolStr;
 
 use std::sync::Arc;
 
+pub mod compaction;
 pub mod filter;
 pub mod keys;
 pub mod types;
@@ -90,6 +94,9 @@ impl Db {
         const fn kb(v: u32) -> u32 {
             v * 1024
         }
+        const fn mb(v: u64) -> u64 {
+            v * 1024 * 1024
+        }
 
         let db = Database::builder(&cfg.database_path)
             .cache_size(cfg.cache_size * 2_u64.pow(20) / 2)
@@ -100,7 +107,22 @@ impl Db {
                     .unwrap_or(fjall::CompressionType::Lz4),
             )
             .worker_threads(cfg.db_worker_threads)
-            .max_journaling_size(cfg.db_max_journaling_size_mb * 1024 * 1024)
+            .max_journaling_size(mb(cfg.db_max_journaling_size_mb))
+            .with_compaction_filter_factories({
+                let ephemeral = cfg.ephemeral;
+                let f = move |ks: &str| match ks {
+                    "records" => {
+                        ephemeral.then(|| -> Arc<dyn Factory> { Arc::new(DropAllFilterFactory) })
+                    }
+                    "counts" => ephemeral.then(|| -> Arc<dyn Factory> {
+                        Arc::new(DropPrefixFilterFactory {
+                            prefix: keys::COUNT_COLLECTION_PREFIX,
+                        })
+                    }),
+                    _ => None,
+                };
+                Arc::new(f)
+            })
             .open()
             .into_diagnostic()?;
         let db = Arc::new(db);
@@ -115,7 +137,7 @@ impl Db {
             opts()
                 // crawler checks if a repo doesn't exist
                 .expect_point_read_hits(false)
-                .max_memtable_size(cfg.db_repos_memtable_size_mb * 1024 * 1024)
+                .max_memtable_size(mb(cfg.db_repos_memtable_size_mb))
                 .data_block_size_policy(BlockSizePolicy::all(kb(4))),
         )?;
         let blocks = open_ks(
@@ -123,7 +145,7 @@ impl Db {
             opts()
                 // point reads are used a lot by stream
                 .expect_point_read_hits(true)
-                .max_memtable_size(cfg.db_blocks_memtable_size_mb * 1024 * 1024)
+                .max_memtable_size(mb(cfg.db_blocks_memtable_size_mb))
                 // 32 - 64 kb is probably fine, as the newer blocks will be in the first levels
                 // and any consumers will probably be streaming the newer events...
                 .data_block_size_policy(BlockSizePolicy::new([kb(4), kb(8), kb(32), kb(64)])),
@@ -135,7 +157,7 @@ impl Db {
             // since this keyspace is big, turning off bloom filters will help a lot
             opts()
                 .expect_point_read_hits(true)
-                .max_memtable_size(cfg.db_records_memtable_size_mb * 1024 * 1024)
+                .max_memtable_size(mb(cfg.db_records_memtable_size_mb))
                 .data_block_size_policy(BlockSizePolicy::all(kb(8))),
         )?;
         let cursors = open_ks(
@@ -143,6 +165,7 @@ impl Db {
             opts()
                 // cursor point reads hit almost 100% of the time
                 .expect_point_read_hits(true)
+                .max_memtable_size(mb(4))
                 .data_block_size_policy(BlockSizePolicy::all(kb(1))),
         )?;
         let pending = open_ks(
@@ -150,19 +173,22 @@ impl Db {
             opts()
                 // iterated over as a queue, no point reads are used so bloom filters are disabled
                 .expect_point_read_hits(true)
-                .max_memtable_size(cfg.db_pending_memtable_size_mb * 1024 * 1024)
+                .max_memtable_size(mb(cfg.db_pending_memtable_size_mb))
                 .data_block_size_policy(BlockSizePolicy::all(kb(4))),
         )?;
         // resync point reads often miss (because most repos aren't resyncing), so keeping the bloom filter helps avoid disk hits
         let resync = open_ks(
             "resync",
-            opts().data_block_size_policy(BlockSizePolicy::all(kb(8))),
+            opts()
+                .max_memtable_size(mb(cfg.db_pending_memtable_size_mb))
+                .data_block_size_policy(BlockSizePolicy::all(kb(8))),
         )?;
         let resync_buffer = open_ks(
             "resync_buffer",
             opts()
                 // iterated during backfill, no point reads
                 .expect_point_read_hits(true)
+                .max_memtable_size(mb(16))
                 .data_block_size_policy(BlockSizePolicy::all(kb(32))),
         )?;
         let events = open_ks(
@@ -170,14 +196,20 @@ impl Db {
             opts()
                 // only iterators are used here, no point reads
                 .expect_point_read_hits(true)
-                .max_memtable_size(cfg.db_events_memtable_size_mb * 1024 * 1024)
-                .data_block_size_policy(BlockSizePolicy::new([kb(16), kb(32)])),
+                .max_memtable_size(mb(cfg.db_events_memtable_size_mb))
+                .data_block_size_policy(BlockSizePolicy::new([kb(16), kb(32)]))
+                .compaction_strategy(if cfg.ephemeral {
+                    Arc::new(Fifo::new(mb(512), Some(60 * 60)))
+                } else {
+                    Arc::new(Levelled::default())
+                }),
         )?;
         let counts = open_ks(
             "counts",
             opts()
                 // count increments hit because counters are mostly pre-initialized
                 .expect_point_read_hits(true)
+                .max_memtable_size(mb(32))
                 // the data is very small
                 .data_block_size_policy(BlockSizePolicy::all(kb(1))),
         )?;
@@ -188,14 +220,14 @@ impl Db {
             "filter",
             // this can be pretty small since the DIDs wont be compressed that well anyhow
             opts()
-                .max_memtable_size((kb(1024) * 16) as u64)
+                .max_memtable_size(mb(16))
                 .data_block_size_policy(BlockSizePolicy::all(kb(1))),
         )?;
 
         let crawler = open_ks(
             "crawler",
             opts()
-                .max_memtable_size((kb(1024) * 16) as u64)
+                .max_memtable_size(mb(16))
                 .data_block_size_policy(BlockSizePolicy::all(kb(1))),
         )?;
 
