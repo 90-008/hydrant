@@ -161,7 +161,7 @@ pub struct MarshallableEvt<'i> {
 pub enum BroadcastEvent {
     #[allow(dead_code)]
     Persisted(u64),
-    Ephemeral(MarshallableEvt<'static>),
+    Ephemeral(Box<MarshallableEvt<'static>>),
 }
 
 #[derive(Debug, Serialize, Clone)]

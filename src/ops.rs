@@ -49,7 +49,7 @@ pub fn make_identity_event(db: &Db, evt: IdentityEvt<'static>) -> BroadcastEvent
         identity: Some(evt),
         account: None,
     };
-    BroadcastEvent::Ephemeral(marshallable)
+    BroadcastEvent::Ephemeral(Box::new(marshallable))
 }
 
 pub fn make_account_event(db: &Db, evt: AccountEvt<'static>) -> BroadcastEvent {
@@ -61,7 +61,7 @@ pub fn make_account_event(db: &Db, evt: AccountEvt<'static>) -> BroadcastEvent {
         identity: None,
         account: Some(evt),
     };
-    BroadcastEvent::Ephemeral(marshallable)
+    BroadcastEvent::Ephemeral(Box::new(marshallable))
 }
 
 pub fn delete_repo<'batch>(
