@@ -1,6 +1,7 @@
 use crate::api::AppState;
 use crate::db::keys;
 use crate::types::{RepoState, ResyncState, StoredEvent};
+use axum::routing::{get, post};
 use axum::{
     Json,
     extract::{Query, State},
@@ -26,9 +27,12 @@ pub struct DebugCountResponse {
 
 pub fn router() -> axum::Router<Arc<AppState>> {
     axum::Router::new()
-        .route("/debug/count", axum::routing::get(handle_debug_count))
-        .route("/debug/get", axum::routing::get(handle_debug_get))
-        .route("/debug/iter", axum::routing::get(handle_debug_iter))
+        .route("/debug/count", get(handle_debug_count))
+        .route("/debug/get", get(handle_debug_get))
+        .route("/debug/iter", get(handle_debug_iter))
+        .route("/debug/refcount", get(handle_debug_refcount))
+        .route("/debug/refcount", post(handle_set_debug_refcount))
+        .route("/debug/compact", post(handle_debug_compact))
 }
 
 pub async fn handle_debug_count(
@@ -182,7 +186,7 @@ pub async fn handle_debug_iter(
     let end = parse_bound(req.end)?;
 
     let items = tokio::task::spawn_blocking(move || {
-        let limit = req.limit.unwrap_or(50).min(1000);
+        let limit = req.limit.unwrap_or(50);
 
         let collect = |iter: &mut dyn Iterator<Item = fjall::Guard>| {
             let mut items = Vec::new();
@@ -196,6 +200,11 @@ pub async fn handle_debug_iter(
                         u64::from_be_bytes(arr).to_string()
                     } else {
                         "invalid_u64".to_string()
+                    }
+                } else if partition == "blocks" {
+                    match cid::Cid::read_bytes(k.as_ref()) {
+                        Ok(cid) => cid.to_string(),
+                        Err(_) => String::from_utf8_lossy(&k).into_owned(),
                     }
                 } else {
                     String::from_utf8_lossy(&k).into_owned()
@@ -254,4 +263,72 @@ fn get_keyspace_by_name(db: &crate::db::Db, name: &str) -> Result<fjall::Keyspac
         "records" => Ok(db.records.clone()),
         _ => Err(StatusCode::BAD_REQUEST),
     }
+}
+
+#[derive(Deserialize)]
+pub struct DebugCompactRequest {
+    pub partition: String,
+}
+
+pub async fn handle_debug_compact(
+    State(state): State<Arc<AppState>>,
+    Query(req): Query<DebugCompactRequest>,
+) -> Result<StatusCode, StatusCode> {
+    let ks = get_keyspace_by_name(&state.db, &req.partition)?;
+    let state_clone = state.clone();
+
+    tokio::task::spawn_blocking(move || {
+        let _ = ks.remove(b"dummy_tombstone123");
+        let _ = state_clone.db.persist();
+        let _ = ks.rotate_memtable_and_wait();
+        ks.major_compact()
+    })
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(StatusCode::OK)
+}
+
+#[derive(Deserialize)]
+pub struct DebugRefcountRequest {
+    pub cid: String,
+}
+
+#[derive(Serialize)]
+pub struct DebugRefcountResponse {
+    pub count: Option<i64>,
+}
+
+pub async fn handle_debug_refcount(
+    State(state): State<Arc<AppState>>,
+    Query(req): Query<DebugRefcountRequest>,
+) -> Result<Json<DebugRefcountResponse>, StatusCode> {
+    let cid = cid::Cid::from_str(&req.cid).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let cid_bytes = fjall::Slice::from(cid.to_bytes());
+
+    let count = state
+        .db
+        .block_refcounts
+        .read_sync(cid_bytes.as_ref(), |_, v| *v);
+
+    Ok(Json(DebugRefcountResponse { count }))
+}
+
+#[derive(Deserialize)]
+pub struct DebugSetRefcountRequest {
+    pub cid: String,
+    pub count: i64,
+}
+
+pub async fn handle_set_debug_refcount(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Json(req): axum::extract::Json<DebugSetRefcountRequest>,
+) -> Result<StatusCode, StatusCode> {
+    let cid = cid::Cid::from_str(&req.cid).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let cid_bytes = fjall::Slice::from(cid.to_bytes());
+
+    let _ = state.db.block_refcounts.insert_sync(cid_bytes, req.count);
+
+    Ok(StatusCode::OK)
 }

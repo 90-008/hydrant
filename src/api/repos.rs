@@ -14,6 +14,7 @@ use rand::Rng;
 use serde::{Deserialize, Serialize};
 
 use crate::api::AppState;
+use crate::db::refcount::RefcountedBatch;
 use crate::db::{keys, ser_repo_state};
 use crate::types::{GaugeState, RepoState};
 
@@ -28,7 +29,7 @@ pub fn router() -> Router<Arc<AppState>> {
 #[derive(Deserialize, Debug)]
 pub struct RepoRequest {
     pub did: String,
-    #[serde(skip_serializing_if = "Option::is_none", rename = "deleteData")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub delete_data: Option<bool>,
 }
 
@@ -276,7 +277,7 @@ pub async fn handle_delete_repos(
     let state_task = state.clone();
     let (deleted_count, gauge_decrements) = tokio::task::spawn_blocking(move || {
         let db = &state_task.db;
-        let mut batch = db.inner.batch();
+        let mut batch = RefcountedBatch::new(db);
         let mut deleted_count = 0i64;
         let mut gauge_decrements = Vec::new();
 
@@ -306,13 +307,15 @@ pub async fn handle_delete_repos(
                 } else if repo_state.tracked {
                     let mut repo_state = repo_state.into_static();
                     repo_state.tracked = false;
-                    batch.insert(
+                    batch.batch_mut().insert(
                         &db.repos,
                         &did_key,
                         ser_repo_state(&repo_state).map_err(internal)?,
                     );
-                    batch.remove(&db.pending, keys::pending_key(repo_state.index_id));
-                    batch.remove(&db.resync, &did_key);
+                    batch
+                        .batch_mut()
+                        .remove(&db.pending, keys::pending_key(repo_state.index_id));
+                    batch.batch_mut().remove(&db.resync, &did_key);
                     if old_gauge != GaugeState::Synced {
                         gauge_decrements.push(old_gauge);
                     }

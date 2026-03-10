@@ -7,7 +7,7 @@ use crate::resolver::{NoSigningKeyError, ResolverError};
 use crate::state::AppState;
 use crate::types::{AccountEvt, BroadcastEvent, GaugeState, IdentityEvt, RepoState, RepoStatus};
 
-use fjall::OwnedWriteBatch;
+use crate::db::refcount::RefcountedBatch;
 
 use jacquard_common::IntoStatic;
 use jacquard_common::cowstr::ToCowStr;
@@ -59,13 +59,15 @@ pub struct FirehoseWorker {
     state: Arc<AppState>,
     rx: BufferRx,
     verify_signatures: bool,
+    ephemeral: bool,
     num_shards: usize,
 }
 
 struct WorkerContext<'a> {
     verify_signatures: bool,
+    ephemeral: bool,
     state: &'a AppState,
-    batch: &'a mut OwnedWriteBatch,
+    batch: RefcountedBatch<'a>,
     added_blocks: &'a mut i64,
     records_delta: &'a mut i64,
     broadcast_events: &'a mut Vec<BroadcastEvent>,
@@ -77,12 +79,14 @@ impl FirehoseWorker {
         state: Arc<AppState>,
         rx: BufferRx,
         verify_signatures: bool,
+        ephemeral: bool,
         num_shards: usize,
     ) -> Self {
         Self {
             state,
             rx,
             verify_signatures,
+            ephemeral,
             num_shards,
         }
     }
@@ -99,12 +103,13 @@ impl FirehoseWorker {
 
             let state = self.state.clone();
             let verify = self.verify_signatures;
+            let ephemeral = self.ephemeral;
             let handle = handle.clone();
 
             std::thread::Builder::new()
                 .name(format!("ingest-shard-{i}"))
                 .spawn(move || {
-                    Self::shard(i, rx, state, verify, handle);
+                    Self::shard(i, rx, state, verify, ephemeral, handle);
                 })
                 .into_diagnostic()?;
         }
@@ -149,6 +154,7 @@ impl FirehoseWorker {
         mut rx: mpsc::UnboundedReceiver<IngestMessage>,
         state: Arc<AppState>,
         verify_signatures: bool,
+        ephemeral: bool,
         handle: tokio::runtime::Handle,
     ) {
         let _guard = handle.enter();
@@ -157,7 +163,7 @@ impl FirehoseWorker {
         let mut broadcast_events = Vec::new();
 
         while let Some(msg) = rx.blocking_recv() {
-            let mut batch = state.db.inner.batch();
+            let batch = RefcountedBatch::new(&state.db);
             broadcast_events.clear();
 
             let mut added_blocks = 0;
@@ -165,12 +171,13 @@ impl FirehoseWorker {
 
             let mut ctx = WorkerContext {
                 state: &state,
-                batch: &mut batch,
+                batch,
                 added_blocks: &mut added_blocks,
                 records_delta: &mut records_delta,
                 broadcast_events: &mut broadcast_events,
                 handle: &handle,
                 verify_signatures,
+                ephemeral,
             };
 
             match msg {
@@ -191,7 +198,7 @@ impl FirehoseWorker {
                                             // while the resync buffer is being drained, we should handle that probably
                                             // but also it should still be fine since we'll sync eventually anyway
                                             let res = ops::update_repo_status(
-                                                &mut batch,
+                                                ctx.batch.batch_mut(),
                                                 &state.db,
                                                 &did,
                                                 s,
@@ -260,7 +267,7 @@ impl FirehoseWorker {
                 }
             }
 
-            if let Err(e) = batch.commit() {
+            if let Err(e) = ctx.batch.commit() {
                 error!(shard = id, err = %e, "failed to commit batch");
             }
 
@@ -366,7 +373,7 @@ impl FirehoseWorker {
 
                 let handle = identity.handle.as_ref().map(|h| h.clone());
                 repo_state.handle = handle.or(repo_state.handle);
-                ctx.batch.insert(
+                ctx.batch.batch_mut().insert(
                     &ctx.state.db.repos,
                     keys::repo_key(did),
                     crate::db::ser_repo_state(&repo_state)?,
@@ -394,7 +401,12 @@ impl FirehoseWorker {
                     match &account.status {
                         Some(AccountStatus::Deleted) => {
                             debug!(did = %did, "account deleted, wiping data");
-                            crate::ops::delete_repo(ctx.batch, &ctx.state.db, did, &repo_state)?;
+                            crate::ops::delete_repo(
+                                &mut ctx.batch,
+                                &ctx.state.db,
+                                did,
+                                &repo_state,
+                            )?;
                             return Ok(RepoProcessResult::Deleted);
                         }
                         status => {
@@ -432,7 +444,7 @@ impl FirehoseWorker {
                             }
 
                             repo_state = ops::update_repo_status(
-                                ctx.batch,
+                                ctx.batch.batch_mut(),
                                 &ctx.state.db,
                                 did,
                                 repo_state,
@@ -509,13 +521,15 @@ impl FirehoseWorker {
             return Ok(RepoProcessResult::Syncing(Some(commit)));
         }
 
+        let signing_key = Self::fetch_key(ctx, did)?;
         let res = ops::apply_commit(
-            ctx.batch,
+            &mut ctx.batch,
             &ctx.state.db,
             repo_state,
             &commit,
-            Self::fetch_key(ctx, did)?.as_ref(),
+            signing_key.as_ref(),
             &ctx.state.filter.load(),
+            ctx.ephemeral,
         )?;
         let repo_state = res.repo_state;
         *ctx.added_blocks += res.blocks_count;
@@ -629,7 +643,7 @@ impl FirehoseWorker {
                     }
                 }
                 repo_state = ops::update_repo_status(
-                    ctx.batch,
+                    ctx.batch.batch_mut(),
                     &ctx.state.db,
                     did,
                     repo_state,
@@ -660,21 +674,27 @@ impl FirehoseWorker {
                 Ok(r) => r,
                 Err(e) => {
                     if !Self::check_if_retriable_failure(&e) {
-                        ctx.batch.remove(&ctx.state.db.resync_buffer, key);
+                        ctx.batch
+                            .batch_mut()
+                            .remove(&ctx.state.db.resync_buffer, key);
                     }
                     return Err(e);
                 }
             };
             match res {
                 RepoProcessResult::Ok(rs) => {
-                    ctx.batch.remove(&ctx.state.db.resync_buffer, key);
+                    ctx.batch
+                        .batch_mut()
+                        .remove(&ctx.state.db.resync_buffer, key);
                     repo_state = rs;
                 }
                 RepoProcessResult::Syncing(_) => {
                     return Ok(RepoProcessResult::Syncing(None));
                 }
                 RepoProcessResult::Deleted => {
-                    ctx.batch.remove(&ctx.state.db.resync_buffer, key);
+                    ctx.batch
+                        .batch_mut()
+                        .remove(&ctx.state.db.resync_buffer, key);
                     return Ok(RepoProcessResult::Deleted);
                 }
             }
@@ -692,7 +712,7 @@ impl FirehoseWorker {
         ctx.state.resolver.invalidate_sync(did);
         let doc = ctx.handle.block_on(ctx.state.resolver.resolve_doc(did))?;
         repo_state.update_from_doc(doc);
-        ctx.batch.insert(
+        ctx.batch.batch_mut().insert(
             &ctx.state.db.repos,
             keys::repo_key(did),
             crate::db::ser_repo_state(&repo_state)?,

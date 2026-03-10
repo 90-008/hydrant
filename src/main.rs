@@ -29,6 +29,13 @@ async fn main() -> miette::Result<()> {
 
     let state = AppState::new(&cfg)?;
 
+    // load block refcounts for GC - must complete before any ingest workers start
+    if cfg.ephemeral {
+        db::gc::ephemeral_startup_load_refcounts(&state.db)?;
+    } else {
+        db::gc::startup_load_refcounts(&state.db)?;
+    }
+
     if cfg.full_network
         || cfg.filter_signals.is_some()
         || cfg.filter_collections.is_some()
@@ -76,6 +83,21 @@ async fn main() -> miette::Result<()> {
     let (buffer_tx, buffer_rx) = mpsc::unbounded_channel();
     let state = Arc::new(state);
 
+    // spawn GC workers
+    if cfg.ephemeral {
+        let state_ttl = state.clone();
+        std::thread::Builder::new()
+            .name("ephemeral-ttl".into())
+            .spawn(move || db::gc::ephemeral_ttl_worker(state_ttl))
+            .into_diagnostic()?;
+    } else {
+        let state_gc = state.clone();
+        std::thread::Builder::new()
+            .name("gc-checkpoint".into())
+            .spawn(move || db::gc::checkpoint_worker(state_gc))
+            .into_diagnostic()?;
+    }
+
     if cfg.enable_backfill {
         tokio::spawn({
             let state = state.clone();
@@ -89,6 +111,7 @@ async fn main() -> miette::Result<()> {
                     cfg.verify_signatures,
                     SignatureVerification::Full | SignatureVerification::BackfillOnly
                 ),
+                cfg.ephemeral,
             )
             .run()
         });
@@ -213,6 +236,7 @@ async fn main() -> miette::Result<()> {
                     state,
                     buffer_rx,
                     matches!(cfg.verify_signatures, SignatureVerification::Full),
+                    cfg.ephemeral,
                     cfg.firehose_workers,
                 )
                 .run(handle)

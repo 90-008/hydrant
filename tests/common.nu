@@ -52,8 +52,8 @@ export def activate-account [pds_url: string, jwt: string] {
 # build the hydrant binary
 export def build-hydrant [] {
     print "building hydrant..."
-    cargo build --release
-    "target/release/hydrant"
+    cargo build
+    "target/debug/hydrant"
 }
 
 # start hydrant in the background

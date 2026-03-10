@@ -1,6 +1,6 @@
-use crate::db::compaction::{DropAllFilterFactory, DropPrefixFilterFactory};
+use crate::db::compaction::DropPrefixFilterFactory;
 use crate::types::{BroadcastEvent, RepoState};
-use fjall::compaction::{Fifo, Levelled};
+
 use fjall::config::BlockSizePolicy;
 use fjall::{Database, Keyspace, KeyspaceCreateOptions, OwnedWriteBatch, PersistMode, Slice};
 use jacquard_common::IntoStatic;
@@ -11,13 +11,15 @@ use scc::HashMap;
 use smol_str::SmolStr;
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64};
 
 pub mod compaction;
 pub mod filter;
+pub mod gc;
 pub mod keys;
+pub mod refcount;
 pub mod types;
 
-use std::sync::atomic::AtomicU64;
 use tokio::sync::broadcast;
 use tracing::error;
 
@@ -38,6 +40,11 @@ pub struct Db {
     pub counts: Keyspace,
     pub filter: Keyspace,
     pub crawler: Keyspace,
+    pub block_refs: Keyspace,
+    pub block_reflog: Keyspace,
+    pub block_refcounts: Arc<HashMap<Slice, i64>>,
+    pub gc_ready: Arc<AtomicBool>,
+    pub next_reflog_seq: Arc<AtomicU64>,
     pub event_tx: broadcast::Sender<BroadcastEvent>,
     pub next_event_id: Arc<AtomicU64>,
     pub counts_map: HashMap<SmolStr, u64>,
@@ -98,6 +105,12 @@ impl Db {
             v * 1024 * 1024
         }
 
+        let gc_ready = Arc::new(AtomicBool::new(false));
+        let block_refcounts: Arc<HashMap<Slice, i64>> = Arc::new(HashMap::new());
+
+        let gc_ready_factory = gc_ready.clone();
+        let refcounts_factory = block_refcounts.clone();
+
         let db = Database::builder(&cfg.database_path)
             .cache_size(cfg.cache_size * 2_u64.pow(20) / 2)
             .manual_journal_persist(true)
@@ -110,16 +123,20 @@ impl Db {
             .max_journaling_size(mb(cfg.db_max_journaling_size_mb))
             .with_compaction_filter_factories({
                 let ephemeral = cfg.ephemeral;
-                let f = move |ks: &str| match ks {
-                    "records" => {
-                        ephemeral.then(|| -> Arc<dyn Factory> { Arc::new(DropAllFilterFactory) })
+                let f = move |ks: &str| {
+                    tracing::info!("with_compaction_filter_factories queried for keyspace: {ks}",);
+                    match ks {
+                        "counts" => ephemeral.then(|| -> Arc<dyn Factory> {
+                            Arc::new(DropPrefixFilterFactory {
+                                prefix: keys::COUNT_COLLECTION_PREFIX,
+                            })
+                        }),
+                        "blocks" => Some(Arc::new(gc::BlocksGcFilterFactory {
+                            gc_ready: gc_ready_factory.clone(),
+                            refcounts: refcounts_factory.clone(),
+                        }) as Arc<dyn Factory>),
+                        _ => None,
                     }
-                    "counts" => ephemeral.then(|| -> Arc<dyn Factory> {
-                        Arc::new(DropPrefixFilterFactory {
-                            prefix: keys::COUNT_COLLECTION_PREFIX,
-                        })
-                    }),
-                    _ => None,
                 };
                 Arc::new(f)
             })
@@ -197,12 +214,7 @@ impl Db {
                 // only iterators are used here, no point reads
                 .expect_point_read_hits(true)
                 .max_memtable_size(mb(cfg.db_events_memtable_size_mb))
-                .data_block_size_policy(BlockSizePolicy::new([kb(16), kb(32)]))
-                .compaction_strategy(if cfg.ephemeral {
-                    Arc::new(Fifo::new(mb(512), Some(60 * 60)))
-                } else {
-                    Arc::new(Levelled::default())
-                }),
+                .data_block_size_policy(BlockSizePolicy::new([kb(16), kb(32)])),
         )?;
         let counts = open_ks(
             "counts",
@@ -231,6 +243,24 @@ impl Db {
                 .data_block_size_policy(BlockSizePolicy::all(kb(1))),
         )?;
 
+        let block_refs = open_ks(
+            "block_refs",
+            opts()
+                // only ever iterated on
+                .expect_point_read_hits(true)
+                .max_memtable_size(mb(cfg.db_records_memtable_size_mb / 2))
+                .data_block_size_policy(BlockSizePolicy::all(kb(64))),
+        )?;
+
+        let block_reflog = open_ks(
+            "block_reflog",
+            opts()
+                // only ever iterated on
+                .expect_point_read_hits(true)
+                .max_memtable_size(mb(4))
+                .data_block_size_policy(BlockSizePolicy::all(kb(64))),
+        )?;
+
         let mut last_id = 0;
         if let Some(guard) = events.iter().next_back() {
             let k = guard.key().into_diagnostic()?;
@@ -241,6 +271,18 @@ impl Db {
                     .wrap_err("expected to be id (8 bytes)")?,
             );
         }
+
+        let mut last_reflog_seq = 0u64;
+        if let Some(guard) = block_reflog.iter().next_back() {
+            let k = guard.key().into_diagnostic()?;
+            last_reflog_seq = u64::from_be_bytes(
+                k.as_ref()
+                    .try_into()
+                    .into_diagnostic()
+                    .wrap_err("expected to be reflog seq (8 bytes)")?,
+            );
+        }
+        let next_reflog_seq = Arc::new(AtomicU64::new(last_reflog_seq.saturating_add(1)));
 
         // load counts into memory
         let counts_map = HashMap::new();
@@ -284,6 +326,11 @@ impl Db {
             counts,
             filter,
             crawler,
+            block_refs,
+            block_reflog,
+            block_refcounts,
+            gc_ready,
+            next_reflog_seq,
             event_tx,
             counts_map,
             next_event_id: Arc::new(AtomicU64::new(last_id + 1)),

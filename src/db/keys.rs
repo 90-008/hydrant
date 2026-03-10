@@ -8,7 +8,11 @@ pub const SEP: u8 = b'|';
 
 pub const CURSOR_KEY: &[u8] = b"firehose_cursor";
 
-// Key format: {DID}
+pub const BLOCK_REFS_CHECKPOINT_SEQ_KEY: &[u8] = b"block_refs_checkpoint_seq";
+
+pub const EVENT_WATERMARK_PREFIX: &[u8] = b"ewm|";
+
+// key format: {DID}
 pub fn repo_key<'a>(did: &'a Did) -> Vec<u8> {
     let mut vec = Vec::with_capacity(32);
     TrimmedDid::from(did).write_to_vec(&mut vec);
@@ -17,6 +21,17 @@ pub fn repo_key<'a>(did: &'a Did) -> Vec<u8> {
 
 pub fn pending_key(id: u64) -> [u8; 8] {
     id.to_be_bytes()
+}
+
+pub fn reflog_key(seq: u64) -> [u8; 8] {
+    seq.to_be_bytes()
+}
+
+pub fn event_watermark_key(timestamp_secs: u64) -> Vec<u8> {
+    let mut key = Vec::with_capacity(EVENT_WATERMARK_PREFIX.len() + 8);
+    key.extend_from_slice(EVENT_WATERMARK_PREFIX);
+    key.extend_from_slice(&timestamp_secs.to_be_bytes());
+    key
 }
 
 // prefix format: {DID}| (DID trimmed)

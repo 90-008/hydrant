@@ -22,6 +22,7 @@ use miette::{Diagnostic, IntoDiagnostic, Result};
 use reqwest::StatusCode;
 use smol_str::{SmolStr, ToSmolStr};
 use std::collections::HashMap;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
@@ -39,6 +40,7 @@ pub struct BackfillWorker {
     http: reqwest::Client,
     semaphore: Arc<Semaphore>,
     verify_signatures: bool,
+    ephemeral: bool,
     in_flight: Arc<scc::HashSet<Did<'static>>>,
 }
 
@@ -49,6 +51,7 @@ impl BackfillWorker {
         timeout: Duration,
         concurrency_limit: usize,
         verify_signatures: bool,
+        ephemeral: bool,
     ) -> Self {
         Self {
             state,
@@ -62,6 +65,7 @@ impl BackfillWorker {
                 .expect("failed to build http client"),
             semaphore: Arc::new(Semaphore::new(concurrency_limit)),
             verify_signatures,
+            ephemeral,
             in_flight: Arc::new(scc::HashSet::new()),
         }
     }
@@ -123,10 +127,14 @@ impl BackfillWorker {
                 let did = did.clone();
                 let buffer_tx = self.buffer_tx.clone();
                 let verify = self.verify_signatures;
+                let ephemeral = self.ephemeral;
 
                 tokio::spawn(async move {
                     let _guard = guard;
-                    let res = did_task(&state, http, buffer_tx, &did, key, permit, verify).await;
+                    let res = did_task(
+                        &state, http, buffer_tx, &did, key, permit, verify, ephemeral,
+                    )
+                    .await;
 
                     if let Err(e) = res {
                         error!(did = %did, err = %e, "backfill process failed");
@@ -161,10 +169,11 @@ async fn did_task(
     pending_key: Slice,
     _permit: tokio::sync::OwnedSemaphorePermit,
     verify_signatures: bool,
+    ephemeral: bool,
 ) -> Result<(), BackfillError> {
     let db = &state.db;
 
-    match process_did(&state, &http, &did, verify_signatures).await {
+    match process_did(&state, &http, &did, verify_signatures, ephemeral).await {
         Ok(Some(repo_state)) => {
             let did_key = keys::repo_key(&did);
 
@@ -367,6 +376,7 @@ async fn process_did<'i>(
     http: &reqwest::Client,
     did: &Did<'static>,
     verify_signatures: bool,
+    ephemeral: bool,
 ) -> Result<Option<RepoState<'static>>, BackfillError> {
     debug!(did = %did, "backfilling");
 
@@ -426,7 +436,7 @@ async fn process_did<'i>(
         Err(XrpcError::Xrpc(e)) => {
             if matches!(e, GetRepoError::RepoNotFound(_)) {
                 warn!(did = %did, "repo not found, deleting");
-                let mut batch = db.inner.batch();
+                let mut batch = db::refcount::RefcountedBatch::new(db);
                 if let Err(e) = crate::ops::delete_repo(&mut batch, db, did, &state) {
                     tracing::error!(err = %e, "failed to wipe repo during backfill");
                 }
@@ -539,35 +549,37 @@ async fn process_did<'i>(
             let mut delta = 0;
             let mut added_blocks = 0;
             let mut collection_counts: HashMap<SmolStr, u64> = HashMap::new();
-            let mut batch = app_state.db.inner.batch();
+            let mut batch = db::refcount::RefcountedBatch::new(&app_state.db);
             let store = mst.storage();
 
             let prefix = keys::record_prefix_did(&did);
             let mut existing_cids: HashMap<(SmolStr, DbRkey), SmolStr> = HashMap::new();
 
-            for guard in app_state.db.records.prefix(&prefix) {
-                let (key, cid_bytes) = guard.into_inner().into_diagnostic()?;
-                // key is did|collection|rkey
-                // skip did|
-                let mut remaining = key[prefix.len()..].splitn(2, |b| keys::SEP.eq(b));
-                let collection_raw = remaining
-                    .next()
-                    .ok_or_else(|| miette::miette!("invalid record key format: {key:?}"))?;
-                let rkey_raw = remaining
-                    .next()
-                    .ok_or_else(|| miette::miette!("invalid record key format: {key:?}"))?;
+            if !ephemeral {
+                for guard in app_state.db.records.prefix(&prefix) {
+                    let (key, cid_bytes) = guard.into_inner().into_diagnostic()?;
+                    // key is did|collection|rkey
+                    // skip did|
+                    let mut remaining = key[prefix.len()..].splitn(2, |b| keys::SEP.eq(b));
+                    let collection_raw = remaining
+                        .next()
+                        .ok_or_else(|| miette::miette!("invalid record key format: {key:?}"))?;
+                    let rkey_raw = remaining
+                        .next()
+                        .ok_or_else(|| miette::miette!("invalid record key format: {key:?}"))?;
 
-                let collection = std::str::from_utf8(collection_raw)
-                    .map_err(|e| miette::miette!("invalid collection utf8: {e}"))?;
+                    let collection = std::str::from_utf8(collection_raw)
+                        .map_err(|e| miette::miette!("invalid collection utf8: {e}"))?;
 
-                let rkey = keys::parse_rkey(rkey_raw)
-                    .map_err(|e| miette::miette!("invalid rkey '{key:?}' for {did}: {e}"))?;
+                    let rkey = keys::parse_rkey(rkey_raw)
+                        .map_err(|e| miette::miette!("invalid rkey '{key:?}' for {did}: {e}"))?;
 
-                let cid = cid::Cid::read_bytes(cid_bytes.as_ref())
-                    .map_err(|e| miette::miette!("invalid cid '{cid_bytes:?}' for {did}: {e}"))?
-                    .to_smolstr();
+                    let cid = cid::Cid::read_bytes(cid_bytes.as_ref())
+                        .map_err(|e| miette::miette!("invalid cid '{cid_bytes:?}' for {did}: {e}"))?
+                        .to_smolstr();
 
-                existing_cids.insert((collection.into(), rkey), cid);
+                    existing_cids.insert((collection.into(), rkey), cid);
+                }
             }
 
             let mut signal_seen = filter.mode == FilterMode::Full || filter.signals.is_empty();
@@ -602,25 +614,28 @@ async fn process_did<'i>(
                     let cid_obj = Cid::ipld(cid);
 
                     // check if this record already exists with same CID
-                    let (action, is_new) = if let Some(existing_cid) = existing_cids.remove(&path) {
+                    let existing_cid = existing_cids.remove(&path);
+                    let action = if let Some(existing_cid) = &existing_cid {
                         if existing_cid == cid_obj.as_str() {
                             trace!(did = %did, collection = %collection, rkey = %rkey, cid = %cid, "skip unchanged record");
                             continue; // skip unchanged record
                         }
-                        (DbAction::Update, false)
+                        DbAction::Update
                     } else {
-                        (DbAction::Create, true)
+                        DbAction::Create
                     };
                     trace!(did = %did, collection = %collection, rkey = %rkey, cid = %cid, ?action, "action record");
 
                     // key is did|collection|rkey
                     let db_key = keys::record_key(&did, collection, &rkey);
 
-                    batch.insert(&app_state.db.blocks, cid.to_bytes(), val.as_ref());
-                    batch.insert(&app_state.db.records, db_key, cid.to_bytes());
+                    batch.batch_mut().insert(&app_state.db.blocks, cid.to_bytes(), val.as_ref());
+                    if !ephemeral {
+                        batch.batch_mut().insert(&app_state.db.records, db_key, cid.to_bytes());
+                    }
 
                     added_blocks += 1;
-                    if is_new {
+                    if action == DbAction::Create {
                         delta += 1;
                         *collection_counts.entry(path.0.clone()).or_default() += 1;
                     }
@@ -636,7 +651,27 @@ async fn process_did<'i>(
                         cid: Some(cid_obj.to_ipld().expect("valid cid")),
                     };
                     let bytes = rmp_serde::to_vec(&evt).into_diagnostic()?;
-                    batch.insert(&app_state.db.events, keys::event_key(event_id), bytes);
+                    batch.batch_mut().insert(&app_state.db.events, keys::event_key(event_id), bytes);
+
+                    // update block refcount
+                    let cid_bytes = Slice::from(cid.to_bytes());
+                    // if ephemeral, we only care about events, so its 1
+                    // if not, then its 2 since we also insert to records
+                    batch.update_block_refcount(cid_bytes, ephemeral.then_some(1).unwrap_or(2))?;
+                    // for Update, also decrement old CID refcount
+                    // event will still be there, so we only decrement for records
+                    // which means only if not ephemeral
+                    if !ephemeral && action == DbAction::Update {
+                        let existing_cid = existing_cid.expect("that cid exists since this is Update");
+                        if existing_cid != cid_obj.as_str() {
+                            let old_cid_bytes = Slice::from(
+                                cid::Cid::from_str(&existing_cid)
+                                    .expect("valid cid from existing_cids")
+                                    .to_bytes()
+                            );
+                            batch.update_block_refcount(old_cid_bytes, -1)?;
+                        }
+                    }
 
                     count += 1;
                 }
@@ -646,10 +681,20 @@ async fn process_did<'i>(
             for ((collection, rkey), cid) in existing_cids {
                 trace!(did = %did, collection = %collection, rkey = %rkey, cid = %cid, "remove existing record");
 
-                batch.remove(
+                // we dont have to put if ephemeral around here since
+                // existing_cids will be empty anyyway
+                batch.batch_mut().remove(
                     &app_state.db.records,
                     keys::record_key(&did, &collection, &rkey),
                 );
+
+                // decrement block refcount
+                let cid_bytes = Slice::from(
+                    cid::Cid::from_str(&cid)
+                        .expect("valid cid from existing_cids")
+                        .to_bytes()
+                );
+                batch.update_block_refcount(cid_bytes, -1)?;
 
                 let event_id = app_state.db.next_event_id.fetch_add(1, Ordering::SeqCst);
                 let evt = StoredEvent {
@@ -662,7 +707,7 @@ async fn process_did<'i>(
                     cid: None,
                 };
                 let bytes = rmp_serde::to_vec(&evt).into_diagnostic()?;
-                batch.insert(&app_state.db.events, keys::event_key(event_id), bytes);
+                batch.batch_mut().insert(&app_state.db.events, keys::event_key(event_id), bytes);
 
                 delta -= 1;
                 count += 1;
@@ -679,15 +724,17 @@ async fn process_did<'i>(
             state.data = Some(root_commit.data);
             state.last_updated_at = chrono::Utc::now().timestamp();
 
-            batch.insert(
+            batch.batch_mut().insert(
                 &app_state.db.repos,
                 keys::repo_key(&did),
                 ser_repo_state(&state)?,
             );
 
             // add the counts
-            for (col, cnt) in collection_counts {
-                db::set_record_count(&mut batch, &app_state.db, &did, &col, cnt);
+            if !ephemeral {
+                for (col, cnt) in collection_counts {
+                    db::set_record_count(batch.batch_mut(), &app_state.db, &did, &col, cnt);
+                }
             }
 
             batch.commit().into_diagnostic()?;

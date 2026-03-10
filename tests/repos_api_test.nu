@@ -110,8 +110,8 @@ def main [] {
 
 # Helper to build hydrant
 def build-hydrant [] {
-    cargo build --release --quiet
-    "./target/release/hydrant"
+    cargo build --quiet
+    "./target/debug/hydrant"
 }
 
 # Helper to start hydrant

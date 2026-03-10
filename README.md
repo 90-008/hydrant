@@ -131,6 +131,9 @@ returns `{ count }`.
 - `GET /stream`: subscribe to the event stream.
   - query parameters:
     - `cursor` (optional): start streaming from a specific event ID.
+- `POST /stream/ack`: ack events.
+  - body:
+    - `ids`: list of event IDs to acknowledge.
 
 ### stats
 
