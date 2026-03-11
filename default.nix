@@ -21,7 +21,7 @@ rustPlatform.buildRustPackage {
     lockFile = ./Cargo.lock;
     outputHashes = {
       "rmp-0.8.15" = "sha256-0VATbSR2lGiCJ8Ww4a5pkOHSRUjoysnFonpKS/oMzgU=";
-      "jacquard-api-0.9.5" = "sha256-4j2mtYbrzr655UsKFFgamub7O38Mht+mfGal8WDvPrc=";
+      "jacquard-api-0.9.5" = "sha256-olYYhjocR86Mey5ma4IPKde1tE9BCPQNFRjNKGr+qdo=";
     };
   };
 }
