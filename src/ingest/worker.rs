@@ -576,10 +576,9 @@ impl FirehoseWorker {
                         .unwrap_or(false)
                 });
                 if !touches_signal {
-                    debug!(did = %did, "dropping commit, no signal-matching ops");
+                    trace!(did = %did, "dropping commit, no signal-matching ops");
                     return Ok(RepoProcessResult::Syncing(None));
                 }
-                debug!(did = %did, "commit touches a signal, queuing backfill");
             }
 
             debug!(did = %did, "discovered new account from firehose, queueing backfill");
@@ -611,7 +610,7 @@ impl FirehoseWorker {
         let mut repo_state = crate::db::deser_repo_state(&state_bytes)?.into_static();
 
         if !repo_state.tracked && repo_state.status != RepoStatus::Backfilling {
-            debug!(did = %did, "ignoring active status as it is explicitly untracked");
+            trace!(did = %did, "ignoring active status as it is explicitly untracked");
             return Ok(RepoProcessResult::Syncing(None));
         }
 

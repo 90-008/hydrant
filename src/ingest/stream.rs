@@ -250,6 +250,7 @@ pub struct Commit<'a> {
     pub repo: Did<'a>,
     pub rev: Tid,
     pub seq: i64,
+    #[serde(deserialize_with = "deserialize_tid_or_empty")]
     pub since: Option<Tid>,
     pub time: Datetime,
     pub too_big: bool,
@@ -505,6 +506,22 @@ pub enum SubscribeReposMessage<'i> {
 use serde::Deserialize;
 use serde_ipld_dagcbor::de::Deserializer;
 
+// some relays send `""` for `since` when there is no previous revision instead of null
+fn deserialize_tid_or_empty<'de, D>(deserializer: D) -> Result<Option<Tid>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let s = <Option<String>>::deserialize(deserializer)?;
+    match s.as_deref() {
+        None => Ok(None),
+        Some("") => {
+            tracing::warn!("received since with empty string instead of null");
+            Ok(None)
+        }
+        Some(s) => s.parse::<Tid>().map(Some).map_err(serde::de::Error::custom),
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct EventHeader {
     op: i64,
@@ -559,5 +576,19 @@ mod test {
         let bytes = data_encoding::BASE64.decode(FRAME).unwrap();
         let msg = decode_frame(&bytes).unwrap();
         assert!(matches!(msg, SubscribeReposMessage::Account(_)));
+    }
+
+    /// regression: some relays send `since: ""` (empty string) instead of null/absent for the initial commit.
+    /// this should decode cleanly with `since = None`.
+    /// TODO: is this behaviour we should reject?
+    #[test]
+    fn test_decode_commit_empty_since() {
+        const FRAME: &[u8] = b"omF0ZyNjb21taXRib3ABq2NvcHOAY3Jldm0zbWdkeWNmdWIyeTIyY3NlcRsAAAACZ8sHJmRyZXBveCBkaWQ6cGxjOmpxM3p2cmI1ZXdnMnFndXA3M3Fzb3V6ZWR0aW1leBsyMDI2LTAzLTA1VDE1OjQ3OjU0LjcxNjMyOFplYmxvYnOAZXNpbmNlYGZibG9ja3NZAUk6omVyb290c4HYKlglAAFxEiAlaO/rjabPL4/e2QlxkoxzCCwv69hE4P3Vdxpv7f6uEWd2ZXJzaW9uAeABAXESICVo7+uNps8vj97ZCXGSjHMILC/r2ETg/dV3Gm/t/q4RpmNkaWR4IGRpZDpwbGM6anEzenZyYjVld2cycWd1cDczcXNvdXplY3Jldm0zbWdkeWNmdWIyeTIyY3NpZ1hAwKfrZtwwbN7dW0uSbviOs65NWQRvlS9Qc7oRtiorybMTEYxKGJaFK2kHIMEWIJqumb4751En2aJEpsilWlaQOWRkYXRh2CpYJQABcRIgnf7+Yd126j3K5QI4gLCDedV63yBILW/b4nWSifZHZ3tkcHJldvZndmVyc2lvbgMrAXESIJ3+/mHdduo9yuUCOICwg3nVet8gSC1v2+J1kon2R2d7omFlgGFs9mZjb21taXTYKlglAAFxEiAlaO/rjabPL4/e2QlxkoxzCCwv69hE4P3Vdxpv7f6uEWZyZWJhc2X0ZnRvb0JpZ/Q=";
+        let bytes = data_encoding::BASE64.decode(FRAME).unwrap();
+        let msg = decode_frame(&bytes).unwrap();
+        let SubscribeReposMessage::Commit(c) = msg else {
+            panic!("expected Commit");
+        };
+        assert!(c.since.is_none(), "since should be None for empty string");
     }
 }

@@ -598,7 +598,7 @@ impl Crawler {
             return Ok(next_wake);
         }
 
-        info!(count = ready.len(), "retrying pending repos");
+        debug!(count = ready.len(), "retrying pending repos");
 
         let handle = tokio::runtime::Handle::current();
         let filter = self.state.filter.load();
