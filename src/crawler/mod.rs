@@ -208,7 +208,7 @@ impl Crawler {
         let crawler = Arc::new(self);
 
         // stats ticker
-        tokio::spawn({
+        let ticker = tokio::spawn({
             use std::time::Instant;
             let crawler = crawler.clone();
             let mut last_time = Instant::now();
@@ -226,7 +226,7 @@ impl Crawler {
                         if is_throttled {
                             info!("throttled: pending queue full");
                         } else {
-                            debug!("no repos crawled or processed in 60s");
+                            info!("idle: no repos crawled or processed in 60s");
                         }
                         continue;
                     }
@@ -251,6 +251,11 @@ impl Crawler {
                 }
             }
         });
+        tokio::spawn(async move {
+            let Err(e) = ticker.await;
+            error!(err = ?e, "stats ticker panicked, aborting");
+            std::process::abort();
+        });
 
         // retry thread
         std::thread::spawn({
@@ -261,15 +266,21 @@ impl Crawler {
 
                 let _g = handle.enter();
 
-                loop {
-                    match crawler.process_retry_queue() {
-                        Ok(Some(dur)) => sleep(dur.max(Duration::from_secs(1))),
-                        Ok(None) => sleep(Duration::from_secs(60)),
-                        Err(e) => {
-                            error!(err = %e, "retry loop failed");
-                            sleep(Duration::from_secs(60));
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    loop {
+                        match crawler.process_retry_queue() {
+                            Ok(Some(dur)) => sleep(dur.max(Duration::from_secs(1))),
+                            Ok(None) => sleep(Duration::from_secs(60)),
+                            Err(e) => {
+                                error!(err = %e, "retry loop failed");
+                                sleep(Duration::from_secs(60));
+                            }
                         }
                     }
+                }));
+                if result.is_err() {
+                    error!("retry thread panicked, aborting");
+                    std::process::abort();
                 }
             }
         });
@@ -484,7 +495,9 @@ impl Crawler {
                         info!("reached end of list.");
                         cursor = Cursor::Done(c);
                     }
+                    info!("sleeping 1h before next enumeration pass");
                     tokio::time::sleep(Duration::from_secs(3600)).await;
+                    info!("resuming after 1h sleep");
                     continue;
                 }
                 Err(e) => return Err(e).wrap_err("error while crawling"),
@@ -546,7 +559,9 @@ impl Crawler {
             crawler.account_new_repos(valid_dids.len()).await;
 
             if matches!(cursor, Cursor::Done(_)) {
+                info!("enumeration complete, sleeping 1h before next pass");
                 tokio::time::sleep(Duration::from_secs(3600)).await;
+                info!("resuming after 1h sleep");
             }
         }
     }
