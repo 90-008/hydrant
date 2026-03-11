@@ -22,7 +22,9 @@ async fn main() -> miette::Result<()> {
 
     let cfg = Config::from_env()?;
 
-    let env_filter = tracing_subscriber::EnvFilter::new(&cfg.log_level);
+    let env_filter = tracing_subscriber::EnvFilter::builder()
+        .with_default_directive(tracing::Level::INFO.into())
+        .from_env_lossy();
     tracing_subscriber::fmt().with_env_filter(env_filter).init();
 
     info!("{cfg}");

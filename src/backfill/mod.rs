@@ -749,13 +749,11 @@ async fn process_did<'i>(
         // signal mode: no signal-matching records found — clean up the optimistically-added repo
         let did_key = keys::repo_key(did);
         let backfill_pending_key = keys::pending_key(previous_state.index_id);
-        let repos_ks = app_state.db.repos.clone();
-        let pending_ks = app_state.db.pending.clone();
-        let db_inner = app_state.db.inner.clone();
+        let app_state = app_state.clone();
         tokio::task::spawn_blocking(move || {
-            let mut batch = db_inner.batch();
-            batch.remove(&repos_ks, &did_key);
-            batch.remove(&pending_ks, backfill_pending_key);
+            let mut batch = app_state.db.inner.batch();
+            batch.remove(&app_state.db.repos, &did_key);
+            batch.remove(&app_state.db.pending, backfill_pending_key);
             batch.commit().into_diagnostic()
         })
         .await

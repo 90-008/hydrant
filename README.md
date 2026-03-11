@@ -22,12 +22,12 @@ the `WS /stream` (hydrant) and `WS /channel` (tap) endpoints have different desi
 
 ## configuration
 
-`hydrant` is configured via environment variables. all variables are prefixed with `HYDRANT_`.
+`hydrant` is configured via environment variables. all variables are prefixed with `HYDRANT_` (except `RUST_LOG`).
 
 | variable | default | description |
 | :--- | :--- | :--- |
 | `DATABASE_PATH` | `./hydrant.db` | path to the database folder. |
-| `LOG_LEVEL` | `info` | log level (e.g., `debug`, `info`, `warn`, `error`). |
+| `RUST_LOG` | `info` | log filter directives (e.g., `debug`, `hydrant=trace`). standard [`tracing` env-filter syntax](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html). |
 | `RELAY_HOST` | `wss://relay.fire.hose.cam` | websocket URL of the upstream firehose relay. |
 | `PLC_URL` | `https://plc.wtf` | base URL(s) of the PLC directory (comma-separated for multiple). |
 | `FULL_NETWORK` | `false` | if `true`, discovers and indexes all repositories in the network. |

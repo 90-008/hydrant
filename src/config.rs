@@ -1,5 +1,4 @@
 use miette::Result;
-use smol_str::SmolStr;
 use std::fmt;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -44,7 +43,6 @@ pub struct Config {
     pub ephemeral: bool,
     pub cursor_save_interval: Duration,
     pub repo_fetch_timeout: Duration,
-    pub log_level: SmolStr,
     pub api_port: u16,
     pub cache_size: u64,
     pub backfill_concurrency_limit: usize,
@@ -91,8 +89,6 @@ impl Config {
                     .into()
             };
         }
-
-        let log_level = cfg!("LOG_LEVEL", "info");
 
         let relay_host = cfg!(
             "RELAY_HOST",
@@ -190,7 +186,6 @@ impl Config {
             full_network,
             cursor_save_interval,
             repo_fetch_timeout,
-            log_level,
             api_port,
             cache_size,
             backfill_concurrency_limit,
@@ -230,7 +225,6 @@ impl fmt::Display for Config {
         const LABEL_WIDTH: usize = 27;
 
         writeln!(f, "hydrant configuration:")?;
-        config_line!(f, "log level", self.log_level)?;
         config_line!(f, "relay host", self.relay_host)?;
         config_line!(f, "plc urls", format_args!("{:?}", self.plc_urls))?;
         config_line!(f, "full network indexing", self.full_network)?;
