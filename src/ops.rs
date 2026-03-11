@@ -101,7 +101,7 @@ pub fn delete_repo(
     let records_prefix = keys::record_prefix_did(did);
     for guard in db.records.prefix(&records_prefix) {
         let (k, cid_bytes) = guard.into_inner().into_diagnostic()?;
-        batch.update_block_refcount(cid_bytes, -1);
+        batch.update_block_refcount(cid_bytes, -1)?;
         batch.batch_mut().remove(&db.records, k);
     }
 
@@ -304,7 +304,10 @@ pub fn apply_commit<'db, 'commit, 's>(
                     .batch_mut()
                     .insert(&db.blocks, cid_bytes.clone(), bytes.to_vec());
                 blocks_count += 1;
-                batch.update_block_refcount(cid_bytes.clone(), ephemeral.then_some(1).unwrap_or(2));
+                batch.update_block_refcount(
+                    cid_bytes.clone(),
+                    ephemeral.then_some(1).unwrap_or(2),
+                )?;
 
                 if !ephemeral {
                     batch
@@ -318,7 +321,7 @@ pub fn apply_commit<'db, 'commit, 's>(
                             ));
                         };
                         if old_cid_bytes != cid_bytes {
-                            batch.update_block_refcount(old_cid_bytes, -1);
+                            batch.update_block_refcount(old_cid_bytes, -1)?;
                         }
                     }
                     // accumulate counts
@@ -333,7 +336,7 @@ pub fn apply_commit<'db, 'commit, 's>(
                     // decrement block refcount
                     let old_cid_bytes = db.records.get(&db_key).into_diagnostic()?;
                     if let Some(cid_bytes) = old_cid_bytes {
-                        batch.update_block_refcount(cid_bytes, -1);
+                        batch.update_block_refcount(cid_bytes, -1)?;
                     }
                     batch.batch_mut().remove(&db.records, db_key);
 

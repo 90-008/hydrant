@@ -61,9 +61,35 @@ def compact-and-check-blocks [debug_url: string, expected_count: int] {
     }
 }
 
+def check-repo-refcounts [debug_url: string, did: string, expected_refcount: int] {
+    let refs = (http get $"($debug_url)/debug/repo_refcounts?did=($did)")
+    let cids = $refs.cids
+    let count = ($cids | columns | length)
+    if $count == 0 {
+        if $expected_refcount != 0 {
+            error make {msg: $"FAILED: expected refcounts to be ($expected_refcount) but found no cids for ($did)"}
+        }
+        print $"blocks for ($did) completely verified as 0"
+        return
+    }
+    
+    for rcid in ($cids | transpose key value) {
+        if $rcid.value < $expected_refcount {
+            error make {msg: $"FAILED: expected refcount for ($rcid.key) to be >= ($expected_refcount), but found ($rcid.value)"}
+        }
+        if $expected_refcount == 0 and $rcid.value != 0 {
+            error make {msg: $"FAILED: expected refcount for ($rcid.key) to be 0, but found ($rcid.value)"}
+        }
+    }
+    print $"all ($count) tracked blocks for ($did) verified with refcount >= ($expected_refcount)"
+}
+
 def ack-all-events [debug_url: string, url: string] {
     print "acking all events..."
+    mut total_acked = 0
     mut items = []
+    
+    # wait for at least some events
     for i in 1..30 {
         let events = http get $"($debug_url)/debug/iter?partition=events&limit=1000"
         $items = $events.items
@@ -77,10 +103,20 @@ def ack-all-events [debug_url: string, url: string] {
         error make {msg: "FAILED: no events to ack"}
     }
 
-    let event_ids = ($items | each { |x| ($x | first | into int) })
-
-    http post -t application/json $"($url)/stream/ack" { ids: $event_ids }
-    print $"acked ($event_ids | length) events"
+    loop {
+        let event_ids = ($items | each { |x| ($x | first | into int) })
+        http post -t application/json $"($url)/stream/ack" { ids: $event_ids }
+        $total_acked += ($event_ids | length)
+        
+        # getting next batch
+        let next_events = http get $"($debug_url)/debug/iter?partition=events&limit=1000"
+        $items = $next_events.items
+        if ($items | length) == 0 {
+            break
+        }
+    }
+    
+    print $"acked ($total_acked) events"
 }
 
 def main [] {
@@ -93,10 +129,14 @@ def main [] {
         
         let before_count = (wait-for-blocks $debug_url)
         print $"found ($before_count) blocks before GC"
+        
+        check-repo-refcounts $debug_url $repo1 2
 
         print "deleting repo..."
         http delete -t application/json $"($url)/repos" --data [ { did: ($repo1), delete_data: true } ]
         sleep 1sec
+
+        check-repo-refcounts $debug_url $repo1 1
 
         compact-and-check-blocks $debug_url $before_count
     }
@@ -107,9 +147,13 @@ def main [] {
         
         let before_count = (wait-for-blocks $debug_url)
         print $"found ($before_count) blocks before GC"
+        
+        check-repo-refcounts $debug_url $repo1 2
 
         ack-all-events $debug_url $url
         sleep 1sec
+
+        check-repo-refcounts $debug_url $repo1 1
 
         compact-and-check-blocks $debug_url $before_count
     }
@@ -120,12 +164,66 @@ def main [] {
         
         let before_count = (wait-for-blocks $debug_url)
         print $"found ($before_count) blocks before GC"
+        
+        check-repo-refcounts $debug_url $repo1 2
 
         print "deleting repo..."
         http delete -t application/json $"($url)/repos" --data [ { did: ($repo1), delete_data: true } ]
 
         ack-all-events $debug_url $url
         sleep 1sec
+        
+        check-repo-refcounts $debug_url $repo1 0
+
+        compact-and-check-blocks $debug_url 0
+    }
+
+    run-test-instance "delete repo, compact, ack events, compact" { |url, debug_url|
+        print $"adding repo ($repo1) to tracking..."
+        http put -t application/json $"($url)/repos" [ { did: ($repo1) } ]
+        
+        let before_count = (wait-for-blocks $debug_url)
+        print $"found ($before_count) blocks before GC"
+        
+        check-repo-refcounts $debug_url $repo1 2
+
+        print "deleting repo..."
+        http delete -t application/json $"($url)/repos" --data [ { did: ($repo1), delete_data: true } ]
+        sleep 1sec
+        
+        check-repo-refcounts $debug_url $repo1 1
+
+        compact-and-check-blocks $debug_url $before_count
+
+        ack-all-events $debug_url $url
+        sleep 1sec
+        
+        check-repo-refcounts $debug_url $repo1 0
+
+        compact-and-check-blocks $debug_url 0
+    }
+
+    run-test-instance "ack events, compact, delete repo, compact" { |url, debug_url|
+        print $"adding repo ($repo1) to tracking..."
+        http put -t application/json $"($url)/repos" [ { did: ($repo1) } ]
+        
+        let before_count = (wait-for-blocks $debug_url)
+        print $"found ($before_count) blocks before GC"
+        
+        check-repo-refcounts $debug_url $repo1 2
+
+        ack-all-events $debug_url $url
+        sleep 1sec
+        
+        check-repo-refcounts $debug_url $repo1 1
+
+        compact-and-check-blocks $debug_url $before_count
+
+        print "deleting repo..."
+        http delete -t application/json $"($url)/repos" --data [ { did: ($repo1), delete_data: true } ]
+        sleep 1sec
+        
+        check-repo-refcounts $debug_url $repo1 0
 
         compact-and-check-blocks $debug_url 0
     }
@@ -151,6 +249,11 @@ def main [] {
         # we will ack all events to be safe. Since repo2 is NOT deleted, its refcount should be fine even if events are acked.
         ack-all-events $debug_url $url
         sleep 1sec
+
+        # repo1 should have expected refcount 0
+        check-repo-refcounts $debug_url $repo1 0
+        # Wait, for repo2, we didn't delete it, but events are acked, so its refcount should be 1
+        check-repo-refcounts $debug_url $repo2 1
 
         compact-and-check-blocks $debug_url $repo2_blocks
     }
