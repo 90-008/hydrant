@@ -372,7 +372,7 @@ impl Crawler {
             list_repos_url
                 .query_pairs_mut()
                 .append_pair("limit", "1000");
-            if let Cursor::Next(Some(c)) = &cursor {
+            if let Cursor::Next(Some(c)) | Cursor::Done(c) = &cursor {
                 list_repos_url
                     .query_pairs_mut()
                     .append_pair("cursor", c.as_str());
