@@ -3,6 +3,13 @@ use std::time::Duration;
 use rand::RngExt;
 use reqwest::StatusCode;
 use serde::{Deserialize, Deserializer, Serializer};
+use url::Url;
+
+pub type RelayId = Vec<u8>;
+
+pub fn relay_id(url: &Url) -> RelayId {
+    url.as_str().as_bytes().to_vec()
+}
 
 /// outcome of [`RetryWithBackoff::retry`] when the operation does not succeed.
 pub enum RetryOutcome<E> {

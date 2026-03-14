@@ -121,7 +121,7 @@ impl FirehoseWorker {
         // dispatch loop
         while let Some(msg) = self.rx.blocking_recv() {
             let did = match &msg {
-                IngestMessage::Firehose(m) => match m {
+                IngestMessage::Firehose { msg: m, .. } => match m {
                     SubscribeReposMessage::Commit(c) => &c.repo,
                     SubscribeReposMessage::Identity(i) => &i.did,
                     SubscribeReposMessage::Account(a) => &a.did,
@@ -223,7 +223,7 @@ impl FirehoseWorker {
                         }
                     }
                 }
-                IngestMessage::Firehose(msg) => {
+                IngestMessage::Firehose { relay_id, msg } => {
                     let (did, seq) = match &msg {
                         SubscribeReposMessage::Commit(c) => (&c.repo, c.seq),
                         SubscribeReposMessage::Identity(i) => (&i.did, i.seq),
@@ -261,9 +261,9 @@ impl FirehoseWorker {
                         }
                     }
 
-                    state
-                        .cur_firehose
-                        .store(seq, std::sync::atomic::Ordering::SeqCst);
+                    if let Some((_, cursor)) = state.relay_cursors.get(&relay_id) {
+                        cursor.store(seq, std::sync::atomic::Ordering::SeqCst);
+                    }
                 }
             }
 

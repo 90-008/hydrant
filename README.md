@@ -20,6 +20,16 @@ the `WS /stream` (hydrant) and `WS /channel` (tap) endpoints have different desi
 | backfill | backfill events are mixed into the live queue and prioritized (per-repo, acting as synchronization barrier) by the server. | backfill simply inserts historical events (`live: false`) into the global event log. streaming is just reading this log sequentially. synchronization is the same as tap, `live: true` vs `live: false`. |
 | event types | `record`, `identity` (includes status) | `record`, `identity` (handle), `account` (status) |
 
+### multiple relay support
+
+`hydrant` supports connecting to multiple relays simultaneously for both firehose ingestion and crawling. when `RELAY_HOSTS` is configured with multiple URLs:
+
+- one independent firehose stream loop is spawned per relay
+- one independent crawling loop is spawned per relay
+- each relay maintains its own firehose / crawler cursor state
+- all ingestion loops and crawlers share the same worker pool and database
+- all crawlers share the same pending queue for backfill
+
 ## configuration
 
 `hydrant` is configured via environment variables. all variables are prefixed with `HYDRANT_` (except `RUST_LOG`).
@@ -52,15 +62,6 @@ the `WS /stream` (hydrant) and `WS /channel` (tap) endpoints have different desi
 | `ENABLE_CRAWLER` | `false` (if Filter), `true` (if Full) | whether to actively query the network for unknown repositories. |
 | `CRAWLER_MAX_PENDING_REPOS` | `2000` | max pending repos for crawler. |
 | `CRAWLER_RESUME_PENDING_REPOS` | `1000` | resume threshold for crawler pending repos. |
-
-### multi-relay crawling
-
-the crawler supports querying multiple relays simultaneously. when `RELAY_HOSTS` is configured with multiple URLs:
-
-- one independent crawling loop is spawned per relay
-- each relay maintains its own cursor state
-- all crawlers share the same pending queue for backfill
-- firehose connection uses the first relay in the list
 
 ## api
 

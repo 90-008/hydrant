@@ -1,19 +1,7 @@
 #!/usr/bin/env nu
 use common.nu *
 
-def main [] {
-    let env_vars = load-env-file
-    let did = ($env_vars | get --optional TEST_REPO)
-    let password = ($env_vars | get --optional TEST_PASSWORD)
-    
-    if ($did | is-empty) or ($password | is-empty) {
-        print "error: TEST_REPO and TEST_PASSWORD must be set in .env"
-        exit 1
-    }
-
-    let pds_url = resolve-pds $did
-    
-    let port = 3005
+def run-auth-test [did: string, password: string, pds_url: string, relays: string, port: int] {
     let url = $"http://localhost:($port)"
     let ws_url = $"ws://localhost:($port)/stream"
     let db_path = (mktemp -d -t hydrant_auth_test.XXXXXX)
@@ -25,9 +13,11 @@ def main [] {
     print "authentication successful"
 
     # 2. start hydrant
-    print $"starting hydrant on port ($port)..."
-    let binary = build-hydrant
-    let instance = start-hydrant $binary $db_path $port
+    print $"starting hydrant on port ($port) with relays: ($relays)..."
+    let binary = "target/debug/hydrant" # already built in main
+    let instance = (with-env { HYDRANT_RELAY_HOSTS: $relays } {
+        start-hydrant $binary $db_path $port
+    })
     
     mut test_passed = false
 
@@ -175,9 +165,40 @@ def main [] {
     print "cleaning up..."
     try { kill -9 $instance.pid }
     
-    if $test_passed {
+    $test_passed
+}
+
+def main [] {
+    let env_vars = load-env-file
+    let did = ($env_vars | get --optional TEST_REPO)
+    let password = ($env_vars | get --optional TEST_PASSWORD)
+    
+    if ($did | is-empty) or ($password | is-empty) {
+        print "error: TEST_REPO and TEST_PASSWORD must be set in .env"
+        exit 1
+    }
+
+    let pds_url = resolve-pds $did
+    
+    # ensure build
+    build-hydrant | ignore
+    
+    print "=== running single-relay test ==="
+    let relay1 = "wss://relay.fire.hose.cam"
+    let success1 = run-auth-test $did $password $pds_url $relay1 3005
+    
+    print ""
+    print "=== running multi-relay test ==="
+    let relay_multi = "wss://relay.fire.hose.cam,wss://relay3.fr.hose.cam,wss://relay1.us-west.bsky.network,wss://relay1.us-east.bsky.network"
+    let success2 = run-auth-test $did $password $pds_url $relay_multi 3015
+    
+    if $success1 and $success2 {
+        print ""
+        print "ALL AUTHENTICATED STREAM TESTS PASSED"
         exit 0
     } else {
+        print ""
+        print $"TESTS FAILED: single=($success1), multi=($success2)"
         exit 1
     }
 }

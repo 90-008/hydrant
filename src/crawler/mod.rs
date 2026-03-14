@@ -3,7 +3,7 @@ use crate::db::keys::crawler_cursor_key;
 use crate::db::{Db, keys, ser_repo_state};
 use crate::state::AppState;
 use crate::types::RepoState;
-use crate::util::{ErrorForStatus, RetryOutcome, RetryWithBackoff, parse_retry_after};
+use crate::util::{ErrorForStatus, RetryOutcome, RetryWithBackoff, parse_retry_after, relay_id};
 use chrono::{DateTime, TimeDelta, Utc};
 use futures::FutureExt;
 use jacquard_api::com_atproto::repo::describe_repo::DescribeRepoOutput;
@@ -214,7 +214,7 @@ impl Crawler {
     }
 
     async fn get_cursor(&self, relay_host: &Url) -> Result<Cursor> {
-        let key = crawler_cursor_key(relay_host);
+        let key = crawler_cursor_key(&relay_id(relay_host));
         let cursor_bytes = Db::get(self.state.db.cursors.clone(), &key).await?;
         let cursor: Cursor = cursor_bytes
             .as_deref()
@@ -358,17 +358,22 @@ impl Crawler {
         Ok(())
     }
 
-    async fn crawl(crawler: Arc<Self>, relay_host: &Url) -> Result<()> {
-        let mut relay_url = relay_host.clone();
-        match relay_url.scheme() {
-            "wss" => relay_url
+    fn base_url(url: &Url) -> Result<Url> {
+        let mut url = url.clone();
+        match url.scheme() {
+            "wss" => url
                 .set_scheme("https")
-                .map_err(|_| miette::miette!("invalid url: {relay_url}"))?,
-            "ws" => relay_url
+                .map_err(|_| miette::miette!("invalid url: {url}"))?,
+            "ws" => url
                 .set_scheme("http")
-                .map_err(|_| miette::miette!("invalid url: {relay_url}"))?,
+                .map_err(|_| miette::miette!("invalid url: {url}"))?,
             _ => {}
         }
+        Ok(url)
+    }
+
+    async fn crawl(crawler: Arc<Self>, relay_host: &Url) -> Result<()> {
+        let base_url = Self::base_url(relay_host)?;
 
         let mut rng: SmallRng = rand::make_rng();
         let db = &crawler.state.db;
@@ -431,7 +436,7 @@ impl Crawler {
                 }
             }
 
-            let mut list_repos_url = relay_url
+            let mut list_repos_url = base_url
                 .join("/xrpc/com.atproto.sync.listRepos")
                 .into_diagnostic()?;
             list_repos_url
@@ -598,7 +603,7 @@ impl Crawler {
             }
             batch.insert(
                 &db.cursors,
-                crawler_cursor_key(relay_host),
+                crawler_cursor_key(&relay_id(relay_host)),
                 rmp_serde::to_vec(&cursor)
                     .into_diagnostic()
                     .wrap_err("cant serialize cursor")?,

@@ -45,6 +45,7 @@ def main [] {
             HYDRANT_DISABLE_BACKFILL: "true", # disable backfill so pending count stays up
             HYDRANT_API_PORT: ($port | into string),
             HYDRANT_LOG_LEVEL: "debug",
+            RUST_LOG: "debug",
             HYDRANT_CRAWLER_MAX_PENDING_REPOS: "2",
             HYDRANT_CRAWLER_RESUME_PENDING_REPOS: "1"
         } {
@@ -88,7 +89,7 @@ def main [] {
             sleep 2sec # give logging a moment
             
             let logs = (open $log_file | str replace --all "\n" " ")
-            if ($logs | str contains "crawler throttling: pending repos") {
+            if ($logs | str contains "throttling: above max pending") {
                 print "CONFIRMED: crawler is throttling!"
                 
                 # now testing resumption
@@ -108,7 +109,7 @@ def main [] {
                 
                 # check logs for resumption message
                 let logs_after = (open $log_file | str replace --all "\n" " ")
-                if ($logs_after | str contains "crawler resuming") {
+                if ($logs_after | str contains "throttling released") {
                      print "CONFIRMED: crawler resumed!"
                      $success = true
                 } else {

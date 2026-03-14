@@ -1,20 +1,23 @@
+use std::collections::HashMap;
 use std::sync::atomic::AtomicI64;
 
 use miette::Result;
 use tokio::sync::Notify;
+use url::Url;
 
 use crate::{
     config::Config,
     db::Db,
     filter::{FilterHandle, new_handle},
     resolver::Resolver,
+    util::{RelayId, relay_id},
 };
 
 pub struct AppState {
     pub db: Db,
     pub resolver: Resolver,
     pub filter: FilterHandle,
-    pub cur_firehose: AtomicI64,
+    pub relay_cursors: HashMap<RelayId, (Url, AtomicI64)>,
     pub backfill_notify: Notify,
 }
 
@@ -25,11 +28,17 @@ impl AppState {
         let filter_config = crate::db::filter::load(&db.filter)?;
         let filter = new_handle(filter_config);
 
+        let relay_cursors = config
+            .relays
+            .iter()
+            .map(|url| (relay_id(url), (url.clone(), AtomicI64::new(0))))
+            .collect();
+
         Ok(Self {
             db,
             resolver,
             filter,
-            cur_firehose: AtomicI64::new(0),
+            relay_cursors,
             backfill_notify: Notify::new(),
         })
     }

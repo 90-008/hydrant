@@ -1,6 +1,6 @@
 use futures::{FutureExt, future::BoxFuture};
 use hydrant::config::{Config, SignatureVerification};
-use hydrant::db::{self, set_firehose_cursor};
+use hydrant::db;
 use hydrant::ingest::firehose::FirehoseIngestor;
 use hydrant::state::AppState;
 use hydrant::{api, backfill::BackfillWorker, ingest::worker::FirehoseWorker};
@@ -176,11 +176,15 @@ async fn main() -> miette::Result<()> {
             loop {
                 std::thread::sleep(persist_interval);
 
-                // persist firehose cursor
-                let seq = state.cur_firehose.load(Ordering::SeqCst);
-                if let Err(e) = set_firehose_cursor(&state.db, seq) {
-                    error!(err = %e, "failed to save cursor");
-                    db::check_poisoned_report(&e);
+                // persist firehose cursors
+                for (relay_id, (relay, cursor)) in &state.relay_cursors {
+                    let seq = cursor.load(Ordering::SeqCst);
+                    if seq > 0 {
+                        if let Err(e) = db::set_firehose_cursor(&state.db, relay_id, seq) {
+                            error!(relay = %relay, err = %e, "failed to save cursor");
+                            db::check_poisoned_report(&e);
+                        }
+                    }
                 }
 
                 // persist counts
@@ -249,28 +253,27 @@ async fn main() -> miette::Result<()> {
             }
         });
 
-        let ingestor = FirehoseIngestor::new(
-            state.clone(),
-            buffer_tx,
-            cfg.relays
-                .first()
-                .cloned()
-                .expect("at least one relay host must be configured"),
-            state.filter.clone(),
-            matches!(cfg.verify_signatures, SignatureVerification::Full),
-        );
+        let mut t: Vec<BoxFuture<miette::Result<()>>> = vec![Box::pin(
+            tokio::task::spawn_blocking(move || {
+                firehose_worker
+                    .join()
+                    .map_err(|e| miette::miette!("buffer processor died: {e:?}"))
+            })
+            .map(|r| r.into_diagnostic().flatten().flatten()),
+        )];
 
-        vec![
-            Box::pin(
-                tokio::task::spawn_blocking(move || {
-                    firehose_worker
-                        .join()
-                        .map_err(|e| miette::miette!("buffer processor died: {e:?}"))
-                })
-                .map(|r| r.into_diagnostic().flatten().flatten()),
-            ) as BoxFuture<_>,
-            Box::pin(ingestor.run()),
-        ]
+        for relay_url in &cfg.relays {
+            let ingestor = FirehoseIngestor::new(
+                state.clone(),
+                buffer_tx.clone(),
+                relay_url.clone(),
+                state.filter.clone(),
+                matches!(cfg.verify_signatures, SignatureVerification::Full),
+            );
+            t.push(Box::pin(ingestor.run()));
+        }
+
+        t
     } else {
         info!("firehose ingestion disabled by config");
         // if firehose is disabled, we just wait indefinitely (or until signal)

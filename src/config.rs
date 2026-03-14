@@ -92,7 +92,7 @@ impl Config {
 
         let relay_host: Url = cfg!(
             "RELAY_HOST",
-            Url::parse("wss://relay.fire.hose.cam").unwrap()
+            Url::parse("wss://relay.fire.hose.cam/").unwrap()
         );
         let relay_hosts = std::env::var("HYDRANT_RELAY_HOSTS")
             .ok()
