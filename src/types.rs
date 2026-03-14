@@ -39,6 +39,14 @@ pub struct RepoState<'i> {
     pub status: RepoStatus,
     pub rev: Option<DbTid>,
     pub data: Option<IpldCid>,
+    // todo: is this actually valid? the spec says this is informal and intermadiate
+    // services may change it. we should probably document it. if we cant use this
+    // then how do we dedup account / identity ops?
+    /// ms since epoch of the last firehose message we processed for this repo.
+    /// used to deduplicate identity / account events that can arrive from multiple relays at
+    /// different wall-clock times but represent the same underlying PDS event.
+    #[serde(default)]
+    pub last_message_time: Option<i64>,
     /// this is when we *ingested* any last updates
     pub last_updated_at: i64, // unix timestamp
     /// whether we are ingesting events for this repo
@@ -65,6 +73,7 @@ impl<'i> RepoState<'i> {
             handle: None,
             pds: None,
             signing_key: None,
+            last_message_time: None,
         }
     }
 
@@ -74,6 +83,16 @@ impl<'i> RepoState<'i> {
             tracked: false,
             ..Self::backfilling(index_id)
         }
+    }
+
+    // advances the high-water mark to event_ms if it's newer than what we've seen
+    pub fn advance_message_time(&mut self, event_ms: i64) {
+        self.last_message_time = Some(event_ms.max(self.last_message_time.unwrap_or(0)));
+    }
+
+    // updates last_updated_at to now
+    pub fn touch(&mut self) {
+        self.last_updated_at = chrono::Utc::now().timestamp();
     }
 
     pub fn update_from_doc(&mut self, doc: MiniDoc) -> bool {
@@ -102,6 +121,7 @@ impl<'i> IntoStatic for RepoState<'i> {
             handle: self.handle.map(IntoStatic::into_static),
             pds: self.pds.map(IntoStatic::into_static),
             signing_key: self.signing_key.map(IntoStatic::into_static),
+            last_message_time: self.last_message_time,
         }
     }
 }

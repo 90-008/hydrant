@@ -183,7 +183,7 @@ pub fn update_repo_status<'batch, 's>(
     }
 
     repo_state.status = new_status;
-    repo_state.last_updated_at = chrono::Utc::now().timestamp();
+    repo_state.touch();
 
     batch.insert(&db.repos, &repo_key, ser_repo_state(&repo_state)?);
 
@@ -260,7 +260,7 @@ pub fn apply_commit<'db, 'commit, 's>(
 
     repo_state.rev = Some((&commit.rev).into());
     repo_state.data = Some(repo_commit.data);
-    repo_state.last_updated_at = chrono::Utc::now().timestamp();
+    repo_state.touch();
 
     batch
         .batch_mut()

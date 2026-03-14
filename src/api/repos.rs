@@ -8,6 +8,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{delete, get, put},
 };
+use chrono::{DateTime, Utc};
 use jacquard_common::{IntoStatic, types::did::Did};
 use miette::IntoDiagnostic;
 use rand::Rng;
@@ -47,7 +48,10 @@ pub struct RepoResponse {
     // this does not have the did:key: prefix
     #[serde(skip_serializing_if = "Option::is_none")]
     pub signing_key: Option<String>,
-    pub last_updated_at: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_updated_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_message_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Deserialize)]
@@ -352,7 +356,8 @@ fn repo_state_to_response(did: String, s: RepoState<'_>) -> RepoResponse {
         handle: s.handle.map(|h| h.to_string()),
         pds: s.pds.map(|p| p.to_string()),
         signing_key: s.signing_key.map(|k| k.encode()),
-        last_updated_at: s.last_updated_at,
+        last_updated_at: DateTime::from_timestamp_secs(s.last_updated_at),
+        last_message_at: s.last_message_time.and_then(DateTime::from_timestamp_secs),
     }
 }
 

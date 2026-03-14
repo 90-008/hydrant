@@ -1,6 +1,6 @@
 use crate::db::{self, keys};
 use crate::filter::FilterMode;
-use crate::ingest::stream::{Commit, SubscribeReposMessage};
+use crate::ingest::stream::{Account, Commit, Identity, SubscribeReposMessage, Sync};
 use crate::ingest::{BufferRx, IngestMessage};
 use crate::ops;
 use crate::resolver::{NoSigningKeyError, ResolverError};
@@ -48,14 +48,27 @@ impl From<miette::Report> for IngestError {
     }
 }
 
+// gate returned by check_repo_state, tells the shard loop what to do with the message
+enum ProcessGate<'s, 'c> {
+    // did not exist in db, newly queued for backfill, drop
+    NewRepo,
+    // explicitly untracked, backfilling, or in error, drop
+    Drop,
+    // inactive repo receiving a non-account message, buffer the commit if present, drop otherwise
+    Buffer(Option<&'c Commit<'c>>),
+    // ready to process with the latest state
+    Ready(RepoState<'s>),
+}
+
+// result returned by a message handler after the gate has been resolved
 #[derive(Debug)]
 enum RepoProcessResult<'s, 'c> {
+    // message processed successfully, here is the (possibly updated) state
+    Ok(RepoState<'s>),
+    // repo was deleted as part of processing
     Deleted,
-    Syncing(Option<&'c Commit<'c>>),
-    Ok {
-        state: RepoState<'s>,
-        old_status: RepoStatus,
-    },
+    // needs backfill; carries the triggering commit to buffer (None when already in the buffer)
+    NeedsBackfill(Option<&'c Commit<'c>>),
 }
 
 pub struct FirehoseWorker {
@@ -187,39 +200,33 @@ impl FirehoseWorker {
                 IngestMessage::BackfillFinished(did) => {
                     debug!(did = %did, "backfill finished, verifying state and draining buffer");
 
-                    // load repo state to transition status and draining buffer
                     let repo_key = keys::repo_key(&did);
                     if let Ok(Some(state_bytes)) = state.db.repos.get(&repo_key).into_diagnostic() {
                         match crate::db::deser_repo_state(&state_bytes) {
                             Ok(repo_state) => {
                                 let repo_state = repo_state.into_static();
 
-                                let old_status = repo_state.status.clone();
-                                match Self::drain_resync_buffer(
-                                    &mut ctx, &did, repo_state, old_status,
-                                ) {
-                                    Ok(res) => match res {
-                                        RepoProcessResult::Ok { state: s, .. } => {
-                                            // TODO: there might be a race condition here where we get a new commit
-                                            // while the resync buffer is being drained, we should handle that probably
-                                            // but also it should still be fine since we'll sync eventually anyway
-                                            let res = ops::update_repo_status(
-                                                ctx.batch.batch_mut(),
-                                                &state.db,
-                                                &did,
-                                                s,
-                                                RepoStatus::Synced,
-                                            );
-                                            if let Err(e) = res {
-                                                // this can only fail if serde retry fails which would be really weird
-                                                error!(did = %did, err = %e, "failed to transition to synced");
-                                            }
+                                match Self::drain_resync_buffer(&mut ctx, &did, repo_state) {
+                                    Ok(RepoProcessResult::Ok(s)) => {
+                                        // TODO: there might be a race condition here where we get a new commit
+                                        // while the resync buffer is being drained, we should handle that probably
+                                        // but also it should still be fine since we'll sync eventually anyway
+                                        let res = ops::update_repo_status(
+                                            ctx.batch.batch_mut(),
+                                            &state.db,
+                                            &did,
+                                            s,
+                                            RepoStatus::Synced,
+                                        );
+                                        if let Err(e) = res {
+                                            // this can only fail if serde retry fails which would be really weird
+                                            error!(did = %did, err = %e, "failed to transition to synced");
                                         }
-                                        // we don't have to handle this since drain_resync_buffer doesn't delete
-                                        // the commits from the resync buffer so they will get retried later
-                                        RepoProcessResult::Syncing(_) => {}
-                                        RepoProcessResult::Deleted => {}
-                                    },
+                                    }
+                                    // we don't have to handle this since drain_resync_buffer doesn't delete
+                                    // the commits from the resync buffer so they will get retried later
+                                    Ok(RepoProcessResult::NeedsBackfill(_)) => {}
+                                    Ok(RepoProcessResult::Deleted) => {}
                                     Err(e) => {
                                         error!(did = %did, err = %e, "failed to drain resync buffer")
                                     }
@@ -238,22 +245,87 @@ impl FirehoseWorker {
                         _ => continue,
                     };
 
-                    match Self::process_message(&mut ctx, &msg, did) {
-                        Ok(RepoProcessResult::Ok { .. }) => {}
-                        Ok(RepoProcessResult::Deleted) => {}
-                        Ok(RepoProcessResult::Syncing(Some(commit))) => {
-                            if let Err(e) = ops::persist_to_resync_buffer(&state.db, did, commit) {
-                                error!(did = %did, err = %e, "failed to persist commit to resync_buffer");
+                    let gate = match Self::check_repo_state(&mut ctx, did, &msg) {
+                        Ok(g) => g,
+                        Err(e) => {
+                            if let IngestError::Generic(ref r) = e {
+                                db::check_poisoned_report(r);
+                            }
+                            error!(did = %did, err = %e, "error in check_repo_state");
+                            if let Some((_, cursor)) = state.relay_cursors.get(&relay_id) {
+                                cursor.store(seq, std::sync::atomic::Ordering::SeqCst);
+                            }
+                            continue;
+                        }
+                    };
+
+                    match gate {
+                        ProcessGate::NewRepo | ProcessGate::Drop => {}
+                        ProcessGate::Buffer(commit) => {
+                            if let Some(commit) = commit {
+                                if let Err(e) =
+                                    ops::persist_to_resync_buffer(&state.db, did, commit)
+                                {
+                                    error!(
+                                        did = %did, err = %e,
+                                        "failed to persist commit to resync_buffer"
+                                    );
+                                }
                             }
                         }
-                        Ok(RepoProcessResult::Syncing(None)) => {}
-                        Err(e) => {
-                            if let IngestError::Generic(e) = &e {
-                                db::check_poisoned_report(e);
+                        ProcessGate::Ready(mut repo_state) => {
+                            let pre_status = repo_state.status.clone();
+
+                            // if it was in deactivated/takendown/suspended state, we can mark it
+                            // as synced because we are receiving an active=true account event now.
+                            // we do this before dispatching so handle_account sees pre_status correctly
+                            if matches!(
+                                pre_status,
+                                RepoStatus::Deactivated
+                                    | RepoStatus::Suspended
+                                    | RepoStatus::Takendown
+                            ) {
+                                if let SubscribeReposMessage::Account(acc) = &msg {
+                                    if acc.active {
+                                        match ops::update_repo_status(
+                                            ctx.batch.batch_mut(),
+                                            &ctx.state.db,
+                                            did,
+                                            repo_state,
+                                            RepoStatus::Synced,
+                                        ) {
+                                            Ok(rs) => {
+                                                repo_state = rs;
+                                                ctx.state.db.update_gauge_diff(
+                                                    &GaugeState::Resync(None),
+                                                    &GaugeState::Synced,
+                                                );
+                                            }
+                                            Err(e) => {
+                                                error!(
+                                                    did = %did, err = %e,
+                                                    "failed to transition inactive repo to synced"
+                                                );
+                                                if let Some((_, cursor)) =
+                                                    state.relay_cursors.get(&relay_id)
+                                                {
+                                                    cursor.store(
+                                                        seq,
+                                                        std::sync::atomic::Ordering::SeqCst,
+                                                    );
+                                                }
+                                                continue;
+                                            }
+                                        }
+                                    }
+                                }
                             }
-                            error!(did = %did, err = %e, "error processing message");
-                            if Self::check_if_retriable_failure(&e) {
-                                if let SubscribeReposMessage::Commit(commit) = &msg {
+
+                            match Self::process_message(&mut ctx, &msg, did, repo_state, pre_status)
+                            {
+                                Ok(RepoProcessResult::Ok(_)) => {}
+                                Ok(RepoProcessResult::Deleted) => {}
+                                Ok(RepoProcessResult::NeedsBackfill(Some(commit))) => {
                                     if let Err(e) =
                                         ops::persist_to_resync_buffer(&state.db, did, commit)
                                     {
@@ -261,6 +333,25 @@ impl FirehoseWorker {
                                             did = %did, err = %e,
                                             "failed to persist commit to resync_buffer"
                                         );
+                                    }
+                                }
+                                Ok(RepoProcessResult::NeedsBackfill(None)) => {}
+                                Err(e) => {
+                                    if let IngestError::Generic(ref r) = e {
+                                        db::check_poisoned_report(r);
+                                    }
+                                    error!(did = %did, err = %e, "error processing message");
+                                    if Self::check_if_retriable_failure(&e) {
+                                        if let SubscribeReposMessage::Commit(commit) = &msg {
+                                            if let Err(e) = ops::persist_to_resync_buffer(
+                                                &state.db, did, commit,
+                                            ) {
+                                                error!(
+                                                    did = %did, err = %e,
+                                                    "failed to persist commit to resync_buffer"
+                                                );
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -291,7 +382,7 @@ impl FirehoseWorker {
         }
     }
 
-    // dont retry commit or sync on key fetch errors
+    // don't retry commit or sync on key fetch errors
     // since we'll just try again later if we get commit or sync again
     fn check_if_retriable_failure(e: &IngestError) -> bool {
         matches!(
@@ -306,218 +397,42 @@ impl FirehoseWorker {
         ctx: &mut WorkerContext,
         msg: &'c SubscribeReposMessage<'static>,
         did: &Did,
+        repo_state: RepoState<'s>,
+        pre_status: RepoStatus,
     ) -> Result<RepoProcessResult<'s, 'c>, IngestError> {
-        let check_repo_res = Self::check_repo_state(ctx, did, msg)?;
-        let (mut repo_state, old_status) = match check_repo_res {
-            RepoProcessResult::Syncing(_) | RepoProcessResult::Deleted => {
-                return Ok(check_repo_res);
-            }
-            RepoProcessResult::Ok { state, old_status } => (state, old_status),
-        };
-
         match msg {
             SubscribeReposMessage::Commit(commit) => {
-                trace!(did = %did, "processing buffered commit");
-
-                let res = Self::process_commit(ctx, did, repo_state, commit)?;
-                return match res {
-                    RepoProcessResult::Ok { state, .. } => {
-                        Ok(RepoProcessResult::Ok { state, old_status })
-                    }
-                    other => Ok(other),
-                };
+                trace!(did = %did, "processing commit");
+                Self::handle_commit(ctx, did, repo_state, commit)
             }
             SubscribeReposMessage::Sync(sync) => {
-                debug!(did = %did, "processing buffered sync");
-
-                Self::refresh_doc(ctx, &mut repo_state, did)?;
-
-                match ops::verify_sync_event(
-                    sync.blocks.as_ref(),
-                    Self::fetch_key(ctx, did)?.as_ref(),
-                ) {
-                    Ok((root, rev)) => {
-                        if let Some(current_data) = &repo_state.data {
-                            if current_data == &root.to_ipld().expect("valid cid") {
-                                debug!(did = %did, "skipping noop sync");
-                                return Ok(RepoProcessResult::Ok {
-                                    state: repo_state,
-                                    old_status,
-                                });
-                            }
-                        }
-
-                        if let Some(current_rev) = &repo_state.rev {
-                            if rev.as_str() <= current_rev.to_tid().as_str() {
-                                debug!(did = %did, "skipping replayed sync");
-                                return Ok(RepoProcessResult::Ok {
-                                    state: repo_state,
-                                    old_status,
-                                });
-                            }
-                        }
-
-                        warn!(did = %did, "sync event, triggering backfill");
-                        let mut batch = ctx.state.db.inner.batch();
-                        repo_state = ops::update_repo_status(
-                            &mut batch,
-                            &ctx.state.db,
-                            did,
-                            repo_state,
-                            RepoStatus::Backfilling,
-                        )?;
-                        batch.commit().into_diagnostic()?;
-                        ctx.state
-                            .db
-                            .update_gauge_diff(&GaugeState::Synced, &GaugeState::Pending);
-                        ctx.state.notify_backfill();
-                        return Ok(RepoProcessResult::Ok {
-                            state: repo_state,
-                            old_status,
-                        });
-                    }
-                    Err(e) => {
-                        error!(did = %did, err = %e, "failed to process sync event");
-                    }
-                }
+                debug!(did = %did, "processing sync");
+                Self::handle_sync(ctx, did, repo_state, sync)
             }
             SubscribeReposMessage::Identity(identity) => {
-                debug!(did = %did, "processing buffered identity");
-
-                let changed = if identity.handle.is_none() {
-                    // we invalidate only if no handle is sent since its like a
-                    // "invalidate your caches" message then basically
-                    ctx.state.resolver.invalidate_sync(did);
-                    let doc = ctx.handle.block_on(ctx.state.resolver.resolve_doc(did))?;
-                    repo_state.update_from_doc(doc)
-                } else {
-                    let old_handle = repo_state.handle.clone();
-                    repo_state.handle = identity.handle.clone().or(repo_state.handle);
-                    repo_state.handle != old_handle
-                };
-
-                ctx.batch.batch_mut().insert(
-                    &ctx.state.db.repos,
-                    keys::repo_key(did),
-                    crate::db::ser_repo_state(&repo_state)?,
-                );
-
-                if changed {
-                    let evt = IdentityEvt {
-                        did: did.clone().into_static(),
-                        handle: repo_state.handle.clone(),
-                    };
-                    ctx.broadcast_events
-                        .push(ops::make_identity_event(&ctx.state.db, evt));
-                }
+                debug!(did = %did, "processing identity");
+                Self::handle_identity(ctx, did, repo_state, identity)
             }
             SubscribeReposMessage::Account(account) => {
-                debug!(did = %did, "processing buffered account");
-                let was_inactive = matches!(
-                    old_status,
-                    RepoStatus::Deactivated | RepoStatus::Takendown | RepoStatus::Suspended
-                );
-                let is_inactive = !account.active;
-                let evt = AccountEvt {
-                    did: did.clone().into_static(),
-                    active: account.active,
-                    status: account.status.as_ref().map(|s| s.to_cowstr().into_static()),
-                };
-
-                Self::refresh_doc(ctx, &mut repo_state, did)?;
-
-                if !account.active {
-                    use crate::ingest::stream::AccountStatus;
-                    match &account.status {
-                        Some(AccountStatus::Deleted) => {
-                            debug!(did = %did, "account deleted, wiping data");
-                            crate::ops::delete_repo(
-                                &mut ctx.batch,
-                                &ctx.state.db,
-                                did,
-                                &repo_state,
-                            )?;
-                            return Ok(RepoProcessResult::Deleted);
-                        }
-                        status => {
-                            let target_status = match status {
-                                Some(status) => match status {
-                                    AccountStatus::Deleted => {
-                                        unreachable!("deleted account status is handled before")
-                                    }
-                                    AccountStatus::Takendown => RepoStatus::Takendown,
-                                    AccountStatus::Suspended => RepoStatus::Suspended,
-                                    AccountStatus::Deactivated => RepoStatus::Deactivated,
-                                    AccountStatus::Throttled => {
-                                        RepoStatus::Error("throttled".into())
-                                    }
-                                    AccountStatus::Desynchronized => {
-                                        RepoStatus::Error("desynchronized".into())
-                                    }
-                                    AccountStatus::Other(s) => {
-                                        warn!(
-                                            did = %did, status = %s,
-                                            "unknown account status, will put in error state"
-                                        );
-                                        RepoStatus::Error(s.to_smolstr())
-                                    }
-                                },
-                                None => {
-                                    warn!(did = %did, "account inactive but no status provided");
-                                    RepoStatus::Error("unknown".into())
-                                }
-                            };
-
-                            if repo_state.status == target_status {
-                                debug!(did = %did, ?target_status, "account status unchanged");
-                                return Ok(RepoProcessResult::Ok {
-                                    state: repo_state,
-                                    old_status,
-                                });
-                            }
-
-                            repo_state = ops::update_repo_status(
-                                ctx.batch.batch_mut(),
-                                &ctx.state.db,
-                                did,
-                                repo_state,
-                                target_status,
-                            )?;
-                            ctx.state
-                                .db
-                                .update_gauge_diff(&GaugeState::Synced, &GaugeState::Resync(None));
-                        }
-                    }
-                } else {
-                    // normally we would initiate backfill here
-                    // but we don't have to do anything because:
-                    // 1. we handle changing repo status to Synced before this (in check repo state)
-                    // 2. initiating backfilling is also handled there
-                }
-
-                if was_inactive != is_inactive || repo_state.status != old_status {
-                    ctx.broadcast_events
-                        .push(ops::make_account_event(&ctx.state.db, evt));
-                }
+                debug!(did = %did, "processing account");
+                Self::handle_account(ctx, did, repo_state, pre_status, account)
             }
             _ => {
                 warn!(did = %did, "unknown message type in buffer");
+                Ok(RepoProcessResult::Ok(repo_state))
             }
         }
-
-        Ok(RepoProcessResult::Ok {
-            state: repo_state,
-            old_status,
-        })
     }
 
-    fn process_commit<'c, 'ns, 's: 'ns>(
+    fn handle_commit<'s, 'c>(
         ctx: &mut WorkerContext,
         did: &Did,
-        repo_state: RepoState<'s>,
+        mut repo_state: RepoState<'s>,
         commit: &'c Commit<'c>,
-    ) -> Result<RepoProcessResult<'ns, 'c>, IngestError> {
-        // check for replayed events (already seen revision)
+    ) -> Result<RepoProcessResult<'s, 'c>, IngestError> {
+        repo_state.advance_message_time(commit.time.0.timestamp_millis());
+
+        // skip replayed events (already seen revision)
         if matches!(repo_state.rev, Some(ref rev) if commit.rev.as_str() <= rev.to_tid().as_str()) {
             debug!(
                 did = %did,
@@ -525,11 +440,7 @@ impl FirehoseWorker {
                 state_rev = %repo_state.rev.as_ref().map(|r| r.to_tid()).expect("we checked in if"),
                 "skipping replayed event"
             );
-            let old_status = repo_state.status.clone();
-            return Ok(RepoProcessResult::Ok {
-                state: repo_state,
-                old_status,
-            });
+            return Ok(RepoProcessResult::Ok(repo_state));
         }
 
         if let (Some(repo), Some(prev_commit)) = (&repo_state.data, &commit.prev_data)
@@ -556,12 +467,11 @@ impl FirehoseWorker {
                 RepoStatus::Backfilling,
             )?;
             batch.commit().into_diagnostic()?;
-            ctx.state.db.update_gauge_diff(
-                &crate::types::GaugeState::Synced,
-                &crate::types::GaugeState::Pending,
-            );
+            ctx.state
+                .db
+                .update_gauge_diff(&GaugeState::Synced, &GaugeState::Pending);
             ctx.state.notify_backfill();
-            return Ok(RepoProcessResult::Syncing(Some(commit)));
+            return Ok(RepoProcessResult::NeedsBackfill(Some(commit)));
         }
 
         let signing_key = Self::fetch_key(ctx, did)?;
@@ -569,7 +479,7 @@ impl FirehoseWorker {
             &mut ctx.batch,
             &ctx.state.db,
             repo_state,
-            &commit,
+            commit,
             signing_key.as_ref(),
             &ctx.state.filter.load(),
             ctx.ephemeral,
@@ -585,21 +495,220 @@ impl FirehoseWorker {
                 - 1,
         ));
 
-        let old_status = repo_state.status.clone();
-        Ok(RepoProcessResult::Ok {
-            state: repo_state,
-            old_status,
-        })
+        Ok(RepoProcessResult::Ok(repo_state))
     }
 
-    // checks the current state of the repo in the database
+    fn handle_sync<'s, 'c>(
+        ctx: &mut WorkerContext,
+        did: &Did,
+        mut repo_state: RepoState<'s>,
+        sync: &'c Sync<'c>,
+    ) -> Result<RepoProcessResult<'s, 'c>, IngestError> {
+        repo_state.advance_message_time(sync.time.0.timestamp_millis());
+
+        Self::refresh_doc(ctx, &mut repo_state, did)?;
+
+        match ops::verify_sync_event(sync.blocks.as_ref(), Self::fetch_key(ctx, did)?.as_ref()) {
+            Ok((root, rev)) => {
+                if let Some(current_data) = &repo_state.data {
+                    if current_data == &root.to_ipld().expect("valid cid") {
+                        debug!(did = %did, "skipping noop sync");
+                        return Ok(RepoProcessResult::Ok(repo_state));
+                    }
+                }
+
+                if let Some(current_rev) = &repo_state.rev {
+                    if rev.as_str() <= current_rev.to_tid().as_str() {
+                        debug!(did = %did, "skipping replayed sync");
+                        return Ok(RepoProcessResult::Ok(repo_state));
+                    }
+                }
+
+                warn!(did = %did, "sync event, triggering backfill");
+                let mut batch = ctx.state.db.inner.batch();
+                repo_state = ops::update_repo_status(
+                    &mut batch,
+                    &ctx.state.db,
+                    did,
+                    repo_state,
+                    RepoStatus::Backfilling,
+                )?;
+                batch.commit().into_diagnostic()?;
+                ctx.state
+                    .db
+                    .update_gauge_diff(&GaugeState::Synced, &GaugeState::Pending);
+                ctx.state.notify_backfill();
+                Ok(RepoProcessResult::Ok(repo_state))
+            }
+            Err(e) => {
+                error!(did = %did, err = %e, "failed to process sync event");
+                Ok(RepoProcessResult::Ok(repo_state))
+            }
+        }
+    }
+
+    fn handle_identity<'s>(
+        ctx: &mut WorkerContext,
+        did: &Did,
+        mut repo_state: RepoState<'s>,
+        identity: &Identity<'_>,
+    ) -> Result<RepoProcessResult<'s, 'static>, IngestError> {
+        let event_ms = identity.time.0.timestamp_millis();
+        if repo_state.last_message_time.is_some_and(|t| event_ms <= t) {
+            debug!(did = %did, "skipping stale/duplicate identity event");
+            return Ok(RepoProcessResult::Ok(repo_state));
+        }
+        repo_state.advance_message_time(event_ms);
+
+        let changed = if identity.handle.is_none() {
+            // no handle sent is basically "invalidate your caches"
+            ctx.state.resolver.invalidate_sync(did);
+            let doc = ctx.handle.block_on(ctx.state.resolver.resolve_doc(did))?;
+            repo_state.update_from_doc(doc)
+        } else {
+            let old_handle = repo_state.handle.clone();
+            repo_state.handle = identity
+                .handle
+                .clone()
+                .map(IntoStatic::into_static)
+                .or(repo_state.handle);
+            repo_state.handle != old_handle
+        };
+
+        repo_state.touch();
+        ctx.batch.batch_mut().insert(
+            &ctx.state.db.repos,
+            keys::repo_key(did),
+            crate::db::ser_repo_state(&repo_state)?,
+        );
+
+        if changed {
+            let evt = IdentityEvt {
+                did: did.clone().into_static(),
+                handle: repo_state.handle.clone().map(IntoStatic::into_static),
+            };
+            ctx.broadcast_events
+                .push(ops::make_identity_event(&ctx.state.db, evt));
+        }
+
+        Ok(RepoProcessResult::Ok(repo_state))
+    }
+
+    fn handle_account<'s, 'c>(
+        ctx: &mut WorkerContext,
+        did: &Did,
+        mut repo_state: RepoState<'s>,
+        pre_status: RepoStatus,
+        account: &'c Account<'c>,
+    ) -> Result<RepoProcessResult<'s, 'c>, IngestError> {
+        let event_ms = account.time.0.timestamp_millis();
+        if repo_state.last_message_time.is_some_and(|t| event_ms <= t) {
+            debug!(did = %did, "skipping stale/duplicate account event");
+            return Ok(RepoProcessResult::Ok(repo_state));
+        }
+        repo_state.advance_message_time(event_ms);
+
+        // get active before we do any mutations
+        let was_inactive = matches!(
+            pre_status,
+            RepoStatus::Deactivated | RepoStatus::Takendown | RepoStatus::Suspended
+        );
+        let is_inactive = !account.active;
+        let evt = AccountEvt {
+            did: did.clone().into_static(),
+            active: account.active,
+            status: account.status.as_ref().map(|s| s.to_cowstr().into_static()),
+        };
+
+        Self::refresh_doc(ctx, &mut repo_state, did)?;
+
+        if !account.active {
+            use crate::ingest::stream::AccountStatus;
+            match &account.status {
+                Some(AccountStatus::Deleted) => {
+                    debug!(did = %did, "account deleted, wiping data");
+                    crate::ops::delete_repo(&mut ctx.batch, &ctx.state.db, did, &repo_state)?;
+                    return Ok(RepoProcessResult::Deleted);
+                }
+                status => {
+                    let target_status = match status {
+                        Some(status) => match status {
+                            AccountStatus::Deleted => {
+                                unreachable!("deleted account status is handled before")
+                            }
+                            AccountStatus::Takendown => RepoStatus::Takendown,
+                            AccountStatus::Suspended => RepoStatus::Suspended,
+                            AccountStatus::Deactivated => RepoStatus::Deactivated,
+                            AccountStatus::Throttled => RepoStatus::Error("throttled".into()),
+                            AccountStatus::Desynchronized => {
+                                RepoStatus::Error("desynchronized".into())
+                            }
+                            AccountStatus::Other(s) => {
+                                warn!(
+                                    did = %did, status = %s,
+                                    "unknown account status, will put in error state"
+                                );
+                                RepoStatus::Error(s.to_smolstr())
+                            }
+                        },
+                        None => {
+                            warn!(did = %did, "account inactive but no status provided");
+                            RepoStatus::Error("unknown".into())
+                        }
+                    };
+
+                    if repo_state.status == target_status {
+                        debug!(did = %did, ?target_status, "account status unchanged");
+                        ctx.batch.batch_mut().insert(
+                            &ctx.state.db.repos,
+                            keys::repo_key(did),
+                            crate::db::ser_repo_state(&repo_state)?,
+                        );
+                        return Ok(RepoProcessResult::Ok(repo_state));
+                    }
+
+                    repo_state = ops::update_repo_status(
+                        ctx.batch.batch_mut(),
+                        &ctx.state.db,
+                        did,
+                        repo_state,
+                        target_status,
+                    )?;
+                    ctx.state
+                        .db
+                        .update_gauge_diff(&GaugeState::Synced, &GaugeState::Resync(None));
+                }
+            }
+        } else {
+            // active=true: transition to synced is handled in the shard dispatch before calling this
+        }
+
+        if was_inactive != is_inactive || repo_state.status != pre_status {
+            ctx.broadcast_events
+                .push(ops::make_account_event(&ctx.state.db, evt));
+        }
+
+        // persist last_message_time for paths that don't go through update_repo_status
+        // (active=true and already synced). harmless double-write for the status-changed path
+        ctx.batch.batch_mut().insert(
+            &ctx.state.db.repos,
+            keys::repo_key(did),
+            crate::db::ser_repo_state(&repo_state)?,
+        );
+
+        Ok(RepoProcessResult::Ok(repo_state))
+    }
+
+    // checks the current state of the repo in the database and returns a gate
+    // indicating what the shard loop should do with the message.
     // if the repo is new, creates initial state and triggers backfill
-    // handles transitions between states (backfilling -> synced, etc)
+    // for synced repos with buffered commits, drains the buffer first
+    // so events are applied in order
     fn check_repo_state<'s, 'c>(
         ctx: &mut WorkerContext,
         did: &Did<'_>,
         msg: &'c SubscribeReposMessage<'static>,
-    ) -> Result<RepoProcessResult<'s, 'c>, IngestError> {
+    ) -> Result<ProcessGate<'s, 'c>, IngestError> {
         let repo_key = keys::repo_key(&did);
         let Some(state_bytes) = ctx.state.db.repos.get(&repo_key).into_diagnostic()? else {
             let filter = ctx.state.filter.load();
@@ -607,7 +716,7 @@ impl FirehoseWorker {
             if filter.mode == FilterMode::Filter && !filter.signals.is_empty() {
                 let commit = match msg {
                     SubscribeReposMessage::Commit(c) => c,
-                    _ => return Ok(RepoProcessResult::Syncing(None)),
+                    _ => return Ok(ProcessGate::NewRepo),
                 };
                 let touches_signal = commit.ops.iter().any(|op| {
                     op.path
@@ -624,7 +733,7 @@ impl FirehoseWorker {
                 });
                 if !touches_signal {
                     trace!(did = %did, "dropping commit, no signal-matching ops");
-                    return Ok(RepoProcessResult::Syncing(None));
+                    return Ok(ProcessGate::NewRepo);
                 }
             }
 
@@ -645,79 +754,55 @@ impl FirehoseWorker {
             batch.commit().into_diagnostic()?;
 
             ctx.state.db.update_count("repos", 1);
-            ctx.state.db.update_gauge_diff(
-                &crate::types::GaugeState::Synced,
-                &crate::types::GaugeState::Pending,
-            );
+            ctx.state
+                .db
+                .update_gauge_diff(&GaugeState::Synced, &GaugeState::Pending);
 
             ctx.state.notify_backfill();
 
-            return Ok(RepoProcessResult::Syncing(None));
+            return Ok(ProcessGate::NewRepo);
         };
-        let mut repo_state = crate::db::deser_repo_state(&state_bytes)?.into_static();
-        let old_status = repo_state.status.clone();
+
+        let repo_state = crate::db::deser_repo_state(&state_bytes)?.into_static();
 
         if !repo_state.tracked && repo_state.status != RepoStatus::Backfilling {
-            trace!(did = %did, "ignoring active status as it is explicitly untracked");
-            return Ok(RepoProcessResult::Syncing(None));
+            trace!(did = %did, "ignoring message, repo is explicitly untracked");
+            return Ok(ProcessGate::Drop);
         }
 
-        // if we are backfilling or it is new, DON'T mark it as synced yet
-        // the backfill worker will do that when it finishes
         match &repo_state.status {
             RepoStatus::Synced => {
-                // lazy drain: if there are buffered commits, drain them now
+                // lazy drain: if there are buffered commits, drain them now before
+                // applying the live message so events are applied in order
                 if ops::has_buffered_commits(&ctx.state.db, did) {
-                    Self::drain_resync_buffer(ctx, did, repo_state, old_status)
-                } else {
-                    Ok(RepoProcessResult::Ok {
-                        state: repo_state,
-                        old_status,
-                    })
+                    return match Self::drain_resync_buffer(ctx, did, repo_state)? {
+                        RepoProcessResult::Ok(rs) => Ok(ProcessGate::Ready(rs)),
+                        // gap triggered during drain, so drop the live message
+                        RepoProcessResult::NeedsBackfill(_) => Ok(ProcessGate::Drop),
+                        RepoProcessResult::Deleted => Ok(ProcessGate::Drop),
+                    };
                 }
+                Ok(ProcessGate::Ready(repo_state))
             }
             RepoStatus::Backfilling | RepoStatus::Error(_) => {
                 debug!(
                     did = %did, status = ?repo_state.status,
-                    "ignoring active status"
+                    "ignoring message, repo is backfilling or in error state"
                 );
-                Ok(RepoProcessResult::Syncing(None))
+                Ok(ProcessGate::Drop)
             }
             RepoStatus::Deactivated | RepoStatus::Suspended | RepoStatus::Takendown => {
-                // if it was in deactivated/takendown/suspended state, we can mark it as synced
-                // because we are receiving live events now
-                // UNLESS it is an account status event that keeps it deactivated
-                if let SubscribeReposMessage::Account(acc) = msg {
-                    if !acc.active {
-                        return Ok(RepoProcessResult::Ok {
-                            state: repo_state,
-                            old_status,
-                        });
-                    }
-                } else {
-                    // buffer commits and drop everything else until we get an active=true message
-                    return match msg {
-                        SubscribeReposMessage::Commit(commit) => {
-                            Ok(RepoProcessResult::Syncing(Some(commit)))
-                        }
-                        _ => Ok(RepoProcessResult::Syncing(None)),
-                    };
+                // account events always pass through because the
+                // shard dispatch handles the active=true transition
+                if let SubscribeReposMessage::Account(_) = msg {
+                    return Ok(ProcessGate::Ready(repo_state));
                 }
-                repo_state = ops::update_repo_status(
-                    ctx.batch.batch_mut(),
-                    &ctx.state.db,
-                    did,
-                    repo_state,
-                    RepoStatus::Synced,
-                )?;
-                ctx.state.db.update_gauge_diff(
-                    &crate::types::GaugeState::Resync(None),
-                    &crate::types::GaugeState::Synced,
-                );
-                Ok(RepoProcessResult::Ok {
-                    state: repo_state,
-                    old_status,
-                })
+                // buffer commits and drop everything else until we get an active=true message
+                let commit = match msg {
+                    SubscribeReposMessage::Commit(c) => Some(c.as_ref()),
+                    _ => None,
+                };
+                Ok(ProcessGate::Buffer(commit))
             }
         }
     }
@@ -726,7 +811,6 @@ impl FirehoseWorker {
         ctx: &mut WorkerContext,
         did: &Did,
         mut repo_state: RepoState<'s>,
-        old_status: RepoStatus,
     ) -> Result<RepoProcessResult<'s, 'static>, IngestError> {
         let prefix = keys::resync_buffer_prefix(did);
 
@@ -734,7 +818,7 @@ impl FirehoseWorker {
             let (key, value) = guard.into_inner().into_diagnostic()?;
             let commit: Commit = rmp_serde::from_slice(&value).into_diagnostic()?;
 
-            let res = Self::process_commit(ctx, did, repo_state, &commit);
+            let res = Self::handle_commit(ctx, did, repo_state, &commit);
             let res = match res {
                 Ok(r) => r,
                 Err(e) => {
@@ -747,14 +831,15 @@ impl FirehoseWorker {
                 }
             };
             match res {
-                RepoProcessResult::Ok { state: rs, .. } => {
+                RepoProcessResult::Ok(rs) => {
                     ctx.batch
                         .batch_mut()
                         .remove(&ctx.state.db.resync_buffer, key);
                     repo_state = rs;
                 }
-                RepoProcessResult::Syncing(_) => {
-                    return Ok(RepoProcessResult::Syncing(None));
+                RepoProcessResult::NeedsBackfill(_) => {
+                    // commit is already in the buffer, leave it there for the next backfill
+                    return Ok(RepoProcessResult::NeedsBackfill(None));
                 }
                 RepoProcessResult::Deleted => {
                     ctx.batch
@@ -765,10 +850,7 @@ impl FirehoseWorker {
             }
         }
 
-        Ok(RepoProcessResult::Ok {
-            state: repo_state,
-            old_status,
-        })
+        Ok(RepoProcessResult::Ok(repo_state))
     }
 
     // refreshes the handle, pds url and signing key of a did
@@ -780,6 +862,7 @@ impl FirehoseWorker {
         ctx.state.resolver.invalidate_sync(did);
         let doc = ctx.handle.block_on(ctx.state.resolver.resolve_doc(did))?;
         repo_state.update_from_doc(doc);
+        repo_state.touch();
         ctx.batch.batch_mut().insert(
             &ctx.state.db.repos,
             keys::repo_key(did),

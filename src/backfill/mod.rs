@@ -722,7 +722,7 @@ async fn process_did<'i>(
             state.tracked = true;
             state.rev = Some((&rev).into());
             state.data = Some(root_commit.data);
-            state.last_updated_at = chrono::Utc::now().timestamp();
+            state.touch();
 
             batch.batch_mut().insert(
                 &app_state.db.repos,
