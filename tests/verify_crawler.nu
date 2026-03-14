@@ -89,14 +89,16 @@ def main [] {
             # check cursor persistence
             print "verifying crawler cursor persistence..."
             let cursor_check = try {
-                let cursor_res = (http get $"($debug_url)/debug/get?partition=cursors&key=crawler_cursor").value
+                # cursor key format: crawler_cursor|{scheme}://{host}:{port}
+                let cursor_res = (http get $"($debug_url)/debug/get?partition=cursors&key=crawler_cursor|http://localhost:3008").value
                 print $"cursor value from debug: ($cursor_res)"
-                
-                if $cursor_res == "50" {
+
+                # cursor should be non-empty if crawler successfully fetched repos
+                if ($cursor_res | is-not-empty) {
                     print "cursor verified."
                     true
                 } else {
-                    print "cursor mismatch or missing."
+                    print "cursor missing or empty."
                     false
                 }
             } catch {

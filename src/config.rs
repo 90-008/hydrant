@@ -37,7 +37,7 @@ impl fmt::Display for SignatureVerification {
 #[derive(Debug, Clone)]
 pub struct Config {
     pub database_path: PathBuf,
-    pub relay_host: Url,
+    pub relays: Vec<Url>,
     pub plc_urls: Vec<Url>,
     pub full_network: bool,
     pub ephemeral: bool,
@@ -90,10 +90,26 @@ impl Config {
             };
         }
 
-        let relay_host = cfg!(
+        let relay_host: Url = cfg!(
             "RELAY_HOST",
             Url::parse("wss://relay.fire.hose.cam").unwrap()
         );
+        let relay_hosts = std::env::var("HYDRANT_RELAY_HOSTS")
+            .ok()
+            .and_then(|hosts| {
+                hosts
+                    .split(',')
+                    .map(|s| Url::parse(s.trim()))
+                    .collect::<Result<Vec<_>, _>>()
+                    .inspect_err(|e| tracing::warn!("invalid relay host URL: {e}"))
+                    .ok()
+            })
+            .unwrap_or_default();
+        let relay_hosts = relay_hosts
+            .is_empty()
+            .then(|| vec![relay_host])
+            .unwrap_or(relay_hosts);
+
         let plc_urls: Vec<Url> = std::env::var("HYDRANT_PLC_URL")
             .ok()
             .map(|s| {
@@ -180,7 +196,7 @@ impl Config {
 
         Ok(Self {
             database_path,
-            relay_host,
+            relays: relay_hosts,
             plc_urls,
             ephemeral,
             full_network,
@@ -225,7 +241,7 @@ impl fmt::Display for Config {
         const LABEL_WIDTH: usize = 27;
 
         writeln!(f, "hydrant configuration:")?;
-        config_line!(f, "relay host", self.relay_host)?;
+        config_line!(f, "relay hosts", format_args!("{:?}", self.relays))?;
         config_line!(f, "plc urls", format_args!("{:?}", self.plc_urls))?;
         config_line!(f, "full network indexing", self.full_network)?;
         config_line!(f, "verify signatures", self.verify_signatures)?;

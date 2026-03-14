@@ -1,4 +1,5 @@
 use crate::crawler::throttle::ThrottleHandle;
+use crate::db::keys::crawler_cursor_key;
 use crate::db::{Db, keys, ser_repo_state};
 use crate::state::AppState;
 use crate::types::RepoState;
@@ -13,6 +14,7 @@ use rand::Rng;
 use rand::RngExt;
 use rand::rngs::SmallRng;
 use reqwest::StatusCode;
+use scc::HashSet;
 use serde::{Deserialize, Serialize};
 use smol_str::{SmolStr, ToSmolStr, format_smolstr};
 use std::collections::HashMap;
@@ -139,8 +141,6 @@ fn is_tls_cert_error(io_err: &std::io::Error) -> bool {
     false
 }
 
-const CURSOR_KEY: &[u8] = b"crawler_cursor";
-
 #[derive(Debug, Serialize, Deserialize)]
 enum Cursor {
     Done(SmolStr),
@@ -150,9 +150,28 @@ enum Cursor {
 pub mod throttle;
 use throttle::{OrFailure, Throttler};
 
+type InFlight = Arc<HashSet<Did<'static>>>;
+
+struct InFlightGuard {
+    set: InFlight,
+    did: Did<'static>,
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.set.remove_sync(&self.did);
+    }
+}
+
+#[must_use]
+struct InFlightRepos {
+    repos: Vec<Did<'static>>,
+    guards: Vec<InFlightGuard>,
+}
+
 pub struct Crawler {
     state: Arc<AppState>,
-    relay_host: Url,
+    relays: Vec<Url>,
     http: reqwest::Client,
     max_pending: usize,
     resume_pending: usize,
@@ -160,12 +179,13 @@ pub struct Crawler {
     crawled_count: AtomicUsize,
     throttled: AtomicBool,
     pds_throttler: Throttler,
+    in_flight: InFlight,
 }
 
 impl Crawler {
     pub fn new(
         state: Arc<AppState>,
-        relay_host: Url,
+        relay_hosts: Vec<Url>,
         max_pending: usize,
         resume_pending: usize,
     ) -> Self {
@@ -181,7 +201,7 @@ impl Crawler {
 
         Self {
             state,
-            relay_host,
+            relays: relay_hosts,
             http,
             max_pending,
             resume_pending,
@@ -189,11 +209,13 @@ impl Crawler {
             crawled_count: AtomicUsize::new(0),
             throttled: AtomicBool::new(false),
             pds_throttler: Throttler::new(),
+            in_flight: Arc::new(HashSet::new()),
         }
     }
 
-    async fn get_cursor(&self) -> Result<Cursor> {
-        let cursor_bytes = Db::get(self.state.db.cursors.clone(), CURSOR_KEY).await?;
+    async fn get_cursor(&self, relay_host: &Url) -> Result<Cursor> {
+        let key = crawler_cursor_key(relay_host);
+        let cursor_bytes = Db::get(self.state.db.cursors.clone(), &key).await?;
         let cursor: Cursor = cursor_bytes
             .as_deref()
             .map(rmp_serde::from_slice)
@@ -232,16 +254,40 @@ impl Crawler {
                     }
 
                     let elapsed = last_time.elapsed().as_secs_f64();
-                    let cursor = Self::get_cursor(&crawler).await.map_or_else(
-                        |e| e.to_smolstr(),
-                        |c| match c {
-                            Cursor::Done(c) => format_smolstr!("done({c})"),
-                            Cursor::Next(None) => "none".to_smolstr(),
-                            Cursor::Next(Some(c)) => c.to_smolstr(),
-                        },
-                    );
+
+                    // fetch all cursors
+                    use futures::future::join_all;
+                    let cursor_futures: Vec<_> = crawler
+                        .relays
+                        .iter()
+                        .map(|relay_host| {
+                            let domain = relay_host.host_str().unwrap_or("unknown");
+                            let relay_host = relay_host.clone();
+                            let crawler = crawler.clone();
+                            async move {
+                                let cursor_str = match crawler.get_cursor(&relay_host).await {
+                                    Ok(c) => match c {
+                                        Cursor::Done(c) => format_smolstr!("done({c})"),
+                                        Cursor::Next(None) => "none".to_smolstr(),
+                                        Cursor::Next(Some(c)) => c.to_smolstr(),
+                                    },
+                                    Err(e) => e.to_smolstr(),
+                                };
+                                format_smolstr!("{domain}={cursor_str}")
+                            }
+                        })
+                        .collect();
+
+                    let cursors: Vec<_> = join_all(cursor_futures).await.into_iter().collect();
+
+                    let cursors_display = if cursors.is_empty() {
+                        "none".to_smolstr()
+                    } else {
+                        cursors.join(", ").into()
+                    };
+
                     info!(
-                        %cursor,
+                        cursors = %cursors_display,
                         processed = delta_processed,
                         crawled = delta_crawled,
                         elapsed,
@@ -285,16 +331,35 @@ impl Crawler {
             }
         });
 
-        loop {
-            if let Err(e) = Self::crawl(crawler.clone()).await {
-                error!(err = ?e, "fatal error, restarting in 30s");
-                tokio::time::sleep(Duration::from_secs(30)).await;
-            }
+        info!(
+            relay_count = crawler.relays.len(),
+            hosts = ?crawler.relays,
+            "starting crawler"
+        );
+
+        let mut tasks = tokio::task::JoinSet::new();
+        for url in crawler.relays.clone() {
+            let crawler = crawler.clone();
+            let span = tracing::info_span!("crawl", %url);
+            tasks.spawn(
+                async move {
+                    loop {
+                        if let Err(e) = Self::crawl(crawler.clone(), &url).await {
+                            error!(err = ?e, "fatal error, restarting in 30s");
+                            tokio::time::sleep(Duration::from_secs(30)).await;
+                        }
+                    }
+                }
+                .instrument(span),
+            );
         }
+        let _ = tasks.join_all().await;
+
+        Ok(())
     }
 
-    async fn crawl(crawler: Arc<Self>) -> Result<()> {
-        let mut relay_url = crawler.relay_host.clone();
+    async fn crawl(crawler: Arc<Self>, relay_host: &Url) -> Result<()> {
+        let mut relay_url = relay_host.clone();
         match relay_url.scheme() {
             "wss" => relay_url
                 .set_scheme("https")
@@ -308,7 +373,7 @@ impl Crawler {
         let mut rng: SmallRng = rand::make_rng();
         let db = &crawler.state.db;
 
-        let mut cursor = crawler.get_cursor().await?;
+        let mut cursor = crawler.get_cursor(relay_host).await?;
 
         match &cursor {
             Cursor::Next(Some(c)) => info!(cursor = %c, "resuming"),
@@ -506,16 +571,17 @@ impl Crawler {
             debug!(count, "fetched repos");
             crawler.crawled_count.fetch_add(count, Ordering::Relaxed);
 
-            let valid_dids = if filter.check_signals() && !unknown_dids.is_empty() {
+            let in_flight = if filter.check_signals() && !unknown_dids.is_empty() {
                 // we dont need to pass any existing since we have none; we are crawling after all
                 crawler
                     .check_signals_batch(&unknown_dids, &filter, &mut batch, &HashMap::new())
                     .await?
             } else {
-                unknown_dids
+                // no signal checking but still need dedup to avoid orphan pending entries
+                crawler.acquire_in_flight(unknown_dids).await
             };
 
-            for did in &valid_dids {
+            for did in &in_flight.repos {
                 let did_key = keys::repo_key(did);
                 trace!(did = %did, "found new repo");
 
@@ -532,7 +598,7 @@ impl Crawler {
             }
             batch.insert(
                 &db.cursors,
-                CURSOR_KEY,
+                crawler_cursor_key(relay_host),
                 rmp_serde::to_vec(&cursor)
                     .into_diagnostic()
                     .wrap_err("cant serialize cursor")?,
@@ -556,7 +622,9 @@ impl Crawler {
             })
             .ok();
 
-            crawler.account_new_repos(valid_dids.len()).await;
+            drop(in_flight.guards);
+
+            crawler.account_new_repos(in_flight.repos.len()).await;
 
             if matches!(cursor, Cursor::Done(_)) {
                 info!("enumeration complete, sleeping 1h before next pass");
@@ -617,11 +685,11 @@ impl Crawler {
 
         let handle = tokio::runtime::Handle::current();
         let filter = self.state.filter.load();
-        let valid_dids =
+        let in_flight =
             handle.block_on(self.check_signals_batch(&ready, &filter, &mut batch, &existing))?;
 
         let mut rng: SmallRng = rand::make_rng();
-        for did in &valid_dids {
+        for did in &in_flight.repos {
             let did_key = keys::repo_key(did);
 
             if db.repos.contains_key(&did_key).into_diagnostic()? {
@@ -635,9 +703,11 @@ impl Crawler {
 
         batch.commit().into_diagnostic()?;
 
-        if !valid_dids.is_empty() {
-            info!(count = valid_dids.len(), "recovered from retry queue");
-            handle.block_on(self.account_new_repos(valid_dids.len()));
+        drop(in_flight.guards);
+
+        if !in_flight.repos.is_empty() {
+            info!(count = in_flight.repos.len(), "recovered from retry queue");
+            handle.block_on(self.account_new_repos(in_flight.repos.len()));
         }
 
         // if we hit the batch cap there are more ready entries, loop back immediately
@@ -812,20 +882,23 @@ impl Crawler {
 
     async fn check_signals_batch(
         &self,
-        dids: &[Did<'static>],
+        repos: &[Did<'static>],
         filter: &Arc<crate::filter::FilterConfig>,
         batch: &mut fjall::OwnedWriteBatch,
         existing: &HashMap<Did<'static>, RetryState>,
-    ) -> Result<Vec<Did<'static>>> {
+    ) -> Result<InFlightRepos> {
         let db = &self.state.db;
-        let mut valid = Vec::new();
+        let in_flight = self.acquire_in_flight(repos.to_vec()).await;
+        let mut valid = Vec::with_capacity(in_flight.repos.len());
         let mut set = tokio::task::JoinSet::new();
 
-        for did in dids {
-            let did = did.clone();
+        for did in in_flight.repos {
             let filter = filter.clone();
             let span = tracing::info_span!("signals", did = %did);
-            set.spawn(self.check_repo_signals(filter, did).instrument(span));
+            set.spawn(
+                self.check_repo_signals(filter, did.clone())
+                    .instrument(span),
+            );
         }
 
         while let Some(res) = tokio::time::timeout(Duration::from_secs(60), set.join_next())
@@ -839,7 +912,7 @@ impl Crawler {
             let (did, result) = match res {
                 Ok(inner) => inner,
                 Err(e) => {
-                    error!(err = ?e, "signal check task failed or panicked");
+                    error!(err = ?e, "signal check panicked");
                     continue;
                 }
             };
@@ -874,7 +947,30 @@ impl Crawler {
             }
         }
 
-        Ok(valid)
+        Ok(InFlightRepos {
+            repos: valid,
+            guards: in_flight.guards,
+        })
+    }
+
+    async fn acquire_in_flight(&self, dids: Vec<Did<'static>>) -> InFlightRepos {
+        let mut filtered = Vec::with_capacity(dids.len());
+        let mut guards = Vec::with_capacity(dids.len());
+        for did in dids {
+            if self.in_flight.insert_async(did.clone()).await.is_err() {
+                trace!(did = %did, "repo in-flight, skipping");
+                continue;
+            }
+            guards.push(InFlightGuard {
+                set: self.in_flight.clone(),
+                did: did.clone(),
+            });
+            filtered.push(did);
+        }
+        InFlightRepos {
+            guards,
+            repos: filtered,
+        }
     }
 
     async fn account_new_repos(&self, count: usize) {

@@ -28,7 +28,8 @@ the `WS /stream` (hydrant) and `WS /channel` (tap) endpoints have different desi
 | :--- | :--- | :--- |
 | `DATABASE_PATH` | `./hydrant.db` | path to the database folder. |
 | `RUST_LOG` | `info` | log filter directives (e.g., `debug`, `hydrant=trace`). standard [`tracing` env-filter syntax](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html). |
-| `RELAY_HOST` | `wss://relay.fire.hose.cam` | websocket URL of the upstream firehose relay. |
+| `RELAY_HOST` | `http://relay.fire.hose.cam` | URL of the relay. |
+| `RELAY_HOSTS` | | comma-separated list of relay URLs. if unset, falls back to `RELAY_HOST`. |
 | `PLC_URL` | `https://plc.wtf` | base URL(s) of the PLC directory (comma-separated for multiple). |
 | `FULL_NETWORK` | `false` | if `true`, discovers and indexes all repositories in the network. |
 | `FILTER_SIGNALS` | | comma-separated list of NSID patterns to use for the filter on startup (e.g. `app.bsky.feed.post,app.bsky.graph.*`). |
@@ -51,6 +52,15 @@ the `WS /stream` (hydrant) and `WS /channel` (tap) endpoints have different desi
 | `ENABLE_CRAWLER` | `false` (if Filter), `true` (if Full) | whether to actively query the network for unknown repositories. |
 | `CRAWLER_MAX_PENDING_REPOS` | `2000` | max pending repos for crawler. |
 | `CRAWLER_RESUME_PENDING_REPOS` | `1000` | resume threshold for crawler pending repos. |
+
+### multi-relay crawling
+
+the crawler supports querying multiple relays simultaneously. when `RELAY_HOSTS` is configured with multiple URLs:
+
+- one independent crawling loop is spawned per relay
+- each relay maintains its own cursor state
+- all crawlers share the same pending queue for backfill
+- firehose connection uses the first relay in the list
 
 ## api
 

@@ -361,7 +361,7 @@ pub async fn handle_debug_repo_refcounts(
     let cids = tokio::task::spawn_blocking(move || {
         let mut unique_cids: std::collections::HashSet<String> = std::collections::HashSet::new();
         let db = &state_clone.db;
-        
+
         // 1. Scan records
         let records_prefix = crate::db::keys::record_prefix_did(&did);
         for guard in db.records.prefix(&records_prefix) {
@@ -371,7 +371,7 @@ pub async fn handle_debug_repo_refcounts(
                 }
             }
         }
-        
+
         // 2. Scan events
         let trimmed_did = crate::db::types::TrimmedDid::from(&did);
         for guard in db.events.iter() {
@@ -385,12 +385,15 @@ pub async fn handle_debug_repo_refcounts(
                 }
             }
         }
-        
+
         let mut counts: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
         for cid_str in unique_cids {
             if let Ok(cid) = cid::Cid::from_str(&cid_str) {
                 let cid_bytes = fjall::Slice::from(cid.to_bytes());
-                let count = db.block_refcounts.read_sync(cid_bytes.as_ref(), |_, v| *v).unwrap_or(0);
+                let count = db
+                    .block_refcounts
+                    .read_sync(cid_bytes.as_ref(), |_, v| *v)
+                    .unwrap_or(0);
                 counts.insert(cid_str, count);
             }
         }

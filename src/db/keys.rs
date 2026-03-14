@@ -1,5 +1,6 @@
 use jacquard_common::types::string::Did;
 use smol_str::SmolStr;
+use url::Url;
 
 use crate::db::types::{DbRkey, DbTid, TrimmedDid};
 
@@ -160,4 +161,11 @@ pub fn crawler_retry_key(did: &Did) -> Vec<u8> {
 
 pub fn crawler_retry_parse_key(key: &[u8]) -> miette::Result<TrimmedDid<'_>> {
     TrimmedDid::try_from(&key[CRAWLER_RETRY_PREFIX.len()..])
+}
+
+pub fn crawler_cursor_key(relay_host: &Url) -> Vec<u8> {
+    let mut key = b"crawler_cursor".to_vec();
+    key.push(SEP);
+    key.extend_from_slice(relay_host.as_str().as_bytes());
+    key
 }

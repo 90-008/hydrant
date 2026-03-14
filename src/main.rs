@@ -200,8 +200,8 @@ async fn main() -> miette::Result<()> {
     });
 
     info!("starting crawler ({:?})", state.filter.load().mode);
-    let state_clone = state.clone();
-    let relay_host_clone = cfg.relay_host.clone();
+    let state_for_crawler = state.clone();
+    let relay_hosts = cfg.relays.clone();
     let crawler_max_pending = cfg.crawler_max_pending_repos;
     let crawler_resume_pending = cfg.crawler_resume_pending_repos;
 
@@ -212,11 +212,15 @@ async fn main() -> miette::Result<()> {
     };
 
     if should_run_crawler {
+        info!(
+            relay_count = relay_hosts.len(),
+            hosts = ?relay_hosts,
+            "spawning crawler"
+        );
         tokio::spawn(async move {
-            // the crawler is responsible for finding new repos
             let crawler = hydrant::crawler::Crawler::new(
-                state_clone,
-                relay_host_clone,
+                state_for_crawler,
+                relay_hosts,
                 crawler_max_pending,
                 crawler_resume_pending,
             );
@@ -248,7 +252,10 @@ async fn main() -> miette::Result<()> {
         let ingestor = FirehoseIngestor::new(
             state.clone(),
             buffer_tx,
-            cfg.relay_host,
+            cfg.relays
+                .first()
+                .cloned()
+                .expect("at least one relay host must be configured"),
             state.filter.clone(),
             matches!(cfg.verify_signatures, SignatureVerification::Full),
         );
