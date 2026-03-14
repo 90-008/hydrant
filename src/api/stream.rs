@@ -183,13 +183,10 @@ fn stream(
                 let _entered = info_span!("record", cid = ?cid.map(|c| c.to_string())).entered();
 
                 let marshallable = {
-                    let record_val;
-                    let block_bytes = cid
-                        .map(|cid| db.blocks.get(&cid.to_bytes()))
-                        .transpose()
-                        .map(Option::flatten);
+                    let mut record_val = None;
+                    let block_bytes = cid.map(|cid| db.blocks.get(&cid.to_bytes())).transpose();
                     match block_bytes {
-                        Ok(Some(block_bytes)) => {
+                        Ok(Some(Some(block_bytes))) => {
                             match serde_ipld_dagcbor::from_slice::<RawData>(&block_bytes) {
                                 Ok(val) => record_val = serde_json::to_value(val).ok(),
                                 Err(e) => {
@@ -198,11 +195,14 @@ fn stream(
                                 }
                             }
                         }
-                        Ok(None) => {
+                        Ok(Some(None)) => {
                             warn!(
                                 "block not found, possibly repo deleted but events not evicted yet?"
                             );
                             continue;
+                        }
+                        Ok(None) => {
+                            // cid not found, its ok, delete event
                         }
                         Err(e) => {
                             error!(err = %e, "can't get block");
