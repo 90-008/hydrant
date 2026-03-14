@@ -360,7 +360,7 @@ impl Display for DbRkey {
 }
 
 /// did:key:z... → raw multicodec public key bytes
-#[derive(Debug, Clone, Serialize, Deserialize, jacquard_derive::IntoStatic)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, jacquard_derive::IntoStatic)]
 pub struct DidKey<'b>(
     #[serde(borrow)]
     #[serde(with = "serde_bytes")]

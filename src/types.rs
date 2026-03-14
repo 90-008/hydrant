@@ -41,19 +41,16 @@ pub struct RepoState<'i> {
     pub data: Option<IpldCid>,
     /// this is when we *ingested* any last updates
     pub last_updated_at: i64, // unix timestamp
+    /// whether we are ingesting events for this repo
+    pub tracked: bool,
+    /// index id in pending keyspace
+    pub index_id: u64,
+    #[serde(borrow)]
+    pub signing_key: Option<DidKey<'i>>,
+    #[serde(borrow)]
+    pub pds: Option<CowStr<'i>>,
     #[serde(borrow)]
     pub handle: Option<Handle<'i>>,
-    pub index_id: u64,
-    #[serde(default = "default_tracked")]
-    pub tracked: bool,
-    #[serde(default)]
-    pub signing_key: Option<DidKey<'i>>,
-    #[serde(default)]
-    pub pds: Option<CowStr<'i>>,
-}
-
-fn default_tracked() -> bool {
-    true
 }
 
 impl<'i> RepoState<'i> {
@@ -63,7 +60,6 @@ impl<'i> RepoState<'i> {
             rev: None,
             data: None,
             last_updated_at: chrono::Utc::now().timestamp(),
-
             index_id,
             tracked: true,
             handle: None,
@@ -80,10 +76,15 @@ impl<'i> RepoState<'i> {
         }
     }
 
-    pub fn update_from_doc(&mut self, doc: MiniDoc) {
+    pub fn update_from_doc(&mut self, doc: MiniDoc) -> bool {
+        let new_signing_key = doc.key.map(From::from);
+        let changed = self.pds.as_deref() != Some(doc.pds.as_str())
+            || self.handle != doc.handle
+            || self.signing_key != new_signing_key;
         self.pds = Some(CowStr::Owned(doc.pds.to_smolstr()));
         self.handle = doc.handle;
-        self.signing_key = doc.key.map(From::from);
+        self.signing_key = new_signing_key;
+        changed
     }
 }
 

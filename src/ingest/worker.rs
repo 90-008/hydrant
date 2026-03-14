@@ -52,7 +52,10 @@ impl From<miette::Report> for IngestError {
 enum RepoProcessResult<'s, 'c> {
     Deleted,
     Syncing(Option<&'c Commit<'c>>),
-    Ok(RepoState<'s>),
+    Ok {
+        state: RepoState<'s>,
+        old_status: RepoStatus,
+    },
 }
 
 pub struct FirehoseWorker {
@@ -191,9 +194,12 @@ impl FirehoseWorker {
                             Ok(repo_state) => {
                                 let repo_state = repo_state.into_static();
 
-                                match Self::drain_resync_buffer(&mut ctx, &did, repo_state) {
+                                let old_status = repo_state.status.clone();
+                                match Self::drain_resync_buffer(
+                                    &mut ctx, &did, repo_state, old_status,
+                                ) {
                                     Ok(res) => match res {
-                                        RepoProcessResult::Ok(s) => {
+                                        RepoProcessResult::Ok { state: s, .. } => {
                                             // TODO: there might be a race condition here where we get a new commit
                                             // while the resync buffer is being drained, we should handle that probably
                                             // but also it should still be fine since we'll sync eventually anyway
@@ -233,7 +239,7 @@ impl FirehoseWorker {
                     };
 
                     match Self::process_message(&mut ctx, &msg, did) {
-                        Ok(RepoProcessResult::Ok(_)) => {}
+                        Ok(RepoProcessResult::Ok { .. }) => {}
                         Ok(RepoProcessResult::Deleted) => {}
                         Ok(RepoProcessResult::Syncing(Some(commit))) => {
                             if let Err(e) = ops::persist_to_resync_buffer(&state.db, did, commit) {
@@ -302,18 +308,24 @@ impl FirehoseWorker {
         did: &Did,
     ) -> Result<RepoProcessResult<'s, 'c>, IngestError> {
         let check_repo_res = Self::check_repo_state(ctx, did, msg)?;
-        let mut repo_state = match check_repo_res {
+        let (mut repo_state, old_status) = match check_repo_res {
             RepoProcessResult::Syncing(_) | RepoProcessResult::Deleted => {
                 return Ok(check_repo_res);
             }
-            RepoProcessResult::Ok(s) => s,
+            RepoProcessResult::Ok { state, old_status } => (state, old_status),
         };
 
         match msg {
             SubscribeReposMessage::Commit(commit) => {
                 trace!(did = %did, "processing buffered commit");
 
-                return Self::process_commit(ctx, did, repo_state, commit);
+                let res = Self::process_commit(ctx, did, repo_state, commit)?;
+                return match res {
+                    RepoProcessResult::Ok { state, .. } => {
+                        Ok(RepoProcessResult::Ok { state, old_status })
+                    }
+                    other => Ok(other),
+                };
             }
             SubscribeReposMessage::Sync(sync) => {
                 debug!(did = %did, "processing buffered sync");
@@ -328,14 +340,20 @@ impl FirehoseWorker {
                         if let Some(current_data) = &repo_state.data {
                             if current_data == &root.to_ipld().expect("valid cid") {
                                 debug!(did = %did, "skipping noop sync");
-                                return Ok(RepoProcessResult::Ok(repo_state));
+                                return Ok(RepoProcessResult::Ok {
+                                    state: repo_state,
+                                    old_status,
+                                });
                             }
                         }
 
                         if let Some(current_rev) = &repo_state.rev {
                             if rev.as_str() <= current_rev.to_tid().as_str() {
                                 debug!(did = %did, "skipping replayed sync");
-                                return Ok(RepoProcessResult::Ok(repo_state));
+                                return Ok(RepoProcessResult::Ok {
+                                    state: repo_state,
+                                    old_status,
+                                });
                             }
                         }
 
@@ -353,7 +371,10 @@ impl FirehoseWorker {
                             .db
                             .update_gauge_diff(&GaugeState::Synced, &GaugeState::Pending);
                         ctx.state.notify_backfill();
-                        return Ok(RepoProcessResult::Ok(repo_state));
+                        return Ok(RepoProcessResult::Ok {
+                            state: repo_state,
+                            old_status,
+                        });
                     }
                     Err(e) => {
                         error!(did = %did, err = %e, "failed to process sync event");
@@ -363,31 +384,40 @@ impl FirehoseWorker {
             SubscribeReposMessage::Identity(identity) => {
                 debug!(did = %did, "processing buffered identity");
 
-                if identity.handle.is_none() {
+                let changed = if identity.handle.is_none() {
                     // we invalidate only if no handle is sent since its like a
                     // "invalidate your caches" message then basically
                     ctx.state.resolver.invalidate_sync(did);
                     let doc = ctx.handle.block_on(ctx.state.resolver.resolve_doc(did))?;
-                    repo_state.update_from_doc(doc);
-                }
+                    repo_state.update_from_doc(doc)
+                } else {
+                    let old_handle = repo_state.handle.clone();
+                    repo_state.handle = identity.handle.clone().or(repo_state.handle);
+                    repo_state.handle != old_handle
+                };
 
-                let handle = identity.handle.as_ref().map(|h| h.clone());
-                repo_state.handle = handle.or(repo_state.handle);
                 ctx.batch.batch_mut().insert(
                     &ctx.state.db.repos,
                     keys::repo_key(did),
                     crate::db::ser_repo_state(&repo_state)?,
                 );
 
-                let evt = IdentityEvt {
-                    did: did.clone().into_static(),
-                    handle: repo_state.handle.clone(),
-                };
-                ctx.broadcast_events
-                    .push(ops::make_identity_event(&ctx.state.db, evt));
+                if changed {
+                    let evt = IdentityEvt {
+                        did: did.clone().into_static(),
+                        handle: repo_state.handle.clone(),
+                    };
+                    ctx.broadcast_events
+                        .push(ops::make_identity_event(&ctx.state.db, evt));
+                }
             }
             SubscribeReposMessage::Account(account) => {
                 debug!(did = %did, "processing buffered account");
+                let was_inactive = matches!(
+                    old_status,
+                    RepoStatus::Deactivated | RepoStatus::Takendown | RepoStatus::Suspended
+                );
+                let is_inactive = !account.active;
                 let evt = AccountEvt {
                     did: did.clone().into_static(),
                     active: account.active,
@@ -440,7 +470,10 @@ impl FirehoseWorker {
 
                             if repo_state.status == target_status {
                                 debug!(did = %did, ?target_status, "account status unchanged");
-                                return Ok(RepoProcessResult::Ok(repo_state));
+                                return Ok(RepoProcessResult::Ok {
+                                    state: repo_state,
+                                    old_status,
+                                });
                             }
 
                             repo_state = ops::update_repo_status(
@@ -461,15 +494,21 @@ impl FirehoseWorker {
                     // 1. we handle changing repo status to Synced before this (in check repo state)
                     // 2. initiating backfilling is also handled there
                 }
-                ctx.broadcast_events
-                    .push(ops::make_account_event(&ctx.state.db, evt));
+
+                if was_inactive != is_inactive || repo_state.status != old_status {
+                    ctx.broadcast_events
+                        .push(ops::make_account_event(&ctx.state.db, evt));
+                }
             }
             _ => {
                 warn!(did = %did, "unknown message type in buffer");
             }
         }
 
-        Ok(RepoProcessResult::Ok(repo_state))
+        Ok(RepoProcessResult::Ok {
+            state: repo_state,
+            old_status,
+        })
     }
 
     fn process_commit<'c, 'ns, 's: 'ns>(
@@ -486,7 +525,11 @@ impl FirehoseWorker {
                 state_rev = %repo_state.rev.as_ref().map(|r| r.to_tid()).expect("we checked in if"),
                 "skipping replayed event"
             );
-            return Ok(RepoProcessResult::Ok(repo_state));
+            let old_status = repo_state.status.clone();
+            return Ok(RepoProcessResult::Ok {
+                state: repo_state,
+                old_status,
+            });
         }
 
         if let (Some(repo), Some(prev_commit)) = (&repo_state.data, &commit.prev_data)
@@ -542,7 +585,11 @@ impl FirehoseWorker {
                 - 1,
         ));
 
-        Ok(RepoProcessResult::Ok(repo_state))
+        let old_status = repo_state.status.clone();
+        Ok(RepoProcessResult::Ok {
+            state: repo_state,
+            old_status,
+        })
     }
 
     // checks the current state of the repo in the database
@@ -608,6 +655,7 @@ impl FirehoseWorker {
             return Ok(RepoProcessResult::Syncing(None));
         };
         let mut repo_state = crate::db::deser_repo_state(&state_bytes)?.into_static();
+        let old_status = repo_state.status.clone();
 
         if !repo_state.tracked && repo_state.status != RepoStatus::Backfilling {
             trace!(did = %did, "ignoring active status as it is explicitly untracked");
@@ -620,9 +668,12 @@ impl FirehoseWorker {
             RepoStatus::Synced => {
                 // lazy drain: if there are buffered commits, drain them now
                 if ops::has_buffered_commits(&ctx.state.db, did) {
-                    Self::drain_resync_buffer(ctx, did, repo_state)
+                    Self::drain_resync_buffer(ctx, did, repo_state, old_status)
                 } else {
-                    Ok(RepoProcessResult::Ok(repo_state))
+                    Ok(RepoProcessResult::Ok {
+                        state: repo_state,
+                        old_status,
+                    })
                 }
             }
             RepoStatus::Backfilling | RepoStatus::Error(_) => {
@@ -638,8 +689,19 @@ impl FirehoseWorker {
                 // UNLESS it is an account status event that keeps it deactivated
                 if let SubscribeReposMessage::Account(acc) = msg {
                     if !acc.active {
-                        return Ok(RepoProcessResult::Ok(repo_state));
+                        return Ok(RepoProcessResult::Ok {
+                            state: repo_state,
+                            old_status,
+                        });
                     }
+                } else {
+                    // buffer commits and drop everything else until we get an active=true message
+                    return match msg {
+                        SubscribeReposMessage::Commit(commit) => {
+                            Ok(RepoProcessResult::Syncing(Some(commit)))
+                        }
+                        _ => Ok(RepoProcessResult::Syncing(None)),
+                    };
                 }
                 repo_state = ops::update_repo_status(
                     ctx.batch.batch_mut(),
@@ -652,7 +714,10 @@ impl FirehoseWorker {
                     &crate::types::GaugeState::Resync(None),
                     &crate::types::GaugeState::Synced,
                 );
-                Ok(RepoProcessResult::Ok(repo_state))
+                Ok(RepoProcessResult::Ok {
+                    state: repo_state,
+                    old_status,
+                })
             }
         }
     }
@@ -661,6 +726,7 @@ impl FirehoseWorker {
         ctx: &mut WorkerContext,
         did: &Did,
         mut repo_state: RepoState<'s>,
+        old_status: RepoStatus,
     ) -> Result<RepoProcessResult<'s, 'static>, IngestError> {
         let prefix = keys::resync_buffer_prefix(did);
 
@@ -681,7 +747,7 @@ impl FirehoseWorker {
                 }
             };
             match res {
-                RepoProcessResult::Ok(rs) => {
+                RepoProcessResult::Ok { state: rs, .. } => {
                     ctx.batch
                         .batch_mut()
                         .remove(&ctx.state.db.resync_buffer, key);
@@ -699,7 +765,10 @@ impl FirehoseWorker {
             }
         }
 
-        Ok(RepoProcessResult::Ok(repo_state))
+        Ok(RepoProcessResult::Ok {
+            state: repo_state,
+            old_status,
+        })
     }
 
     // refreshes the handle, pds url and signing key of a did

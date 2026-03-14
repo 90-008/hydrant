@@ -5,7 +5,7 @@ def run-auth-test [did: string, password: string, pds_url: string, relays: strin
     let url = $"http://localhost:($port)"
     let ws_url = $"ws://localhost:($port)/stream"
     let db_path = (mktemp -d -t hydrant_auth_test.XXXXXX)
-    
+
     # 1. authenticate
     print $"authenticating with ($pds_url)..."
     let session = authenticate $pds_url $did $password
@@ -18,17 +18,17 @@ def run-auth-test [did: string, password: string, pds_url: string, relays: strin
     let instance = (with-env { HYDRANT_RELAY_HOSTS: $relays } {
         start-hydrant $binary $db_path $port
     })
-    
+
     mut test_passed = false
 
     if (wait-for-api $url) {
         # 3. start listener (live stream)
         let output_file = $"($db_path)/stream_output.txt"
         print $"starting stream listener -> ($output_file)"
-        # use websocat to capture output. 
+        # use websocat to capture output.
         let stream_pid = (bash -c $"websocat '($ws_url)' > '($output_file)' & echo $!" | str trim | into int)
         print $"listener pid: ($stream_pid)"
-        
+
         # 4. add repo to hydrant (backfill trigger)
         print $"adding repo ($did) to tracking..."
         try {
@@ -36,7 +36,7 @@ def run-auth-test [did: string, password: string, pds_url: string, relays: strin
         } catch {
             print "warning: failed to add repo (might already be tracked), continuing..."
         }
-        
+
         sleep 5sec
 
         # 5. perform actions
@@ -56,7 +56,7 @@ def run-auth-test [did: string, password: string, pds_url: string, relays: strin
 
         print "--- action: update ---"
         let update_data = ($record_data | update text $"updated text ($timestamp)")
-        
+
         try {
             http post -t application/json -H ["Authorization" $"Bearer ($jwt)"] $"($pds_url)/xrpc/com.atproto.repo.putRecord" {
                 repo: $did,
@@ -88,12 +88,12 @@ def run-auth-test [did: string, password: string, pds_url: string, relays: strin
 
         print "--- action: activate ---"
         activate-account $pds_url $jwt
-        
+
         # 6. verify
         sleep 3sec
         print "stopping listener..."
         try { kill -9 $stream_pid }
-        
+
         if ($output_file | path exists) {
             let content = (open $output_file | str trim)
             if ($content | is-empty) {
@@ -124,8 +124,7 @@ def run-auth-test [did: string, password: string, pds_url: string, relays: strin
                     { |e| $e.type == "record" and $e.record.action == "update" },
                     { |e| $e.type == "record" and $e.record.action == "delete" },
                     { |e| $e.type == "account" and $e.account.active == false },
-                    { |e| $e.type == "account" and $e.account.active == true },
-                    { |e| $e.type == "identity" and $e.identity.did == $did }
+                    { |e| $e.type == "account" and $e.account.active == true }
                 ]
 
                 if ($relevant_events | length) != ($checks | length) {
@@ -144,7 +143,7 @@ def run-auth-test [did: string, password: string, pds_url: string, relays: strin
                             break
                         }
                     }
-                    
+
                     if not $failed {
                         print "test success!"
                         $test_passed = true
@@ -164,7 +163,7 @@ def run-auth-test [did: string, password: string, pds_url: string, relays: strin
     # cleanup
     print "cleaning up..."
     try { kill -9 $instance.pid }
-    
+
     $test_passed
 }
 
@@ -172,26 +171,26 @@ def main [] {
     let env_vars = load-env-file
     let did = ($env_vars | get --optional TEST_REPO)
     let password = ($env_vars | get --optional TEST_PASSWORD)
-    
+
     if ($did | is-empty) or ($password | is-empty) {
         print "error: TEST_REPO and TEST_PASSWORD must be set in .env"
         exit 1
     }
 
     let pds_url = resolve-pds $did
-    
+
     # ensure build
     build-hydrant | ignore
-    
+
     print "=== running single-relay test ==="
     let relay1 = "wss://relay.fire.hose.cam"
     let success1 = run-auth-test $did $password $pds_url $relay1 3005
-    
+
     print ""
     print "=== running multi-relay test ==="
     let relay_multi = "wss://relay.fire.hose.cam,wss://relay3.fr.hose.cam,wss://relay1.us-west.bsky.network,wss://relay1.us-east.bsky.network"
     let success2 = run-auth-test $did $password $pds_url $relay_multi 3015
-    
+
     if $success1 and $success2 {
         print ""
         print "ALL AUTHENTICATED STREAM TESTS PASSED"
