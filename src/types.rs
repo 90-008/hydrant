@@ -39,6 +39,7 @@ pub struct RepoState<'i> {
     pub status: RepoStatus,
     pub rev: Option<DbTid>,
     pub data: Option<IpldCid>,
+    /// this is when we *ingested* any last updates
     pub last_updated_at: i64, // unix timestamp
     #[serde(borrow)]
     pub handle: Option<Handle<'i>>,
