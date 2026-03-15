@@ -41,19 +41,19 @@ impl CompactionFilter for BlocksGcFilter {
             return Ok(Verdict::Keep);
         }
 
-        let count = self
+        Ok(self
             .refcounts
-            .read_sync(item.key().as_ref(), |_, v| *v)
-            .unwrap_or(0);
+            .read_sync(item.key().as_ref(), |_, count| {
+                #[cfg(debug_assertions)]
+                if let Ok(cid) = cid::Cid::read_bytes(item.key().as_ref()) {
+                    tracing::debug!(cid = %cid, count, "BlocksGcFilter checking block");
+                }
 
-        #[cfg(debug_assertions)]
-        if let Ok(cid) = cid::Cid::read_bytes(item.key().as_ref()) {
-            tracing::debug!(cid = %cid, count, "BlocksGcFilter checking block");
-        }
-
-        Ok((count <= 0)
-            .then_some(Verdict::Destroy)
-            .unwrap_or(Verdict::Keep))
+                (*count <= 0)
+                    .then_some(Verdict::Destroy)
+                    .unwrap_or(Verdict::Keep)
+            })
+            .unwrap_or(Verdict::Destroy))
     }
 }
 
