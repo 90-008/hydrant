@@ -236,7 +236,8 @@ impl FirehoseWorker {
                         }
                     }
                 }
-                IngestMessage::Firehose { relay_id, msg } => {
+                IngestMessage::Firehose { relay, msg } => {
+                    let _span = tracing::info_span!("firehose", relay = %relay).entered();
                     let (did, seq) = match &msg {
                         SubscribeReposMessage::Commit(c) => (&c.repo, c.seq),
                         SubscribeReposMessage::Identity(i) => (&i.did, i.seq),
@@ -252,7 +253,7 @@ impl FirehoseWorker {
                                 db::check_poisoned_report(r);
                             }
                             error!(did = %did, err = %e, "error in check_repo_state");
-                            if let Some((_, cursor)) = state.relay_cursors.get(&relay_id) {
+                            if let Some(cursor) = state.relay_cursors.get(&relay) {
                                 cursor.store(seq, std::sync::atomic::Ordering::SeqCst);
                             }
                             continue;
@@ -306,8 +307,8 @@ impl FirehoseWorker {
                                                     did = %did, err = %e,
                                                     "failed to transition inactive repo to synced"
                                                 );
-                                                if let Some((_, cursor)) =
-                                                    state.relay_cursors.get(&relay_id)
+                                                if let Some(cursor) =
+                                                    state.relay_cursors.get(&relay)
                                                 {
                                                     cursor.store(
                                                         seq,
@@ -358,7 +359,7 @@ impl FirehoseWorker {
                         }
                     }
 
-                    if let Some((_, cursor)) = state.relay_cursors.get(&relay_id) {
+                    if let Some(cursor) = state.relay_cursors.get(&relay) {
                         cursor.store(seq, std::sync::atomic::Ordering::SeqCst);
                     }
                 }

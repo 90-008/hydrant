@@ -3,7 +3,7 @@ use crate::db::keys::crawler_cursor_key;
 use crate::db::{Db, keys, ser_repo_state};
 use crate::state::AppState;
 use crate::types::RepoState;
-use crate::util::{ErrorForStatus, RetryOutcome, RetryWithBackoff, parse_retry_after, relay_id};
+use crate::util::{ErrorForStatus, RetryOutcome, RetryWithBackoff, parse_retry_after};
 use chrono::{DateTime, TimeDelta, Utc};
 use futures::FutureExt;
 use jacquard_api::com_atproto::repo::describe_repo::DescribeRepoOutput;
@@ -214,7 +214,7 @@ impl Crawler {
     }
 
     async fn get_cursor(&self, relay_host: &Url) -> Result<Cursor> {
-        let key = crawler_cursor_key(&relay_id(relay_host));
+        let key = crawler_cursor_key(relay_host);
         let cursor_bytes = Db::get(self.state.db.cursors.clone(), &key).await?;
         let cursor: Cursor = cursor_bytes
             .as_deref()
@@ -603,7 +603,7 @@ impl Crawler {
             }
             batch.insert(
                 &db.cursors,
-                crawler_cursor_key(&relay_id(relay_host)),
+                crawler_cursor_key(relay_host),
                 rmp_serde::to_vec(&cursor)
                     .into_diagnostic()
                     .wrap_err("cant serialize cursor")?,

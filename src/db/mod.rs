@@ -13,7 +13,7 @@ use smol_str::SmolStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64};
 
-use crate::util::RelayId;
+use url::Url;
 
 pub mod compaction;
 pub mod filter;
@@ -517,14 +517,14 @@ impl Db {
     }
 }
 
-pub fn set_firehose_cursor(db: &Db, relay_id: &RelayId, cursor: i64) -> Result<()> {
+pub fn set_firehose_cursor(db: &Db, relay: &Url, cursor: i64) -> Result<()> {
     db.cursors
-        .insert(keys::firehose_cursor_key(relay_id), cursor.to_be_bytes())
+        .insert(keys::firehose_cursor_key(relay), cursor.to_be_bytes())
         .into_diagnostic()
 }
 
-pub async fn get_firehose_cursor(db: &Db, relay_id: &RelayId) -> Result<Option<i64>> {
-    let per_relay_key = keys::firehose_cursor_key(relay_id);
+pub async fn get_firehose_cursor(db: &Db, relay: &Url) -> Result<Option<i64>> {
+    let per_relay_key = keys::firehose_cursor_key(relay);
     if let Some(v) = Db::get(db.cursors.clone(), per_relay_key).await? {
         return Ok(Some(i64::from_be_bytes(
             v.as_ref()

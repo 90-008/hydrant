@@ -7,12 +7,12 @@ pub mod worker;
 use jacquard_common::types::did::Did;
 
 use crate::ingest::stream::SubscribeReposMessage;
-use crate::util::RelayId;
+use url::Url;
 
 #[derive(Debug)]
 pub enum IngestMessage {
     Firehose {
-        relay_id: RelayId,
+        relay: Url,
         msg: SubscribeReposMessage<'static>,
     },
     BackfillFinished(Did<'static>),

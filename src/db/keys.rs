@@ -2,7 +2,7 @@ use jacquard_common::types::string::Did;
 use smol_str::SmolStr;
 
 use crate::db::types::{DbRkey, DbTid, TrimmedDid};
-use crate::util::RelayId;
+use url::Url;
 
 /// separator used for composite keys
 pub const SEP: u8 = b'|';
@@ -163,14 +163,14 @@ pub fn crawler_retry_parse_key(key: &[u8]) -> miette::Result<TrimmedDid<'_>> {
     TrimmedDid::try_from(&key[CRAWLER_RETRY_PREFIX.len()..])
 }
 
-pub fn crawler_cursor_key(relay_id: &RelayId) -> Vec<u8> {
+pub fn crawler_cursor_key(relay: &Url) -> Vec<u8> {
     let mut key = b"crawler_cursor|".to_vec();
-    key.extend_from_slice(relay_id);
+    key.extend_from_slice(relay.as_str().as_bytes());
     key
 }
 
-pub fn firehose_cursor_key(relay_id: &RelayId) -> Vec<u8> {
+pub fn firehose_cursor_key(relay: &Url) -> Vec<u8> {
     let mut key = b"firehose_cursor|".to_vec();
-    key.extend_from_slice(relay_id);
+    key.extend_from_slice(relay.as_str().as_bytes());
     key
 }

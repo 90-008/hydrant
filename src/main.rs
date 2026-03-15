@@ -177,10 +177,10 @@ async fn main() -> miette::Result<()> {
                 std::thread::sleep(persist_interval);
 
                 // persist firehose cursors
-                for (relay_id, (relay, cursor)) in &state.relay_cursors {
+                for (relay, cursor) in &state.relay_cursors {
                     let seq = cursor.load(Ordering::SeqCst);
                     if seq > 0 {
-                        if let Err(e) = db::set_firehose_cursor(&state.db, relay_id, seq) {
+                        if let Err(e) = db::set_firehose_cursor(&state.db, relay, seq) {
                             error!(relay = %relay, err = %e, "failed to save cursor");
                             db::check_poisoned_report(&e);
                         }

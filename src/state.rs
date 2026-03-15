@@ -10,14 +10,13 @@ use crate::{
     db::Db,
     filter::{FilterHandle, new_handle},
     resolver::Resolver,
-    util::{RelayId, relay_id},
 };
 
 pub struct AppState {
     pub db: Db,
     pub resolver: Resolver,
     pub filter: FilterHandle,
-    pub relay_cursors: HashMap<RelayId, (Url, AtomicI64)>,
+    pub relay_cursors: HashMap<Url, AtomicI64>,
     pub backfill_notify: Notify,
 }
 
@@ -31,7 +30,7 @@ impl AppState {
         let relay_cursors = config
             .relays
             .iter()
-            .map(|url| (relay_id(url), (url.clone(), AtomicI64::new(0))))
+            .map(|url| (url.clone(), AtomicI64::new(0)))
             .collect();
 
         Ok(Self {
