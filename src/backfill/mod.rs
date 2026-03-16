@@ -153,10 +153,8 @@ impl BackfillWorker {
             if spawned == 0 {
                 // wait for new tasks
                 self.state.backfill_notify.notified().await;
-            } else {
-                // if we spawned tasks, yield briefly to let them start and avoid tight loop
-                tokio::time::sleep(Duration::from_millis(10)).await;
             }
+            // loop immediately since we might have more tasks
         }
     }
 }
@@ -211,7 +209,6 @@ async fn did_task(
             .await
             .into_diagnostic()??;
 
-            // Notify completion to worker shard
             if let Err(e) = buffer_tx.send(IngestMessage::BackfillFinished(did.clone())) {
                 error!(did = %did, err = %e, "failed to send BackfillFinished");
             }
