@@ -340,7 +340,11 @@ impl Db {
     }
 
     pub fn persist(&self) -> Result<()> {
-        self.inner.persist(PersistMode::SyncAll).into_diagnostic()?;
+        #[cfg(not(feature = "sync_all"))]
+        const MODE: PersistMode = PersistMode::Buffer;
+        #[cfg(feature = "sync_all")]
+        const MODE: PersistMode = PersistMode::SyncAll;
+        self.inner.persist(MODE).into_diagnostic()?;
         Ok(())
     }
 
