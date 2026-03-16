@@ -40,15 +40,15 @@ the `WS /stream` (hydrant) and `WS /channel` (tap) endpoints have different desi
 | :--- | :--- | :--- |
 | `DATABASE_PATH` | `./hydrant.db` | path to the database folder. |
 | `RUST_LOG` | `info` | log filter directives (e.g., `debug`, `hydrant=trace`). standard [`tracing` env-filter syntax](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html). |
-| `RELAY_HOST` | `http://relay.fire.hose.cam` | URL of the relay. |
+| `RELAY_HOST` | `wss://relay.fire.hose.cam/` | URL of the relay. |
 | `RELAY_HOSTS` | | comma-separated list of relay URLs. if unset, falls back to `RELAY_HOST`. |
 | `PLC_URL` | `https://plc.wtf` | base URL(s) of the PLC directory (comma-separated for multiple). |
 | `FULL_NETWORK` | `false` | if `true`, discovers and indexes all repositories in the network. |
 | `FILTER_SIGNALS` | | comma-separated list of NSID patterns to use for the filter on startup (e.g. `app.bsky.feed.post,app.bsky.graph.*`). |
 | `FILTER_COLLECTIONS` | | comma-separated list of NSID patterns to use for the collections filter on startup. |
 | `FILTER_EXCLUDES` | | comma-separated list of DIDs to exclude from indexing on startup. |
-| `FIREHOSE_WORKERS` | `8` (`32` if full network) | number of concurrent workers for firehose events. |
-| `BACKFILL_CONCURRENCY_LIMIT` | `128` | maximum number of concurrent backfill tasks. |
+| `FIREHOSE_WORKERS` | `8` (`24` if full network) | number of concurrent workers for firehose events. |
+| `BACKFILL_CONCURRENCY_LIMIT` | `32` (`128` if full network) | maximum number of concurrent backfill tasks. |
 | `VERIFY_SIGNATURES` | `full` | signature verification level: `full`, `backfill-only`, or `none`. |
 | `CURSOR_SAVE_INTERVAL` | `5` | interval (in seconds) to save the firehose cursor. |
 | `REPO_FETCH_TIMEOUT` | `300` | timeout (in seconds) for fetching repositories. |

@@ -140,10 +140,13 @@ impl Config {
             .ok()
             .and_then(|s| s.parse().ok());
 
-        let backfill_concurrency_limit = cfg!("BACKFILL_CONCURRENCY_LIMIT", 128usize);
+        let backfill_concurrency_limit = cfg!(
+            "BACKFILL_CONCURRENCY_LIMIT",
+            full_network.then_some(128usize).unwrap_or(32usize)
+        );
         let firehose_workers = cfg!(
             "FIREHOSE_WORKERS",
-            full_network.then_some(32usize).unwrap_or(8usize)
+            full_network.then_some(24usize).unwrap_or(8usize)
         );
 
         let (
@@ -159,16 +162,22 @@ impl Config {
             "DB_MAX_JOURNALING_SIZE_MB",
             default_db_max_journaling_size_mb
         );
-        let db_pending_memtable_size_mb =
-            cfg!("DB_PENDING_MEMTABLE_SIZE_MB", default_db_memtable_size_mb);
         let db_blocks_memtable_size_mb =
             cfg!("DB_BLOCKS_MEMTABLE_SIZE_MB", default_db_memtable_size_mb);
-        let db_repos_memtable_size_mb =
-            cfg!("DB_REPOS_MEMTABLE_SIZE_MB", default_db_memtable_size_mb);
         let db_events_memtable_size_mb =
             cfg!("DB_EVENTS_MEMTABLE_SIZE_MB", default_db_memtable_size_mb);
-        let db_records_memtable_size_mb =
-            cfg!("DB_RECORDS_MEMTABLE_SIZE_MB", default_db_memtable_size_mb);
+        let db_records_memtable_size_mb = cfg!(
+            "DB_RECORDS_MEMTABLE_SIZE_MB",
+            // records is did + col + rkey -> CID so its pretty cheap
+            default_db_memtable_size_mb / 3 * 2
+        );
+        let db_repos_memtable_size_mb =
+            cfg!("DB_REPOS_MEMTABLE_SIZE_MB", default_db_memtable_size_mb / 2);
+        let db_pending_memtable_size_mb = cfg!(
+            "DB_PENDING_MEMTABLE_SIZE_MB",
+            // pending is uint id -> did, which is cheap
+            default_db_memtable_size_mb / 3
+        );
 
         let crawler_max_pending_repos = cfg!("CRAWLER_MAX_PENDING_REPOS", 2000usize);
         let crawler_resume_pending_repos = cfg!("CRAWLER_RESUME_PENDING_REPOS", 1000usize);
