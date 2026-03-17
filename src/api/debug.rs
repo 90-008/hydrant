@@ -30,10 +30,12 @@ pub fn router() -> axum::Router<Arc<AppState>> {
         .route("/debug/count", get(handle_debug_count))
         .route("/debug/get", get(handle_debug_get))
         .route("/debug/iter", get(handle_debug_iter))
-        .route("/debug/refcount", get(handle_debug_refcount))
-        .route("/debug/refcount", post(handle_set_debug_refcount))
-        .route("/debug/repo_refcounts", get(handle_debug_repo_refcounts))
         .route("/debug/compact", post(handle_debug_compact))
+        .route(
+            "/debug/ephemeral_ttl_tick",
+            post(handle_debug_ephemeral_ttl_tick),
+        )
+        .route("/debug/seed_watermark", post(handle_debug_seed_watermark))
 }
 
 pub async fn handle_debug_count(
@@ -291,116 +293,44 @@ pub async fn handle_debug_compact(
     Ok(StatusCode::OK)
 }
 
-#[derive(Deserialize)]
-pub struct DebugRefcountRequest {
-    pub cid: String,
-}
-
-#[derive(Serialize)]
-pub struct DebugRefcountResponse {
-    pub count: Option<i64>,
-}
-
-pub async fn handle_debug_refcount(
+pub async fn handle_debug_ephemeral_ttl_tick(
     State(state): State<Arc<AppState>>,
-    Query(req): Query<DebugRefcountRequest>,
-) -> Result<Json<DebugRefcountResponse>, StatusCode> {
-    let cid = cid::Cid::from_str(&req.cid).map_err(|_| StatusCode::BAD_REQUEST)?;
-    let cid_bytes = fjall::Slice::from(cid.to_bytes());
-
-    let count = state
-        .db
-        .block_refcounts
-        .read_sync(cid_bytes.as_ref(), |_, v| *v);
-
-    Ok(Json(DebugRefcountResponse { count }))
-}
-
-#[derive(Deserialize)]
-pub struct DebugSetRefcountRequest {
-    pub cid: String,
-    pub count: i64,
-}
-
-pub async fn handle_set_debug_refcount(
-    State(state): State<Arc<AppState>>,
-    axum::extract::Json(req): axum::extract::Json<DebugSetRefcountRequest>,
 ) -> Result<StatusCode, StatusCode> {
-    let cid = cid::Cid::from_str(&req.cid).map_err(|_| StatusCode::BAD_REQUEST)?;
-    let cid_bytes = fjall::Slice::from(cid.to_bytes());
-
-    let _ = state.db.block_refcounts.insert_sync(cid_bytes, req.count);
+    tokio::task::spawn_blocking(move || crate::db::ephemeral::ephemeral_ttl_tick(&state.db))
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     Ok(StatusCode::OK)
 }
 
 #[derive(Deserialize)]
-pub struct DebugRepoRefcountsRequest {
-    pub did: String,
+pub struct DebugSeedWatermarkRequest {
+    /// unix timestamp (seconds) to write the watermark at
+    pub ts: u64,
+    /// event_id the watermark points to — all events before this id will be pruned
+    pub event_id: u64,
 }
 
-#[derive(Serialize)]
-pub struct DebugRepoRefcountsResponse {
-    pub cids: std::collections::HashMap<String, i64>,
-}
-
-pub async fn handle_debug_repo_refcounts(
+/// writes an event watermark entry directly to the cursors keyspace, using identical
+/// key/value encoding to the real TTL worker. used in tests to plant a past watermark
+/// so the real `ephemeral_ttl_tick` code path is exercised without waiting 3600 seconds.
+pub async fn handle_debug_seed_watermark(
     State(state): State<Arc<AppState>>,
-    Query(req): Query<DebugRepoRefcountsRequest>,
-) -> Result<Json<DebugRepoRefcountsResponse>, StatusCode> {
-    let raw_did = jacquard_common::types::ident::AtIdentifier::new(req.did.as_str())
-        .map_err(|_| StatusCode::BAD_REQUEST)?;
-    let did = state
-        .resolver
-        .resolve_did(&raw_did)
-        .await
-        .map_err(|_| StatusCode::BAD_REQUEST)?;
-
-    let state_clone = state.clone();
-
-    let cids = tokio::task::spawn_blocking(move || {
-        let mut unique_cids: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let db = &state_clone.db;
-
-        // 1. Scan records
-        let records_prefix = crate::db::keys::record_prefix_did(&did);
-        for guard in db.records.prefix(&records_prefix) {
-            if let Ok((_k, v)) = guard.into_inner() {
-                if let Ok(cid) = cid::Cid::read_bytes(v.as_ref()) {
-                    unique_cids.insert(cid.to_string());
-                }
-            }
-        }
-
-        // 2. Scan events
-        let trimmed_did = crate::db::types::TrimmedDid::from(&did);
-        for guard in db.events.iter() {
-            if let Ok((_k, v)) = guard.into_inner() {
-                if let Ok(evt) = rmp_serde::from_slice::<crate::types::StoredEvent>(v.as_ref()) {
-                    if evt.did == trimmed_did {
-                        if let Some(cid) = evt.cid {
-                            unique_cids.insert(cid.to_string());
-                        }
-                    }
-                }
-            }
-        }
-
-        let mut counts: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
-        for cid_str in unique_cids {
-            if let Ok(cid) = cid::Cid::from_str(&cid_str) {
-                let cid_bytes = fjall::Slice::from(cid.to_bytes());
-                let count = db
-                    .block_refcounts
-                    .read_sync(cid_bytes.as_ref(), |_, v| *v)
-                    .unwrap_or(0);
-                counts.insert(cid_str, count);
-            }
-        }
-        counts
+    Query(req): Query<DebugSeedWatermarkRequest>,
+) -> Result<StatusCode, StatusCode> {
+    tokio::task::spawn_blocking(move || {
+        state
+            .db
+            .cursors
+            .insert(
+                crate::db::keys::event_watermark_key(req.ts),
+                req.event_id.to_be_bytes(),
+            )
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
     })
     .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)??;
 
-    Ok(Json(DebugRepoRefcountsResponse { cids }))
+    Ok(StatusCode::OK)
 }

@@ -1,7 +1,6 @@
 use fjall::OwnedWriteBatch;
 use fjall::Slice;
 
-use crate::db::refcount::RefcountedBatch;
 use jacquard_common::CowStr;
 use jacquard_common::IntoStatic;
 use jacquard_common::types::cid::Cid;
@@ -68,7 +67,7 @@ pub fn make_account_event(db: &Db, evt: AccountEvt<'static>) -> BroadcastEvent {
 }
 
 pub fn delete_repo(
-    batch: &mut RefcountedBatch<'_>,
+    batch: &mut OwnedWriteBatch,
     db: &Db,
     did: &Did,
     repo_state: &RepoState,
@@ -79,14 +78,14 @@ pub fn delete_repo(
     let pending_key = keys::pending_key(repo_state.index_id);
 
     // 1. delete from repos, pending, resync
-    batch.batch_mut().remove(&db.repos, &repo_key);
+    batch.remove(&db.repos, &repo_key);
     match repo_state.status {
         RepoStatus::Synced => {}
         RepoStatus::Backfilling => {
-            batch.batch_mut().remove(&db.pending, &pending_key);
+            batch.remove(&db.pending, &pending_key);
         }
         _ => {
-            batch.batch_mut().remove(&db.resync, &repo_key);
+            batch.remove(&db.resync, &repo_key);
         }
     }
 
@@ -94,15 +93,16 @@ pub fn delete_repo(
     let resync_prefix = keys::resync_buffer_prefix(did);
     for guard in db.resync_buffer.prefix(&resync_prefix) {
         let k = guard.key().into_diagnostic()?;
-        batch.batch_mut().remove(&db.resync_buffer, k);
+        batch.remove(&db.resync_buffer, k);
     }
 
     // 3. delete from records
+    // todo: figure out how we want to handle the blocks associated with these records
+    //       without delving too much into gc madness we had before
     let records_prefix = keys::record_prefix_did(did);
     for guard in db.records.prefix(&records_prefix) {
-        let (k, cid_bytes) = guard.into_inner().into_diagnostic()?;
-        batch.update_block_refcount(cid_bytes, -1)?;
-        batch.batch_mut().remove(&db.records, k);
+        let (k, _cid_bytes) = guard.into_inner().into_diagnostic()?;
+        batch.remove(&db.records, k);
     }
 
     // 4. reset collection counts
@@ -114,7 +114,7 @@ pub fn delete_repo(
 
     for guard in db.counts.prefix(&count_prefix) {
         let k = guard.key().into_diagnostic()?;
-        batch.batch_mut().remove(&db.counts, k);
+        batch.remove(&db.counts, k);
     }
 
     Ok(())
@@ -222,9 +222,9 @@ pub struct ApplyCommitResults<'s> {
     pub blocks_count: i64,
 }
 
-pub fn apply_commit<'db, 'commit, 's>(
-    batch: &mut RefcountedBatch<'db>,
-    db: &'db Db,
+pub fn apply_commit<'commit, 's>(
+    batch: &mut OwnedWriteBatch,
+    db: &Db,
     mut repo_state: RepoState<'s>,
     commit: &'commit Commit<'commit>,
     signing_key: Option<&PublicKey>,
@@ -262,9 +262,7 @@ pub fn apply_commit<'db, 'commit, 's>(
     repo_state.data = Some(repo_commit.data);
     repo_state.touch();
 
-    batch
-        .batch_mut()
-        .insert(&db.repos, keys::repo_key(did), ser_repo_state(&repo_state)?);
+    batch.insert(&db.repos, keys::repo_key(did), ser_repo_state(&repo_state)?);
 
     // 2. iterate ops and update records index
     let mut records_delta = 0;
@@ -300,45 +298,29 @@ pub fn apply_commit<'db, 'commit, 's>(
                     ));
                 };
                 let cid_bytes = Slice::from(cid_ipld.to_bytes());
-                batch
-                    .batch_mut()
-                    .insert(&db.blocks, cid_bytes.clone(), bytes.to_vec());
+                batch.insert(&db.blocks, cid_bytes.clone(), bytes.to_vec());
                 blocks_count += 1;
-                batch.update_block_refcount(
-                    cid_bytes.clone(),
-                    ephemeral.then_some(1).unwrap_or(2),
-                )?;
 
                 if !ephemeral {
-                    batch
-                        .batch_mut()
-                        .insert(&db.records, db_key.clone(), cid_ipld.to_bytes());
-                    // for Update, also decrement old CID refcount
-                    if action == DbAction::Update {
-                        let Some(old_cid_bytes) = db.records.get(&db_key).into_diagnostic()? else {
-                            return Err(miette::miette!(
-                                "!!! THIS IS A BUG !!! expected previous cid to be there for record being updated ({did}/{collection}/{rkey}). how did we get here?"
-                            ));
-                        };
-                        if old_cid_bytes != cid_bytes {
-                            batch.update_block_refcount(old_cid_bytes, -1)?;
-                        }
-                    }
+                    batch.insert(&db.records, db_key.clone(), cid_ipld.to_bytes());
                     // accumulate counts
                     if action == DbAction::Create {
                         records_delta += 1;
                         *collection_deltas.entry(collection).or_default() += 1;
                     }
+                } else if action == DbAction::Create || action == DbAction::Update {
+                    // ephemeral: track refcount for this event's CID so the TTL worker can
+                    // delete the block when the last referencing event expires
+                    let mut entry = db
+                        .block_refcounts
+                        .entry_sync(cid_bytes.clone())
+                        .or_insert(0);
+                    *entry += 1;
                 }
             }
             DbAction::Delete => {
                 if !ephemeral {
-                    // decrement block refcount
-                    let old_cid_bytes = db.records.get(&db_key).into_diagnostic()?;
-                    if let Some(cid_bytes) = old_cid_bytes {
-                        batch.update_block_refcount(cid_bytes, -1)?;
-                    }
-                    batch.batch_mut().remove(&db.records, db_key);
+                    batch.remove(&db.records, db_key);
 
                     // accumulate counts
                     records_delta -= 1;
@@ -358,15 +340,13 @@ pub fn apply_commit<'db, 'commit, 's>(
         };
 
         let bytes = rmp_serde::to_vec(&evt).into_diagnostic()?;
-        batch
-            .batch_mut()
-            .insert(&db.events, keys::event_key(event_id), bytes);
+        batch.insert(&db.events, keys::event_key(event_id), bytes);
     }
 
     // update counts
     if !ephemeral {
         for (col, delta) in collection_deltas {
-            db::update_record_count(batch.batch_mut(), db, did, col, delta)?;
+            db::update_record_count(batch, db, did, col, delta)?;
         }
     }
 

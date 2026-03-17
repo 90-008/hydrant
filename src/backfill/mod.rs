@@ -22,7 +22,6 @@ use miette::{Diagnostic, IntoDiagnostic, Result};
 use reqwest::StatusCode;
 use smol_str::{SmolStr, ToSmolStr};
 use std::collections::HashMap;
-use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
@@ -436,7 +435,7 @@ async fn process_did<'i>(
         Err(XrpcError::Xrpc(e)) => {
             if matches!(e, GetRepoError::RepoNotFound(_)) {
                 warn!("repo not found, deleting");
-                let mut batch = db::refcount::RefcountedBatch::new(db);
+                let mut batch = db.inner.batch();
                 if let Err(e) = crate::ops::delete_repo(&mut batch, db, did, &state) {
                     error!(err = %e, "failed to wipe repo during backfill");
                 }
@@ -546,7 +545,7 @@ async fn process_did<'i>(
             let mut delta = 0;
             let mut added_blocks = 0;
             let mut collection_counts: HashMap<SmolStr, u64> = HashMap::new();
-            let mut batch = db::refcount::RefcountedBatch::new(&app_state.db);
+            let mut batch = app_state.db.inner.batch();
             let store = mst.storage();
 
             let prefix = keys::record_prefix_did(&did);
@@ -618,9 +617,14 @@ async fn process_did<'i>(
                     // key is did|collection|rkey
                     let db_key = keys::record_key(&did, collection, &rkey);
 
-                    batch.batch_mut().insert(&app_state.db.blocks, cid.to_bytes(), val.as_ref());
+                    let cid_bytes = Slice::from(cid.to_bytes());
+                    batch.insert(&app_state.db.blocks, cid_bytes.clone(), val.as_ref());
                     if !ephemeral {
-                        batch.batch_mut().insert(&app_state.db.records, db_key, cid.to_bytes());
+                        batch.insert(&app_state.db.records, db_key, cid.to_bytes());
+                    } else {
+                        // ephemeral: track refcount for this event's CID
+                        let mut entry = app_state.db.block_refcounts.entry_sync(cid_bytes).or_insert(0);
+                        *entry += 1;
                     }
 
                     added_blocks += 1;
@@ -640,27 +644,8 @@ async fn process_did<'i>(
                         cid: Some(cid_obj.to_ipld().expect("valid cid")),
                     };
                     let bytes = rmp_serde::to_vec(&evt).into_diagnostic()?;
-                    batch.batch_mut().insert(&app_state.db.events, keys::event_key(event_id), bytes);
+                    batch.insert(&app_state.db.events, keys::event_key(event_id), bytes);
 
-                    // update block refcount
-                    let cid_bytes = Slice::from(cid.to_bytes());
-                    // if ephemeral, we only care about events, so its 1
-                    // if not, then its 2 since we also insert to records
-                    batch.update_block_refcount(cid_bytes, ephemeral.then_some(1).unwrap_or(2))?;
-                    // for Update, also decrement old CID refcount
-                    // event will still be there, so we only decrement for records
-                    // which means only if not ephemeral
-                    if !ephemeral && action == DbAction::Update {
-                        let existing_cid = existing_cid.expect("that cid exists since this is Update");
-                        if existing_cid != cid_obj.as_str() {
-                            let old_cid_bytes = Slice::from(
-                                cid::Cid::from_str(&existing_cid)
-                                    .expect("valid cid from existing_cids")
-                                    .to_bytes()
-                            );
-                            batch.update_block_refcount(old_cid_bytes, -1)?;
-                        }
-                    }
 
                     count += 1;
                 }
@@ -671,19 +656,12 @@ async fn process_did<'i>(
                 trace!(collection = %collection, rkey = %rkey, cid = %cid, "remove existing record");
 
                 // we dont have to put if ephemeral around here since
-                // existing_cids will be empty anyyway
-                batch.batch_mut().remove(
+                // existing_cids will be empty anyway
+                batch.remove(
                     &app_state.db.records,
                     keys::record_key(&did, &collection, &rkey),
                 );
 
-                // decrement block refcount
-                let cid_bytes = Slice::from(
-                    cid::Cid::from_str(&cid)
-                        .expect("valid cid from existing_cids")
-                        .to_bytes()
-                );
-                batch.update_block_refcount(cid_bytes, -1)?;
 
                 let event_id = app_state.db.next_event_id.fetch_add(1, Ordering::SeqCst);
                 let evt = StoredEvent {
@@ -696,7 +674,7 @@ async fn process_did<'i>(
                     cid: None,
                 };
                 let bytes = rmp_serde::to_vec(&evt).into_diagnostic()?;
-                batch.batch_mut().insert(&app_state.db.events, keys::event_key(event_id), bytes);
+                batch.insert(&app_state.db.events, keys::event_key(event_id), bytes);
 
                 delta -= 1;
                 count += 1;
@@ -713,7 +691,7 @@ async fn process_did<'i>(
             state.data = Some(root_commit.data);
             state.touch();
 
-            batch.batch_mut().insert(
+            batch.insert(
                 &app_state.db.repos,
                 keys::repo_key(&did),
                 ser_repo_state(&state)?,
@@ -722,7 +700,7 @@ async fn process_did<'i>(
             // add the counts
             if !ephemeral {
                 for (col, cnt) in collection_counts {
-                    db::set_record_count(batch.batch_mut(), &app_state.db, &did, &col, cnt);
+                    db::set_record_count(&mut batch, &app_state.db, &did, &col, cnt);
                 }
             }
 

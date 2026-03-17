@@ -43,6 +43,7 @@ the `WS /stream` (hydrant) and `WS /channel` (tap) endpoints have different desi
 | `RELAY_HOST` | `wss://relay.fire.hose.cam/` | URL of the relay. |
 | `RELAY_HOSTS` | | comma-separated list of relay URLs. if unset, falls back to `RELAY_HOST`. |
 | `PLC_URL` | `https://plc.wtf` | base URL(s) of the PLC directory (comma-separated for multiple). |
+| `EPHEMERAL` | `false` | if enabled, no records are stored. events are only stored up to 10 minutes for playback. |
 | `FULL_NETWORK` | `false` | if `true`, discovers and indexes all repositories in the network. |
 | `FILTER_SIGNALS` | | comma-separated list of NSID patterns to use for the filter on startup (e.g. `app.bsky.feed.post,app.bsky.graph.*`). |
 | `FILTER_COLLECTIONS` | | comma-separated list of NSID patterns to use for the collections filter on startup. |
@@ -58,7 +59,6 @@ the `WS /stream` (hydrant) and `WS /channel` (tap) endpoints have different desi
 | `ENABLE_DEBUG` | `false` | enable debug endpoints. |
 | `DEBUG_PORT` | `3001` | port for debug endpoints (if enabled). |
 | `NO_LZ4_COMPRESSION` | `false` | disable lz4 compression for storage. |
-| `EPHEMERAL` | `false` | if enabled, no records are stored (XRPCs won't be reliable). events are only stored up to an hour for playback. |
 | `ENABLE_FIREHOSE` | `true` | whether to ingest relay subscriptions. |
 | `ENABLE_BACKFILL` | `true` | whether to backfill from PDS instances. |
 | `ENABLE_CRAWLER` | `false` (if Filter), `true` (if Full) | whether to actively query the network for unknown repositories. |
@@ -112,7 +112,7 @@ each set field accepts one of two forms:
     - `partition`: `all` (default), `pending` (backfill queue), or `resync` (retries)
 - `GET /repos/{did}`: get the sync status and metadata of a specific repository. also returns the handle, PDS URL and the atproto signing key (these won't be available before the repo has been backfilled once at least).
 - `PUT /repos`: explicitly track repositories. accepts an NDJSON body of `{"did": "..."}` (or JSON array of the same).
-- `DELETE /repos`: untrack repositories. accepts an NDJSON body of `{"did": "..."}` (or JSON array of the same). optionally include `"deleteData": true` to also purge the repository from the database.
+- `DELETE /repos`: untrack repositories. accepts an NDJSON body of `{"did": "..."}` (or JSON array of the same).
 
 ### data access (xrpc)
 
@@ -144,9 +144,6 @@ returns `{ count }`.
 - `GET /stream`: subscribe to the event stream.
   - query parameters:
     - `cursor` (optional): start streaming from a specific event ID.
-- `POST /stream/ack`: ack events.
-  - body:
-    - `ids`: list of event IDs to acknowledge.
 
 ### stats
 

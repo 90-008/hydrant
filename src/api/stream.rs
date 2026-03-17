@@ -1,10 +1,8 @@
 use crate::api::AppState;
 use crate::db::keys;
-use crate::db::refcount::RefcountedBatch;
 use crate::types::{BroadcastEvent, MarshallableEvt, RecordEvt, StoredEvent};
 use axum::Router;
-use axum::http::StatusCode;
-use axum::routing::{get, post};
+use axum::routing::get;
 use axum::{
     extract::{
         Query, State,
@@ -20,55 +18,7 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use tracing::{error, info_span, warn};
 
 pub fn router() -> Router<Arc<AppState>> {
-    Router::new()
-        .route("/", get(handle_stream))
-        .route("/ack", post(handle_ack))
-}
-
-#[derive(Deserialize)]
-pub struct AckBody {
-    pub ids: Vec<u64>,
-}
-
-pub async fn handle_ack(
-    State(state): State<Arc<AppState>>,
-    axum::Json(body): axum::Json<AckBody>,
-) -> Result<StatusCode, (StatusCode, String)> {
-    if body.ids.is_empty() {
-        return Ok(StatusCode::OK);
-    }
-
-    let state = state.clone();
-    let ids = body.ids;
-    tokio::task::spawn_blocking(move || {
-        let mut batch = RefcountedBatch::new(&state.db);
-        for &id in &ids {
-            let _entered = tracing::info_span!("ack", id).entered();
-            let key = keys::event_key(id);
-            let Some(event_bytes) = state.db.events.get(&key).into_diagnostic()? else {
-                tracing::warn!("event bytes not found");
-                continue;
-            };
-            let evt = rmp_serde::from_slice::<StoredEvent>(&event_bytes).into_diagnostic()?;
-            if let Some(cid) = evt.cid {
-                tracing::debug!(cid = %cid, "acking event");
-                batch.update_block_refcount(fjall::Slice::from(cid.to_bytes()), -1)?;
-            } else {
-                tracing::debug!("acking event with NO cid");
-            }
-            batch.batch_mut().remove(&state.db.events, key);
-        }
-        batch
-            .commit()
-            .into_diagnostic()
-            .wrap_err("failed to delete events")?;
-        Ok(StatusCode::OK)
-    })
-    .await
-    .into_diagnostic()
-    .wrap_err("panicked while deleting events")
-    .flatten()
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+    Router::new().route("/", get(handle_stream))
 }
 
 #[derive(Deserialize)]

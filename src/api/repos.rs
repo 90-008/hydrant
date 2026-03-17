@@ -15,7 +15,6 @@ use rand::Rng;
 use serde::{Deserialize, Serialize};
 
 use crate::api::AppState;
-use crate::db::refcount::RefcountedBatch;
 use crate::db::{keys, ser_repo_state};
 use crate::types::{GaugeState, RepoState};
 
@@ -30,8 +29,6 @@ pub fn router() -> Router<Arc<AppState>> {
 #[derive(Deserialize, Debug)]
 pub struct RepoRequest {
     pub did: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub delete_data: Option<bool>,
 }
 
 #[derive(Serialize, Debug)]
@@ -52,12 +49,6 @@ pub struct RepoResponse {
     pub last_updated_at: Option<DateTime<Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_message_at: Option<DateTime<Utc>>,
-}
-
-#[derive(Deserialize)]
-pub struct DeleteParams {
-    #[serde(default)]
-    pub delete_data: bool,
 }
 
 #[derive(Deserialize)]
@@ -273,7 +264,6 @@ pub async fn handle_put_repos(
 
 pub async fn handle_delete_repos(
     State(state): State<Arc<AppState>>,
-    Query(params): Query<DeleteParams>,
     req: axum::extract::Request,
 ) -> Result<StatusCode, (StatusCode, String)> {
     let items = parse_body(req).await?;
@@ -281,13 +271,13 @@ pub async fn handle_delete_repos(
     let state_task = state.clone();
     let (deleted_count, gauge_decrements) = tokio::task::spawn_blocking(move || {
         let db = &state_task.db;
-        let mut batch = RefcountedBatch::new(db);
-        let mut deleted_count = 0i64;
+        let mut batch = db.inner.batch();
+        // keeping this for later, unused for now
+        let deleted_count = 0i64;
         let mut gauge_decrements = Vec::new();
 
         for item in items {
             let did = Did::new(&item.did).map_err(bad_request)?;
-            let delete_data = item.delete_data.unwrap_or(params.delete_data);
             let did_key = keys::repo_key(&did);
 
             let repo_bytes = db.repos.get(&did_key).map_err(internal)?;
@@ -302,24 +292,16 @@ pub async fn handle_delete_repos(
                 let old_gauge =
                     crate::db::Db::repo_gauge_state(&repo_state, resync_bytes.as_deref());
 
-                if delete_data {
-                    crate::ops::delete_repo(&mut batch, db, &did, &repo_state).map_err(internal)?;
-                    deleted_count += 1;
-                    if old_gauge != GaugeState::Synced {
-                        gauge_decrements.push(old_gauge);
-                    }
-                } else if repo_state.tracked {
+                if repo_state.tracked {
                     let mut repo_state = repo_state.into_static();
                     repo_state.tracked = false;
-                    batch.batch_mut().insert(
+                    batch.insert(
                         &db.repos,
                         &did_key,
                         ser_repo_state(&repo_state).map_err(internal)?,
                     );
-                    batch
-                        .batch_mut()
-                        .remove(&db.pending, keys::pending_key(repo_state.index_id));
-                    batch.batch_mut().remove(&db.resync, &did_key);
+                    batch.remove(&db.pending, keys::pending_key(repo_state.index_id));
+                    batch.remove(&db.resync, &did_key);
                     if old_gauge != GaugeState::Synced {
                         gauge_decrements.push(old_gauge);
                     }

@@ -9,8 +9,6 @@ pub const SEP: u8 = b'|';
 
 pub const CURSOR_KEY: &[u8] = b"firehose_cursor";
 
-pub const BLOCK_REFS_CHECKPOINT_SEQ_KEY: &[u8] = b"block_refs_checkpoint_seq";
-
 pub const EVENT_WATERMARK_PREFIX: &[u8] = b"ewm|";
 
 // key format: {DID}
@@ -22,10 +20,6 @@ pub fn repo_key<'a>(did: &'a Did) -> Vec<u8> {
 
 pub fn pending_key(id: u64) -> [u8; 8] {
     id.to_be_bytes()
-}
-
-pub fn reflog_key(seq: u64) -> [u8; 8] {
-    seq.to_be_bytes()
 }
 
 pub fn event_watermark_key(timestamp_secs: u64) -> Vec<u8> {
