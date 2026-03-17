@@ -300,6 +300,21 @@ impl Db {
         Ok(())
     }
 
+    pub fn compact(&self) -> Result<()> {
+        self.repos.major_compact().into_diagnostic()?;
+        self.records.major_compact().into_diagnostic()?;
+        self.blocks.major_compact().into_diagnostic()?;
+        self.cursors.major_compact().into_diagnostic()?;
+        self.pending.major_compact().into_diagnostic()?;
+        self.resync.major_compact().into_diagnostic()?;
+        self.resync_buffer.major_compact().into_diagnostic()?;
+        self.events.major_compact().into_diagnostic()?;
+        self.counts.major_compact().into_diagnostic()?;
+        self.filter.major_compact().into_diagnostic()?;
+        self.crawler.major_compact().into_diagnostic()?;
+        Ok(())
+    }
+
     pub async fn get(ks: Keyspace, key: impl Into<Slice>) -> Result<Option<Slice>> {
         let key = key.into();
         tokio::task::spawn_blocking(move || ks.get(key).into_diagnostic())

@@ -55,6 +55,7 @@ pub struct Config {
     pub enable_backfill: bool,
     pub enable_crawler: Option<bool>,
     pub firehose_workers: usize,
+    pub db_compact: bool,
     pub db_worker_threads: usize,
     pub db_max_journaling_size_mb: u64,
     pub db_pending_memtable_size_mb: u64,
@@ -149,6 +150,8 @@ impl Config {
             full_network.then_some(24usize).unwrap_or(8usize)
         );
 
+        let db_compact = cfg!("COMPACT_DB", false);
+
         let (
             default_db_worker_threads,
             default_db_max_journaling_size_mb,
@@ -223,6 +226,7 @@ impl Config {
             enable_backfill,
             enable_crawler,
             firehose_workers,
+            db_compact,
             db_worker_threads,
             db_max_journaling_size_mb,
             db_pending_memtable_size_mb,
@@ -272,6 +276,7 @@ impl fmt::Display for Config {
         config_line!(f, "disable lz4 compression", self.disable_lz4_compression)?;
         config_line!(f, "api port", self.api_port)?;
         config_line!(f, "firehose workers", self.firehose_workers)?;
+        config_line!(f, "db compact", self.db_compact)?;
         config_line!(f, "db worker threads", self.db_worker_threads)?;
         config_line!(
             f,

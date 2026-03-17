@@ -31,6 +31,11 @@ async fn main() -> miette::Result<()> {
 
     let state = AppState::new(&cfg)?;
 
+    if cfg.db_compact {
+        info!("compacting database...");
+        state.db.compact()?;
+    }
+
     if cfg.full_network
         || cfg.filter_signals.is_some()
         || cfg.filter_collections.is_some()
