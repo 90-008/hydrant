@@ -149,12 +149,13 @@ impl Db {
         let blocks = open_ks(
             "blocks",
             opts()
-                // point reads are used a lot by stream
+                // point reads are used a lot by stream, we know the blocks exist though
                 .expect_point_read_hits(true)
                 .max_memtable_size(mb(cfg.db_blocks_memtable_size_mb))
-                // 32 - 64 kb is probably fine, as the newer blocks will be in the first levels
+                // 16 - 128 kb is probably fine, as the newer blocks will be in the first levels
                 // and any consumers will probably be streaming the newer events...
-                .data_block_size_policy(BlockSizePolicy::new([kb(4), kb(8), kb(32), kb(64)])),
+                // and blocks are pretty big-ish like around 5kb usually so this helps i think
+                .data_block_size_policy(BlockSizePolicy::new([kb(8), kb(16), kb(64), kb(128)])),
         )?;
         let records = open_ks(
             "records",
@@ -182,10 +183,12 @@ impl Db {
                 .max_memtable_size(mb(cfg.db_pending_memtable_size_mb))
                 .data_block_size_policy(BlockSizePolicy::all(kb(4))),
         )?;
-        // resync point reads often miss (because most repos aren't resyncing), so keeping the bloom filter helps avoid disk hits
         let resync = open_ks(
             "resync",
             opts()
+                // we only point read in backfill when we check for existing resync state
+                // ...and also in repos api. so we can disable bloom filters
+                .expect_point_read_hits(true)
                 .max_memtable_size(mb(cfg.db_pending_memtable_size_mb))
                 .data_block_size_policy(BlockSizePolicy::all(kb(8))),
         )?;
@@ -203,6 +206,9 @@ impl Db {
                 // only iterators are used here, no point reads
                 .expect_point_read_hits(true)
                 .max_memtable_size(mb(cfg.db_events_memtable_size_mb))
+                // the compression here wont be good since events are quite random
+                // eg. by many different repos and different records etc.
+                // since its sequential we should still go with bigger block size though
                 .data_block_size_policy(BlockSizePolicy::new([kb(16), kb(32)])),
         )?;
         let counts = open_ks(
@@ -210,7 +216,7 @@ impl Db {
             opts()
                 // count increments hit because counters are mostly pre-initialized
                 .expect_point_read_hits(true)
-                .max_memtable_size(mb(32))
+                .max_memtable_size(mb(16))
                 // the data is very small
                 .data_block_size_policy(BlockSizePolicy::all(kb(1))),
         )?;
@@ -228,6 +234,8 @@ impl Db {
         let crawler = open_ks(
             "crawler",
             opts()
+                // only iterators are used here
+                .expect_point_read_hits(true)
                 .max_memtable_size(mb(16))
                 .data_block_size_policy(BlockSizePolicy::all(kb(1))),
         )?;
