@@ -76,6 +76,19 @@ def main [] {
                  print "PASSED: /debug/iter on events returns JSON objects"
             }
 
+            # 4. Test size in /stats
+            print "testing size in /stats"
+            let stats = http get $"($url)/stats"
+            if ($stats.size | is-empty) {
+                print "FAILED: /stats returned empty size"
+                exit 1
+            }
+            if not ("repos" in ($stats.size | columns)) {
+                print "FAILED: /stats missing 'repos' in size"
+                exit 1
+            }
+            print "PASSED: /stats returns keyspace sizes"
+
         } else {
             print "backfill failed"
             exit 1

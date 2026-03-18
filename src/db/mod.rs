@@ -28,6 +28,7 @@ fn default_opts() -> KeyspaceCreateOptions {
     KeyspaceCreateOptions::default()
 }
 
+#[derive(Clone)]
 pub struct Db {
     pub inner: Arc<Database>,
     pub repos: Keyspace,
@@ -230,6 +231,9 @@ impl Db {
                 .max_memtable_size(mb(16))
                 .data_block_size_policy(BlockSizePolicy::all(kb(1))),
         )?;
+
+        // when adding new keyspaces, make sure to add them to the /stats endpoint
+        // and also update any relevant /debug/* endpoints
 
         let mut last_id = 0;
         if let Some(guard) = events.iter().next_back() {
