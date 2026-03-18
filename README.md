@@ -39,22 +39,22 @@ the `WS /stream` (hydrant) and `WS /channel` (tap) endpoints have different desi
 | variable | default | description |
 | :--- | :--- | :--- |
 | `DATABASE_PATH` | `./hydrant.db` | path to the database folder. |
-| `RUST_LOG` | `info` | log filter directives (e.g., `debug`, `hydrant=trace`). standard [`tracing` env-filter syntax](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html). |
+| `RUST_LOG` | `info` | log filter directives (e.g., `debug`, `hydrant=trace`). [`tracing` env-filter syntax](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html). |
 | `RELAY_HOST` | `wss://relay.fire.hose.cam/` | URL of the relay. |
 | `RELAY_HOSTS` | | comma-separated list of relay URLs. if unset, falls back to `RELAY_HOST`. |
-| `PLC_URL` | `https://plc.wtf` | base URL(s) of the PLC directory (comma-separated for multiple). |
+| `PLC_URL` | `https://plc.wtf`, `https://plc.directory` if full network | base URL(s) of the PLC directory (comma-separated for multiple). |
 | `EPHEMERAL` | `false` | if enabled, no records are stored. events are only stored up to 10 minutes for playback. |
 | `FULL_NETWORK` | `false` | if `true`, discovers and indexes all repositories in the network. |
-| `FILTER_SIGNALS` | | comma-separated list of NSID patterns to use for the filter on startup (e.g. `app.bsky.feed.post,app.bsky.graph.*`). |
-| `FILTER_COLLECTIONS` | | comma-separated list of NSID patterns to use for the collections filter on startup. |
-| `FILTER_EXCLUDES` | | comma-separated list of DIDs to exclude from indexing on startup. |
+| `FILTER_SIGNALS` | | comma-separated list of NSID patterns to use for the filter (e.g. `app.bsky.feed.post,app.bsky.graph.*`). |
+| `FILTER_COLLECTIONS` | | comma-separated list of NSID patterns to use for the collections filter. |
+| `FILTER_EXCLUDES` | | comma-separated list of DIDs to exclude from indexing. |
 | `FIREHOSE_WORKERS` | `8` (`24` if full network) | number of concurrent workers for firehose events. |
-| `BACKFILL_CONCURRENCY_LIMIT` | `32` (`128` if full network) | maximum number of concurrent backfill tasks. |
+| `BACKFILL_CONCURRENCY_LIMIT` | `16` (`64` if full network) | maximum number of concurrent backfill tasks. |
 | `VERIFY_SIGNATURES` | `full` | signature verification level: `full`, `backfill-only`, or `none`. |
 | `CURSOR_SAVE_INTERVAL` | `3` | interval (in seconds) to save the firehose cursor. |
 | `REPO_FETCH_TIMEOUT` | `300` | timeout (in seconds) for fetching repositories. |
 | `CACHE_SIZE` | `256` | size of the database cache in MB. |
-| `IDENTITY_CACHE_SIZE` | `1000000` | number of identity entries to cache. |
+| `IDENTITY_CACHE_SIZE` | `100000` | number of identity entries to cache. |
 | `API_PORT` | `3000` | port for the API server. |
 | `ENABLE_DEBUG` | `false` | enable debug endpoints. |
 | `DEBUG_PORT` | `API_PORT + 1` | port for debug endpoints (if enabled). |
@@ -147,4 +147,6 @@ returns `{ count }`.
 
 ### stats
 
-- `GET /stats`: get aggregate counts of repos, records, events, and errors.
+- `GET /stats`: get stats about the database:
+  - `counts`: counts of repos, records, events, and errors, etc.
+  - `sizes`: sizes of the database keyspaces on disk, in bytes.

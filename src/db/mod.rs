@@ -165,7 +165,7 @@ impl Db {
             opts()
                 // iterated over as a queue, no point reads are used so bloom filters are disabled
                 .expect_point_read_hits(true)
-                .max_memtable_size(mb(cfg.db_pending_memtable_size_mb))
+                .max_memtable_size(mb(8))
                 // its just index of id (int) -> did, and dids arent compressable (especially with the ids being random)
                 .data_block_size_policy(BlockSizePolicy::all(kb(1)))
                 // and we'll transition from pending to synced anyway, no point trying to compress
@@ -177,7 +177,7 @@ impl Db {
                 // we only point read in backfill when we check for existing resync state
                 // ...and also in repos api. so we can disable bloom filters
                 .expect_point_read_hits(true)
-                .max_memtable_size(mb(cfg.db_pending_memtable_size_mb))
+                .max_memtable_size(mb(8))
                 // did -> error state, so its gonna be basically random, cant compress well
                 .data_block_size_policy(BlockSizePolicy::all(kb(4)))
                 // and we arent going to have many of these anyway, no point trying

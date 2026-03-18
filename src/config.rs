@@ -85,7 +85,6 @@ pub struct Config {
     pub db_compact: bool,
     pub db_worker_threads: usize,
     pub db_max_journaling_size_mb: u64,
-    pub db_pending_memtable_size_mb: u64,
     pub db_blocks_memtable_size_mb: u64,
     pub db_repos_memtable_size_mb: u64,
     pub db_events_memtable_size_mb: u64,
@@ -138,6 +137,8 @@ impl Config {
             .then(|| vec![relay_host])
             .unwrap_or(relay_hosts);
 
+        let full_network: bool = cfg!("FULL_NETWORK", false);
+
         let plc_urls: Vec<Url> = std::env::var("HYDRANT_PLC_URL")
             .ok()
             .map(|s| {
@@ -146,9 +147,14 @@ impl Config {
                     .collect::<Result<Vec<_>, _>>()
                     .map_err(|e| miette::miette!("invalid PLC URL: {e}"))
             })
-            .unwrap_or_else(|| Ok(vec![Url::parse("https://plc.wtf").unwrap()]))?;
+            .unwrap_or_else(|| {
+                Ok(vec![
+                    full_network
+                        .then_some(Url::parse("https://plc.directory").unwrap())
+                        .unwrap_or(Url::parse("https://plc.wtf").unwrap()),
+                ])
+            })?;
 
-        let full_network: bool = cfg!("FULL_NETWORK", false);
         let cursor_save_interval = cfg!("CURSOR_SAVE_INTERVAL", 3, sec);
         let repo_fetch_timeout = cfg!("REPO_FETCH_TIMEOUT", 300, sec);
 
@@ -172,7 +178,7 @@ impl Config {
 
         let backfill_concurrency_limit = cfg!(
             "BACKFILL_CONCURRENCY_LIMIT",
-            full_network.then_some(128usize).unwrap_or(32usize)
+            full_network.then_some(64usize).unwrap_or(16usize)
         );
         let firehose_workers = cfg!(
             "FIREHOSE_WORKERS",
@@ -205,11 +211,6 @@ impl Config {
         );
         let db_repos_memtable_size_mb =
             cfg!("DB_REPOS_MEMTABLE_SIZE_MB", default_db_memtable_size_mb / 2);
-        let db_pending_memtable_size_mb = cfg!(
-            "DB_PENDING_MEMTABLE_SIZE_MB",
-            // pending is uint id -> did, which is cheap
-            default_db_memtable_size_mb / 3
-        );
 
         let crawler_max_pending_repos = cfg!("CRAWLER_MAX_PENDING_REPOS", 2000usize);
         let crawler_resume_pending_repos = cfg!("CRAWLER_RESUME_PENDING_REPOS", 1000usize);
@@ -259,7 +260,6 @@ impl Config {
             db_compact,
             db_worker_threads,
             db_max_journaling_size_mb,
-            db_pending_memtable_size_mb,
             db_blocks_memtable_size_mb,
             db_repos_memtable_size_mb,
             db_events_memtable_size_mb,
@@ -313,11 +313,6 @@ impl fmt::Display for Config {
             f,
             "db journal size",
             format_args!("{} mb", self.db_max_journaling_size_mb)
-        )?;
-        config_line!(
-            f,
-            "db pending memtable",
-            format_args!("{} mb", self.db_pending_memtable_size_mb)
         )?;
         config_line!(
             f,
