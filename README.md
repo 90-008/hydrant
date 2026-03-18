@@ -57,7 +57,7 @@ the `WS /stream` (hydrant) and `WS /channel` (tap) endpoints have different desi
 | `IDENTITY_CACHE_SIZE` | `1000000` | number of identity entries to cache. |
 | `API_PORT` | `3000` | port for the API server. |
 | `ENABLE_DEBUG` | `false` | enable debug endpoints. |
-| `DEBUG_PORT` | `3001` | port for debug endpoints (if enabled). |
+| `DEBUG_PORT` | `API_PORT + 1` | port for debug endpoints (if enabled). |
 | `NO_LZ4_COMPRESSION` | `false` | disable lz4 compression for storage. |
 | `ENABLE_FIREHOSE` | `true` | whether to ingest relay subscriptions. |
 | `ENABLE_BACKFILL` | `true` | whether to backfill from PDS instances. |

@@ -160,7 +160,8 @@ impl Config {
 
         let api_port = cfg!("API_PORT", 3000u16);
         let enable_debug = cfg!("ENABLE_DEBUG", false);
-        let debug_port = cfg!("DEBUG_PORT", 3001u16);
+        let debug_port: u16 = api_port + 1;
+        let debug_port = cfg!("DEBUG_PORT", debug_port);
         let verify_signatures = cfg!("VERIFY_SIGNATURES", SignatureVerification::Full);
         let identity_cache_size = cfg!("IDENTITY_CACHE_SIZE", 1_000_000u64);
         let enable_firehose = cfg!("ENABLE_FIREHOSE", true);
