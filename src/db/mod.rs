@@ -2,7 +2,7 @@ use crate::config::Compression;
 use crate::db::compaction::DropPrefixFilterFactory;
 use crate::types::{BroadcastEvent, RepoState};
 
-use fjall::config::{BlockSizePolicy, CompressionPolicy};
+use fjall::config::{BlockSizePolicy, CompressionPolicy, RestartIntervalPolicy};
 use fjall::{
     CompressionType, Database, Keyspace, KeyspaceCreateOptions, OwnedWriteBatch, PersistMode, Slice,
 };
@@ -152,13 +152,18 @@ impl Db {
                 .expect_point_read_hits(false)
                 .max_memtable_size(mb(cfg.db_repos_memtable_size_mb))
                 // did -> repo state, not gonna be compressable well because dids are random
-                // and repo state doesnt have repeats really
+                // and repo state doesnt have repeats really..
+                // these block sizes work fine since we insert into repos constantly anyway
+                // whenever we update anything related to a repo, so the repos that arent
+                // being updated will be compacted away!
                 .data_block_size_policy(BlockSizePolicy::new([kb(4), kb(4), kb(8), kb(64)]))
                 .data_block_compression_policy(CompressionPolicy::new([
                     CompressionType::None,
                     CompressionType::None,
                     compression,
-                ])),
+                ]))
+                // did plc are random so the interval wont rlly matter
+                .data_block_restart_interval_policy(RestartIntervalPolicy::new([2, 4])),
         )?;
         let pending = open_ks(
             "pending",
@@ -167,9 +172,11 @@ impl Db {
                 .expect_point_read_hits(true)
                 .max_memtable_size(mb(8))
                 // its just index of id (int) -> did, and dids arent compressable (especially with the ids being random)
-                .data_block_size_policy(BlockSizePolicy::all(kb(1)))
+                .data_block_size_policy(BlockSizePolicy::all(kb(8)))
                 // and we'll transition from pending to synced anyway, no point trying to compress
-                .data_block_compression_policy(CompressionPolicy::disabled()),
+                .data_block_compression_policy(CompressionPolicy::disabled())
+                // ids are sequential and share prefix so we can use large interval to save space
+                .data_block_restart_interval_policy(RestartIntervalPolicy::all(64)),
         )?;
         let resync = open_ks(
             "resync",
@@ -181,7 +188,8 @@ impl Db {
                 // did -> error state, so its gonna be basically random, cant compress well
                 .data_block_size_policy(BlockSizePolicy::all(kb(4)))
                 // and we arent going to have many of these anyway, no point trying
-                .data_block_compression_policy(CompressionPolicy::disabled()),
+                .data_block_compression_policy(CompressionPolicy::disabled())
+                .data_block_restart_interval_policy(RestartIntervalPolicy::all(4)),
         )?;
         let blocks = open_ks(
             "blocks",
@@ -189,16 +197,20 @@ impl Db {
                 // point reads are used a lot by stream, we know the blocks exist though
                 .expect_point_read_hits(true)
                 .max_memtable_size(mb(cfg.db_blocks_memtable_size_mb))
-                // 16 - 128 kb is probably fine, as the newer blocks will be in the first levels
+                // 16 - 128 kb, as the newer blocks will be in the first level
                 // and any consumers will probably be streaming the newer events...
-                // and blocks are pretty big-ish like around 5kb usually so this helps i think
+                // and blocks are pretty big-ish like around 5kb...
+                // replaying will hit later levels so it will be slower but thats honestly
+                // an acceptable tradeoff to save more space...
+                // todo: we can probably decrease these when we get zstd dict compression?
                 .data_block_size_policy(BlockSizePolicy::new([kb(16), kb(64), kb(128)]))
                 // lets not compress first level so the reads for new blocks are faster
                 // since we will be streaming them to consumers
                 .data_block_compression_policy(CompressionPolicy::new([
                     CompressionType::None,
                     compression,
-                ])),
+                ]))
+                .data_block_restart_interval_policy(RestartIntervalPolicy::new([8, 16, 32])),
         )?;
         let records = open_ks(
             "records",
@@ -208,11 +220,12 @@ impl Db {
                 // and since this keyspace is big, turning off bloom filters will help a lot
                 .expect_point_read_hits(true)
                 .max_memtable_size(mb(cfg.db_records_memtable_size_mb))
-                // its just did|col|rkey -> cid, very small
+                // its just did|col|rkey -> cid, very small (84 bytes for bsky post)
                 .data_block_size_policy(BlockSizePolicy::new([kb(8), kb(16)]))
                 // cids arent compressable, most rkeys are TIDs so they will get compressed
                 // by prefix truncation anyway
-                .data_block_compression_policy(CompressionPolicy::disabled()),
+                .data_block_compression_policy(CompressionPolicy::disabled())
+                .data_block_restart_interval_policy(RestartIntervalPolicy::all(9)),
         )?;
         let cursors = open_ks(
             "cursors",
@@ -222,7 +235,8 @@ impl Db {
                 .max_memtable_size(mb(4))
                 // its just cursors...
                 .data_block_size_policy(BlockSizePolicy::all(kb(1)))
-                .data_block_compression_policy(CompressionPolicy::disabled()),
+                .data_block_compression_policy(CompressionPolicy::disabled())
+                .data_block_restart_interval_policy(RestartIntervalPolicy::all(1)),
         )?;
         let resync_buffer = open_ks(
             "resync_buffer",
@@ -232,7 +246,8 @@ impl Db {
                 .max_memtable_size(mb(16))
                 .data_block_size_policy(BlockSizePolicy::all(kb(32)))
                 // dont have to compress here since resync buffer will be emptied at some point anyway
-                .data_block_compression_policy(CompressionPolicy::disabled()),
+                .data_block_compression_policy(CompressionPolicy::disabled())
+                .data_block_restart_interval_policy(RestartIntervalPolicy::all(16)),
         )?;
         let events = open_ks(
             "events",
@@ -249,7 +264,9 @@ impl Db {
                 .data_block_compression_policy(CompressionPolicy::new([
                     CompressionType::None,
                     compression,
-                ])),
+                ]))
+                // ids are int, we can prefix truncate a lot
+                .data_block_restart_interval_policy(RestartIntervalPolicy::new([64, 128])),
         )?;
         let counts = open_ks(
             "counts",
@@ -258,9 +275,10 @@ impl Db {
                 .expect_point_read_hits(true)
                 .max_memtable_size(mb(16))
                 // the data is very small
-                // this is at worst did|col -> u64, so its tiny
+                // this is at worst did|col -> u64, so its tiny (40 bytes)
                 .data_block_size_policy(BlockSizePolicy::all(kb(2)))
-                .data_block_compression_policy(CompressionPolicy::disabled()),
+                .data_block_compression_policy(CompressionPolicy::disabled())
+                .data_block_restart_interval_policy(RestartIntervalPolicy::all(7)),
         )?;
 
         // filter handles high-volume point reads (repo excludes) so it needs the bloom filter
@@ -270,7 +288,8 @@ impl Db {
                 .max_memtable_size(mb(16))
                 // dids arent compressable so this is fine, and we have nothing as the value
                 .data_block_size_policy(BlockSizePolicy::all(kb(1)))
-                .data_block_compression_policy(CompressionPolicy::disabled()),
+                .data_block_compression_policy(CompressionPolicy::disabled())
+                .data_block_restart_interval_policy(RestartIntervalPolicy::all(2)),
         )?;
 
         let crawler = open_ks(
@@ -281,7 +300,8 @@ impl Db {
                 .max_memtable_size(mb(16))
                 // did -> failed state, not very compressable
                 .data_block_size_policy(BlockSizePolicy::all(kb(2)))
-                .data_block_compression_policy(CompressionPolicy::disabled()),
+                .data_block_compression_policy(CompressionPolicy::disabled())
+                .data_block_restart_interval_policy(RestartIntervalPolicy::all(2)),
         )?;
 
         // when adding new keyspaces, make sure to add them to the /stats endpoint
