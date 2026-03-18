@@ -18,9 +18,9 @@ the `WS /stream` (hydrant) and `WS /channel` (tap) endpoints have different desi
 | :--- | :--- | :--- |
 | distribution | sharded work queue: events are load-balanced across connected clients. If 5 clients connect, each receives ~20% of events. | broadcast: every connected client receives a full copy of the event stream. if 5 clients connect, all 5 receive 100% of events. |
 | cursors | server-managed: clients ACK messages. the server tracks progress and redelivers unacked messages. | client-managed: client provides `?cursor=123`. the server streams from that point. |
-| persistence | events are stored in an outbox and sent to the consumer, removing them, so they can't be replayed once they are acked. | `record` events are replayable. `identity`/`account` are ephemeral. use `GET /repos/:did` to query identity / account info (handle, pds, signing key, etc.). |
+| persistence | events are stored in an outbox and sent to the consumer, and removed from the outbox when acked. nothing is replayable. | `record` events are replayable. `identity`/`account` are ephemeral. use `GET /repos/:did` to query identity / account info (handle, pds, signing key, etc.). |
 | backfill | backfill events are mixed into the live queue and prioritized (per-repo, acting as synchronization barrier) by the server. | backfill simply inserts historical events (`live: false`) into the global event log. streaming is just reading this log sequentially. synchronization is the same as tap, `live: true` vs `live: false`. |
-| event types | `record`, `identity` (includes status) | `record`, `identity` (handle), `account` (status) |
+| event types | `record`, `identity` (includes status) | `record`, `identity` (handle, cache-buster), `account` (status) |
 
 ### multiple relay support
 
@@ -31,6 +31,9 @@ the `WS /stream` (hydrant) and `WS /channel` (tap) endpoints have different desi
 - each relay maintains its own firehose / crawler cursor state
 - all ingestion loops and crawlers share the same worker pool and database
 - all crawlers share the same pending queue for backfill
+
+commit events are de-duplicated according to the repo `rev`. account / identity events are de-duplicated using the `time` field.
+todo: decide what to do on relay-side account takedowns or if relays set the `time` field.
 
 ## configuration
 
@@ -58,7 +61,6 @@ the `WS /stream` (hydrant) and `WS /channel` (tap) endpoints have different desi
 | `API_PORT` | `3000` | port for the API server. |
 | `ENABLE_DEBUG` | `false` | enable debug endpoints. |
 | `DEBUG_PORT` | `API_PORT + 1` | port for debug endpoints (if enabled). |
-| `NO_LZ4_COMPRESSION` | `false` | disable lz4 compression for storage. |
 | `ENABLE_FIREHOSE` | `true` | whether to ingest relay subscriptions. |
 | `ENABLE_BACKFILL` | `true` | whether to backfill from PDS instances. |
 | `ENABLE_CRAWLER` | `false` (if Filter), `true` (if Full) | whether to actively query the network for unknown repositories. |
