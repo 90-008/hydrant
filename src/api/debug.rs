@@ -205,9 +205,15 @@ pub async fn handle_debug_iter(
                         "invalid_u64".to_string()
                     }
                 } else if partition == "blocks" {
-                    match cid::Cid::read_bytes(k.as_ref()) {
-                        Ok(cid) => cid.to_string(),
-                        Err(_) => String::from_utf8_lossy(&k).into_owned(),
+                    // key is col|cid_bytes — show as "col|<cid_str>"
+                    if let Some(sep) = k.iter().position(|&b| b == keys::SEP) {
+                        let col = String::from_utf8_lossy(&k[..sep]);
+                        match cid::Cid::read_bytes(&k[sep + 1..]) {
+                            Ok(cid) => format!("{col}|{cid}"),
+                            Err(_) => String::from_utf8_lossy(&k).into_owned(),
+                        }
+                    } else {
+                        String::from_utf8_lossy(&k).into_owned()
                     }
                 } else {
                     String::from_utf8_lossy(&k).into_owned()

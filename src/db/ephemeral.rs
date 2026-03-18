@@ -31,8 +31,8 @@ pub fn ephemeral_startup_load_refcounts(db: &Db) -> miette::Result<()> {
         let v = guard.value().into_diagnostic()?;
         let evt = rmp_serde::from_slice::<StoredEvent>(&v).into_diagnostic()?;
         let Some(cid) = evt.cid else { continue };
-        let cid_bytes = Slice::from(cid.to_bytes());
-        let mut entry = db.block_refcounts.entry_sync(cid_bytes).or_insert(0);
+        let block_key = Slice::from(keys::block_key(evt.collection.as_str(), &cid.to_bytes()));
+        let mut entry = db.block_refcounts.entry_sync(block_key).or_insert(0);
         *entry += 1;
     }
     trace!("ephemeral block refcounts ready");
@@ -94,12 +94,12 @@ pub fn ephemeral_ttl_tick(db: &Db) -> miette::Result<()> {
         let evt = rmp_serde::from_slice::<StoredEvent>(&v).into_diagnostic()?;
 
         if let Some(cid) = evt.cid {
-            let cid_bytes = Slice::from(cid.to_bytes());
+            let block_key = Slice::from(keys::block_key(evt.collection.as_str(), &cid.to_bytes()));
 
             let remove_block = {
                 let count = db
                     .block_refcounts
-                    .entry_sync(cid_bytes.clone())
+                    .entry_sync(block_key.clone())
                     .and_modify(|c| {
                         *c = c.saturating_sub(1);
                     })
@@ -108,8 +108,8 @@ pub fn ephemeral_ttl_tick(db: &Db) -> miette::Result<()> {
             };
 
             if remove_block {
-                db.block_refcounts.remove_sync(&cid_bytes);
-                batch.remove(&db.blocks, cid_bytes);
+                db.block_refcounts.remove_sync(&block_key);
+                batch.remove(&db.blocks, block_key);
             }
         }
 

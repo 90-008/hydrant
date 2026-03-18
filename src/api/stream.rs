@@ -134,7 +134,12 @@ fn stream(
 
                 let marshallable = {
                     let mut record_val = None;
-                    let block_bytes = cid.map(|cid| db.blocks.get(&cid.to_bytes())).transpose();
+                    let block_bytes = cid
+                        .map(|cid| {
+                            db.blocks
+                                .get(&keys::block_key(collection.as_str(), &cid.to_bytes()))
+                        })
+                        .transpose();
                     match block_bytes {
                         Ok(Some(Some(block_bytes))) => {
                             match serde_ipld_dagcbor::from_slice::<RawData>(&block_bytes) {

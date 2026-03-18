@@ -297,12 +297,13 @@ pub fn apply_commit<'commit, 's>(
                         "block {cid} not found in CAR for record {did}/{collection}/{rkey}"
                     ));
                 };
-                let cid_bytes = Slice::from(cid_ipld.to_bytes());
-                batch.insert(&db.blocks, cid_bytes.clone(), bytes.to_vec());
+                let cid_raw = cid_ipld.to_bytes();
+                let block_key = Slice::from(keys::block_key(collection, &cid_raw));
+                batch.insert(&db.blocks, block_key.clone(), bytes.to_vec());
                 blocks_count += 1;
 
                 if !ephemeral {
-                    batch.insert(&db.records, db_key.clone(), cid_ipld.to_bytes());
+                    batch.insert(&db.records, db_key.clone(), cid_raw);
                     // accumulate counts
                     if action == DbAction::Create {
                         records_delta += 1;
@@ -313,7 +314,7 @@ pub fn apply_commit<'commit, 's>(
                     // delete the block when the last referencing event expires
                     let mut entry = db
                         .block_refcounts
-                        .entry_sync(cid_bytes.clone())
+                        .entry_sync(block_key.clone())
                         .or_insert(0);
                     *entry += 1;
                 }

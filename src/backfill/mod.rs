@@ -617,13 +617,14 @@ async fn process_did<'i>(
                     // key is did|collection|rkey
                     let db_key = keys::record_key(&did, collection, &rkey);
 
-                    let cid_bytes = Slice::from(cid.to_bytes());
-                    batch.insert(&app_state.db.blocks, cid_bytes.clone(), val.as_ref());
+                    let cid_raw = cid.to_bytes();
+                    let block_key = Slice::from(keys::block_key(collection, &cid_raw));
+                    batch.insert(&app_state.db.blocks, block_key.clone(), val.as_ref());
                     if !ephemeral {
-                        batch.insert(&app_state.db.records, db_key, cid.to_bytes());
+                        batch.insert(&app_state.db.records, db_key, cid_raw);
                     } else {
                         // ephemeral: track refcount for this event's CID
-                        let mut entry = app_state.db.block_refcounts.entry_sync(cid_bytes).or_insert(0);
+                        let mut entry = app_state.db.block_refcounts.entry_sync(block_key).or_insert(0);
                         *entry += 1;
                     }
 

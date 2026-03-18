@@ -143,8 +143,9 @@ pub async fn handle_get_record(
         .map_err(|e| internal_error(GetRecordRequest::PATH, e))?;
 
     if let Some(cid_bytes) = cid_bytes {
-        // lookup block using binary cid
-        let block_bytes = Db::get(db.blocks.clone(), cid_bytes.clone())
+        // lookup block using col|cid key
+        let block_key = keys::block_key(req.collection.as_str(), &cid_bytes);
+        let block_bytes = Db::get(db.blocks.clone(), block_key)
             .await
             .map_err(|e| internal_error(GetRecordRequest::PATH, e))?
             .ok_or_else(|| internal_error(GetRecordRequest::PATH, "not found"))?;
@@ -239,8 +240,10 @@ pub async fn handle_list_records(
                 break;
             }
 
-            // look up using binary cid bytes from the record
-            if let Ok(Some(block_bytes)) = blocks_ks.get(&cid_bytes) {
+            // look up using col|cid key built from collection and binary cid bytes from the record
+            if let Ok(Some(block_bytes)) =
+                blocks_ks.get(&keys::block_key(req.collection.as_str(), &cid_bytes))
+            {
                 let val: Data = serde_ipld_dagcbor::from_slice(&block_bytes).unwrap_or(Data::Null);
                 let cid =
                     Cid::Str(Cid::new(&cid_bytes).into_diagnostic()?.to_cowstr()).into_static();
