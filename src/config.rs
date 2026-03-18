@@ -5,6 +5,32 @@ use std::str::FromStr;
 use std::time::Duration;
 use url::Url;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Compression {
+    Lz4,
+    None,
+}
+
+impl FromStr for Compression {
+    type Err = miette::Error;
+    fn from_str(s: &str) -> Result<Self> {
+        match s {
+            "lz4" => Ok(Self::Lz4),
+            "none" => Ok(Self::None),
+            _ => Err(miette::miette!("invalid compression type")),
+        }
+    }
+}
+
+impl fmt::Display for Compression {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Lz4 => write!(f, "lz4"),
+            Self::None => write!(f, "none"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum SignatureVerification {
     Full,
@@ -46,7 +72,8 @@ pub struct Config {
     pub api_port: u16,
     pub cache_size: u64,
     pub backfill_concurrency_limit: usize,
-    pub disable_lz4_compression: bool,
+    pub data_compression: Compression,
+    pub journal_compression: Compression,
     pub debug_port: u16,
     pub enable_debug: bool,
     pub verify_signatures: SignatureVerification,
@@ -122,13 +149,14 @@ impl Config {
             .unwrap_or_else(|| Ok(vec![Url::parse("https://plc.wtf").unwrap()]))?;
 
         let full_network: bool = cfg!("FULL_NETWORK", false);
-        let cursor_save_interval = cfg!("CURSOR_SAVE_INTERVAL", 5, sec);
+        let cursor_save_interval = cfg!("CURSOR_SAVE_INTERVAL", 3, sec);
         let repo_fetch_timeout = cfg!("REPO_FETCH_TIMEOUT", 300, sec);
 
         let ephemeral: bool = cfg!("EPHEMERAL", false);
         let database_path = cfg!("DATABASE_PATH", "./hydrant.db");
         let cache_size = cfg!("CACHE_SIZE", 256u64);
-        let disable_lz4_compression = cfg!("NO_LZ4_COMPRESSION", false);
+        let data_compression = cfg!("DATA_COMPRESSION", Compression::Lz4);
+        let journal_compression = cfg!("JOURNAL_COMPRESSION", Compression::Lz4);
 
         let api_port = cfg!("API_PORT", 3000u16);
         let enable_debug = cfg!("ENABLE_DEBUG", false);
@@ -217,7 +245,8 @@ impl Config {
             api_port,
             cache_size,
             backfill_concurrency_limit,
-            disable_lz4_compression,
+            data_compression,
+            journal_compression,
             debug_port,
             enable_debug,
             verify_signatures,
@@ -273,7 +302,8 @@ impl fmt::Display for Config {
         config_line!(f, "ephemeral", self.ephemeral)?;
         config_line!(f, "database path", self.database_path.to_string_lossy())?;
         config_line!(f, "cache size", format_args!("{} mb", self.cache_size))?;
-        config_line!(f, "disable lz4 compression", self.disable_lz4_compression)?;
+        config_line!(f, "data compression", self.data_compression)?;
+        config_line!(f, "journal compression", self.journal_compression)?;
         config_line!(f, "api port", self.api_port)?;
         config_line!(f, "firehose workers", self.firehose_workers)?;
         config_line!(f, "db compact", self.db_compact)?;

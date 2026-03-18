@@ -51,7 +51,7 @@ the `WS /stream` (hydrant) and `WS /channel` (tap) endpoints have different desi
 | `FIREHOSE_WORKERS` | `8` (`24` if full network) | number of concurrent workers for firehose events. |
 | `BACKFILL_CONCURRENCY_LIMIT` | `32` (`128` if full network) | maximum number of concurrent backfill tasks. |
 | `VERIFY_SIGNATURES` | `full` | signature verification level: `full`, `backfill-only`, or `none`. |
-| `CURSOR_SAVE_INTERVAL` | `5` | interval (in seconds) to save the firehose cursor. |
+| `CURSOR_SAVE_INTERVAL` | `3` | interval (in seconds) to save the firehose cursor. |
 | `REPO_FETCH_TIMEOUT` | `300` | timeout (in seconds) for fetching repositories. |
 | `CACHE_SIZE` | `256` | size of the database cache in MB. |
 | `IDENTITY_CACHE_SIZE` | `1000000` | number of identity entries to cache. |
