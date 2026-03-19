@@ -13,6 +13,8 @@ use miette::{Context, IntoDiagnostic, Result};
 use scc::HashMap;
 use smol_str::SmolStr;
 
+use std::cell::RefCell;
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 
@@ -34,6 +36,7 @@ fn default_opts() -> KeyspaceCreateOptions {
 #[derive(Clone)]
 pub struct Db {
     pub inner: Arc<Database>,
+    pub path: std::path::PathBuf,
     pub repos: Keyspace,
     pub records: Keyspace,
     pub blocks: Keyspace,
@@ -112,6 +115,7 @@ impl Db {
             .manual_journal_persist(true)
             .journal_compression(match cfg.journal_compression {
                 Compression::Lz4 => CompressionType::Lz4,
+                Compression::Zstd => CompressionType::Zstd { level: 3 },
                 Compression::None => CompressionType::None,
             })
             .worker_threads(cfg.db_worker_threads)
@@ -140,8 +144,38 @@ impl Db {
             db.keyspace(name, move || opts).into_diagnostic()
         };
 
-        let compression: CompressionType = match cfg.data_compression {
+        let load_dict = |name: &str| -> Option<Arc<[u8]>> {
+            let path = cfg.database_path.join(format!("dict_{name}.bin"));
+            if path.exists() {
+                if let Ok(bytes) = std::fs::read(&path) {
+                    tracing::info!(
+                        "loaded zstd dictionary for keyspace {name} ({} bytes)",
+                        bytes.len()
+                    );
+                    return Some(bytes.into());
+                }
+            }
+            None
+        };
+        let dicts = ["repos", "blocks", "events"].into_iter().fold(
+            std::collections::HashMap::new(),
+            |mut acc, name| {
+                let Some(dict) = load_dict(name) else {
+                    return acc;
+                };
+                acc.insert(name, dict);
+                acc
+            },
+        );
+        let get_compression = |name: &str, level: i32| match cfg.data_compression {
             Compression::Lz4 => CompressionType::Lz4,
+            Compression::Zstd => dicts
+                .get(name)
+                .map(|dict| CompressionType::ZstdDict {
+                    level,
+                    dict: dict.clone(),
+                })
+                .unwrap_or_else(|| CompressionType::Zstd { level }),
             Compression::None => CompressionType::None,
         };
 
@@ -156,11 +190,12 @@ impl Db {
                 // these block sizes work fine since we insert into repos constantly anyway
                 // whenever we update anything related to a repo, so the repos that arent
                 // being updated will be compacted away!
-                .data_block_size_policy(BlockSizePolicy::new([kb(4), kb(4), kb(8), kb(64)]))
+                .data_block_size_policy(BlockSizePolicy::new([kb(4), kb(4), kb(16), kb(64)]))
                 .data_block_compression_policy(CompressionPolicy::new([
                     CompressionType::None,
                     CompressionType::None,
-                    compression,
+                    get_compression("repos", 3),
+                    get_compression("repos", 5),
                 ]))
                 // did plc are random so the interval wont rlly matter
                 .data_block_restart_interval_policy(RestartIntervalPolicy::new([2, 4])),
@@ -197,7 +232,7 @@ impl Db {
                 // point reads are used a lot by stream, we know the blocks exist though
                 .expect_point_read_hits(true)
                 .max_memtable_size(mb(cfg.db_blocks_memtable_size_mb))
-                // 16 - 128 kb, as the newer blocks will be in the first level
+                // 16 - 128 kb, as the newer blocks will be in the first level (or memtable)
                 // and any consumers will probably be streaming the newer events...
                 // and blocks are pretty big-ish like around 5kb...
                 // replaying will hit later levels so it will be slower but thats honestly
@@ -208,7 +243,9 @@ impl Db {
                 // since we will be streaming them to consumers
                 .data_block_compression_policy(CompressionPolicy::new([
                     CompressionType::None,
-                    compression,
+                    get_compression("blocks", 3),
+                    get_compression("blocks", 3),
+                    get_compression("blocks", 5),
                 ]))
                 .data_block_restart_interval_policy(RestartIntervalPolicy::new([8, 16, 32])),
         )?;
@@ -225,7 +262,7 @@ impl Db {
                 // cids arent compressable, most rkeys are TIDs so they will get compressed
                 // by prefix truncation anyway
                 .data_block_compression_policy(CompressionPolicy::disabled())
-                .data_block_restart_interval_policy(RestartIntervalPolicy::all(9)),
+                .data_block_restart_interval_policy(RestartIntervalPolicy::new([9, 18])),
         )?;
         let cursors = open_ks(
             "cursors",
@@ -263,7 +300,9 @@ impl Db {
                 // we are streaming the new events to consumers so we dont want to compress them
                 .data_block_compression_policy(CompressionPolicy::new([
                     CompressionType::None,
-                    compression,
+                    get_compression("events", 3),
+                    get_compression("events", 3),
+                    get_compression("events", 5),
                 ]))
                 // ids are int, we can prefix truncate a lot
                 .data_block_restart_interval_policy(RestartIntervalPolicy::new([64, 128])),
@@ -349,6 +388,7 @@ impl Db {
 
         Ok(Self {
             inner: db,
+            path: cfg.database_path.clone(),
             repos,
             records,
             blocks,
@@ -365,6 +405,114 @@ impl Db {
             counts_map,
             next_event_id: Arc::new(AtomicU64::new(last_id + 1)),
         })
+    }
+
+    pub fn train_dict(&self, ks_name: &str) -> Result<()> {
+        let ks = match ks_name {
+            "blocks" => &self.blocks,
+            "events" => &self.events,
+            "repos" => &self.repos,
+            _ => miette::bail!("unknown keyspace for training: {ks_name}"),
+        };
+
+        let dict_size = match ks_name {
+            "blocks" => 32_768,
+            "events" => 16_384,
+            "repos" => 16_384,
+            _ => 16_384,
+        };
+
+        let samples = if ks_name == "blocks" {
+            let mut collections = HashSet::new();
+            let mut iter = ks.iter();
+            while let Some(guard) = iter.next() {
+                let key = guard.key().into_diagnostic()?;
+                if let Some(sep_idx) = key.iter().position(|&b| b == keys::SEP) {
+                    if let Ok(col) = std::str::from_utf8(&key[..sep_idx]) {
+                        collections.insert(col.to_string());
+                        let mut next_prefix = key[..sep_idx].to_vec();
+                        next_prefix.push(keys::SEP + 1);
+                        iter = ks.range(next_prefix..);
+                    } else {
+                        break;
+                    }
+                } else {
+                    break;
+                }
+            }
+
+            let mut all_samples = Vec::new();
+            let mut seen_keys = HashSet::new();
+            let captured_keys = RefCell::new(Vec::new());
+
+            for t in collections {
+                let prefix_str = format!("{t}|");
+                let prefix = prefix_str.as_bytes();
+                let mut end_prefix = prefix.to_vec();
+                if let Some(last) = end_prefix.last_mut() {
+                    *last = last.saturating_add(1);
+                }
+
+                let new = ks
+                    .sample_data_blocks(200, |first, last| {
+                        let passes = first < end_prefix.as_slice()
+                            && last >= prefix
+                            && !seen_keys.contains(&(first.to_vec(), last.to_vec()));
+                        if passes {
+                            captured_keys
+                                .borrow_mut()
+                                .push((first.to_vec(), last.to_vec()));
+                        }
+                        passes
+                    })
+                    .into_diagnostic()?;
+
+                for (s, keys) in new.into_iter().zip(captured_keys.borrow_mut().drain(..)) {
+                    if seen_keys.insert(keys) {
+                        all_samples.push(s.to_vec());
+                    }
+                }
+            }
+            all_samples
+        } else {
+            let mut seen_keys = HashSet::new();
+            let captured_keys = RefCell::new(Vec::new());
+            let new = ks
+                .sample_data_blocks(1000, |first, last| {
+                    let passes = !seen_keys.contains(&(first.to_vec(), last.to_vec()));
+                    if passes {
+                        captured_keys
+                            .borrow_mut()
+                            .push((first.to_vec(), last.to_vec()));
+                    }
+                    passes
+                })
+                .into_diagnostic()?;
+
+            new.into_iter()
+                .zip(captured_keys.into_inner())
+                .filter_map(|(s, keys)| seen_keys.insert(keys).then_some(s.to_vec()))
+                .collect()
+        };
+
+        if samples.is_empty() {
+            miette::bail!("no samples found for keyspace {ks_name}, skipping training");
+        }
+
+        tracing::info!(
+            "training zstd dictionary for keyspace {ks_name} ({} samples, {dict_size} bytes limit)...",
+            samples.len(),
+        );
+        let dict_bytes = lsm_tree::train_zstd_dict(&samples, dict_size).into_diagnostic()?;
+        let path = self.path.join(format!("dict_{ks_name}.bin"));
+        std::fs::write(&path, &dict_bytes).into_diagnostic()?;
+        tracing::info!(
+            "saved zstd dictionary for keyspace {ks_name} ({} bytes) to {}. please restart the indexer to use the new dictionary.",
+            dict_bytes.len(),
+            path.display()
+        );
+
+        Ok(())
     }
 
     pub fn persist(&self) -> Result<()> {

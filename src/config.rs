@@ -8,6 +8,7 @@ use url::Url;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Compression {
     Lz4,
+    Zstd,
     None,
 }
 
@@ -16,6 +17,7 @@ impl FromStr for Compression {
     fn from_str(s: &str) -> Result<Self> {
         match s {
             "lz4" => Ok(Self::Lz4),
+            "zstd" => Ok(Self::Zstd),
             "none" => Ok(Self::None),
             _ => Err(miette::miette!("invalid compression type")),
         }
@@ -26,6 +28,7 @@ impl fmt::Display for Compression {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Lz4 => write!(f, "lz4"),
+            Self::Zstd => write!(f, "zstd"),
             Self::None => write!(f, "none"),
         }
     }
