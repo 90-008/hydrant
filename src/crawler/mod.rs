@@ -3,6 +3,7 @@ use crate::db::keys::crawler_cursor_key;
 use crate::db::{Db, keys, ser_repo_state};
 use crate::state::AppState;
 use crate::types::RepoState;
+use crate::util::WatchEnabledExt;
 use crate::util::{ErrorForStatus, RetryOutcome, RetryWithBackoff, parse_retry_after};
 use chrono::{DateTime, TimeDelta, Utc};
 use futures::FutureExt;
@@ -22,6 +23,7 @@ use std::ops::{Add, Mul, Sub};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
+use tokio::sync::watch;
 use tracing::{Instrument, debug, error, info, trace, warn};
 use url::Url;
 
@@ -180,6 +182,7 @@ pub struct Crawler {
     throttled: AtomicBool,
     pds_throttler: Throttler,
     in_flight: InFlight,
+    enabled: watch::Receiver<bool>,
 }
 
 impl Crawler {
@@ -188,6 +191,7 @@ impl Crawler {
         relay_hosts: Vec<Url>,
         max_pending: usize,
         resume_pending: usize,
+        enabled: watch::Receiver<bool>,
     ) -> Self {
         let http = reqwest::Client::builder()
             .user_agent(concat!(
@@ -210,6 +214,7 @@ impl Crawler {
             throttled: AtomicBool::new(false),
             pds_throttler: Throttler::new(),
             in_flight: Arc::new(HashSet::new()),
+            enabled,
         }
     }
 
@@ -340,10 +345,12 @@ impl Crawler {
         let mut tasks = tokio::task::JoinSet::new();
         for url in crawler.relays.clone() {
             let crawler = crawler.clone();
+            let mut enabled = crawler.enabled.clone();
             let span = tracing::info_span!("crawl", %url);
             tasks.spawn(
                 async move {
                     loop {
+                        enabled.wait_enabled("crawler").await;
                         if let Err(e) = Self::crawl(crawler.clone(), &url).await {
                             error!(err = ?e, "fatal error, restarting in 30s");
                             tokio::time::sleep(Duration::from_secs(30)).await;

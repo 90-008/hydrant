@@ -196,23 +196,35 @@ async fn main() -> miette::Result<()> {
         }
     });
 
-    info!("starting crawler ({:?})", state.filter.load().mode);
-    let state_for_crawler = state.clone();
+    let post_patch_crawler = match cfg.enable_crawler {
+        Some(b) => b,
+        None => state.filter.load().mode == hydrant::filter::FilterMode::Full,
+    };
+    state.crawler_enabled.send_replace(post_patch_crawler);
+
+    info!(
+        crawler_enabled = *state.crawler_enabled.borrow(),
+        firehose_enabled = *state.firehose_enabled.borrow(),
+        filter_mode = ?state.filter.load().mode,
+        "starting ingestion"
+    );
+
     let relay_hosts = cfg.relays.clone();
     let crawler_max_pending = cfg.crawler_max_pending_repos;
     let crawler_resume_pending = cfg.crawler_resume_pending_repos;
 
-    let should_run_crawler = match cfg.enable_crawler {
-        Some(true) => true,
-        Some(false) => false,
-        None => state.filter.load().mode == hydrant::filter::FilterMode::Full,
-    };
-
-    if should_run_crawler {
+    if !relay_hosts.is_empty() {
+        let state_for_crawler = state.clone();
+        let crawler_rx = state.crawler_enabled.subscribe();
         info!(
             relay_count = relay_hosts.len(),
-            hosts = ?relay_hosts,
-            "spawning crawler"
+            hosts = relay_hosts
+                .iter()
+                .map(|h| h.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+            enabled = *state.crawler_enabled.borrow(),
+            "starting crawler(s)"
         );
         tokio::spawn(async move {
             let crawler = hydrant::crawler::Crawler::new(
@@ -220,59 +232,50 @@ async fn main() -> miette::Result<()> {
                 relay_hosts,
                 crawler_max_pending,
                 crawler_resume_pending,
+                crawler_rx,
             );
             if let Err(e) = crawler.run().await {
                 error!(err = %e, "crawler error");
                 db::check_poisoned_report(&e);
             }
         });
-    } else {
-        info!("crawler disabled by config or filter mode");
     }
 
-    let mut tasks = if cfg.enable_firehose {
-        let firehose_worker = std::thread::spawn({
-            let state = state.clone();
-            let handle = tokio::runtime::Handle::current();
-            move || {
-                FirehoseWorker::new(
-                    state,
-                    buffer_rx,
-                    matches!(cfg.verify_signatures, SignatureVerification::Full),
-                    cfg.ephemeral,
-                    cfg.firehose_workers,
-                )
-                .run(handle)
-            }
-        });
-
-        let mut t: Vec<BoxFuture<miette::Result<()>>> = vec![Box::pin(
-            tokio::task::spawn_blocking(move || {
-                firehose_worker
-                    .join()
-                    .map_err(|e| miette::miette!("buffer processor died: {e:?}"))
-            })
-            .map(|r| r.into_diagnostic().flatten().flatten()),
-        )];
-
-        for relay_url in &cfg.relays {
-            let ingestor = FirehoseIngestor::new(
-                state.clone(),
-                buffer_tx.clone(),
-                relay_url.clone(),
-                state.filter.clone(),
+    let firehose_worker = std::thread::spawn({
+        let state = state.clone();
+        let handle = tokio::runtime::Handle::current();
+        move || {
+            FirehoseWorker::new(
+                state,
+                buffer_rx,
                 matches!(cfg.verify_signatures, SignatureVerification::Full),
-            );
-            t.push(Box::pin(ingestor.run()));
+                cfg.ephemeral,
+                cfg.firehose_workers,
+            )
+            .run(handle)
         }
+    });
 
-        t
-    } else {
-        info!("firehose ingestion disabled by config");
-        // if firehose is disabled, we just wait indefinitely (or until signal)
-        // essentially we just want to keep the main thread alive for the other components
-        vec![Box::pin(futures::future::pending::<miette::Result<()>>()) as BoxFuture<_>]
-    };
+    let mut tasks: Vec<BoxFuture<miette::Result<()>>> = vec![Box::pin(
+        tokio::task::spawn_blocking(move || {
+            firehose_worker
+                .join()
+                .map_err(|e| miette::miette!("buffer processor died: {e:?}"))
+        })
+        .map(|r| r.into_diagnostic().flatten().flatten()),
+    )];
+
+    for relay_url in &cfg.relays {
+        let ingestor = FirehoseIngestor::new(
+            state.clone(),
+            buffer_tx.clone(),
+            relay_url.clone(),
+            state.filter.clone(),
+            state.firehose_enabled.subscribe(),
+            matches!(cfg.verify_signatures, SignatureVerification::Full),
+        );
+        tasks.push(Box::pin(ingestor.run()));
+    }
 
     let state_api = state.clone();
     tasks.push(Box::pin(async move {

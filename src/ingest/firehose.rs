@@ -3,11 +3,13 @@ use crate::filter::{FilterHandle, FilterMode};
 use crate::ingest::stream::{FirehoseStream, SubscribeReposMessage, decode_frame};
 use crate::ingest::{BufferTx, IngestMessage};
 use crate::state::AppState;
+use crate::util::WatchEnabledExt;
 use jacquard_common::IntoStatic;
 use jacquard_common::types::did::Did;
 use miette::{IntoDiagnostic, Result};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::watch;
 use tracing::{Span, debug, error, info, trace};
 use url::Url;
 
@@ -16,6 +18,7 @@ pub struct FirehoseIngestor {
     buffer_tx: BufferTx,
     relay_host: Url,
     filter: FilterHandle,
+    enabled: watch::Receiver<bool>,
     _verify_signatures: bool,
 }
 
@@ -25,6 +28,7 @@ impl FirehoseIngestor {
         buffer_tx: BufferTx,
         relay_host: Url,
         filter: FilterHandle,
+        enabled: watch::Receiver<bool>,
         verify_signatures: bool,
     ) -> Self {
         Self {
@@ -32,13 +36,16 @@ impl FirehoseIngestor {
             buffer_tx,
             relay_host,
             filter,
+            enabled,
             _verify_signatures: verify_signatures,
         }
     }
 
     #[tracing::instrument(skip(self), fields(relay = %self.relay_host))]
-    pub async fn run(self) -> Result<()> {
+    pub async fn run(mut self) -> Result<()> {
         loop {
+            self.enabled.wait_enabled("firehose").await;
+
             let start_cursor = db::get_firehose_cursor(&self.state.db, &self.relay_host).await?;
 
             match start_cursor {
@@ -58,25 +65,38 @@ impl FirehoseIngestor {
 
             info!("firehose connected");
 
-            while let Some(bytes_res) = stream.next().await {
-                let bytes = match bytes_res {
-                    Ok(b) => b,
-                    Err(e) => {
-                        error!(err = %e, "firehose stream error");
-                        break;
+            let disconnected_by_error = loop {
+                tokio::select! {
+                    msg = stream.next() => {
+                        let Some(bytes_res) = msg else { break true; };
+                        let bytes = match bytes_res {
+                            Ok(b) => b,
+                            Err(e) => {
+                                error!(err = %e, "firehose stream error");
+                                break true;
+                            }
+                        };
+                        match decode_frame(&bytes) {
+                            Ok(msg) => self.handle_message(msg).await,
+                            Err(e) => {
+                                error!(err = %e, "firehose stream error");
+                                break true;
+                            }
+                        }
                     }
-                };
-                match decode_frame(&bytes) {
-                    Ok(msg) => self.handle_message(msg).await,
-                    Err(e) => {
-                        error!(err = %e, "firehose stream error");
-                        break;
+                    _ = self.enabled.changed() => {
+                        if !*self.enabled.borrow() {
+                            info!("firehose disabled, disconnecting");
+                            break false;
+                        }
                     }
                 }
-            }
+            };
 
-            error!("firehose disconnected, reconnecting in 5s...");
-            tokio::time::sleep(Duration::from_secs(5)).await;
+            if disconnected_by_error {
+                error!("firehose disconnected, reconnecting in 5s...");
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
         }
     }
 

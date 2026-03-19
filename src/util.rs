@@ -3,6 +3,8 @@ use std::time::Duration;
 use rand::RngExt;
 use reqwest::StatusCode;
 use serde::{Deserialize, Deserializer, Serializer};
+use tokio::sync::watch;
+use tracing::info;
 
 /// outcome of [`RetryWithBackoff::retry`] when the operation does not succeed.
 pub enum RetryOutcome<E> {
@@ -51,6 +53,26 @@ where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<T, E>>,
 {
+}
+
+/// extension trait that adds `.wait_enabled()` to `watch::Receiver<bool>`.
+///
+/// waits until the value becomes `true`, logging once when paused and once when resumed.
+pub trait WatchEnabledExt {
+    #[allow(async_fn_in_trait)]
+    async fn wait_enabled(&mut self, component: &'static str);
+}
+
+impl WatchEnabledExt for watch::Receiver<bool> {
+    async fn wait_enabled(&mut self, component: &'static str) {
+        if !*self.borrow() {
+            info!("{component} paused");
+            while !*self.borrow() {
+                let _ = self.changed().await;
+            }
+            info!("{component} resumed");
+        }
+    }
 }
 
 /// extension trait that adds `.error_for_status()` to futures returning a reqwest `Response`.
