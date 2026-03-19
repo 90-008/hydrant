@@ -22,6 +22,8 @@ rustPlatform.buildRustPackage {
     outputHashes = {
       "rmp-0.8.15" = "sha256-0VATbSR2lGiCJ8Ww4a5pkOHSRUjoysnFonpKS/oMzgU=";
       "jacquard-api-0.9.5" = "sha256-olYYhjocR86Mey5ma4IPKde1tE9BCPQNFRjNKGr+qdo=";
+      "fjall-3.1.2" = "sha256-6G2B9DDYCb8OLgT05uG1S2kvooDGKyydLr0tQfxkib0=";
+      "lsm-tree-3.1.2" = "sha256-9tOdxX/3nZQkvF7dJSBXiTKZHcQPwCLFB+dwaD1j0ts=";
     };
   };
 }
