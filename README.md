@@ -62,7 +62,6 @@ todo: decide what to do on relay-side account takedowns or if relays set the `ti
 | `ENABLE_DEBUG` | `false` | enable debug endpoints. |
 | `DEBUG_PORT` | `API_PORT + 1` | port for debug endpoints (if enabled). |
 | `ENABLE_FIREHOSE` | `true` | whether to ingest relay subscriptions. |
-| `ENABLE_BACKFILL` | `true` | whether to backfill from PDS instances. |
 | `ENABLE_CRAWLER` | `false` (if Filter), `true` (if Full) | whether to actively query the network for unknown repositories. |
 | `CRAWLER_MAX_PENDING_REPOS` | `2000` | max pending repos for crawler. |
 | `CRAWLER_RESUME_PENDING_REPOS` | `1000` | resume threshold for crawler pending repos. |

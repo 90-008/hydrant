@@ -31,11 +31,6 @@ async fn main() -> miette::Result<()> {
 
     let state = AppState::new(&cfg)?;
 
-    if cfg.db_compact {
-        info!("compacting database...");
-        state.db.compact().await?;
-    }
-
     if cfg.full_network
         || cfg.filter_signals.is_some()
         || cfg.filter_collections.is_some()
@@ -93,24 +88,22 @@ async fn main() -> miette::Result<()> {
             .into_diagnostic()?;
     }
 
-    if cfg.enable_backfill {
-        tokio::spawn({
-            let state = state.clone();
-            let timeout = cfg.repo_fetch_timeout;
-            BackfillWorker::new(
-                state,
-                buffer_tx.clone(),
-                timeout,
-                cfg.backfill_concurrency_limit,
-                matches!(
-                    cfg.verify_signatures,
-                    SignatureVerification::Full | SignatureVerification::BackfillOnly
-                ),
-                cfg.ephemeral,
-            )
-            .run()
-        });
-    }
+    tokio::spawn({
+        let state = state.clone();
+        let timeout = cfg.repo_fetch_timeout;
+        BackfillWorker::new(
+            state,
+            buffer_tx.clone(),
+            timeout,
+            cfg.backfill_concurrency_limit,
+            matches!(
+                cfg.verify_signatures,
+                SignatureVerification::Full | SignatureVerification::BackfillOnly
+            ),
+            cfg.ephemeral,
+        )
+        .run()
+    });
 
     if let Err(e) = spawn_blocking({
         let state = state.clone();

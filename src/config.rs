@@ -82,10 +82,8 @@ pub struct Config {
     pub verify_signatures: SignatureVerification,
     pub identity_cache_size: u64,
     pub enable_firehose: bool,
-    pub enable_backfill: bool,
     pub enable_crawler: Option<bool>,
     pub firehose_workers: usize,
-    pub db_compact: bool,
     pub db_worker_threads: usize,
     pub db_max_journaling_size_mb: u64,
     pub db_blocks_memtable_size_mb: u64,
@@ -174,7 +172,6 @@ impl Config {
         let verify_signatures = cfg!("VERIFY_SIGNATURES", SignatureVerification::Full);
         let identity_cache_size = cfg!("IDENTITY_CACHE_SIZE", 1_000_000u64);
         let enable_firehose = cfg!("ENABLE_FIREHOSE", true);
-        let enable_backfill = cfg!("ENABLE_BACKFILL", true);
         let enable_crawler = std::env::var("HYDRANT_ENABLE_CRAWLER")
             .ok()
             .and_then(|s| s.parse().ok());
@@ -187,8 +184,6 @@ impl Config {
             "FIREHOSE_WORKERS",
             full_network.then_some(24usize).unwrap_or(8usize)
         );
-
-        let db_compact = cfg!("COMPACT_DB", false);
 
         let (
             default_db_worker_threads,
@@ -257,10 +252,8 @@ impl Config {
             verify_signatures,
             identity_cache_size,
             enable_firehose,
-            enable_backfill,
             enable_crawler,
             firehose_workers,
-            db_compact,
             db_worker_threads,
             db_max_journaling_size_mb,
             db_blocks_memtable_size_mb,
@@ -310,7 +303,6 @@ impl fmt::Display for Config {
         config_line!(f, "journal compression", self.journal_compression)?;
         config_line!(f, "api port", self.api_port)?;
         config_line!(f, "firehose workers", self.firehose_workers)?;
-        config_line!(f, "db compact", self.db_compact)?;
         config_line!(f, "db worker threads", self.db_worker_threads)?;
         config_line!(
             f,
