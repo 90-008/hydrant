@@ -350,8 +350,7 @@ impl Crawler {
             tasks.spawn(
                 async move {
                     loop {
-                        enabled.wait_enabled("crawler").await;
-                        if let Err(e) = Self::crawl(crawler.clone(), &url).await {
+                        if let Err(e) = Self::crawl(crawler.clone(), &url, &mut enabled).await {
                             error!(err = ?e, "fatal error, restarting in 30s");
                             tokio::time::sleep(Duration::from_secs(30)).await;
                         }
@@ -379,7 +378,11 @@ impl Crawler {
         Ok(url)
     }
 
-    async fn crawl(crawler: Arc<Self>, relay_host: &Url) -> Result<()> {
+    async fn crawl(
+        crawler: Arc<Self>,
+        relay_host: &Url,
+        enabled: &mut watch::Receiver<bool>,
+    ) -> Result<()> {
         let base_url = Self::base_url(relay_host)?;
 
         let mut rng: SmallRng = rand::make_rng();
@@ -395,6 +398,8 @@ impl Crawler {
 
         let mut was_throttled = false;
         loop {
+            enabled.wait_enabled("crawler").await;
+
             // throttle check
             loop {
                 let pending = crawler.state.db.get_count("pending").await;
@@ -408,7 +413,12 @@ impl Crawler {
                         was_throttled = true;
                         crawler.throttled.store(true, Ordering::Relaxed);
                     }
-                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    tokio::select! {
+                        _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+                        _ = enabled.changed() => {
+                            if !*enabled.borrow() { return Ok(()); }
+                        }
+                    }
                 } else if pending > crawler.resume_pending as u64 {
                     if !was_throttled {
                         debug!(
@@ -430,7 +440,12 @@ impl Crawler {
                             resume = crawler.resume_pending,
                             "cooldown, waiting"
                         );
-                        tokio::time::sleep(Duration::from_secs(5)).await;
+                        tokio::select! {
+                            _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+                            _ = enabled.changed() => {
+                                if !*enabled.borrow() { return Ok(()); }
+                            }
+                        }
                     }
                     break;
                 } else {
@@ -573,8 +588,14 @@ impl Crawler {
                         cursor = Cursor::Done(c);
                     }
                     info!("sleeping 1h before next enumeration pass");
-                    tokio::time::sleep(Duration::from_secs(3600)).await;
-                    info!("resuming after 1h sleep");
+                    tokio::select! {
+                        _ = tokio::time::sleep(Duration::from_secs(3600)) => {
+                            info!("resuming after 1h sleep");
+                        }
+                        _ = enabled.changed() => {
+                            if !*enabled.borrow() { return Ok(()); }
+                        }
+                    }
                     continue;
                 }
                 Err(e) => return Err(e).wrap_err("error while crawling"),
@@ -640,8 +661,14 @@ impl Crawler {
 
             if matches!(cursor, Cursor::Done(_)) {
                 info!("enumeration complete, sleeping 1h before next pass");
-                tokio::time::sleep(Duration::from_secs(3600)).await;
-                info!("resuming after 1h sleep");
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(3600)) => {
+                        info!("resuming after 1h sleep");
+                    }
+                    _ = enabled.changed() => {
+                        if !*enabled.borrow() { return Ok(()); }
+                    }
+                }
             }
         }
     }

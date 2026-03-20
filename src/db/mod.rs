@@ -422,58 +422,28 @@ impl Db {
             _ => 16_384,
         };
 
-        let samples = if ks_name == "blocks" {
-            let mut collections = HashSet::new();
-            let mut iter = ks.iter();
-            while let Some(guard) = iter.next() {
-                let key = guard.key().into_diagnostic()?;
-                if let Some(sep_idx) = key.iter().position(|&b| b == keys::SEP) {
-                    if let Ok(col) = std::str::from_utf8(&key[..sep_idx]) {
-                        collections.insert(col.to_string());
-                        let mut next_prefix = key[..sep_idx].to_vec();
-                        next_prefix.push(keys::SEP + 1);
-                        iter = ks.range(next_prefix..);
-                    } else {
-                        break;
+        let samples: Vec<Vec<u8>> = if ks_name == "blocks" {
+            // sample up to 200 data blocks per collection, discovered lazily in the predicate
+            let per_collection_limit = 200usize;
+            let collection_counts: RefCell<std::collections::HashMap<Vec<u8>, usize>> =
+                RefCell::new(std::collections::HashMap::new());
+
+            let new = ks
+                .sample_data_blocks(5000, |first, _last| {
+                    let Some(sep_idx) = first.iter().position(|&b| b == keys::SEP) else {
+                        return false;
+                    };
+                    let mut counts = collection_counts.borrow_mut();
+                    let count = counts.entry(first[..sep_idx].to_vec()).or_insert(0);
+                    if *count >= per_collection_limit {
+                        return false;
                     }
-                } else {
-                    break;
-                }
-            }
+                    *count += 1;
+                    true
+                })
+                .into_diagnostic()?;
 
-            let mut all_samples = Vec::new();
-            let mut seen_keys = HashSet::new();
-            let captured_keys = RefCell::new(Vec::new());
-
-            for t in collections {
-                let prefix_str = format!("{t}|");
-                let prefix = prefix_str.as_bytes();
-                let mut end_prefix = prefix.to_vec();
-                if let Some(last) = end_prefix.last_mut() {
-                    *last = last.saturating_add(1);
-                }
-
-                let new = ks
-                    .sample_data_blocks(200, |first, last| {
-                        let passes = first < end_prefix.as_slice()
-                            && last >= prefix
-                            && !seen_keys.contains(&(first.to_vec(), last.to_vec()));
-                        if passes {
-                            captured_keys
-                                .borrow_mut()
-                                .push((first.to_vec(), last.to_vec()));
-                        }
-                        passes
-                    })
-                    .into_diagnostic()?;
-
-                for (s, keys) in new.into_iter().zip(captured_keys.borrow_mut().drain(..)) {
-                    if seen_keys.insert(keys) {
-                        all_samples.push(s.to_vec());
-                    }
-                }
-            }
-            all_samples
+            new.into_iter().map(|s| s.to_vec()).collect()
         } else {
             let mut seen_keys = HashSet::new();
             let captured_keys = RefCell::new(Vec::new());
