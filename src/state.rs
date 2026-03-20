@@ -61,4 +61,21 @@ impl AppState {
     pub fn notify_backfill(&self) {
         self.backfill_notify.notify_one();
     }
+
+    /// pauses both crawler and firehose, runs `f`, then restores their prior state.
+    /// the restore always happens, even if `f` returns an error.
+    pub async fn with_ingestion_paused<F, Fut, T>(&self, f: F) -> T
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = T>,
+    {
+        let crawler_was = *self.crawler_enabled.borrow();
+        let firehose_was = *self.firehose_enabled.borrow();
+        self.crawler_enabled.send_replace(false);
+        self.firehose_enabled.send_replace(false);
+        let result = f().await;
+        self.crawler_enabled.send_replace(crawler_was);
+        self.firehose_enabled.send_replace(firehose_was);
+        result
+    }
 }

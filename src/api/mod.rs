@@ -4,13 +4,13 @@ use std::{net::SocketAddr, sync::Arc};
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
+mod db;
 mod debug;
 mod filter;
 mod ingestion;
 mod repos;
 mod stats;
 mod stream;
-mod train_dict;
 mod xrpc;
 
 pub async fn serve(state: Arc<AppState>, port: u16) -> miette::Result<()> {
@@ -22,7 +22,7 @@ pub async fn serve(state: Arc<AppState>, port: u16) -> miette::Result<()> {
         .merge(filter::router())
         .merge(repos::router())
         .merge(ingestion::router())
-        .merge(train_dict::router())
+        .merge(db::router())
         .with_state(state)
         .layer(TraceLayer::new_for_http())
         .layer(CorsLayer::permissive());

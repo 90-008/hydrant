@@ -524,18 +524,25 @@ impl Db {
         Ok(())
     }
 
-    pub fn compact(&self) -> Result<()> {
-        self.repos.major_compact().into_diagnostic()?;
-        self.records.major_compact().into_diagnostic()?;
-        self.blocks.major_compact().into_diagnostic()?;
-        self.cursors.major_compact().into_diagnostic()?;
-        self.pending.major_compact().into_diagnostic()?;
-        self.resync.major_compact().into_diagnostic()?;
-        self.resync_buffer.major_compact().into_diagnostic()?;
-        self.events.major_compact().into_diagnostic()?;
-        self.counts.major_compact().into_diagnostic()?;
-        self.filter.major_compact().into_diagnostic()?;
-        self.crawler.major_compact().into_diagnostic()?;
+    pub async fn compact(&self) -> Result<()> {
+        let compact = |ks: Keyspace| async move {
+            tokio::task::spawn_blocking(move || ks.major_compact().into_diagnostic())
+                .await
+                .into_diagnostic()?
+        };
+        tokio::try_join!(
+            compact(self.repos.clone()),
+            compact(self.records.clone()),
+            compact(self.blocks.clone()),
+            compact(self.cursors.clone()),
+            compact(self.pending.clone()),
+            compact(self.resync.clone()),
+            compact(self.resync_buffer.clone()),
+            compact(self.events.clone()),
+            compact(self.counts.clone()),
+            compact(self.filter.clone()),
+            compact(self.crawler.clone()),
+        )?;
         Ok(())
     }
 

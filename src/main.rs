@@ -33,7 +33,7 @@ async fn main() -> miette::Result<()> {
 
     if cfg.db_compact {
         info!("compacting database...");
-        state.db.compact()?;
+        state.db.compact().await?;
     }
 
     if cfg.full_network
