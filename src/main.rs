@@ -92,7 +92,7 @@ async fn main() -> miette::Result<()> {
         let state = state.clone();
         let timeout = cfg.repo_fetch_timeout;
         BackfillWorker::new(
-            state,
+            state.clone(),
             buffer_tx.clone(),
             timeout,
             cfg.backfill_concurrency_limit,
@@ -101,6 +101,7 @@ async fn main() -> miette::Result<()> {
                 SignatureVerification::Full | SignatureVerification::BackfillOnly
             ),
             cfg.ephemeral,
+            state.backfill_enabled.subscribe(),
         )
         .run()
     });

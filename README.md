@@ -76,15 +76,15 @@ todo: decide what to do on relay-side account takedowns or if relays set the `ti
 #### ingestion control
 
 - `GET /ingestion`: get the current ingestion status.
-  - returns `{ "crawler": bool, "firehose": bool }`.
+  - returns `{ "crawler": bool, "firehose": bool, "backfill": bool }`.
 - `PATCH /ingestion`: enable or disable ingestion components at runtime without restarting.
-  - body: `{ "crawler"?: bool, "firehose"?: bool }` — only provided fields are updated.
-  - when disabled, the component pauses at the next idle point and resumes immediately when re-enabled.
+  - body: `{ "crawler"?: bool, "firehose"?: bool, "backfill"?: bool }` — only provided fields are updated.
+  - when disabled, each component finishes its current task before pausing (e.g. the backfill worker completes any in-flight repo syncs, the firehose finishes processing the current message). they resume immediately when re-enabled.
 
 #### database operations
 
-- `POST /db/train`: train zstd compression dictionaries for the `repos`, `blocks`, and `events` keyspaces. dictionaries are written to disk; a restart is required to apply them. ingestion is paused for the duration and restored on completion.
-- `POST /db/compact`: trigger a full major compaction of all database keyspaces in parallel. ingestion is paused for the duration and restored on completion.
+- `POST /db/train`: train zstd compression dictionaries for the `repos`, `blocks`, and `events` keyspaces. dictionaries are written to disk; a restart is required to apply them. the crawler, firehose, and backfill worker are paused for the duration and restored on completion.
+- `POST /db/compact`: trigger a full major compaction of all database keyspaces in parallel. the crawler, firehose, and backfill worker are paused for the duration and restored on completion.
 
 #### filter mode
 

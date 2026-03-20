@@ -32,6 +32,7 @@ use tracing::{Instrument, debug, error, info, trace, warn};
 pub mod manager;
 
 use crate::ingest::{BufferTx, IngestMessage};
+use crate::util::WatchEnabledExt;
 
 pub struct BackfillWorker {
     state: Arc<AppState>,
@@ -41,6 +42,7 @@ pub struct BackfillWorker {
     verify_signatures: bool,
     ephemeral: bool,
     in_flight: Arc<scc::HashSet<Did<'static>>>,
+    enabled: tokio::sync::watch::Receiver<bool>,
 }
 
 impl BackfillWorker {
@@ -51,6 +53,7 @@ impl BackfillWorker {
         concurrency_limit: usize,
         verify_signatures: bool,
         ephemeral: bool,
+        enabled: tokio::sync::watch::Receiver<bool>,
     ) -> Self {
         Self {
             state,
@@ -66,6 +69,7 @@ impl BackfillWorker {
             verify_signatures,
             ephemeral,
             in_flight: Arc::new(scc::HashSet::new()),
+            enabled,
         }
     }
 }
@@ -82,10 +86,11 @@ impl Drop for InFlightGuard {
 }
 
 impl BackfillWorker {
-    pub async fn run(self) {
+    pub async fn run(mut self) {
         info!("backfill worker started");
 
         loop {
+            self.enabled.wait_enabled("backfill").await;
             let mut spawned = 0;
 
             for guard in self.state.db.pending.iter() {

@@ -19,12 +19,14 @@ pub fn router() -> Router<Arc<AppState>> {
 pub struct IngestionStatus {
     pub crawler: bool,
     pub firehose: bool,
+    pub backfill: bool,
 }
 
 pub async fn get_ingestion(State(state): State<Arc<AppState>>) -> Json<IngestionStatus> {
     Json(IngestionStatus {
         crawler: *state.crawler_enabled.borrow(),
         firehose: *state.firehose_enabled.borrow(),
+        backfill: *state.backfill_enabled.borrow(),
     })
 }
 
@@ -34,6 +36,8 @@ pub struct IngestionPatch {
     pub crawler: Option<bool>,
     #[serde(default)]
     pub firehose: Option<bool>,
+    #[serde(default)]
+    pub backfill: Option<bool>,
 }
 
 pub async fn patch_ingestion(
@@ -45,6 +49,9 @@ pub async fn patch_ingestion(
     }
     if let Some(firehose) = body.firehose {
         state.firehose_enabled.send_replace(firehose);
+    }
+    if let Some(backfill) = body.backfill {
+        state.backfill_enabled.send_replace(backfill);
     }
     StatusCode::OK
 }

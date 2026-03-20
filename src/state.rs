@@ -22,6 +22,8 @@ pub struct AppState {
     pub crawler_enabled: watch::Sender<bool>,
     /// Controls whether firehose ingestion is running. Receivers are held by ingestor tasks.
     pub firehose_enabled: watch::Sender<bool>,
+    /// Controls whether the backfill worker picks up new tasks. Receiver is held by the backfill worker.
+    pub backfill_enabled: watch::Sender<bool>,
 }
 
 impl AppState {
@@ -46,6 +48,7 @@ impl AppState {
 
         let (crawler_enabled, _) = watch::channel(crawler_default);
         let (firehose_enabled, _) = watch::channel(config.enable_firehose);
+        let (backfill_enabled, _) = watch::channel(true);
 
         Ok(Self {
             db,
@@ -55,6 +58,7 @@ impl AppState {
             backfill_notify: Notify::new(),
             crawler_enabled,
             firehose_enabled,
+            backfill_enabled,
         })
     }
 
@@ -62,7 +66,7 @@ impl AppState {
         self.backfill_notify.notify_one();
     }
 
-    /// pauses both crawler and firehose, runs `f`, then restores their prior state.
+    /// pauses the crawler, firehose, and backfill worker, runs `f`, then restores their prior state.
     /// the restore always happens, even if `f` returns an error.
     pub async fn with_ingestion_paused<F, Fut, T>(&self, f: F) -> T
     where
@@ -71,11 +75,14 @@ impl AppState {
     {
         let crawler_was = *self.crawler_enabled.borrow();
         let firehose_was = *self.firehose_enabled.borrow();
+        let backfill_was = *self.backfill_enabled.borrow();
         self.crawler_enabled.send_replace(false);
         self.firehose_enabled.send_replace(false);
+        self.backfill_enabled.send_replace(false);
         let result = f().await;
         self.crawler_enabled.send_replace(crawler_was);
         self.firehose_enabled.send_replace(firehose_was);
+        self.backfill_enabled.send_replace(backfill_was);
         result
     }
 }
