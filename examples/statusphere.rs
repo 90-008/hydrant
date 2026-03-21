@@ -23,6 +23,7 @@ use futures::StreamExt;
 use hydrant::config::Config;
 use hydrant::control::{EventStream, Hydrant, ReposControl};
 use hydrant::filter::FilterMode;
+use jacquard_common::types::did::Did;
 use jacquard_common::types::tid::Tid;
 use scc::HashMap;
 
@@ -101,6 +102,16 @@ async fn run_ticker(index: Arc<StatusIndex>) {
 }
 
 async fn handle_stream(index: Arc<StatusIndex>, repos: ReposControl, mut stream: EventStream) {
+    // get handle of did through the hydrant api
+    let get_handle = async |did: &Did<'_>| {
+        repos
+            .get(did)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|info| info.handle)
+            .unwrap_or_else(|| did.to_string())
+    };
     while let Some(event) = stream.next().await {
         if let Some(rec) = event.record {
             let did = rec.did.as_str().to_owned();
@@ -119,25 +130,14 @@ async fn handle_stream(index: Arc<StatusIndex>, repos: ReposControl, mut stream:
                         .and_then(|v| v.as_str())
                         .unwrap_or("");
                     if index.set(did.clone(), emoji.clone(), created_at) {
-                        let name = repos
-                            .get(&rec.did)
-                            .await
-                            .ok()
-                            .flatten()
-                            .and_then(|info| info.handle)
-                            .unwrap_or(did);
+                        let name = get_handle(&rec.did).await;
                         println!("[{created_at}] {name}: {emoji}");
                     }
                 }
                 "delete" => {
-                    let name = repos
-                        .get(&rec.did)
-                        .await
-                        .ok()
-                        .flatten()
-                        .and_then(|info| info.handle)
-                        .unwrap_or(did.clone());
+                    let name = get_handle(&rec.did).await;
                     index.delete(&did);
+                    // parse the tid to use as date since createdAt doesnt make sense here
                     let date = Tid::from_str(&rec.rkey)
                         .ok()
                         .and_then(|tid| DateTime::from_timestamp_micros(tid.timestamp() as i64))
@@ -183,6 +183,7 @@ async fn main() -> miette::Result<()> {
 
     let index = Arc::new(StatusIndex::new());
     tokio::select! {
+        // this finally starts hydrant, so it will start crawling and backfilling etc.
         r = hydrant.run() => r,
         _ = run_ticker(index.clone()) => Ok(()),
         _ = handle_stream(index.clone(), hydrant.repos.clone(), stream) => Ok(()),
