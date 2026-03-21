@@ -789,184 +789,224 @@ impl FilterControl {
     }
 
     /// set the indexing mode. see [`FilterControl`] for mode semantics.
-    pub async fn set_mode(&self, mode: FilterMode) -> Result<FilterSnapshot> {
-        self.patch(Some(mode), None, None, None).await
+    pub fn set_mode(&self, mode: FilterMode) -> FilterPatch {
+        FilterPatch::new(self).set_mode(mode)
     }
 
     /// replace the entire signals set. existing signals are removed.
-    pub async fn set_signals(
-        &self,
-        signals: impl IntoIterator<Item = impl Into<String>>,
-    ) -> Result<FilterSnapshot> {
-        self.patch(
-            None,
-            Some(SetUpdate::Set(
-                signals.into_iter().map(Into::into).collect(),
-            )),
-            None,
-            None,
-        )
-        .await
+    pub fn set_signals(&self, signals: impl IntoIterator<Item = impl Into<String>>) -> FilterPatch {
+        FilterPatch::new(self).set_signals(signals)
     }
 
     /// add multiple signals without disturbing existing ones.
-    pub async fn append_signals(
+    pub fn append_signals(
         &self,
         signals: impl IntoIterator<Item = impl Into<String>>,
-    ) -> Result<FilterSnapshot> {
-        self.patch(
-            None,
-            Some(SetUpdate::Patch(
-                signals.into_iter().map(|s| (s.into(), true)).collect(),
-            )),
-            None,
-            None,
-        )
-        .await
+    ) -> FilterPatch {
+        FilterPatch::new(self).append_signals(signals)
     }
 
     /// add a single signal. no-op if already present.
-    pub async fn add_signal(&self, signal: impl Into<String>) -> Result<FilterSnapshot> {
-        self.patch(
-            None,
-            Some(SetUpdate::Patch([(signal.into(), true)].into())),
-            None,
-            None,
-        )
-        .await
+    pub fn add_signal(&self, signal: impl Into<String>) -> FilterPatch {
+        FilterPatch::new(self).add_signal(signal)
     }
 
     /// remove a single signal. no-op if not present.
-    pub async fn remove_signal(&self, signal: impl Into<String>) -> Result<FilterSnapshot> {
-        self.patch(
-            None,
-            Some(SetUpdate::Patch([(signal.into(), false)].into())),
-            None,
-            None,
-        )
-        .await
+    pub fn remove_signal(&self, signal: impl Into<String>) -> FilterPatch {
+        FilterPatch::new(self).remove_signal(signal)
     }
 
     /// replace the entire collections set. pass an empty iterator to store all collections.
-    pub async fn set_collections(
+    pub fn set_collections(
         &self,
         collections: impl IntoIterator<Item = impl Into<String>>,
-    ) -> Result<FilterSnapshot> {
-        self.patch(
-            None,
-            None,
-            Some(SetUpdate::Set(
-                collections.into_iter().map(Into::into).collect(),
-            )),
-            None,
-        )
-        .await
+    ) -> FilterPatch {
+        FilterPatch::new(self).set_collections(collections)
     }
 
     /// add multiple collections without disturbing existing ones.
-    pub async fn append_collections(
+    pub fn append_collections(
         &self,
         collections: impl IntoIterator<Item = impl Into<String>>,
-    ) -> Result<FilterSnapshot> {
-        self.patch(
-            None,
-            None,
-            Some(SetUpdate::Patch(
-                collections.into_iter().map(|c| (c.into(), true)).collect(),
-            )),
-            None,
-        )
-        .await
+    ) -> FilterPatch {
+        FilterPatch::new(self).append_collections(collections)
     }
 
     /// add a single collection filter. no-op if already present.
-    pub async fn add_collection(&self, collection: impl Into<String>) -> Result<FilterSnapshot> {
-        self.patch(
-            None,
-            None,
-            Some(SetUpdate::Patch([(collection.into(), true)].into())),
-            None,
-        )
-        .await
+    pub fn add_collection(&self, collection: impl Into<String>) -> FilterPatch {
+        FilterPatch::new(self).add_collection(collection)
     }
 
     /// remove a single collection filter. no-op if not present.
-    pub async fn remove_collection(&self, collection: impl Into<String>) -> Result<FilterSnapshot> {
-        self.patch(
-            None,
-            None,
-            Some(SetUpdate::Patch([(collection.into(), false)].into())),
-            None,
-        )
-        .await
+    pub fn remove_collection(&self, collection: impl Into<String>) -> FilterPatch {
+        FilterPatch::new(self).remove_collection(collection)
     }
 
     /// replace the entire excludes set.
-    pub async fn set_excludes(
+    pub fn set_excludes(
         &self,
         excludes: impl IntoIterator<Item = impl Into<String>>,
-    ) -> Result<FilterSnapshot> {
-        self.patch(
-            None,
-            None,
-            None,
-            Some(SetUpdate::Set(
-                excludes.into_iter().map(Into::into).collect(),
-            )),
-        )
-        .await
+    ) -> FilterPatch {
+        FilterPatch::new(self).set_excludes(excludes)
     }
 
     /// add multiple DIDs to the excludes set without disturbing existing ones.
-    pub async fn append_excludes(
+    pub fn append_excludes(
         &self,
         excludes: impl IntoIterator<Item = impl Into<String>>,
-    ) -> Result<FilterSnapshot> {
-        self.patch(
-            None,
-            None,
-            None,
-            Some(SetUpdate::Patch(
-                excludes.into_iter().map(|d| (d.into(), true)).collect(),
-            )),
-        )
-        .await
+    ) -> FilterPatch {
+        FilterPatch::new(self).append_excludes(excludes)
     }
 
     /// add a single DID to the excludes set. no-op if already excluded.
-    pub async fn add_exclude(&self, did: impl Into<String>) -> Result<FilterSnapshot> {
-        self.patch(
-            None,
-            None,
-            None,
-            Some(SetUpdate::Patch([(did.into(), true)].into())),
-        )
-        .await
+    pub fn add_exclude(&self, did: impl Into<String>) -> FilterPatch {
+        FilterPatch::new(self).add_exclude(did)
     }
 
     /// remove a single DID from the excludes set. no-op if not present.
-    pub async fn remove_exclude(&self, did: impl Into<String>) -> Result<FilterSnapshot> {
-        self.patch(
-            None,
-            None,
-            None,
-            Some(SetUpdate::Patch([(did.into(), false)].into())),
-        )
-        .await
+    pub fn remove_exclude(&self, did: impl Into<String>) -> FilterPatch {
+        FilterPatch::new(self).remove_exclude(did)
+    }
+}
+
+/// a staged set of filter mutations. all methods accumulate changes without touching
+/// the database. call [`FilterPatch::apply`] to commit the entire patch atomically.
+///
+/// obtain an instance by calling any mutation method on [`FilterControl`], or via
+/// [`FilterPatch::new`] to start from a blank patch.
+pub struct FilterPatch {
+    state: Arc<AppState>,
+    /// if set, replaces the current indexing mode.
+    pub mode: Option<FilterMode>,
+    /// if set, replaces or patches the signals set.
+    pub signals: Option<SetUpdate>,
+    /// if set, replaces or patches the collections set.
+    pub collections: Option<SetUpdate>,
+    /// if set, replaces or patches the excludes set.
+    pub excludes: Option<SetUpdate>,
+}
+
+impl FilterPatch {
+    /// create a new blank patch associated with the given [`FilterControl`].
+    pub fn new(control: &FilterControl) -> Self {
+        Self {
+            state: control.0.clone(),
+            mode: None,
+            signals: None,
+            collections: None,
+            excludes: None,
+        }
     }
 
-    /// apply a batch patch atomically. all provided fields are updated in a single db transaction.
-    /// returns the updated [`FilterSnapshot`]. this is the primitive all other `FilterControl` methods delegate to.
-    pub async fn patch(
-        &self,
-        mode: Option<FilterMode>,
-        signals: Option<SetUpdate>,
-        collections: Option<SetUpdate>,
-        excludes: Option<SetUpdate>,
-    ) -> Result<FilterSnapshot> {
-        let filter_ks = self.0.db.filter.clone();
-        let inner = self.0.db.inner.clone();
-        let filter_handle = self.0.filter.clone();
+    /// set the indexing mode. see [`FilterControl`] for mode semantics.
+    pub fn set_mode(mut self, mode: FilterMode) -> Self {
+        self.mode = Some(mode);
+        self
+    }
+
+    /// replace the entire signals set. existing signals are removed.
+    pub fn set_signals(mut self, signals: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.signals = Some(SetUpdate::Set(
+            signals.into_iter().map(Into::into).collect(),
+        ));
+        self
+    }
+
+    /// add multiple signals without disturbing existing ones.
+    pub fn append_signals(mut self, signals: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.signals = Some(SetUpdate::Patch(
+            signals.into_iter().map(|s| (s.into(), true)).collect(),
+        ));
+        self
+    }
+
+    /// add a single signal. no-op if already present.
+    pub fn add_signal(mut self, signal: impl Into<String>) -> Self {
+        self.signals = Some(SetUpdate::Patch([(signal.into(), true)].into()));
+        self
+    }
+
+    /// remove a single signal. no-op if not present.
+    pub fn remove_signal(mut self, signal: impl Into<String>) -> Self {
+        self.signals = Some(SetUpdate::Patch([(signal.into(), false)].into()));
+        self
+    }
+
+    /// replace the entire collections set. pass an empty iterator to store all collections.
+    pub fn set_collections(
+        mut self,
+        collections: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.collections = Some(SetUpdate::Set(
+            collections.into_iter().map(Into::into).collect(),
+        ));
+        self
+    }
+
+    /// add multiple collections without disturbing existing ones.
+    pub fn append_collections(
+        mut self,
+        collections: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.collections = Some(SetUpdate::Patch(
+            collections.into_iter().map(|c| (c.into(), true)).collect(),
+        ));
+        self
+    }
+
+    /// add a single collection filter. no-op if already present.
+    pub fn add_collection(mut self, collection: impl Into<String>) -> Self {
+        self.collections = Some(SetUpdate::Patch([(collection.into(), true)].into()));
+        self
+    }
+
+    /// remove a single collection filter. no-op if not present.
+    pub fn remove_collection(mut self, collection: impl Into<String>) -> Self {
+        self.collections = Some(SetUpdate::Patch([(collection.into(), false)].into()));
+        self
+    }
+
+    /// replace the entire excludes set.
+    pub fn set_excludes(mut self, excludes: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.excludes = Some(SetUpdate::Set(
+            excludes.into_iter().map(Into::into).collect(),
+        ));
+        self
+    }
+
+    /// add multiple DIDs to the excludes set without disturbing existing ones.
+    pub fn append_excludes(
+        mut self,
+        excludes: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.excludes = Some(SetUpdate::Patch(
+            excludes.into_iter().map(|d| (d.into(), true)).collect(),
+        ));
+        self
+    }
+
+    /// add a single DID to the excludes set. no-op if already excluded.
+    pub fn add_exclude(mut self, did: impl Into<String>) -> Self {
+        self.excludes = Some(SetUpdate::Patch([(did.into(), true)].into()));
+        self
+    }
+
+    /// remove a single DID from the excludes set. no-op if not present.
+    pub fn remove_exclude(mut self, did: impl Into<String>) -> Self {
+        self.excludes = Some(SetUpdate::Patch([(did.into(), false)].into()));
+        self
+    }
+
+    /// commit the patch atomically to the database and update the in-memory filter.
+    /// returns the updated [`FilterSnapshot`].
+    pub async fn apply(self) -> Result<FilterSnapshot> {
+        let filter_ks = self.state.db.filter.clone();
+        let inner = self.state.db.inner.clone();
+        let filter_handle = self.state.filter.clone();
+        let mode = self.mode;
+        let signals = self.signals;
+        let collections = self.collections;
+        let excludes = self.excludes;
 
         let new_filter = tokio::task::spawn_blocking(move || {
             let mut batch = inner.batch();
@@ -977,8 +1017,8 @@ impl FilterControl {
         .await
         .into_diagnostic()??;
 
-        let excludes = {
-            let filter_ks = self.0.db.filter.clone();
+        let exclude_list = {
+            let filter_ks = self.state.db.filter.clone();
             tokio::task::spawn_blocking(move || {
                 db_filter::read_set(&filter_ks, db_filter::EXCLUDE_PREFIX)
             })
@@ -994,7 +1034,7 @@ impl FilterControl {
                 .iter()
                 .map(|s| s.to_string())
                 .collect(),
-            excludes,
+            excludes: exclude_list,
         };
 
         filter_handle.store(Arc::new(new_filter));

@@ -173,9 +173,13 @@ async fn main() -> miette::Result<()> {
 
     // discover only repos that publish xyz.statusphere.status records,
     // and only store that collection (all other record types are dropped).
-    hydrant.filter.set_mode(FilterMode::Filter).await?;
-    hydrant.filter.set_signals([COLLECTION]).await?;
-    hydrant.filter.set_collections([COLLECTION]).await?;
+    hydrant
+        .filter
+        .set_mode(FilterMode::Filter)
+        .set_signals([COLLECTION])
+        .set_collections([COLLECTION])
+        .apply()
+        .await?;
 
     // replay all persisted events from the start to rebuild the in-memory index,
     // then switch to live tail. since the index is in-memory, we always need the

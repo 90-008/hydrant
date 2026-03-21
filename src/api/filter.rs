@@ -1,4 +1,4 @@
-use crate::control::Hydrant;
+use crate::control::{FilterPatch, Hydrant};
 use crate::filter::{FilterMode, SetUpdate};
 use axum::{
     Json, Router,
@@ -28,7 +28,7 @@ pub async fn handle_get_filter(
 }
 
 #[derive(Deserialize)]
-pub struct FilterPatch {
+pub struct PatchFilterBody {
     pub mode: Option<FilterMode>,
     pub signals: Option<SetUpdate>,
     pub collections: Option<SetUpdate>,
@@ -37,11 +37,14 @@ pub struct FilterPatch {
 
 pub async fn handle_patch_filter(
     State(hydrant): State<Hydrant>,
-    Json(patch): Json<FilterPatch>,
+    Json(body): Json<PatchFilterBody>,
 ) -> Result<Json<FilterSnapshot>, (StatusCode, String)> {
-    hydrant
-        .filter
-        .patch(patch.mode, patch.signals, patch.collections, patch.excludes)
+    let mut p = FilterPatch::new(&hydrant.filter);
+    p.mode = body.mode;
+    p.signals = body.signals;
+    p.collections = body.collections;
+    p.excludes = body.excludes;
+    p.apply()
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
         .map(Json)
