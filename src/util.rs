@@ -6,6 +6,8 @@ use serde::{Deserialize, Deserializer, Serializer};
 use tokio::sync::watch;
 use tracing::info;
 
+use crate::types::RepoStatus;
+
 /// outcome of [`RetryWithBackoff::retry`] when the operation does not succeed.
 pub enum RetryOutcome<E> {
     /// ratelimited after exhausting all retries
@@ -140,4 +142,15 @@ pub fn deser_status_code<'de, D: Deserializer<'de>>(
         .map(StatusCode::from_u16)
         .transpose()
         .map_err(serde::de::Error::custom)
+}
+
+pub fn opt_cid_serialize_str<S: Serializer>(v: &Option<cid::Cid>, s: S) -> Result<S::Ok, S::Error> {
+    match v {
+        Some(cid) => s.serialize_some(cid.to_string().as_str()),
+        None => s.serialize_none(),
+    }
+}
+
+pub fn repo_status_serialize_str<S: Serializer>(v: &RepoStatus, s: S) -> Result<S::Ok, S::Error> {
+    s.serialize_str(&v.to_string())
 }

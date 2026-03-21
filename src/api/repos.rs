@@ -47,7 +47,7 @@ pub async fn handle_get_repos(
                 .map_err(internal)?
                 .to_did();
 
-            Ok(repo_state_to_info(did.to_string(), repo_state))
+            Ok(repo_state_to_info(did, repo_state))
         };
 
         let results = match partition.as_str() {

@@ -8,7 +8,8 @@ use std::task::{Context, Poll};
 use chrono::{DateTime, Utc};
 use futures::{FutureExt, Stream};
 use jacquard_common::types::cid::{ATP_CID_HASH, IpldCid};
-use jacquard_common::types::string::Did;
+use jacquard_common::types::string::{Did, Handle};
+use jacquard_common::types::tid::Tid;
 use jacquard_common::{CowStr, IntoStatic, RawData};
 use jacquard_repo::DAG_CBOR_CID_CODEC;
 use miette::{IntoDiagnostic, Result};
@@ -16,6 +17,7 @@ use rand::Rng;
 use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, error, info};
+use url::Url;
 
 use crate::backfill::BackfillWorker;
 use crate::config::{Config, SignatureVerification};
@@ -24,7 +26,8 @@ use crate::filter::{FilterMode, SetUpdate};
 use crate::ingest::{firehose::FirehoseIngestor, worker::FirehoseWorker};
 use crate::state::AppState;
 use crate::types::{
-    BroadcastEvent, GaugeState, MarshallableEvt, RecordEvt, RepoState, StoredData, StoredEvent,
+    BroadcastEvent, GaugeState, MarshallableEvt, RecordEvt, RepoState, RepoStatus, StoredData,
+    StoredEvent,
 };
 
 /// an event emitted by the hydrant event stream.
@@ -999,24 +1002,38 @@ impl FilterControl {
     }
 }
 
-// --- repos control ---
-
 /// information about a tracked or known repository. returned by [`ReposControl`] methods.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct RepoInfo {
-    pub did: String,
-    pub status: String,
+    /// the DID of the repository.
+    pub did: Did<'static>,
+    /// the status of the repository.
+    #[serde(serialize_with = "crate::util::repo_status_serialize_str")]
+    pub status: RepoStatus,
+    /// whether this repository is tracked or not.
+    /// untracked repositories are not updated and they stay frozen.
     pub tracked: bool,
+    /// the revision of the root commit of this repository.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub rev: Option<String>,
+    pub rev: Option<Tid>,
+    /// the CID of the root commit of this repository.
+    #[serde(serialize_with = "crate::util::opt_cid_serialize_str")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub handle: Option<String>,
+    pub data: Option<IpldCid>,
+    /// the handle for the DID of this repository.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub pds: Option<String>,
+    pub handle: Option<Handle<'static>>,
+    /// the URL for the PDS in which this repository is hosted on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pds: Option<Url>,
+    /// ATProto signing key of this repository.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub signing_key: Option<String>,
+    /// when this repository was last touched (status update, commit ingested, etc.).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_updated_at: Option<DateTime<Utc>>,
+    /// the time of the last message gotten from the firehose for this repository.
+    /// this is equal to the `time` field.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_message_at: Option<DateTime<Utc>>,
 }
@@ -1038,13 +1055,13 @@ impl ReposControl {
     /// has never seen this DID.
     pub async fn get(&self, did: &Did<'_>) -> Result<Option<RepoInfo>> {
         let did_key = keys::repo_key(did);
-        let did_str = did.as_str().to_owned();
         let db = self.0.db.clone();
+        let did = did.clone().into_static();
 
         tokio::task::spawn_blocking(move || {
             let bytes = db.repos.get(&did_key).into_diagnostic()?;
             let state = bytes.as_deref().map(db::deser_repo_state).transpose()?;
-            Ok(state.map(|s| repo_state_to_info(did_str, s)))
+            Ok(state.map(|s| repo_state_to_info(did, s)))
         })
         .await
         .into_diagnostic()?
@@ -1169,14 +1186,15 @@ impl ReposControl {
     }
 }
 
-pub fn repo_state_to_info(did: String, s: RepoState<'_>) -> RepoInfo {
+pub fn repo_state_to_info(did: Did<'static>, s: RepoState<'_>) -> RepoInfo {
     RepoInfo {
         did,
-        status: s.status.to_string(),
+        status: s.status,
         tracked: s.tracked,
-        rev: s.rev.as_ref().map(|r| r.to_string()),
-        handle: s.handle.map(|h| h.to_string()),
-        pds: s.pds.map(|p| p.to_string()),
+        rev: s.rev.map(|r| r.to_tid()),
+        data: s.data,
+        handle: s.handle.map(|h| h.into_static()),
+        pds: s.pds.and_then(|p| p.parse().ok()),
         signing_key: s.signing_key.map(|k| k.encode()),
         last_updated_at: DateTime::from_timestamp_secs(s.last_updated_at),
         last_message_at: s.last_message_time.and_then(DateTime::from_timestamp_secs),

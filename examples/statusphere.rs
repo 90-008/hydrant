@@ -110,6 +110,7 @@ async fn handle_stream(index: Arc<StatusIndex>, repos: ReposControl, mut stream:
             .ok()
             .flatten()
             .and_then(|info| info.handle)
+            .map(|h| h.to_string())
             .unwrap_or_else(|| did.to_string())
     };
     while let Some(event) = stream.next().await {
