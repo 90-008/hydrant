@@ -8,21 +8,24 @@ use std::task::{Context, Poll};
 use chrono::{DateTime, Utc};
 use futures::{FutureExt, Stream};
 use jacquard_common::cowstr::ToCowStr;
-use jacquard_common::types::cid::{ATP_CID_HASH, IpldCid};
+use jacquard_common::types::cid::{ATP_CID_HASH, Cid, IpldCid};
+use jacquard_common::types::ident::AtIdentifier;
 use jacquard_common::types::nsid::Nsid;
 use jacquard_common::types::string::{Did, Handle, Rkey};
 use jacquard_common::types::tid::Tid;
-use jacquard_common::{CowStr, IntoStatic, RawData};
+use jacquard_common::{CowStr, Data, IntoStatic, RawData};
 use jacquard_repo::DAG_CBOR_CID_CODEC;
 use miette::{IntoDiagnostic, Result};
 use rand::Rng;
 use sha2::{Digest, Sha256};
+use smol_str::ToSmolStr;
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, error, info};
 use url::Url;
 
 use crate::backfill::BackfillWorker;
 use crate::config::{Config, SignatureVerification};
+use crate::db::types::DbRkey;
 use crate::db::{self, filter as db_filter, keys, ser_repo_state};
 use crate::filter::{FilterMode, SetUpdate};
 use crate::ingest::{firehose::FirehoseIngestor, worker::FirehoseWorker};
@@ -1093,20 +1096,28 @@ pub struct RepoInfo {
 pub struct ReposControl(Arc<AppState>);
 
 impl ReposControl {
+    /// gets a handle for a repository to allow acting upon it.
+    pub fn get<'i>(&self, did: &Did<'i>) -> Result<RepoHandle<'i>> {
+        Ok(RepoHandle {
+            state: self.0.clone(),
+            did: did.clone(),
+        })
+    }
+
+    /// same as [`ReposControl::get`] but allows you to pass in an identifier that can be
+    /// either a handle or a DID.
+    pub async fn resolve(&self, repo: &AtIdentifier<'_>) -> Result<RepoHandle<'static>> {
+        let did = self.0.resolver.resolve_did(repo).await?;
+        Ok(RepoHandle {
+            state: self.0.clone(),
+            did,
+        })
+    }
+
     /// fetch the current state of a single repository. returns `None` if hydrant
     /// has never seen this DID.
-    pub async fn get(&self, did: &Did<'_>) -> Result<Option<RepoInfo>> {
-        let did_key = keys::repo_key(did);
-        let db = self.0.db.clone();
-        let did = did.clone().into_static();
-
-        tokio::task::spawn_blocking(move || {
-            let bytes = db.repos.get(&did_key).into_diagnostic()?;
-            let state = bytes.as_deref().map(db::deser_repo_state).transpose()?;
-            Ok(state.map(|s| repo_state_to_info(did, s)))
-        })
-        .await
-        .into_diagnostic()?
+    pub async fn info(&self, did: &Did<'_>) -> Result<Option<RepoInfo>> {
+        self.get(did)?.info().await
     }
 
     /// explicitly track one or more repositories, enqueuing them for backfill if needed.
@@ -1228,7 +1239,7 @@ impl ReposControl {
     }
 }
 
-pub fn repo_state_to_info(did: Did<'static>, s: RepoState<'_>) -> RepoInfo {
+pub(crate) fn repo_state_to_info(did: Did<'static>, s: RepoState<'_>) -> RepoInfo {
     RepoInfo {
         did,
         status: s.status,
@@ -1242,8 +1253,6 @@ pub fn repo_state_to_info(did: Did<'static>, s: RepoState<'_>) -> RepoInfo {
         last_message_at: s.last_message_time.and_then(DateTime::from_timestamp_secs),
     }
 }
-
-// --- db control ---
 
 /// control over database maintenance operations.
 ///
@@ -1285,7 +1294,183 @@ impl DbControl {
     }
 }
 
-// --- stream thread ---
+pub struct Record {
+    pub did: Did<'static>,
+    pub cid: Cid<'static>,
+    pub value: Data<'static>,
+}
+
+pub struct ListedRecord {
+    pub rkey: Rkey<'static>,
+    pub cid: Cid<'static>,
+    pub value: Data<'static>,
+}
+
+pub struct RecordList {
+    pub records: Vec<ListedRecord>,
+    pub cursor: Option<Rkey<'static>>,
+}
+
+/// handle to access data related to this repository.
+#[derive(Clone)]
+pub struct RepoHandle<'i> {
+    state: Arc<AppState>,
+    pub did: Did<'i>,
+}
+
+impl<'i> RepoHandle<'i> {
+    pub async fn info(&self) -> Result<Option<RepoInfo>> {
+        let did_key = keys::repo_key(&self.did);
+        let state = self.state.clone();
+        let did = self.did.clone().into_static();
+
+        tokio::task::spawn_blocking(move || {
+            let bytes = state.db.repos.get(&did_key).into_diagnostic()?;
+            let state = bytes.as_deref().map(db::deser_repo_state).transpose()?;
+            Ok(state.map(|s| repo_state_to_info(did, s)))
+        })
+        .await
+        .into_diagnostic()?
+    }
+
+    pub async fn get_record(&self, collection: &str, rkey: &str) -> Result<Option<Record>> {
+        let did = self.did.clone().into_static();
+        let db_key = keys::record_key(&did, collection, &DbRkey::new(rkey));
+
+        let collection = collection.to_smolstr();
+        let state = self.state.clone();
+        tokio::task::spawn_blocking(move || {
+            use miette::WrapErr;
+
+            let cid_bytes = state.db.records.get(db_key).into_diagnostic()?;
+            let Some(cid_bytes) = cid_bytes else {
+                return Ok(None);
+            };
+
+            // lookup block using col|cid key
+            let block_key = keys::block_key(&collection, &cid_bytes);
+            let Some(block_bytes) = state.db.blocks.get(block_key).into_diagnostic()? else {
+                miette::bail!("block {cid_bytes:?} not found, this is a bug!!");
+            };
+
+            let value = serde_ipld_dagcbor::from_slice::<Data>(&block_bytes)
+                .into_diagnostic()
+                .wrap_err("cant parse block")?
+                .into_static();
+            let cid = Cid::new(&cid_bytes)
+                .into_diagnostic()
+                .wrap_err("cant parse block cid")?
+                .into_static();
+
+            Ok(Some(Record { did, cid, value }))
+        })
+        .await
+        .into_diagnostic()?
+    }
+
+    pub async fn list_records(
+        &self,
+        collection: &str,
+        limit: usize,
+        reverse: bool,
+        cursor: Option<&str>,
+    ) -> Result<RecordList> {
+        let did = self.did.clone().into_static();
+
+        let state = self.state.clone();
+        let prefix = keys::record_prefix_collection(&did, collection);
+        let collection = collection.to_smolstr();
+        let cursor = cursor.map(|c| c.to_smolstr());
+
+        tokio::task::spawn_blocking(move || {
+            let mut results = Vec::new();
+            let mut next_cursor = None;
+
+            let iter: Box<dyn Iterator<Item = _>> = if !reverse {
+                let mut end_prefix = prefix.clone();
+                if let Some(last) = end_prefix.last_mut() {
+                    *last += 1;
+                }
+
+                let end_key = if let Some(cursor) = &cursor {
+                    let mut k = prefix.clone();
+                    k.extend_from_slice(cursor.as_bytes());
+                    k
+                } else {
+                    end_prefix
+                };
+
+                Box::new(
+                    state
+                        .db
+                        .records
+                        .range(prefix.as_slice()..end_key.as_slice())
+                        .rev(),
+                )
+            } else {
+                let start_key = if let Some(cursor) = &cursor {
+                    let mut k = prefix.clone();
+                    k.extend_from_slice(cursor.as_bytes());
+                    k.push(0);
+                    k
+                } else {
+                    prefix.clone()
+                };
+
+                Box::new(state.db.records.range(start_key.as_slice()..))
+            };
+
+            for item in iter {
+                let (key, cid_bytes) = item.into_inner().into_diagnostic()?;
+
+                if !key.starts_with(prefix.as_slice()) {
+                    break;
+                }
+
+                let rkey = keys::parse_rkey(&key[prefix.len()..])?;
+                if results.len() >= limit {
+                    next_cursor = Some(rkey);
+                    break;
+                }
+
+                // look up using col|cid key built from collection and binary cid bytes
+                if let Ok(Some(block_bytes)) = state
+                    .db
+                    .blocks
+                    .get(&keys::block_key(collection.as_str(), &cid_bytes))
+                {
+                    let value: Data =
+                        serde_ipld_dagcbor::from_slice(&block_bytes).unwrap_or(Data::Null);
+                    let cid = Cid::new(&cid_bytes).into_diagnostic()?.into_static();
+                    results.push(ListedRecord {
+                        rkey: Rkey::new_cow(CowStr::Owned(rkey.to_smolstr()))
+                            .expect("that rkey is validated"),
+                        cid,
+                        value: value.into_static(),
+                    });
+                }
+            }
+            Result::<_, miette::Report>::Ok((results, next_cursor))
+        })
+        .await
+        .into_diagnostic()?
+        .map(|(records, next_cursor)| RecordList {
+            records,
+            cursor: next_cursor.map(|rkey| {
+                Rkey::new_cow(CowStr::Owned(rkey.to_smolstr())).expect("that rkey is validated")
+            }),
+        })
+    }
+
+    pub async fn count_records(&self, collection: &str) -> Result<u64> {
+        let did = self.did.clone().into_static();
+        let state = self.state.clone();
+        let collection = collection.to_string();
+        tokio::task::spawn_blocking(move || db::get_record_count(&state.db, &did, &collection))
+            .await
+            .into_diagnostic()?
+    }
+}
 
 fn event_stream_thread(state: Arc<AppState>, tx: mpsc::Sender<Event>, cursor: Option<u64>) {
     let db = &state.db;

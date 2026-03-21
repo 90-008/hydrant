@@ -102,10 +102,10 @@ async fn run_ticker(index: Arc<StatusIndex>) {
 }
 
 async fn handle_stream(index: Arc<StatusIndex>, repos: ReposControl, mut stream: EventStream) {
-    // get handle of did through the hydrant api
+    // get handle for did through the hydrant api
     let get_handle = async |did: &Did<'_>| {
         repos
-            .get(did)
+            .info(did)
             .await
             .ok()
             .flatten()

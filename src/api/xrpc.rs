@@ -1,32 +1,21 @@
 use crate::control::Hydrant;
-use crate::db::types::DbRkey;
-use crate::db::{self, Db, keys};
-use crate::state::AppState;
 use axum::extract::FromRequest;
 use axum::response::IntoResponse;
 use axum::{Json, Router, extract::State, http::StatusCode};
-use futures::TryFutureExt;
 use jacquard_api::com_atproto::repo::{
     get_record::{GetRecordError, GetRecordOutput, GetRecordRequest},
     list_records::{ListRecordsOutput, ListRecordsRequest, Record as RepoRecord},
 };
-use jacquard_common::CowStr;
-use jacquard_common::cowstr::ToCowStr;
 use jacquard_common::types::ident::AtIdentifier;
 use jacquard_common::xrpc::{XrpcEndpoint, XrpcMethod};
 use jacquard_common::{IntoStatic, xrpc::XrpcRequest};
 use jacquard_common::{
-    types::{
-        string::{AtUri, Cid},
-        value::Data,
-    },
+    types::string::AtUri,
     xrpc::{GenericXrpcError, XrpcError},
 };
-use miette::IntoDiagnostic;
 use serde::{Deserialize, Serialize};
 use smol_str::ToSmolStr;
-use std::{fmt::Display, sync::Arc};
-use tokio::task::spawn_blocking;
+use std::fmt::Display;
 
 pub fn router() -> Router<Hydrant> {
     Router::new()
@@ -123,153 +112,77 @@ fn bad_request<E: std::error::Error + IntoStatic>(
 }
 
 pub async fn handle_get_record(
-    State(state): State<Arc<AppState>>,
+    State(hydrant): State<Hydrant>,
     ExtractXrpc(req): ExtractXrpc<GetRecordRequest>,
 ) -> Result<Json<GetRecordOutput<'static>>, XrpcErrorResponse<GetRecordError<'static>>> {
-    let db = &state.db;
-    let did = state
-        .resolver
-        .resolve_did(&req.repo)
+    let record = hydrant
+        .repos
+        .resolve(&req.repo)
         .await
-        .map_err(|e| bad_request(GetRecordRequest::PATH, e))?;
-
-    let db_key = keys::record_key(
-        &did,
-        req.collection.as_str(),
-        &DbRkey::new(req.rkey.0.as_str()),
-    );
-
-    let cid_bytes = Db::get(db.records.clone(), db_key)
+        .map_err(|e| internal_error(GetRecordRequest::PATH, e))?
+        .get_record(&req.collection, &req.rkey.0)
         .await
         .map_err(|e| internal_error(GetRecordRequest::PATH, e))?;
-
-    if let Some(cid_bytes) = cid_bytes {
-        // lookup block using col|cid key
-        let block_key = keys::block_key(req.collection.as_str(), &cid_bytes);
-        let block_bytes = Db::get(db.blocks.clone(), block_key)
-            .await
-            .map_err(|e| internal_error(GetRecordRequest::PATH, e))?
-            .ok_or_else(|| internal_error(GetRecordRequest::PATH, "not found"))?;
-
-        let value: Data = serde_ipld_dagcbor::from_slice(&block_bytes)
-            .map_err(|e| internal_error(GetRecordRequest::PATH, e))?;
-
-        let cid = Cid::new(&cid_bytes)
-            .map_err(|e| internal_error(GetRecordRequest::PATH, e))?
-            .into_static();
-
-        Ok(Json(GetRecordOutput {
-            uri: AtUri::from_parts_owned(
-                did.as_str(),
-                req.collection.as_str(),
-                req.rkey.0.as_str(),
-            )
-            .unwrap(),
-            cid: Some(Cid::Str(cid.to_cowstr()).into_static()),
-            value: value.into_static(),
-            extra_data: Default::default(),
-        }))
-    } else {
-        Err(XrpcErrorResponse {
+    let Some(record) = record else {
+        return Err(XrpcErrorResponse {
             status: StatusCode::NOT_FOUND,
             error: XrpcError::Xrpc(GetRecordError::RecordNotFound(None)),
-        })
-    }
+        });
+    };
+
+    Ok(Json(GetRecordOutput {
+        uri: AtUri::from_parts_owned(
+            record.did.as_str(),
+            req.collection.as_str(),
+            req.rkey.0.as_str(),
+        )
+        .unwrap(),
+        cid: Some(record.cid),
+        value: record.value,
+        extra_data: Default::default(),
+    }))
 }
 
 pub async fn handle_list_records(
-    State(state): State<Arc<AppState>>,
+    State(hydrant): State<Hydrant>,
     ExtractXrpc(req): ExtractXrpc<ListRecordsRequest>,
 ) -> Result<Json<ListRecordsOutput<'static>>, XrpcErrorResponse<GenericXrpcError>> {
-    let db = &state.db;
-    let did = state
-        .resolver
-        .resolve_did(&req.repo)
+    let limit = req.limit.unwrap_or(50).min(100) as usize;
+    let reverse = req.reverse.unwrap_or(false);
+    let cursor = req.cursor.as_deref();
+
+    let repo = hydrant
+        .repos
+        .resolve(&req.repo)
+        .await
+        .map_err(|e| internal_error(GetRecordRequest::PATH, e))?;
+    let list = repo
+        .list_records(req.collection.as_str(), limit, reverse, cursor)
         .await
         .map_err(|e| bad_request(ListRecordsRequest::PATH, e))?;
 
-    let ks = db.records.clone();
-
-    let prefix = keys::record_prefix_collection(&did, req.collection.as_str());
-
-    let limit = req.limit.unwrap_or(50).min(100) as usize;
-    let reverse = req.reverse.unwrap_or(false);
-    let blocks_ks = db.blocks.clone();
-
-    let (results, cursor) = tokio::task::spawn_blocking(move || {
-        let mut results = Vec::new();
-        let mut cursor = None;
-
-        let iter: Box<dyn Iterator<Item = _>> = if !reverse {
-            let mut end_prefix = prefix.clone();
-            if let Some(last) = end_prefix.last_mut() {
-                *last += 1;
-            }
-
-            let end_key = if let Some(cursor) = &req.cursor {
-                let mut k = prefix.clone();
-                k.extend_from_slice(cursor.as_bytes());
-                k
-            } else {
-                end_prefix
-            };
-
-            Box::new(ks.range(prefix.as_slice()..end_key.as_slice()).rev())
-        } else {
-            let start_key = if let Some(cursor) = &req.cursor {
-                let mut k = prefix.clone();
-                k.extend_from_slice(cursor.as_bytes());
-                k.push(0);
-                k
-            } else {
-                prefix.clone()
-            };
-
-            Box::new(ks.range(start_key.as_slice()..))
-        };
-
-        for item in iter {
-            let (key, cid_bytes) = item.into_inner().into_diagnostic()?;
-
-            if !key.starts_with(prefix.as_slice()) {
-                break;
-            }
-
-            let rkey = keys::parse_rkey(&key[prefix.len()..])?;
-            if results.len() >= limit {
-                cursor = Some(rkey);
-                break;
-            }
-
-            // look up using col|cid key built from collection and binary cid bytes from the record
-            if let Ok(Some(block_bytes)) =
-                blocks_ks.get(&keys::block_key(req.collection.as_str(), &cid_bytes))
-            {
-                let val: Data = serde_ipld_dagcbor::from_slice(&block_bytes).unwrap_or(Data::Null);
-                let cid =
-                    Cid::Str(Cid::new(&cid_bytes).into_diagnostic()?.to_cowstr()).into_static();
-                results.push(RepoRecord {
-                    uri: AtUri::from_parts_owned(
-                        did.as_str(),
-                        req.collection.as_str(),
-                        rkey.to_smolstr(),
-                    )
-                    .into_diagnostic()?,
-                    cid,
-                    value: val.into_static(),
-                    extra_data: Default::default(),
-                });
-            }
-        }
-        Result::<_, miette::Report>::Ok((results, cursor))
-    })
-    .await
-    .map_err(|e| internal_error(ListRecordsRequest::PATH, e))?
-    .map_err(|e| internal_error(ListRecordsRequest::PATH, e))?;
+    let records = list
+        .records
+        .into_iter()
+        .filter_map(|r| {
+            let uri = AtUri::from_parts_owned(
+                repo.did.as_str(),
+                req.collection.as_str(),
+                r.rkey.as_str(),
+            )
+            .ok()?;
+            Some(RepoRecord {
+                uri,
+                cid: r.cid,
+                value: r.value,
+                extra_data: Default::default(),
+            })
+        })
+        .collect();
 
     Ok(Json(ListRecordsOutput {
-        records: results,
-        cursor: cursor.map(|c| CowStr::Owned(c.to_smolstr())),
+        records,
+        cursor: list.cursor.map(|r| r.into()),
         extra_data: Default::default(),
     }))
 }
@@ -309,21 +222,17 @@ impl jacquard_common::xrpc::XrpcEndpoint for CountRecords {
 }
 
 pub async fn handle_count_records(
-    State(state): State<Arc<AppState>>,
+    State(hydrant): State<Hydrant>,
     ExtractXrpc(req): ExtractXrpc<CountRecords>,
 ) -> XrpcResult<Json<CountRecordsOutput>> {
-    let did = state
-        .resolver
-        .resolve_did(&req.identifier)
+    let count = hydrant
+        .repos
+        .resolve(&req.identifier)
         .await
-        .map_err(|e| bad_request(CountRecords::PATH, e))?;
-
-    let count = spawn_blocking(move || {
-        db::get_record_count(&state.db, &did, &req.collection)
-            .map_err(|e| internal_error(CountRecords::PATH, e))
-    })
-    .map_err(|e| internal_error(CountRecords::PATH, e))
-    .await??;
+        .map_err(|e| internal_error(GetRecordRequest::PATH, e))?
+        .count_records(&req.collection)
+        .await
+        .map_err(|e| internal_error(CountRecords::PATH, e))?;
 
     Ok(Json(CountRecordsOutput { count }))
 }

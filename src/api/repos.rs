@@ -133,7 +133,7 @@ pub async fn handle_get_repo(
 
     let item = hydrant
         .repos
-        .get(&did)
+        .info(&did)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
