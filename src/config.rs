@@ -6,6 +6,70 @@ use std::time::Duration;
 use url::Url;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CrawlerMode {
+    /// enumerate via `com.atproto.sync.listRepos`, then check signals with `describeRepo`.
+    Relay,
+    /// enumerate via `com.atproto.sync.listReposByCollection` for each configured signal.
+    ByCollection,
+}
+
+impl CrawlerMode {
+    fn default_for(full_network: bool) -> Self {
+        if full_network {
+            Self::Relay
+        } else {
+            Self::ByCollection
+        }
+    }
+}
+
+impl FromStr for CrawlerMode {
+    type Err = miette::Error;
+    fn from_str(s: &str) -> Result<Self> {
+        match s {
+            "relay" => Ok(Self::Relay),
+            "by_collection" | "by-collection" => Ok(Self::ByCollection),
+            _ => Err(miette::miette!(
+                "invalid crawler mode: expected 'relay' or 'by_collection'"
+            )),
+        }
+    }
+}
+
+impl fmt::Display for CrawlerMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Relay => write!(f, "relay"),
+            Self::ByCollection => write!(f, "by_collection"),
+        }
+    }
+}
+
+/// a single crawler source: a URL and the mode used to enumerate it.
+#[derive(Debug, Clone)]
+pub struct CrawlerSource {
+    pub url: Url,
+    pub mode: CrawlerMode,
+}
+
+impl CrawlerSource {
+    /// parse `[mode::]url` — mode prefix is optional, falls back to `default_mode`.
+    fn parse(s: &str, default_mode: CrawlerMode) -> Option<Self> {
+        if let Some((prefix, rest)) = s.split_once("::") {
+            let mode = prefix.parse().ok()?;
+            let url = Url::parse(rest).ok()?;
+            Some(Self { url, mode })
+        } else {
+            let url = Url::parse(s).ok()?;
+            Some(Self {
+                url,
+                mode: default_mode,
+            })
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Compression {
     Lz4,
     Zstd,
@@ -93,6 +157,14 @@ pub struct Config {
     pub filter_signals: Option<Vec<String>>,
     pub filter_collections: Option<Vec<String>>,
     pub filter_excludes: Option<Vec<String>>,
+    /// crawler sources: each entry pairs a URL with a discovery mode.
+    ///
+    /// set via `HYDRANT_CRAWLER_URLS` as a comma-separated list of `[mode::]url` entries,
+    /// e.g. `relay::wss://bsky.network,by_collection::https://lightrail.microcosm.blue`.
+    /// a bare URL without a `mode::` prefix uses the default mode (`relay` for full-network,
+    /// `by_collection` otherwise). defaults to the relay hosts with the default mode.
+    /// set to an empty string to disable crawling entirely.
+    pub crawler_sources: Vec<CrawlerSource>,
 }
 
 impl Config {
@@ -229,6 +301,29 @@ impl Config {
                 .collect()
         });
 
+        let default_mode = CrawlerMode::default_for(full_network);
+        let crawler_sources = match std::env::var("HYDRANT_CRAWLER_URLS") {
+            Ok(s) => s
+                .split(',')
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .filter_map(|s| CrawlerSource::parse(s, default_mode))
+                .collect(),
+            Err(_) => match default_mode {
+                CrawlerMode::Relay => relay_hosts
+                    .iter()
+                    .map(|url| CrawlerSource {
+                        url: url.clone(),
+                        mode: CrawlerMode::Relay,
+                    })
+                    .collect(),
+                CrawlerMode::ByCollection => vec![CrawlerSource {
+                    url: Url::parse("https://lightrail.microcosm.blue").unwrap(),
+                    mode: CrawlerMode::ByCollection,
+                }],
+            },
+        };
+
         Ok(Self {
             database_path,
             relays: relay_hosts,
@@ -258,6 +353,7 @@ impl Config {
             filter_signals,
             filter_collections,
             filter_excludes,
+            crawler_sources,
         })
     }
 }
@@ -355,6 +451,14 @@ impl fmt::Display for Config {
             "crawler resume pending",
             self.crawler_resume_pending_repos
         )?;
+        if !self.crawler_sources.is_empty() {
+            let sources: Vec<_> = self
+                .crawler_sources
+                .iter()
+                .map(|s| format!("{}::{}", s.mode, s.url))
+                .collect();
+            config_line!(f, "crawler sources", sources.join(", "))?;
+        }
         if let Some(signals) = &self.filter_signals {
             config_line!(f, "filter signals", format_args!("{:?}", signals))?;
         }

@@ -32,8 +32,11 @@ impl AppState {
 
         let crawler_default = match config.enable_crawler {
             Some(b) => b,
-            // default: enabled in full-network mode, disabled in filter mode
-            None => filter_config.mode == crate::filter::FilterMode::Full,
+            // default: enabled if full-network mode, or if crawler sources are configured
+            None => {
+                filter_config.mode == crate::filter::FilterMode::Full
+                    || !config.crawler_sources.is_empty()
+            }
         };
 
         let filter = new_handle(filter_config);

@@ -120,16 +120,13 @@ impl Db {
             .max_journaling_size(mb(cfg.db_max_journaling_size_mb))
             .with_compaction_filter_factories({
                 let ephemeral = cfg.ephemeral;
-                let f = move |ks: &str| {
-                    tracing::info!("with_compaction_filter_factories queried for keyspace: {ks}",);
-                    match ks {
-                        "counts" => ephemeral.then(|| -> Arc<dyn Factory> {
-                            Arc::new(DropPrefixFilterFactory {
-                                prefix: keys::COUNT_COLLECTION_PREFIX,
-                            })
-                        }),
-                        _ => None,
-                    }
+                let f = move |ks: &str| match ks {
+                    "counts" => ephemeral.then(|| -> Arc<dyn Factory> {
+                        Arc::new(DropPrefixFilterFactory {
+                            prefix: keys::COUNT_COLLECTION_PREFIX,
+                        })
+                    }),
+                    _ => None,
                 };
                 Arc::new(f)
             })
@@ -146,7 +143,7 @@ impl Db {
             let path = cfg.database_path.join(format!("dict_{name}.bin"));
             if path.exists() {
                 if let Ok(bytes) = std::fs::read(&path) {
-                    tracing::info!(
+                    tracing::debug!(
                         "loaded zstd dictionary for keyspace {name} ({} bytes)",
                         bytes.len()
                     );
@@ -704,12 +701,15 @@ impl Db {
 
 pub fn set_firehose_cursor(db: &Db, relay: &Url, cursor: i64) -> Result<()> {
     db.cursors
-        .insert(keys::firehose_cursor_key(relay), cursor.to_be_bytes())
+        .insert(
+            keys::firehose_cursor_key(relay.as_str()),
+            cursor.to_be_bytes(),
+        )
         .into_diagnostic()
 }
 
 pub async fn get_firehose_cursor(db: &Db, relay: &Url) -> Result<Option<i64>> {
-    let per_relay_key = keys::firehose_cursor_key(relay);
+    let per_relay_key = keys::firehose_cursor_key(relay.as_str());
     if let Some(v) = Db::get(db.cursors.clone(), per_relay_key).await? {
         return Ok(Some(i64::from_be_bytes(
             v.as_ref()

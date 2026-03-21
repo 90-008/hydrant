@@ -11,14 +11,19 @@
 //!
 //! the database persists records across restarts. on each start the full event
 //! history is replayed from the database to rebuild the in-memory index.
+//! (in a better app, we could for example use the ephemeral mode of hydrant,
+//! and use our db, or we could use hydrant to backfill multiple instances of the app.)
 
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use chrono::DateTime;
 use futures::StreamExt;
 use hydrant::config::Config;
 use hydrant::control::{EventStream, Hydrant, ReposControl};
 use hydrant::filter::FilterMode;
+use jacquard_common::types::tid::Tid;
 use scc::HashMap;
 
 const COLLECTION: &str = "xyz.statusphere.status";
@@ -40,14 +45,19 @@ impl StatusIndex {
         }
     }
 
-    fn set(&self, did: String, emoji: String, created_at: String) -> bool {
+    fn set(&self, did: String, emoji: String, created_at: &str) -> bool {
         let is_newer = self
             .current
-            .read_sync(&did, |_, e| created_at > e.created_at)
+            .read_sync(&did, |_, e| created_at > e.created_at.as_str())
             .unwrap_or(true);
         if is_newer {
-            self.current
-                .upsert_sync(did, StatusEntry { emoji, created_at });
+            self.current.upsert_sync(
+                did,
+                StatusEntry {
+                    emoji,
+                    created_at: created_at.to_owned(),
+                },
+            );
         }
         is_newer
     }
@@ -107,8 +117,7 @@ async fn handle_stream(index: Arc<StatusIndex>, repos: ReposControl, mut stream:
                     let created_at = record
                         .get("createdAt")
                         .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_owned();
+                        .unwrap_or("");
                     if index.set(did.clone(), emoji.clone(), created_at) {
                         let name = repos
                             .get(&rec.did)
@@ -117,7 +126,7 @@ async fn handle_stream(index: Arc<StatusIndex>, repos: ReposControl, mut stream:
                             .flatten()
                             .and_then(|info| info.handle)
                             .unwrap_or(did);
-                        println!("[{}] {name} set status: {emoji}", event.id);
+                        println!("[{created_at}] {name}: {emoji}");
                     }
                 }
                 "delete" => {
@@ -129,7 +138,12 @@ async fn handle_stream(index: Arc<StatusIndex>, repos: ReposControl, mut stream:
                         .and_then(|info| info.handle)
                         .unwrap_or(did.clone());
                     index.delete(&did);
-                    println!("[{}] {name} cleared status", event.id);
+                    let date = Tid::from_str(&rec.rkey)
+                        .ok()
+                        .and_then(|tid| DateTime::from_timestamp_micros(tid.timestamp() as i64))
+                        .map(|date| date.to_string())
+                        .unwrap_or_else(|| "invalid rkey".to_string());
+                    println!("[{date}] {name} cleared status");
                 }
                 _ => {}
             }
@@ -148,6 +162,11 @@ async fn main() -> miette::Result<()> {
         .with_env_filter("hydrant=info")
         .init();
 
+    // config is loaded from environment variables (all prefixed with HYDRANT_).
+    // key defaults for this example:
+    // DATABASE_PATH=./hydrant.db                    | where to store the database.
+    // RELAY_HOST=wss://relay.fire.hose.cam/         | firehose source.
+    // CRAWLER_URLS=https://lightrail.microcosm.blue | crawler sources. in filter mode this defaults to `by-collection`.
     let cfg = Config::from_env()?;
     let hydrant = Hydrant::new(cfg).await?;
 

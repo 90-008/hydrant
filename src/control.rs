@@ -19,7 +19,6 @@ use tracing::{debug, error, info};
 
 use crate::backfill::BackfillWorker;
 use crate::config::{Config, SignatureVerification};
-use crate::crawler::Crawler;
 use crate::db::{self, filter as db_filter, keys, ser_repo_state};
 use crate::filter::{FilterMode, SetUpdate};
 use crate::ingest::{firehose::FirehoseIngestor, worker::FirehoseWorker};
@@ -126,7 +125,9 @@ impl Hydrant {
         // 4. set crawler enabled state from config, evaluated against the post-patch filter
         let post_patch_crawler = match config.enable_crawler {
             Some(b) => b,
-            None => state.filter.load().mode == FilterMode::Full,
+            None => {
+                state.filter.load().mode == FilterMode::Full || !config.crawler_sources.is_empty()
+            }
         };
         state.crawler_enabled.send_replace(post_patch_crawler);
 
@@ -317,30 +318,135 @@ impl Hydrant {
                 }
             }
 
-            // 11. spawn the crawler if we have relay hosts to crawl
-            if !relay_hosts.is_empty() {
-                let crawler_rx = state.crawler_enabled.subscribe();
-                info!(
-                    relay_count = relay_hosts.len(),
-                    hosts = relay_hosts
+            // 11. spawn crawler components
+            if !config.crawler_sources.is_empty() {
+                use crate::config::CrawlerMode;
+                use crate::crawler::throttle::Throttler;
+                use crate::crawler::{
+                    ByCollectionProducer, CrawlerStats, CrawlerWorker, InFlight, RelayProducer,
+                    RetryProducer, SignalChecker,
+                };
+                use std::time::Duration;
+                use tracing::Instrument;
+
+                let http = reqwest::Client::builder()
+                    .user_agent(concat!(
+                        env!("CARGO_PKG_NAME"),
+                        "/",
+                        env!("CARGO_PKG_VERSION")
+                    ))
+                    .gzip(true)
+                    .build()
+                    .expect("that reqwest will build");
+                let pds_throttler = Throttler::new();
+                let in_flight = InFlight::new();
+                let stats = CrawlerStats::new(
+                    state.clone(),
+                    config
+                        .crawler_sources
                         .iter()
-                        .map(|h| h.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                    enabled = *state.crawler_enabled.borrow(),
-                    "starting crawler(s)"
+                        .map(|s| s.url.clone())
+                        .collect(),
+                    pds_throttler.clone(),
                 );
-                let state = state.clone();
-                let max_pending = config.crawler_max_pending_repos;
-                let resume_pending = config.crawler_resume_pending_repos;
+                let checker = SignalChecker {
+                    http: http.clone(),
+                    state: state.clone(),
+                    throttler: pds_throttler,
+                };
+
+                info!(
+                    max_pending = config.crawler_max_pending_repos,
+                    resume_pending = config.crawler_resume_pending_repos,
+                    enabled = *state.crawler_enabled.borrow(),
+                    "starting crawler worker"
+                );
+                let (worker, tx) = CrawlerWorker::new(
+                    state.clone(),
+                    config.crawler_max_pending_repos,
+                    config.crawler_resume_pending_repos,
+                    stats.clone(),
+                );
                 tokio::spawn(async move {
-                    let crawler =
-                        Crawler::new(state, relay_hosts, max_pending, resume_pending, crawler_rx);
-                    if let Err(e) = crawler.run().await {
-                        error!(err = %e, "crawler error");
-                        db::check_poisoned_report(&e);
-                    }
+                    worker.run().await;
+                    error!("crawler worker exited unexpectedly, aborting");
+                    std::process::abort();
                 });
+
+                let ticker = tokio::spawn(stats.clone().task());
+                tokio::spawn(async move {
+                    match ticker.await {
+                        Err(e) => error!(err = ?e, "stats ticker panicked, aborting"),
+                        Ok(()) => error!("stats ticker exited unexpectedly, aborting"),
+                    }
+                    std::process::abort();
+                });
+
+                tokio::spawn(
+                    RetryProducer {
+                        checker: checker.clone(),
+                        in_flight: in_flight.clone(),
+                        tx: tx.clone(),
+                    }
+                    .run(),
+                );
+
+                let crawler_rx = state.crawler_enabled.subscribe();
+                for source in config.crawler_sources.iter().cloned() {
+                    let http = http.clone();
+                    let state = state.clone();
+                    let in_flight = in_flight.clone();
+                    let tx = tx.clone();
+                    let stats = stats.clone();
+                    let enabled = crawler_rx.clone();
+                    match source.mode {
+                        CrawlerMode::Relay => {
+                            info!(relay = %source.url, enabled = *state.crawler_enabled.borrow(), "starting relay crawler");
+                            let span = tracing::info_span!("crawl", url = %source.url);
+                            tokio::spawn(
+                                RelayProducer {
+                                    relay_url: source.url,
+                                    checker: checker.clone(),
+                                    in_flight,
+                                    tx,
+                                    enabled,
+                                    stats,
+                                }
+                                .run()
+                                .instrument(span),
+                            );
+                        }
+                        CrawlerMode::ByCollection => {
+                            info!(
+                                host = source.url.host_str(),
+                                enabled = *state.crawler_enabled.borrow(),
+                                "starting by-collection crawler"
+                            );
+                            let span =
+                                tracing::info_span!("by_collection", host = source.url.host_str());
+                            tokio::spawn(
+                                async move {
+                                    loop {
+                                        let producer = ByCollectionProducer {
+                                            index_url: source.url.clone(),
+                                            http: http.clone(),
+                                            state: state.clone(),
+                                            in_flight: in_flight.clone(),
+                                            tx: tx.clone(),
+                                            enabled: enabled.clone(),
+                                            stats: stats.clone(),
+                                        };
+                                        if let Err(e) = producer.run().await {
+                                            error!(err = ?e, "by-collection crawler fatal error, restarting in 30s");
+                                            tokio::time::sleep(Duration::from_secs(30)).await;
+                                        }
+                                    }
+                                }
+                                .instrument(span),
+                            );
+                        }
+                    }
+                }
             }
 
             // 12. spawn the firehose worker on a blocking thread (fatal task)
@@ -550,11 +656,12 @@ pub struct StatsResponse {
 pub struct CrawlerHandle(Arc<AppState>);
 
 impl CrawlerHandle {
-    /// enable the crawler. no-op if already enabled.
+    /// enable the crawler (enables all configured producers). no-op if already enabled.
     pub fn enable(&self) {
         self.0.crawler_enabled.send_replace(true);
     }
-    /// disable the crawler. in-progress repo checks finish before the crawler pauses.
+    /// disable the crawler (disables all configured producers).
+    /// in-progress repo checks finish before the crawler pauses.
     pub fn disable(&self) {
         self.0.crawler_enabled.send_replace(false);
     }
@@ -562,15 +669,30 @@ impl CrawlerHandle {
     pub fn is_enabled(&self) -> bool {
         *self.0.crawler_enabled.borrow()
     }
+
+    /// delete all cursor entries associated with the given URL.
+    pub async fn reset_cursor(&self, url: &str) -> Result<()> {
+        let db = self.0.db.clone();
+        let point_keys = [keys::crawler_cursor_key(url)];
+        let by_collection_prefix = keys::by_collection_cursor_prefix(url);
+        tokio::task::spawn_blocking(move || {
+            let mut batch = db.inner.batch();
+            for k in point_keys {
+                batch.remove(&db.cursors, k);
+            }
+            for entry in db.cursors.prefix(&by_collection_prefix) {
+                let (k, _) = entry.into_inner().into_diagnostic()?;
+                batch.remove(&db.cursors, k);
+            }
+            batch.commit().into_diagnostic()
+        })
+        .await
+        .into_diagnostic()??;
+        Ok(())
+    }
 }
 
 /// runtime control over the firehose ingestor component.
-///
-/// the firehose connects to each configured relay's `com.atproto.sync.subscribeRepos`
-/// websocket and processes commit, identity, account, and sync events in real time.
-/// one independent connection is maintained per relay URL.
-///
-/// disabling the firehose closes the websocket after the current message is processed.
 #[derive(Clone)]
 pub struct FirehoseHandle(Arc<AppState>);
 
@@ -594,8 +716,6 @@ impl FirehoseHandle {
 /// the backfill worker fetches full repo CAR files from each repo's PDS for any
 /// repository in the pending queue, parses the MST, and inserts all matching records
 /// into the database. concurrency is bounded by `HYDRANT_BACKFILL_CONCURRENCY_LIMIT`.
-///
-/// disabling backfill lets any in-flight repo fetches finish before pausing.
 #[derive(Clone)]
 pub struct BackfillHandle(Arc<AppState>);
 
@@ -604,7 +724,7 @@ impl BackfillHandle {
     pub fn enable(&self) {
         self.0.backfill_enabled.send_replace(true);
     }
-    /// disable the backfill worker. in-flight repo fetches complete before pausing.
+    /// disable the backfill worker. in-flight repos complete before pausing.
     pub fn disable(&self) {
         self.0.backfill_enabled.send_replace(false);
     }
@@ -613,8 +733,6 @@ impl BackfillHandle {
         *self.0.backfill_enabled.borrow()
     }
 }
-
-// --- filter control ---
 
 /// a point-in-time snapshot of the filter configuration. returned by all [`FilterControl`] methods.
 ///

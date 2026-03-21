@@ -2,13 +2,13 @@
 
 `hydrant` is an AT Protocol indexer built on the `fjall` database that handles sync for you. it's flexible, supporting both full-network indexing and filtered indexing (e.g., by DID), also allowing querying with XRPCs and providing an ordered event stream with cursor support.
 
-you can see [random.wisp.place](https://tangled.org/did:plc:dfl62fgb7wtjj3fcbb72naae/random.wisp.place) for an example on how to use hydrant.
+you can see [random.wisp.place](https://tangled.org/did:plc:dfl62fgb7wtjj3fcbb72naae/random.wisp.place) (standalone binary using http API) or the [statusphere example](./examples/statusphere.rs) (hydrant-as-library) for examples on how to use hydrant.
 
 **WARNING: *the db format is not stable yet.*** it's in active development so if you are going to rely on the db format being stable, don't (eg. for query features, if you are using ephemeral mode this doesn't matter for example, or you dont mind losing your existing backfilled data in hydrant if you already processed them.).
 
 ## vs `tap`
 
-while [`tap`](https://github.com/bluesky-social/indigo/tree/main/cmd/tap) is designed as a firehose consumer and simply just propagates events while handling sync, `hydrant` is flexible, it allows you to directly query the database for records, and it also provides an ordered view of events, allowing the use of a cursor to fetch events from a specific point in time.
+while [`tap`](https://github.com/bluesky-social/indigo/tree/main/cmd/tap) is designed as a firehose consumer and simply just propagates events while handling sync, `hydrant` is flexible, it allows you to directly query the database for records, and it also provides an ordered view of events, allowing the use of a cursor to fetch events from a specific point. it can act as both an indexer or an ephemeral view of some window of events.
 
 ### stream behavior
 
@@ -24,16 +24,28 @@ the `WS /stream` (hydrant) and `WS /channel` (tap) endpoints have different desi
 
 ### multiple relay support
 
-`hydrant` supports connecting to multiple relays simultaneously for both firehose ingestion and crawling. when `RELAY_HOSTS` is configured with multiple URLs:
+`hydrant` supports connecting to multiple relays simultaneously for firehose ingestion. when `RELAY_HOSTS` is configured with multiple URLs:
 
 - one independent firehose stream loop is spawned per relay
-- one independent crawling loop is spawned per relay
-- each relay maintains its own firehose / crawler cursor state
-- all ingestion loops and crawlers share the same worker pool and database
-- all crawlers share the same pending queue for backfill
+- each relay maintains its own firehose cursor state
+- all ingestion loops share the same worker pool and database
 
 commit events are de-duplicated according to the repo `rev`. account / identity events are de-duplicated using the `time` field.
 todo: decide what to do on relay-side account takedowns or if relays set the `time` field.
+
+### crawler sources
+
+the crawler is configured separately from the firehose via `CRAWLER_URLS`. each source is a `[mode::]url` entry where the mode prefix is optional and defaults to `by_collection` in filter mode or `relay` in full-network mode.
+
+- `relay`: enumerates the network via `com.atproto.sync.listRepos`, then checks each repo's collections via `describeRepo`. used for full-network discovery.
+- `by_collection`: queries `com.atproto.sync.listReposByCollection` for each configured signal. more efficient for filtered indexing since it only surfaces repos that have matching records.
+cursors are stored per collection.
+
+```
+CRAWLER_URLS=by_collection::https://lightrail.microcosm.blue,relay::wss://bsky.network
+```
+
+each source maintains its own cursor so restarts resume mid-pass.
 
 ## configuration
 
@@ -43,8 +55,9 @@ todo: decide what to do on relay-side account takedowns or if relays set the `ti
 | :--- | :--- | :--- |
 | `DATABASE_PATH` | `./hydrant.db` | path to the database folder. |
 | `RUST_LOG` | `info` | log filter directives (e.g., `debug`, `hydrant=trace`). [`tracing` env-filter syntax](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html). |
-| `RELAY_HOST` | `wss://relay.fire.hose.cam/` | URL of the relay. |
-| `RELAY_HOSTS` | | comma-separated list of relay URLs. if unset, falls back to `RELAY_HOST`. |
+| `RELAY_HOST` | `wss://relay.fire.hose.cam/` | URL of the relay (firehose only). |
+| `RELAY_HOSTS` | | comma-separated list of relay URLs (firehose only). if unset, falls back to `RELAY_HOST`. |
+| `CRAWLER_URLS` | relay hosts in full-network mode, `https://lightrail.microcosm.blue` in filter mode | comma-separated list of `[mode::]url` crawler sources. mode is `relay` or `by_collection`; bare URLs use the default mode. set to empty string to disable crawling. |
 | `PLC_URL` | `https://plc.wtf`, `https://plc.directory` if full network | base URL(s) of the PLC directory (comma-separated for multiple). |
 | `EPHEMERAL` | `false` | if enabled, no records are stored. events are deleted after a certain duration (`EPHEMERAL_TTL`). |
 | `EPHEMERAL_TTL` | `60min` | decides after how long events should be deleted. |
@@ -63,7 +76,7 @@ todo: decide what to do on relay-side account takedowns or if relays set the `ti
 | `ENABLE_DEBUG` | `false` | enable debug endpoints. |
 | `DEBUG_PORT` | `API_PORT + 1` | port for debug endpoints (if enabled). |
 | `ENABLE_FIREHOSE` | `true` | whether to ingest relay subscriptions. |
-| `ENABLE_CRAWLER` | `false` (if Filter), `true` (if Full) | whether to actively query the network for unknown repositories. |
+| `ENABLE_CRAWLER` | `true` if full network or crawler sources are configured, `false` otherwise | whether to actively query the network for unknown repositories. |
 | `CRAWLER_MAX_PENDING_REPOS` | `2000` | max pending repos for crawler. |
 | `CRAWLER_RESUME_PENDING_REPOS` | `1000` | resume threshold for crawler pending repos. |
 
@@ -86,6 +99,7 @@ todo: decide what to do on relay-side account takedowns or if relays set the `ti
 
 - `POST /db/train`: train zstd compression dictionaries for the `repos`, `blocks`, and `events` keyspaces. dictionaries are written to disk; a restart is required to apply them. the crawler, firehose, and backfill worker are paused for the duration and restored on completion.
 - `POST /db/compact`: trigger a full major compaction of all database keyspaces in parallel. the crawler, firehose, and backfill worker are paused for the duration and restored on completion.
+- `DELETE /cursors`: reset all stored cursors for a given URL. body: `{ "key": "..." }` where key is a URL. clears the relay crawler cursor, and any by-collection cursors associated with that URL. causes the next crawler pass to restart from the beginning.
 
 #### filter mode
 
