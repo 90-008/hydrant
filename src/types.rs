@@ -1,9 +1,11 @@
 use std::fmt::{Debug, Display};
 
 use jacquard_common::types::cid::IpldCid;
-use jacquard_common::types::string::Did;
+use jacquard_common::types::nsid::Nsid;
+use jacquard_common::types::string::{Did, Rkey};
+use jacquard_common::types::tid::Tid;
 use jacquard_common::{CowStr, IntoStatic, types::string::Handle};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer};
 use serde_json::Value;
 use smol_str::{SmolStr, ToSmolStr};
 
@@ -161,13 +163,33 @@ impl ResyncState {
     }
 }
 
-// from src/api/event.rs
+#[derive(Debug, Serialize, Clone)]
+pub enum EventType {
+    Record,
+    Identity,
+    Account,
+}
+
+impl AsRef<str> for EventType {
+    fn as_ref(&self) -> &str {
+        match self {
+            Self::Record => "record",
+            Self::Identity => "identity",
+            Self::Account => "account",
+        }
+    }
+}
+
+fn event_type_ser_str<S: Serializer>(v: &EventType, s: S) -> Result<S::Ok, S::Error> {
+    s.serialize_str(v.as_ref())
+}
 
 #[derive(Debug, Serialize, Clone)]
 pub struct MarshallableEvt<'i> {
     pub id: u64,
     #[serde(rename = "type")]
-    pub event_type: SmolStr,
+    #[serde(serialize_with = "event_type_ser_str")]
+    pub kind: EventType,
     #[serde(borrow)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub record: Option<RecordEvt<'i>>,
@@ -191,14 +213,15 @@ pub struct RecordEvt<'i> {
     pub live: bool,
     #[serde(borrow)]
     pub did: Did<'i>,
-    pub rev: CowStr<'i>,
-    pub collection: CowStr<'i>,
-    pub rkey: CowStr<'i>,
+    pub rev: Tid,
+    pub collection: Nsid<'i>,
+    pub rkey: Rkey<'i>,
     pub action: CowStr<'i>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub record: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub cid: Option<CowStr<'i>>,
+    #[serde(serialize_with = "crate::util::opt_cid_serialize_str")]
+    pub cid: Option<IpldCid>,
 }
 
 #[derive(Debug, Serialize, Clone)]

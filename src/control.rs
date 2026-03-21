@@ -7,8 +7,10 @@ use std::task::{Context, Poll};
 
 use chrono::{DateTime, Utc};
 use futures::{FutureExt, Stream};
+use jacquard_common::cowstr::ToCowStr;
 use jacquard_common::types::cid::{ATP_CID_HASH, IpldCid};
-use jacquard_common::types::string::{Did, Handle};
+use jacquard_common::types::nsid::Nsid;
+use jacquard_common::types::string::{Did, Handle, Rkey};
 use jacquard_common::types::tid::Tid;
 use jacquard_common::{CowStr, IntoStatic, RawData};
 use jacquard_repo::DAG_CBOR_CID_CODEC;
@@ -1410,16 +1412,18 @@ fn stored_to_event(state: &AppState, id: u64, stored: StoredEvent<'_>) -> Option
 
     Some(MarshallableEvt {
         id,
-        event_type: "record".into(),
+        kind: crate::types::EventType::Record,
         record: Some(RecordEvt {
             live,
             did: did.to_did(),
-            rev: CowStr::Owned(rev.to_tid().into()),
-            collection: CowStr::Owned(collection.as_ref().to_string().into()),
-            rkey: CowStr::Owned(rkey.to_smolstr().into()),
+            rev: rev.to_tid(),
+            collection: Nsid::new_cow(collection.clone().into_static())
+                .expect("that collection is already validated"),
+            rkey: Rkey::new_cow(rkey.to_cowstr().into_static())
+                .expect("that rkey is already validated"),
             action: CowStr::Borrowed(action.as_str()),
             record,
-            cid: cid.map(|c| jacquard_common::types::cid::Cid::ipld(c).into()),
+            cid,
         }),
         identity: None,
         account: None,

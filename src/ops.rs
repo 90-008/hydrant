@@ -47,7 +47,7 @@ pub fn make_identity_event(db: &Db, evt: IdentityEvt<'static>) -> BroadcastEvent
     let event_id = db.next_event_id.fetch_add(1, Ordering::SeqCst);
     let marshallable = MarshallableEvt {
         id: event_id,
-        event_type: "identity".into(),
+        kind: crate::types::EventType::Identity,
         record: None,
         identity: Some(evt),
         account: None,
@@ -59,7 +59,7 @@ pub fn make_account_event(db: &Db, evt: AccountEvt<'static>) -> BroadcastEvent {
     let event_id = db.next_event_id.fetch_add(1, Ordering::SeqCst);
     let marshallable = MarshallableEvt {
         id: event_id,
-        event_type: "account".into(),
+        kind: crate::types::EventType::Account,
         record: None,
         identity: None,
         account: Some(evt),
