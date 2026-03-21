@@ -23,13 +23,13 @@ async fn main() -> miette::Result<()> {
 
     if app.enable_debug {
         tokio::select! {
-            r = hydrant.run() => r,
+            r = hydrant.run()? => r,
             r = hydrant.serve(app.api_port) => r,
             r = hydrant.serve_debug(app.debug_port) => r,
         }
     } else {
         tokio::select! {
-            r = hydrant.run() => r,
+            r = hydrant.run()? => r,
             r = hydrant.serve(app.api_port) => r,
         }
     }

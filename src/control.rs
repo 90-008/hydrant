@@ -162,17 +162,16 @@ impl Hydrant {
     /// resolves with `Ok(())` if a fatal component exits cleanly, or `Err(e)` if it
     /// fails. intended for use in `tokio::select!` alongside [`serve`](Self::serve).
     ///
-    /// panics if called more than once on the same `Hydrant` instance.
-    pub fn run(&self) -> impl Future<Output = Result<()>> {
+    /// returns an error if called more than once on the same `Hydrant` instance.
+    pub fn run(&self) -> Result<impl Future<Output = Result<()>>> {
         let state = self.state.clone();
         let config = self.config.clone();
-        let started = self.started.clone();
 
-        async move {
-            if started.swap(true, Ordering::SeqCst) {
-                panic!("Hydrant::run() called more than once");
-            }
+        if self.started.swap(true, Ordering::SeqCst) {
+            miette::bail!("Hydrant::run() called more than once");
+        }
 
+        let fut = async move {
             // internal buffered channel between ingestors / backfill and the firehose worker
             let (buffer_tx, buffer_rx) = mpsc::unbounded_channel();
 
@@ -499,7 +498,8 @@ impl Hydrant {
                     Err(_) => return Ok(()),
                 }
             }
-        }
+        };
+        Ok(fut)
     }
 
     /// subscribe to the ordered event stream.

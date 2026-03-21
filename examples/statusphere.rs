@@ -189,7 +189,7 @@ async fn main() -> miette::Result<()> {
     let index = Arc::new(StatusIndex::new());
     tokio::select! {
         // this finally starts hydrant, so it will start crawling and backfilling etc.
-        r = hydrant.run() => r,
+        r = hydrant.run()? => r,
         _ = run_ticker(index.clone()) => Ok(()),
         _ = handle_stream(index.clone(), hydrant.repos.clone(), stream) => Ok(()),
     }
