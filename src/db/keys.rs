@@ -177,11 +177,3 @@ pub fn block_key(collection: &str, cid: &[u8]) -> Vec<u8> {
     key.extend_from_slice(cid);
     key
 }
-
-// prefix format: {collection}|
-pub fn block_prefix_collection(collection: &str) -> Vec<u8> {
-    let mut prefix = Vec::with_capacity(collection.len() + 1);
-    prefix.extend_from_slice(collection.as_bytes());
-    prefix.push(SEP);
-    prefix
-}

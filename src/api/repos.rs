@@ -1,5 +1,5 @@
-use std::sync::Arc;
-
+use crate::control::{Hydrant, RepoInfo, repo_state_to_info};
+use crate::db::keys;
 use axum::{
     Json, Router,
     body::Body,
@@ -8,17 +8,10 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{delete, get, put},
 };
-use chrono::{DateTime, Utc};
-use jacquard_common::{IntoStatic, types::did::Did};
-use miette::IntoDiagnostic;
-use rand::Rng;
-use serde::{Deserialize, Serialize};
+use jacquard_common::types::did::Did;
+use serde::Deserialize;
 
-use crate::api::AppState;
-use crate::db::{keys, ser_repo_state};
-use crate::types::{GaugeState, RepoState};
-
-pub fn router() -> Router<Arc<AppState>> {
+pub fn router() -> Router<Hydrant> {
     Router::new()
         .route("/repos", get(handle_get_repos))
         .route("/repos/{did}", get(handle_get_repo))
@@ -31,26 +24,6 @@ pub struct RepoRequest {
     pub did: String,
 }
 
-#[derive(Serialize, Debug)]
-pub struct RepoResponse {
-    pub did: String,
-    pub status: String,
-    pub tracked: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub rev: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub handle: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub pds: Option<String>,
-    // this does not have the did:key: prefix
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub signing_key: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub last_updated_at: Option<DateTime<Utc>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub last_message_at: Option<DateTime<Utc>>,
-}
-
 #[derive(Deserialize)]
 pub struct GetReposParams {
     pub limit: Option<usize>,
@@ -59,22 +32,22 @@ pub struct GetReposParams {
 }
 
 pub async fn handle_get_repos(
-    State(state): State<Arc<AppState>>,
+    State(hydrant): State<Hydrant>,
     Query(params): Query<GetReposParams>,
 ) -> Result<Response, (StatusCode, String)> {
     let limit = params.limit.unwrap_or(100).min(1000);
     let partition = params.partition.unwrap_or_else(|| "all".to_string());
 
     let items = tokio::task::spawn_blocking(move || {
-        let db = &state.db;
+        let db = &hydrant.state.db;
 
-        let to_response = |k: &[u8], v: &[u8]| -> Result<RepoResponse, (StatusCode, String)> {
+        let to_info = |k: &[u8], v: &[u8]| -> Result<RepoInfo, (StatusCode, String)> {
             let repo_state = crate::db::deser_repo_state(v).map_err(internal)?;
             let did = crate::db::types::TrimmedDid::try_from(k)
                 .map_err(internal)?
                 .to_did();
 
-            Ok(repo_state_to_response(did.to_string(), repo_state))
+            Ok(repo_state_to_info(did.to_string(), repo_state))
         };
 
         let results = match partition.as_str() {
@@ -105,7 +78,7 @@ pub async fn handle_get_repos(
                         })?
                     };
 
-                    items.push(to_response(&k, &repo_state_bytes)?);
+                    items.push(to_info(&k, &repo_state_bytes)?);
                 }
                 Ok::<_, (StatusCode, String)>(items)
             }
@@ -126,7 +99,7 @@ pub async fn handle_get_repos(
                     let (_, did_key) = item.into_inner().map_err(internal)?;
 
                     if let Ok(Some(v)) = db.repos.get(&did_key) {
-                        items.push(to_response(&did_key, &v)?);
+                        items.push(to_info(&did_key, &v)?);
                     }
                 }
                 Ok(items)
@@ -153,194 +126,59 @@ pub async fn handle_get_repos(
 }
 
 pub async fn handle_get_repo(
-    State(state): State<Arc<AppState>>,
+    State(hydrant): State<Hydrant>,
     Path(did_str): Path<String>,
-) -> Result<Json<RepoResponse>, (StatusCode, String)> {
+) -> Result<Json<RepoInfo>, (StatusCode, String)> {
     let did = Did::new(&did_str).map_err(bad_request)?;
-    let did_key = keys::repo_key(&did);
 
-    let item = tokio::task::spawn_blocking(move || {
-        let db = &state.db;
-
-        let repo_bytes = db.repos.get(&did_key).map_err(internal)?;
-        let repo_state = repo_bytes
-            .as_deref()
-            .map(crate::db::deser_repo_state)
-            .transpose()
-            .map_err(internal)?;
-
-        Ok(repo_state.map(|s| repo_state_to_response(did_str, s)))
-    })
-    .await
-    .map_err(internal)??;
+    let item = hydrant
+        .repos
+        .get(&did)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     item.map(Json)
         .ok_or_else(|| (StatusCode::NOT_FOUND, "repository not found".to_string()))
 }
 
 pub async fn handle_put_repos(
-    State(state): State<Arc<AppState>>,
+    State(hydrant): State<Hydrant>,
     req: axum::extract::Request,
 ) -> Result<StatusCode, (StatusCode, String)> {
     let items = parse_body(req).await?;
 
-    let state_task = state.clone();
-    let (new_repo_count, gauge_transitions) = tokio::task::spawn_blocking(move || {
-        let db = &state_task.db;
-        let mut batch = db.inner.batch();
-        let mut added = 0i64;
-        let mut gauge_transitions: Vec<(GaugeState, GaugeState)> = Vec::new();
+    let dids: Vec<Did<'static>> = items
+        .into_iter()
+        .filter_map(|item| Did::new_owned(&item.did).ok())
+        .collect();
 
-        let mut rng = rand::rng();
-
-        for item in items {
-            let did = Did::new(&item.did).map_err(bad_request)?;
-            let did_key = keys::repo_key(&did);
-
-            let repo_bytes = db.repos.get(&did_key).map_err(internal)?;
-            let existing_state = repo_bytes
-                .as_deref()
-                .map(crate::db::deser_repo_state)
-                .transpose()
-                .map_err(internal)?;
-
-            if let Some(mut repo_state) = existing_state {
-                if !repo_state.tracked {
-                    let resync_bytes = db.resync.get(&did_key).map_err(internal)?;
-                    let old_gauge =
-                        crate::db::Db::repo_gauge_state(&repo_state, resync_bytes.as_deref());
-
-                    repo_state.tracked = true;
-                    // re-enqueue into pending
-                    batch.insert(
-                        &db.repos,
-                        &did_key,
-                        ser_repo_state(&repo_state).map_err(internal)?,
-                    );
-                    batch.insert(
-                        &db.pending,
-                        keys::pending_key(repo_state.index_id),
-                        &did_key,
-                    );
-                    batch.remove(&db.resync, &did_key);
-                    gauge_transitions.push((old_gauge, GaugeState::Pending));
-                }
-            } else {
-                let repo_state = RepoState::backfilling(rng.next_u64());
-                batch.insert(
-                    &db.repos,
-                    &did_key,
-                    ser_repo_state(&repo_state).map_err(internal)?,
-                );
-                batch.insert(
-                    &db.pending,
-                    keys::pending_key(repo_state.index_id),
-                    &did_key,
-                );
-                added += 1;
-                gauge_transitions.push((GaugeState::Synced, GaugeState::Pending)); // pseudo-transition to just inc pending
-            }
-        }
-
-        batch.commit().into_diagnostic().map_err(internal)?;
-
-        Ok::<_, (StatusCode, String)>((added, gauge_transitions))
-    })
-    .await
-    .map_err(internal)??;
-
-    if new_repo_count > 0 {
-        state.db.update_count_async("repos", new_repo_count).await;
-    }
-    for (old, new) in gauge_transitions {
-        state.db.update_gauge_diff_async(&old, &new).await;
-    }
-
-    // Always notify backfill if anything was added to pending!
-    state.notify_backfill();
+    hydrant
+        .repos
+        .track(dids)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     Ok(StatusCode::OK)
 }
 
 pub async fn handle_delete_repos(
-    State(state): State<Arc<AppState>>,
+    State(hydrant): State<Hydrant>,
     req: axum::extract::Request,
 ) -> Result<StatusCode, (StatusCode, String)> {
     let items = parse_body(req).await?;
 
-    let state_task = state.clone();
-    let (deleted_count, gauge_decrements) = tokio::task::spawn_blocking(move || {
-        let db = &state_task.db;
-        let mut batch = db.inner.batch();
-        // keeping this for later, unused for now
-        let deleted_count = 0i64;
-        let mut gauge_decrements = Vec::new();
+    let dids: Vec<Did<'static>> = items
+        .into_iter()
+        .filter_map(|item| Did::new_owned(&item.did).ok())
+        .collect();
 
-        for item in items {
-            let did = Did::new(&item.did).map_err(bad_request)?;
-            let did_key = keys::repo_key(&did);
-
-            let repo_bytes = db.repos.get(&did_key).map_err(internal)?;
-            let existing_state = repo_bytes
-                .as_deref()
-                .map(crate::db::deser_repo_state)
-                .transpose()
-                .map_err(internal)?;
-
-            if let Some(repo_state) = existing_state {
-                let resync_bytes = db.resync.get(&did_key).map_err(internal)?;
-                let old_gauge =
-                    crate::db::Db::repo_gauge_state(&repo_state, resync_bytes.as_deref());
-
-                if repo_state.tracked {
-                    let mut repo_state = repo_state.into_static();
-                    repo_state.tracked = false;
-                    batch.insert(
-                        &db.repos,
-                        &did_key,
-                        ser_repo_state(&repo_state).map_err(internal)?,
-                    );
-                    batch.remove(&db.pending, keys::pending_key(repo_state.index_id));
-                    batch.remove(&db.resync, &did_key);
-                    if old_gauge != GaugeState::Synced {
-                        gauge_decrements.push(old_gauge);
-                    }
-                }
-            }
-        }
-
-        batch.commit().into_diagnostic().map_err(internal)?;
-
-        Ok::<_, (StatusCode, String)>((deleted_count, gauge_decrements))
-    })
-    .await
-    .map_err(internal)??;
-
-    if deleted_count > 0 {
-        state.db.update_count_async("repos", -deleted_count).await;
-    }
-    for gauge in gauge_decrements {
-        state
-            .db
-            .update_gauge_diff_async(&gauge, &GaugeState::Synced)
-            .await;
-    }
+    hydrant
+        .repos
+        .untrack(dids)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     Ok(StatusCode::OK)
-}
-
-fn repo_state_to_response(did: String, s: RepoState<'_>) -> RepoResponse {
-    RepoResponse {
-        did,
-        status: s.status.to_string(),
-        tracked: s.tracked,
-        rev: s.rev.as_ref().map(|r| r.to_string()),
-        handle: s.handle.map(|h| h.to_string()),
-        pds: s.pds.map(|p| p.to_string()),
-        signing_key: s.signing_key.map(|k| k.encode()),
-        last_updated_at: DateTime::from_timestamp_secs(s.last_updated_at),
-        last_message_at: s.last_message_time.and_then(DateTime::from_timestamp_secs),
-    }
 }
 
 async fn parse_body(req: axum::extract::Request) -> Result<Vec<RepoRequest>, (StatusCode, String)> {

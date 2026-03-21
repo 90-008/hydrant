@@ -1,3 +1,4 @@
+use crate::control::Hydrant;
 use crate::state::AppState;
 use axum::{Router, routing::get};
 use std::{net::SocketAddr, sync::Arc};
@@ -13,7 +14,7 @@ mod stats;
 mod stream;
 mod xrpc;
 
-pub async fn serve(state: Arc<AppState>, port: u16) -> miette::Result<()> {
+pub async fn serve(hydrant: Hydrant, port: u16) -> miette::Result<()> {
     let app = Router::new()
         .route("/health", get(|| async { "OK" }))
         .route("/stats", get(stats::get_stats))
@@ -23,7 +24,7 @@ pub async fn serve(state: Arc<AppState>, port: u16) -> miette::Result<()> {
         .merge(repos::router())
         .merge(ingestion::router())
         .merge(db::router())
-        .with_state(state)
+        .with_state(hydrant)
         .layer(TraceLayer::new_for_http())
         .layer(CorsLayer::permissive());
 

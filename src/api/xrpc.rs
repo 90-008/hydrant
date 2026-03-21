@@ -1,6 +1,7 @@
-use crate::api::AppState;
+use crate::control::Hydrant;
 use crate::db::types::DbRkey;
 use crate::db::{self, Db, keys};
+use crate::state::AppState;
 use axum::extract::FromRequest;
 use axum::response::IntoResponse;
 use axum::{Json, Router, extract::State, http::StatusCode};
@@ -27,7 +28,7 @@ use smol_str::ToSmolStr;
 use std::{fmt::Display, sync::Arc};
 use tokio::task::spawn_blocking;
 
-pub fn router() -> Router<Arc<AppState>> {
+pub fn router() -> Router<Hydrant> {
     Router::new()
         .route(
             GetRecordRequest::PATH,

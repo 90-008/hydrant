@@ -73,13 +73,10 @@ pub struct Config {
     pub ephemeral_ttl: Duration,
     pub cursor_save_interval: Duration,
     pub repo_fetch_timeout: Duration,
-    pub api_port: u16,
     pub cache_size: u64,
     pub backfill_concurrency_limit: usize,
     pub data_compression: Compression,
     pub journal_compression: Compression,
-    pub debug_port: u16,
-    pub enable_debug: bool,
     pub verify_signatures: SignatureVerification,
     pub identity_cache_size: u64,
     pub enable_firehose: bool,
@@ -167,10 +164,6 @@ impl Config {
         let data_compression = cfg!("DATA_COMPRESSION", Compression::Lz4);
         let journal_compression = cfg!("JOURNAL_COMPRESSION", Compression::Lz4);
 
-        let api_port = cfg!("API_PORT", 3000u16);
-        let enable_debug = cfg!("ENABLE_DEBUG", false);
-        let debug_port: u16 = api_port + 1;
-        let debug_port = cfg!("DEBUG_PORT", debug_port);
         let verify_signatures = cfg!("VERIFY_SIGNATURES", SignatureVerification::Full);
         let identity_cache_size = cfg!("IDENTITY_CACHE_SIZE", 1_000_000u64);
         let enable_firehose = cfg!("ENABLE_FIREHOSE", true);
@@ -245,13 +238,10 @@ impl Config {
             full_network,
             cursor_save_interval,
             repo_fetch_timeout,
-            api_port,
             cache_size,
             backfill_concurrency_limit,
             data_compression,
             journal_compression,
-            debug_port,
-            enable_debug,
             verify_signatures,
             identity_cache_size,
             enable_firehose,
@@ -269,6 +259,34 @@ impl Config {
             filter_collections,
             filter_excludes,
         })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct AppConfig {
+    pub api_port: u16,
+    pub enable_debug: bool,
+    pub debug_port: u16,
+}
+
+impl AppConfig {
+    pub fn from_env() -> Self {
+        macro_rules! cfg {
+            ($key:expr, $default:expr) => {
+                std::env::var(concat!("HYDRANT_", $key))
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or($default)
+            };
+        }
+        let api_port = cfg!("API_PORT", 3000u16);
+        let enable_debug = cfg!("ENABLE_DEBUG", false);
+        let debug_port = cfg!("DEBUG_PORT", api_port + 1);
+        Self {
+            api_port,
+            enable_debug,
+            debug_port,
+        }
     }
 }
 
@@ -304,7 +322,6 @@ impl fmt::Display for Config {
         config_line!(f, "cache size", format_args!("{} mb", self.cache_size))?;
         config_line!(f, "data compression", self.data_compression)?;
         config_line!(f, "journal compression", self.journal_compression)?;
-        config_line!(f, "api port", self.api_port)?;
         config_line!(f, "firehose workers", self.firehose_workers)?;
         config_line!(f, "db worker threads", self.db_worker_threads)?;
         config_line!(
@@ -346,10 +363,6 @@ impl fmt::Display for Config {
         }
         if let Some(excludes) = &self.filter_excludes {
             config_line!(f, "filter excludes", format_args!("{:?}", excludes))?;
-        }
-        config_line!(f, "enable debug", self.enable_debug)?;
-        if self.enable_debug {
-            config_line!(f, "debug port", self.debug_port)?;
         }
         Ok(())
     }

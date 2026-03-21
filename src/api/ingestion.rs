@@ -1,6 +1,4 @@
-use std::sync::Arc;
-
-use crate::state::AppState;
+use crate::control::Hydrant;
 use axum::{
     Json, Router,
     extract::State,
@@ -9,7 +7,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
-pub fn router() -> Router<Arc<AppState>> {
+pub fn router() -> Router<Hydrant> {
     Router::new()
         .route("/ingestion", get(get_ingestion))
         .route("/ingestion", patch(patch_ingestion))
@@ -22,11 +20,11 @@ pub struct IngestionStatus {
     pub backfill: bool,
 }
 
-pub async fn get_ingestion(State(state): State<Arc<AppState>>) -> Json<IngestionStatus> {
+pub async fn get_ingestion(State(hydrant): State<Hydrant>) -> Json<IngestionStatus> {
     Json(IngestionStatus {
-        crawler: *state.crawler_enabled.borrow(),
-        firehose: *state.firehose_enabled.borrow(),
-        backfill: *state.backfill_enabled.borrow(),
+        crawler: hydrant.crawler.is_enabled(),
+        firehose: hydrant.firehose.is_enabled(),
+        backfill: hydrant.backfill.is_enabled(),
     })
 }
 
@@ -41,17 +39,29 @@ pub struct IngestionPatch {
 }
 
 pub async fn patch_ingestion(
-    State(state): State<Arc<AppState>>,
+    State(hydrant): State<Hydrant>,
     Json(body): Json<IngestionPatch>,
 ) -> StatusCode {
     if let Some(crawler) = body.crawler {
-        state.crawler_enabled.send_replace(crawler);
+        if crawler {
+            hydrant.crawler.enable();
+        } else {
+            hydrant.crawler.disable();
+        }
     }
     if let Some(firehose) = body.firehose {
-        state.firehose_enabled.send_replace(firehose);
+        if firehose {
+            hydrant.firehose.enable();
+        } else {
+            hydrant.firehose.disable();
+        }
     }
     if let Some(backfill) = body.backfill {
-        state.backfill_enabled.send_replace(backfill);
+        if backfill {
+            hydrant.backfill.enable();
+        } else {
+            hydrant.backfill.disable();
+        }
     }
     StatusCode::OK
 }
