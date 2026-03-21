@@ -1,4 +1,4 @@
-use std::fmt::Display;
+use std::fmt::{Debug, Display};
 
 use jacquard_common::types::cid::IpldCid;
 use jacquard_common::types::string::Did;
@@ -218,6 +218,38 @@ pub struct AccountEvt<'i> {
     pub status: Option<CowStr<'i>>,
 }
 
+use jacquard_common::bytes::Bytes;
+
+#[derive(Serialize, Deserialize, Clone)]
+pub enum StoredData {
+    Nothing,
+    Ptr(IpldCid),
+    #[serde(with = "serde_bytes_squared")]
+    Block(Bytes),
+}
+
+impl StoredData {
+    pub fn is_nothing(&self) -> bool {
+        matches!(self, StoredData::Nothing)
+    }
+}
+
+impl Default for StoredData {
+    fn default() -> Self {
+        Self::Nothing
+    }
+}
+
+impl Debug for StoredData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Nothing => f.write_str("nothing"),
+            Self::Block(_) => f.write_str("<block>"),
+            Self::Ptr(cid) => write!(f, "{cid}"),
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(bound(deserialize = "'i: 'de"))]
 pub struct StoredEvent<'i> {
@@ -231,8 +263,21 @@ pub struct StoredEvent<'i> {
     pub rkey: DbRkey,
     pub action: DbAction,
     #[serde(default)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cid: Option<IpldCid>,
+    #[serde(skip_serializing_if = "StoredData::is_nothing")]
+    pub data: StoredData,
+}
+
+mod serde_bytes_squared {
+    use jacquard_common::bytes::Bytes;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(v: impl AsRef<[u8]>, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_bytes(serde_bytes::Bytes::new(v.as_ref()))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Bytes, D::Error> {
+        serde_bytes::ByteBuf::deserialize(d).map(|b| b.into_vec().into())
+    }
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]

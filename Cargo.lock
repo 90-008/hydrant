@@ -1516,6 +1516,7 @@ dependencies = [
  "serde_ipld_dagcbor",
  "serde_json",
  "serde_urlencoded",
+ "sha2",
  "smol_str",
  "tempfile",
  "thiserror 2.0.18",

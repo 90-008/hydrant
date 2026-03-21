@@ -1,6 +1,6 @@
 use crate::api::AppState;
 use crate::db::keys;
-use crate::types::{BroadcastEvent, MarshallableEvt, RecordEvt, StoredEvent};
+use crate::types::{BroadcastEvent, MarshallableEvt, RecordEvt, StoredData, StoredEvent};
 use axum::Router;
 use axum::routing::get;
 use axum::{
@@ -10,12 +10,16 @@ use axum::{
     },
     response::IntoResponse,
 };
+use cid::multihash::Multihash;
+use jacquard_common::types::cid::{ATP_CID_HASH, IpldCid};
 use jacquard_common::{CowStr, RawData};
+use jacquard_repo::DAG_CBOR_CID_CODEC;
 use miette::{Context, IntoDiagnostic};
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc, oneshot};
-use tracing::{error, info_span, warn};
+use tracing::{error, info_span};
 
 pub fn router() -> Router<Arc<AppState>> {
     Router::new().route("/", get(handle_stream))
@@ -121,7 +125,7 @@ fn stream(
                     collection,
                     rkey,
                     action,
-                    cid,
+                    data,
                 } = match rmp_serde::from_slice(&v) {
                     Ok(e) => e,
                     Err(e) => {
@@ -130,58 +134,76 @@ fn stream(
                     }
                 };
 
-                let _entered = info_span!("record", cid = ?cid.map(|c| c.to_string())).entered();
+                let _entered = info_span!("record", data = ?data).entered();
 
-                let marshallable = {
-                    let mut record_val = None;
-                    let block_bytes = cid
-                        .map(|cid| {
-                            db.blocks
-                                .get(&keys::block_key(collection.as_str(), &cid.to_bytes()))
-                        })
-                        .transpose();
-                    match block_bytes {
-                        Ok(Some(Some(block_bytes))) => {
-                            match serde_ipld_dagcbor::from_slice::<RawData>(&block_bytes) {
-                                Ok(val) => record_val = serde_json::to_value(val).ok(),
-                                Err(e) => {
-                                    error!(err = %e, "cant parse block, must be corrupted?");
-                                    return;
+                let record = match data {
+                    StoredData::Ptr(cid) => {
+                        let block = db
+                            .blocks
+                            .get(&keys::block_key(collection.as_str(), &cid.to_bytes()));
+                        match block {
+                            Ok(Some(bytes)) => {
+                                match serde_ipld_dagcbor::from_slice::<RawData>(&bytes) {
+                                    Ok(val) => Some((
+                                        cid,
+                                        serde_json::to_value(val)
+                                            .expect("that cbor raw data is valid json"),
+                                    )),
+                                    Err(e) => {
+                                        error!(err = %e, "cant parse block, must be corrupted?");
+                                        return;
+                                    }
                                 }
                             }
-                        }
-                        Ok(Some(None)) => {
-                            warn!(
-                                "block not found, possibly repo deleted but events not evicted yet?"
-                            );
-                            continue;
-                        }
-                        Ok(None) => {
-                            // cid not found, its ok, delete event
-                        }
-                        Err(e) => {
-                            error!(err = %e, "can't get block");
-                            crate::db::check_poisoned(&e);
-                            return;
+                            Ok(None) => {
+                                error!("block not found? this is a bug!!");
+                                continue;
+                            }
+                            Err(e) => {
+                                error!(err = %e, "can't get block");
+                                crate::db::check_poisoned(&e);
+                                return;
+                            }
                         }
                     }
+                    StoredData::Block(block) => {
+                        let digest = Sha256::digest(&block);
+                        let hash =
+                            Multihash::wrap(ATP_CID_HASH, &digest).expect("that its valid sha256");
+                        let cid = IpldCid::new_v1(DAG_CBOR_CID_CODEC, hash);
+                        match serde_ipld_dagcbor::from_slice::<RawData>(&block) {
+                            Ok(val) => Some((
+                                cid,
+                                serde_json::to_value(val)
+                                    .expect("that cbor raw data is valid json"),
+                            )),
+                            Err(e) => {
+                                error!(err = %e, "cant parse block, must be corrupted?");
+                                return;
+                            }
+                        }
+                    }
+                    StoredData::Nothing => None,
+                };
 
-                    MarshallableEvt {
-                        id,
-                        event_type: "record".into(),
-                        record: Some(RecordEvt {
-                            live,
-                            did: did.to_did(),
-                            rev: CowStr::Owned(rev.to_tid().into()),
-                            collection,
-                            rkey: CowStr::Owned(rkey.to_smolstr().into()),
-                            action: CowStr::Borrowed(action.as_str()),
-                            record: record_val,
-                            cid: cid.map(|c| jacquard_common::types::cid::Cid::ipld(c).into()),
-                        }),
-                        identity: None,
-                        account: None,
-                    }
+                let (cid, record) = record
+                    .map(|(c, r)| (Some(c), Some(r)))
+                    .unwrap_or((None, None));
+                let marshallable = MarshallableEvt {
+                    id,
+                    event_type: "record".into(),
+                    record: Some(RecordEvt {
+                        live,
+                        did: did.to_did(),
+                        rev: CowStr::Owned(rev.to_tid().into()),
+                        collection,
+                        rkey: CowStr::Owned(rkey.to_smolstr().into()),
+                        action: CowStr::Borrowed(action.as_str()),
+                        record,
+                        cid: cid.map(|c| jacquard_common::types::cid::Cid::ipld(c).into()),
+                    }),
+                    identity: None,
+                    account: None,
                 };
 
                 let json_str = match serde_json::to_string(&marshallable) {

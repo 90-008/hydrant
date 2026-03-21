@@ -6,7 +6,7 @@ use crate::resolver::ResolverError;
 use crate::state::AppState;
 use crate::types::{
     AccountEvt, BroadcastEvent, GaugeState, RepoState, RepoStatus, ResyncErrorKind, ResyncState,
-    StoredEvent,
+    StoredData, StoredEvent,
 };
 
 use fjall::Slice;
@@ -624,13 +624,9 @@ async fn process_did<'i>(
 
                     let cid_raw = cid.to_bytes();
                     let block_key = Slice::from(keys::block_key(collection, &cid_raw));
-                    batch.insert(&app_state.db.blocks, block_key.clone(), val.as_ref());
                     if !ephemeral {
+                        batch.insert(&app_state.db.blocks, block_key.clone(), val.as_ref());
                         batch.insert(&app_state.db.records, db_key, cid_raw);
-                    } else {
-                        // ephemeral: track refcount for this event's CID
-                        let mut entry = app_state.db.block_refcounts.entry_sync(block_key).or_insert(0);
-                        *entry += 1;
                     }
 
                     added_blocks += 1;
@@ -647,11 +643,10 @@ async fn process_did<'i>(
                         collection: CowStr::Borrowed(collection),
                         rkey,
                         action,
-                        cid: Some(cid_obj.to_ipld().expect("valid cid")),
+                        data: ephemeral.then_some(StoredData::Block(val)).unwrap_or_else(|| StoredData::Ptr(cid_obj.to_ipld().expect("valid cid"))),
                     };
                     let bytes = rmp_serde::to_vec(&evt).into_diagnostic()?;
                     batch.insert(&app_state.db.events, keys::event_key(event_id), bytes);
-
 
                     count += 1;
                 }
@@ -668,7 +663,6 @@ async fn process_did<'i>(
                     keys::record_key(&did, &collection, &rkey),
                 );
 
-
                 let event_id = app_state.db.next_event_id.fetch_add(1, Ordering::SeqCst);
                 let evt = StoredEvent {
                     live: false,
@@ -677,7 +671,7 @@ async fn process_did<'i>(
                     collection: CowStr::Borrowed(&collection),
                     rkey,
                     action: DbAction::Delete,
-                    cid: None,
+                    data: StoredData::Nothing,
                 };
                 let bytes = rmp_serde::to_vec(&evt).into_diagnostic()?;
                 batch.insert(&app_state.db.events, keys::event_key(event_id), bytes);

@@ -70,6 +70,7 @@ pub struct Config {
     pub plc_urls: Vec<Url>,
     pub full_network: bool,
     pub ephemeral: bool,
+    pub ephemeral_ttl: Duration,
     pub cursor_save_interval: Duration,
     pub repo_fetch_timeout: Duration,
     pub api_port: u16,
@@ -160,6 +161,7 @@ impl Config {
         let repo_fetch_timeout = cfg!("REPO_FETCH_TIMEOUT", 300, sec);
 
         let ephemeral: bool = cfg!("EPHEMERAL", false);
+        let ephemeral_ttl = cfg!("EPHEMERAL_TTL", 60 * 60, sec);
         let database_path = cfg!("DATABASE_PATH", "./hydrant.db");
         let cache_size = cfg!("CACHE_SIZE", 256u64);
         let data_compression = cfg!("DATA_COMPRESSION", Compression::Lz4);
@@ -239,6 +241,7 @@ impl Config {
             relays: relay_hosts,
             plc_urls,
             ephemeral,
+            ephemeral_ttl,
             full_network,
             cursor_save_interval,
             repo_fetch_timeout,

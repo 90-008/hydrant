@@ -46,7 +46,8 @@ todo: decide what to do on relay-side account takedowns or if relays set the `ti
 | `RELAY_HOST` | `wss://relay.fire.hose.cam/` | URL of the relay. |
 | `RELAY_HOSTS` | | comma-separated list of relay URLs. if unset, falls back to `RELAY_HOST`. |
 | `PLC_URL` | `https://plc.wtf`, `https://plc.directory` if full network | base URL(s) of the PLC directory (comma-separated for multiple). |
-| `EPHEMERAL` | `false` | if enabled, no records are stored. events are only stored up to 10 minutes for playback. |
+| `EPHEMERAL` | `false` | if enabled, no records are stored. events are deleted after a certain duration (`EPHEMERAL_TTL`). |
+| `EPHEMERAL_TTL` | `60min` | decides after how long events should be deleted. |
 | `FULL_NETWORK` | `false` | if `true`, discovers and indexes all repositories in the network. |
 | `FILTER_SIGNALS` | | comma-separated list of NSID patterns to use for the filter (e.g. `app.bsky.feed.post,app.bsky.graph.*`). |
 | `FILTER_COLLECTIONS` | | comma-separated list of NSID patterns to use for the collections filter. |
@@ -54,8 +55,8 @@ todo: decide what to do on relay-side account takedowns or if relays set the `ti
 | `FIREHOSE_WORKERS` | `8` (`24` if full network) | number of concurrent workers for firehose events. |
 | `BACKFILL_CONCURRENCY_LIMIT` | `16` (`64` if full network) | maximum number of concurrent backfill tasks. |
 | `VERIFY_SIGNATURES` | `full` | signature verification level: `full`, `backfill-only`, or `none`. |
-| `CURSOR_SAVE_INTERVAL` | `3` | interval (in seconds) to save the firehose cursor. |
-| `REPO_FETCH_TIMEOUT` | `300` | timeout (in seconds) for fetching repositories. |
+| `CURSOR_SAVE_INTERVAL` | `3sec` | interval (in seconds) to save the firehose cursor. |
+| `REPO_FETCH_TIMEOUT` | `5min` | timeout (in seconds) for fetching repositories. |
 | `CACHE_SIZE` | `256` | size of the database cache in MB. |
 | `IDENTITY_CACHE_SIZE` | `100000` | number of identity entries to cache. |
 | `API_PORT` | `3000` | port for the API server. |

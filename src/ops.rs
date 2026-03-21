@@ -18,6 +18,7 @@ use crate::db::types::{DbAction, DbRkey, DbTid, TrimmedDid};
 use crate::db::{self, Db, keys, ser_repo_state};
 use crate::filter::FilterConfig;
 use crate::ingest::stream::Commit;
+use crate::types::StoredData;
 use crate::types::{
     AccountEvt, BroadcastEvent, IdentityEvt, MarshallableEvt, RepoState, RepoStatus, ResyncState,
     StoredEvent,
@@ -282,7 +283,7 @@ pub fn apply_commit<'commit, 's>(
         let event_id = db.next_event_id.fetch_add(1, Ordering::SeqCst);
 
         let action = DbAction::try_from(op.action.as_str())?;
-        match action {
+        let block = match action {
             DbAction::Create | DbAction::Update => {
                 let Some(cid) = &op.cid else {
                     continue;
@@ -299,24 +300,21 @@ pub fn apply_commit<'commit, 's>(
                 };
                 let cid_raw = cid_ipld.to_bytes();
                 let block_key = Slice::from(keys::block_key(collection, &cid_raw));
-                batch.insert(&db.blocks, block_key.clone(), bytes.to_vec());
-                blocks_count += 1;
 
+                blocks_count += 1;
                 if !ephemeral {
+                    batch.insert(&db.blocks, block_key.clone(), bytes.as_ref());
                     batch.insert(&db.records, db_key.clone(), cid_raw);
                     // accumulate counts
                     if action == DbAction::Create {
                         records_delta += 1;
                         *collection_deltas.entry(collection).or_default() += 1;
                     }
+                    None
                 } else if action == DbAction::Create || action == DbAction::Update {
-                    // ephemeral: track refcount for this event's CID so the TTL worker can
-                    // delete the block when the last referencing event expires
-                    let mut entry = db
-                        .block_refcounts
-                        .entry_sync(block_key.clone())
-                        .or_insert(0);
-                    *entry += 1;
+                    Some(bytes.clone())
+                } else {
+                    unreachable!("we tested if we are in create or update action")
                 }
             }
             DbAction::Delete => {
@@ -327,8 +325,10 @@ pub fn apply_commit<'commit, 's>(
                     records_delta -= 1;
                     *collection_deltas.entry(collection).or_default() -= 1;
                 }
+
+                None
             }
-        }
+        };
 
         let evt = StoredEvent {
             live: true,
@@ -337,7 +337,15 @@ pub fn apply_commit<'commit, 's>(
             collection: CowStr::Borrowed(collection),
             rkey,
             action,
-            cid: op.cid.as_ref().map(|c| c.to_ipld().expect("valid cid")),
+            data: block
+                .map(StoredData::Block)
+                .or_else(|| {
+                    op.cid
+                        .as_ref()
+                        .map(|c| c.to_ipld().expect("valid cid"))
+                        .map(StoredData::Ptr)
+                })
+                .unwrap_or(StoredData::Nothing),
         };
 
         let bytes = rmp_serde::to_vec(&evt).into_diagnostic()?;

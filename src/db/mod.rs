@@ -48,8 +48,6 @@ pub struct Db {
     pub counts: Keyspace,
     pub filter: Keyspace,
     pub crawler: Keyspace,
-    // only meaningful in ephemeral mode; empty and unused in non-ephemeral
-    pub block_refcounts: scc::HashMap<Slice, u32>,
     pub event_tx: broadcast::Sender<BroadcastEvent>,
     pub next_event_id: Arc<AtomicU64>,
     pub counts_map: HashMap<SmolStr, u64>,
@@ -226,6 +224,7 @@ impl Db {
                 .data_block_compression_policy(CompressionPolicy::disabled())
                 .data_block_restart_interval_policy(RestartIntervalPolicy::all(4)),
         )?;
+        // this is used in non-ephemeral mode
         let blocks = open_ks(
             "blocks",
             opts()
@@ -296,14 +295,29 @@ impl Db {
                 // eg. by many different repos and different records etc.
                 // since its sequential we should still go with bigger block size though
                 // backfills will be sequential though...
-                .data_block_size_policy(BlockSizePolicy::new([kb(16), kb(64)]))
+                .data_block_size_policy(
+                    cfg.ephemeral
+                        .then(|| BlockSizePolicy::new([kb(64), kb(128), kb(256)]))
+                        .unwrap_or_else(|| BlockSizePolicy::new([kb(16), kb(64)])),
+                )
                 // we are streaming the new events to consumers so we dont want to compress them
-                .data_block_compression_policy(CompressionPolicy::new([
-                    CompressionType::None,
-                    get_compression("events", 3),
-                    get_compression("events", 3),
-                    get_compression("events", 5),
-                ]))
+                .data_block_compression_policy(
+                    cfg.ephemeral
+                        .then(|| {
+                            CompressionPolicy::new([
+                                CompressionType::None,
+                                get_compression("events", 3),
+                            ])
+                        })
+                        .unwrap_or_else(|| {
+                            CompressionPolicy::new([
+                                CompressionType::None,
+                                get_compression("events", 3),
+                                get_compression("events", 3),
+                                get_compression("events", 5),
+                            ])
+                        }),
+                )
                 // ids are int, we can prefix truncate a lot
                 .data_block_restart_interval_policy(RestartIntervalPolicy::new([64, 128])),
         )?;
@@ -400,7 +414,6 @@ impl Db {
             counts,
             filter,
             crawler,
-            block_refcounts: scc::HashMap::default(),
             event_tx,
             counts_map,
             next_event_id: Arc::new(AtomicU64::new(last_id + 1)),

@@ -302,10 +302,12 @@ pub async fn handle_debug_compact(
 pub async fn handle_debug_ephemeral_ttl_tick(
     State(state): State<Arc<AppState>>,
 ) -> Result<StatusCode, StatusCode> {
-    tokio::task::spawn_blocking(move || crate::db::ephemeral::ephemeral_ttl_tick(&state.db))
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    tokio::task::spawn_blocking(move || {
+        crate::db::ephemeral::ephemeral_ttl_tick(&state.db, &state.ephemeral_ttl)
+    })
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     Ok(StatusCode::OK)
 }

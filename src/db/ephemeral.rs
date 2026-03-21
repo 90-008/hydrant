@@ -1,57 +1,23 @@
-//! ephemeral mode block lifecycle: in-memory refcounting and TTL-based event expiry.
-//!
-//! ## model
-//!
-//! every event that references a block CID holds one refcount entry. the TTL worker
-//! decrements the count when the event expires. when the count hits zero the block is
-//! deleted inline in the same batch as the event deletion.
-//!
-//! ## correctness
-//!
-//! - refcounts are rebuilt from `db.events` on startup before the server accepts requests.
-//! - shared CIDs are handled correctly: two events referencing the same block each
-//!   increment the counter; the block is deleted only when the second one expires.
-
 use crate::db::{Db, keys};
-use crate::types::StoredEvent;
-use fjall::Slice;
 use miette::{IntoDiagnostic, WrapErr};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
-use tracing::{debug, error, info, trace};
-
-pub const EVENT_TTL_SECS: u64 = 60 * 10;
-
-/// rebuilds `db.block_refcounts` by scanning all stored events.
-/// must be called on startup in ephemeral mode before accepting requests.
-pub fn ephemeral_startup_load_refcounts(db: &Db) -> miette::Result<()> {
-    info!("rebuilding block refcounts from events (ephemeral mode)");
-    for guard in db.events.iter() {
-        let v = guard.value().into_diagnostic()?;
-        let evt = rmp_serde::from_slice::<StoredEvent>(&v).into_diagnostic()?;
-        let Some(cid) = evt.cid else { continue };
-        let block_key = Slice::from(keys::block_key(evt.collection.as_str(), &cid.to_bytes()));
-        let mut entry = db.block_refcounts.entry_sync(block_key).or_insert(0);
-        *entry += 1;
-    }
-    trace!("ephemeral block refcounts ready");
-    Ok(())
-}
+use tracing::{debug, error, info};
 
 pub fn ephemeral_ttl_worker(state: Arc<crate::state::AppState>) {
     info!("ephemeral TTL worker started");
     loop {
         std::thread::sleep(Duration::from_secs(60));
-        if let Err(e) = ephemeral_ttl_tick(&state.db) {
+        if let Err(e) = ephemeral_ttl_tick(&state.db, &state.ephemeral_ttl) {
             error!(err = %e, "ephemeral TTL tick failed");
         }
     }
 }
 
-pub fn ephemeral_ttl_tick(db: &Db) -> miette::Result<()> {
+pub fn ephemeral_ttl_tick(db: &Db, ttl: &Duration) -> miette::Result<()> {
     let now = chrono::Utc::now().timestamp() as u64;
-    let cutoff_ts = now.saturating_sub(EVENT_TTL_SECS);
+    let cutoff_ts = now.saturating_sub(ttl.as_secs());
 
     // write current watermark
     let current_event_id = db.next_event_id.load(Ordering::SeqCst);
@@ -90,29 +56,7 @@ pub fn ephemeral_ttl_tick(db: &Db) -> miette::Result<()> {
     let mut pruned = 0usize;
 
     for guard in db.events.range(..cutoff_key_events) {
-        let (k, v) = guard.into_inner().into_diagnostic()?;
-        let evt = rmp_serde::from_slice::<StoredEvent>(&v).into_diagnostic()?;
-
-        if let Some(cid) = evt.cid {
-            let block_key = Slice::from(keys::block_key(evt.collection.as_str(), &cid.to_bytes()));
-
-            let remove_block = {
-                let count = db
-                    .block_refcounts
-                    .entry_sync(block_key.clone())
-                    .and_modify(|c| {
-                        *c = c.saturating_sub(1);
-                    })
-                    .or_default();
-                *count == 0
-            };
-
-            if remove_block {
-                db.block_refcounts.remove_sync(&block_key);
-                batch.remove(&db.blocks, block_key);
-            }
-        }
-
+        let k = guard.key().into_diagnostic()?;
         batch.remove(&db.events, k);
         pruned += 1;
     }

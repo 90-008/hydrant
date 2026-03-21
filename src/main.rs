@@ -79,12 +79,10 @@ async fn main() -> miette::Result<()> {
     let state = Arc::new(state);
 
     if cfg.ephemeral {
-        db::ephemeral::ephemeral_startup_load_refcounts(&state.db)?;
-
-        let state_ttl = state.clone();
+        let state = state.clone();
         std::thread::Builder::new()
-            .name("ephemeral-ttl".into())
-            .spawn(move || db::ephemeral::ephemeral_ttl_worker(state_ttl))
+            .name("ephemeral-gc".into())
+            .spawn(move || db::ephemeral::ephemeral_ttl_worker(state))
             .into_diagnostic()?;
     }
 

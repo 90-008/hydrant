@@ -13,7 +13,7 @@ def run-ephemeral-instance [name: string, scenario_closure: closure] {
     print $"database path: ($db_path)"
 
     let binary = build-hydrant
-    let instance = (with-env { HYDRANT_EPHEMERAL: "true" } {
+    let instance = (with-env { HYDRANT_EPHEMERAL: "true", HYDRANT_EPHEMERAL_TTL: "60min" } {
         start-hydrant $binary $db_path $port
     })
 
@@ -36,18 +36,6 @@ def run-ephemeral-instance [name: string, scenario_closure: closure] {
     sleep 2sec
 }
 
-def check-block-count [debug_url: string, expected: int] {
-    let response = (http get -f -e $"($debug_url)/debug/iter?partition=blocks&limit=1000000")
-    if $response.status != 200 {
-        error make {msg: $"FAILED: debug/iter returned ($response.status)"}
-    }
-    let count = ($response.body.items | length)
-    if $count != $expected {
-        error make {msg: $"FAILED: expected ($expected) blocks, found ($count)"}
-    }
-    print $"block count verified: ($count)"
-}
-
 def trigger-ttl-tick [debug_url: string] {
     print "triggering ephemeral TTL tick..."
     let response = (http post -f -e -H [Content-Length 0] $"($debug_url)/debug/ephemeral_ttl_tick" "")
@@ -55,27 +43,6 @@ def trigger-ttl-tick [debug_url: string] {
         error make {msg: $"FAILED: ephemeral_ttl_tick returned ($response.status)"}
     }
     print "TTL tick complete"
-}
-
-# in ephemeral mode, records are never written to the records keyspace, so
-# common.nu's wait-for-backfill (which checks records > 0) hangs forever.
-# poll pending == 0 and blocks > 0 instead.
-def wait-for-ephemeral-backfill [url: string, debug_url: string] {
-    print "waiting for ephemeral backfill to complete..."
-    for i in 1..120 {
-        let stats = (http get $"($url)/stats?accurate=true").counts
-        let pending = ($stats.pending | into int)
-        let blocks = ((http get -f -e $"($debug_url)/debug/iter?partition=blocks&limit=1").body.items | length)
-
-        print $"[($i)/120] pending: ($pending), has_blocks: ($blocks > 0)"
-
-        if ($pending == 0) and ($blocks > 0) {
-            print "ephemeral backfill complete."
-            return true
-        }
-        sleep 1sec
-    }
-    false
 }
 
 def main [] {
@@ -86,14 +53,12 @@ def main [] {
         print $"adding repo ($repo1)..."
         http put -t application/json $"($url)/repos" [{ did: ($repo1) }]
 
-        if not (wait-for-ephemeral-backfill $url $debug_url) {
+        if not (wait-for-backfill $url) {
             error make {msg: "backfill did not complete"}
         }
 
         let event_count = ((http get -f -e $"($debug_url)/debug/iter?partition=events&limit=1000").body.items | length)
         print $"found ($event_count) events after backfill"
-
-        let before_blocks = ((http get -f -e $"($debug_url)/debug/iter?partition=blocks&limit=1000000").body.items | length)
 
         # immediately trigger TTL tick, watermarks are too recent, nothing should be pruned
         trigger-ttl-tick $debug_url
@@ -103,10 +68,6 @@ def main [] {
             error make {msg: $"FAILED: expected ($event_count) events after TTL tick, got ($after_events)"}
         }
         print "event count unchanged after TTL tick (no events eligible)"
-
-        # blocks must also be unchanged
-        check-block-count $debug_url $before_blocks
-        print "block count unchanged after TTL tick (correct)"
     }
 
     # plant a past watermark, trigger the real TTL path, and verify all events and blocks are gone
@@ -114,7 +75,7 @@ def main [] {
         print $"adding repo ($repo1)..."
         http put -t application/json $"($url)/repos" [{ did: ($repo1) }]
 
-        if not (wait-for-ephemeral-backfill $url $debug_url) {
+        if not (wait-for-backfill $url) {
             error make {msg: "backfill did not complete"}
         }
 
@@ -124,12 +85,6 @@ def main [] {
             error make {msg: "FAILED: expected events after backfill, found none"}
         }
         print $"found ($event_count) events after backfill"
-
-        let block_count = ((http get -f -e $"($debug_url)/debug/iter?partition=blocks&limit=1000000").body.items | length)
-        if $block_count == 0 {
-            error make {msg: "FAILED: expected blocks after backfill, found none"}
-        }
-        print $"found ($block_count) blocks after backfill"
 
         # get the highest event id so we can set the cutoff just above it
         let max_event_id = ($events | each { |item| ($item | first | into int) } | math max)
@@ -154,10 +109,6 @@ def main [] {
             error make {msg: $"FAILED: expected 0 events after TTL expiry, got ($remaining_events)"}
         }
         print "all events pruned"
-
-        # all blocks should be deleted (refcounts all hit zero)
-        check-block-count $debug_url 0
-        print "all blocks deleted"
     }
 
     print "all ephemeral gc tests passed!"

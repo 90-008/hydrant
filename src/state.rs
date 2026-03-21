@@ -1,5 +1,5 @@
-use std::collections::HashMap;
 use std::sync::atomic::AtomicI64;
+use std::{collections::HashMap, time::Duration};
 
 use miette::Result;
 use tokio::sync::{Notify, watch};
@@ -18,12 +18,10 @@ pub struct AppState {
     pub filter: FilterHandle,
     pub relay_cursors: HashMap<Url, AtomicI64>,
     pub backfill_notify: Notify,
-    /// Controls whether the crawler is running. Receivers are held by crawler tasks.
     pub crawler_enabled: watch::Sender<bool>,
-    /// Controls whether firehose ingestion is running. Receivers are held by ingestor tasks.
     pub firehose_enabled: watch::Sender<bool>,
-    /// Controls whether the backfill worker picks up new tasks. Receiver is held by the backfill worker.
     pub backfill_enabled: watch::Sender<bool>,
+    pub ephemeral_ttl: Duration,
 }
 
 impl AppState {
@@ -59,6 +57,7 @@ impl AppState {
             crawler_enabled,
             firehose_enabled,
             backfill_enabled,
+            ephemeral_ttl: config.ephemeral_ttl.clone(),
         })
     }
 
