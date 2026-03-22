@@ -170,7 +170,71 @@ pub struct Config {
     pub crawler_sources: Vec<CrawlerSource>,
 }
 
+impl Default for Config {
+    fn default() -> Self {
+        const BASE_MEMTABLE_MB: u64 = 32;
+        Self {
+            database_path: PathBuf::from("./hydrant.db"),
+            relays: vec![Url::parse("wss://relay.fire.hose.cam/").unwrap()],
+            plc_urls: vec![Url::parse("https://plc.wtf").unwrap()],
+            full_network: false,
+            ephemeral: false,
+            ephemeral_ttl: Duration::from_secs(3600),
+            cursor_save_interval: Duration::from_secs(3),
+            repo_fetch_timeout: Duration::from_secs(300),
+            cache_size: 256,
+            backfill_concurrency_limit: 16,
+            data_compression: Compression::Lz4,
+            journal_compression: Compression::Lz4,
+            verify_signatures: SignatureVerification::Full,
+            identity_cache_size: 1_000_000,
+            enable_firehose: true,
+            enable_crawler: None,
+            firehose_workers: 8,
+            db_worker_threads: 4,
+            db_max_journaling_size_mb: 400,
+            db_blocks_memtable_size_mb: BASE_MEMTABLE_MB,
+            db_repos_memtable_size_mb: BASE_MEMTABLE_MB / 2,
+            db_events_memtable_size_mb: BASE_MEMTABLE_MB,
+            db_records_memtable_size_mb: BASE_MEMTABLE_MB / 3 * 2,
+            crawler_max_pending_repos: 2000,
+            crawler_resume_pending_repos: 1000,
+            filter_signals: None,
+            filter_collections: None,
+            filter_excludes: None,
+            enable_backlinks: false,
+            crawler_sources: vec![CrawlerSource {
+                url: Url::parse("https://lightrail.microcosm.blue").unwrap(),
+                mode: CrawlerMode::ByCollection,
+            }],
+        }
+    }
+}
+
 impl Config {
+    /// returns the default config for full network usage.
+    pub fn full_network() -> Self {
+        const BASE_MEMTABLE_MB: u64 = 192;
+        Self {
+            full_network: true,
+            plc_urls: vec![Url::parse("https://plc.directory").unwrap()],
+            backfill_concurrency_limit: 64,
+            firehose_workers: 24,
+            db_worker_threads: 8,
+            db_max_journaling_size_mb: 1024,
+            db_blocks_memtable_size_mb: BASE_MEMTABLE_MB,
+            db_events_memtable_size_mb: BASE_MEMTABLE_MB,
+            db_repos_memtable_size_mb: BASE_MEMTABLE_MB / 2,
+            db_records_memtable_size_mb: BASE_MEMTABLE_MB / 3 * 2,
+            crawler_sources: vec![CrawlerSource {
+                url: Url::parse("wss://relay.fire.hose.cam/").unwrap(),
+                mode: CrawlerMode::Relay,
+            }],
+            ..Self::default()
+        }
+    }
+
+    /// reads and builds the config from environment variables.
     pub fn from_env() -> Result<Self> {
         macro_rules! cfg {
             (@val $key:expr) => {
@@ -180,7 +244,7 @@ impl Config {
                 cfg!(@val $key)
                     .ok()
                     .and_then(|s| humantime::parse_duration(&s).ok())
-                    .unwrap_or(Duration::from_secs($default))
+                    .unwrap_or($default)
             };
             ($key:expr, $default:expr) => {
                 cfg!(@val $key)
@@ -191,10 +255,13 @@ impl Config {
             };
         }
 
-        let relay_host: Url = cfg!(
-            "RELAY_HOST",
-            Url::parse("wss://relay.fire.hose.cam/").unwrap()
-        );
+        // full_network is read first since it determines which defaults to use.
+        let full_network: bool = cfg!("FULL_NETWORK", false);
+        let defaults = full_network
+            .then(Self::full_network)
+            .unwrap_or_else(Self::default);
+
+        let relay_host: Url = cfg!("RELAY_HOST", defaults.relays[0].clone());
         let relay_hosts = std::env::var("HYDRANT_RELAY_HOSTS")
             .ok()
             .and_then(|hosts| {
@@ -211,8 +278,6 @@ impl Config {
             .then(|| vec![relay_host])
             .unwrap_or(relay_hosts);
 
-        let full_network: bool = cfg!("FULL_NETWORK", false);
-
         let plc_urls: Vec<Url> = std::env::var("HYDRANT_PLC_URL")
             .ok()
             .map(|s| {
@@ -221,67 +286,61 @@ impl Config {
                     .collect::<Result<Vec<_>, _>>()
                     .map_err(|e| miette::miette!("invalid PLC URL: {e}"))
             })
-            .unwrap_or_else(|| {
-                Ok(vec![
-                    full_network
-                        .then_some(Url::parse("https://plc.directory").unwrap())
-                        .unwrap_or(Url::parse("https://plc.wtf").unwrap()),
-                ])
-            })?;
+            .unwrap_or_else(|| Ok(defaults.plc_urls.clone()))?;
 
-        let cursor_save_interval = cfg!("CURSOR_SAVE_INTERVAL", 3, sec);
-        let repo_fetch_timeout = cfg!("REPO_FETCH_TIMEOUT", 300, sec);
+        let cursor_save_interval = cfg!("CURSOR_SAVE_INTERVAL", defaults.cursor_save_interval, sec);
+        let repo_fetch_timeout = cfg!("REPO_FETCH_TIMEOUT", defaults.repo_fetch_timeout, sec);
 
-        let ephemeral: bool = cfg!("EPHEMERAL", false);
-        let ephemeral_ttl = cfg!("EPHEMERAL_TTL", 60 * 60, sec);
-        let database_path = cfg!("DATABASE_PATH", "./hydrant.db");
-        let cache_size = cfg!("CACHE_SIZE", 256u64);
-        let data_compression = cfg!("DATA_COMPRESSION", Compression::Lz4);
-        let journal_compression = cfg!("JOURNAL_COMPRESSION", Compression::Lz4);
+        let ephemeral: bool = cfg!("EPHEMERAL", defaults.ephemeral);
+        let ephemeral_ttl = cfg!("EPHEMERAL_TTL", defaults.ephemeral_ttl, sec);
+        let database_path = cfg!("DATABASE_PATH", defaults.database_path);
+        let cache_size = cfg!("CACHE_SIZE", defaults.cache_size);
+        let data_compression = cfg!("DATA_COMPRESSION", defaults.data_compression);
+        let journal_compression = cfg!("JOURNAL_COMPRESSION", defaults.journal_compression);
 
-        let verify_signatures = cfg!("VERIFY_SIGNATURES", SignatureVerification::Full);
-        let identity_cache_size = cfg!("IDENTITY_CACHE_SIZE", 1_000_000u64);
-        let enable_firehose = cfg!("ENABLE_FIREHOSE", true);
+        let verify_signatures = cfg!("VERIFY_SIGNATURES", defaults.verify_signatures);
+        let identity_cache_size = cfg!("IDENTITY_CACHE_SIZE", defaults.identity_cache_size);
+        let enable_firehose = cfg!("ENABLE_FIREHOSE", defaults.enable_firehose);
         let enable_crawler = std::env::var("HYDRANT_ENABLE_CRAWLER")
             .ok()
             .and_then(|s| s.parse().ok());
 
         let backfill_concurrency_limit = cfg!(
             "BACKFILL_CONCURRENCY_LIMIT",
-            full_network.then_some(64usize).unwrap_or(16usize)
+            defaults.backfill_concurrency_limit
         );
-        let firehose_workers = cfg!(
-            "FIREHOSE_WORKERS",
-            full_network.then_some(24usize).unwrap_or(8usize)
-        );
+        let firehose_workers = cfg!("FIREHOSE_WORKERS", defaults.firehose_workers);
 
-        let (
-            default_db_worker_threads,
-            default_db_max_journaling_size_mb,
-            default_db_memtable_size_mb,
-        ): (usize, u64, u64) = full_network
-            .then_some((8usize, 1024u64, 192u64))
-            .unwrap_or((4usize, 400u64, 32u64));
-
-        let db_worker_threads = cfg!("DB_WORKER_THREADS", default_db_worker_threads);
+        let db_worker_threads = cfg!("DB_WORKER_THREADS", defaults.db_worker_threads);
         let db_max_journaling_size_mb = cfg!(
             "DB_MAX_JOURNALING_SIZE_MB",
-            default_db_max_journaling_size_mb
+            defaults.db_max_journaling_size_mb
         );
-        let db_blocks_memtable_size_mb =
-            cfg!("DB_BLOCKS_MEMTABLE_SIZE_MB", default_db_memtable_size_mb);
-        let db_events_memtable_size_mb =
-            cfg!("DB_EVENTS_MEMTABLE_SIZE_MB", default_db_memtable_size_mb);
+        let db_blocks_memtable_size_mb = cfg!(
+            "DB_BLOCKS_MEMTABLE_SIZE_MB",
+            defaults.db_blocks_memtable_size_mb
+        );
+        let db_events_memtable_size_mb = cfg!(
+            "DB_EVENTS_MEMTABLE_SIZE_MB",
+            defaults.db_events_memtable_size_mb
+        );
         let db_records_memtable_size_mb = cfg!(
             "DB_RECORDS_MEMTABLE_SIZE_MB",
-            // records is did + col + rkey -> CID so its pretty cheap
-            default_db_memtable_size_mb / 3 * 2
+            defaults.db_records_memtable_size_mb
         );
-        let db_repos_memtable_size_mb =
-            cfg!("DB_REPOS_MEMTABLE_SIZE_MB", default_db_memtable_size_mb / 2);
+        let db_repos_memtable_size_mb = cfg!(
+            "DB_REPOS_MEMTABLE_SIZE_MB",
+            defaults.db_repos_memtable_size_mb
+        );
 
-        let crawler_max_pending_repos = cfg!("CRAWLER_MAX_PENDING_REPOS", 2000usize);
-        let crawler_resume_pending_repos = cfg!("CRAWLER_RESUME_PENDING_REPOS", 1000usize);
+        let crawler_max_pending_repos = cfg!(
+            "CRAWLER_MAX_PENDING_REPOS",
+            defaults.crawler_max_pending_repos
+        );
+        let crawler_resume_pending_repos = cfg!(
+            "CRAWLER_RESUME_PENDING_REPOS",
+            defaults.crawler_resume_pending_repos
+        );
 
         let filter_signals = std::env::var("HYDRANT_FILTER_SIGNALS").ok().map(|s| {
             s.split(',')
@@ -304,7 +363,7 @@ impl Config {
                 .collect()
         });
 
-        let enable_backlinks: bool = cfg!("ENABLE_BACKLINKS", false);
+        let enable_backlinks: bool = cfg!("ENABLE_BACKLINKS", defaults.enable_backlinks);
 
         let default_mode = CrawlerMode::default_for(full_network);
         let crawler_sources = match std::env::var("HYDRANT_CRAWLER_URLS") {
@@ -322,10 +381,7 @@ impl Config {
                         mode: CrawlerMode::Relay,
                     })
                     .collect(),
-                CrawlerMode::ByCollection => vec![CrawlerSource {
-                    url: Url::parse("https://lightrail.microcosm.blue").unwrap(),
-                    mode: CrawlerMode::ByCollection,
-                }],
+                CrawlerMode::ByCollection => defaults.crawler_sources.clone(),
             },
         };
 
