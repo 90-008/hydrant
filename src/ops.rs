@@ -2,6 +2,8 @@ use fjall::OwnedWriteBatch;
 use fjall::Slice;
 
 use jacquard_common::CowStr;
+#[cfg(feature = "backlinks")]
+use jacquard_common::Data;
 use jacquard_common::IntoStatic;
 use jacquard_common::types::cid::Cid;
 use jacquard_common::types::crypto::PublicKey;
@@ -117,6 +119,10 @@ pub fn delete_repo(
         let k = guard.key().into_diagnostic()?;
         batch.remove(&db.counts, k);
     }
+
+    // 5. remove backlinks for all records in this repo
+    #[cfg(feature = "backlinks")]
+    crate::backlinks::store::delete_repo(batch, &db.backlinks, did)?;
 
     Ok(())
 }
@@ -310,6 +316,17 @@ pub fn apply_commit<'commit, 's>(
                         records_delta += 1;
                         *collection_deltas.entry(collection).or_default() += 1;
                     }
+                    #[cfg(feature = "backlinks")]
+                    if let Ok(value) = serde_ipld_dagcbor::from_slice::<Data>(bytes.as_ref()) {
+                        crate::backlinks::store::index_record(
+                            batch,
+                            &db.backlinks,
+                            did.as_str(),
+                            collection,
+                            &rkey.to_smolstr(),
+                            &value,
+                        )?;
+                    }
                     None
                 } else if action == DbAction::Create || action == DbAction::Update {
                     Some(bytes.clone())
@@ -324,6 +341,15 @@ pub fn apply_commit<'commit, 's>(
                     // accumulate counts
                     records_delta -= 1;
                     *collection_deltas.entry(collection).or_default() -= 1;
+
+                    #[cfg(feature = "backlinks")]
+                    crate::backlinks::store::delete_record(
+                        batch,
+                        &db.backlinks,
+                        did.as_str(),
+                        collection,
+                        &rkey.to_smolstr(),
+                    )?;
                 }
 
                 None

@@ -56,6 +56,13 @@ export def build-hydrant [] {
     "target/debug/hydrant"
 }
 
+# build the hydrant binary with extra cargo features (space-separated string)
+export def build-hydrant-features [features: string] {
+    print $"building hydrant with features: ($features)..."
+    cargo build --features $features
+    "target/debug/hydrant"
+}
+
 # start hydrant in the background
 export def start-hydrant [binary: string, db_path: string, port: int] {
     let log_file = $"($db_path)/hydrant.log"

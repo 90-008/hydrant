@@ -48,6 +48,8 @@ pub struct Db {
     pub counts: Keyspace,
     pub filter: Keyspace,
     pub crawler: Keyspace,
+    #[cfg(feature = "backlinks")]
+    pub backlinks: Keyspace,
     pub event_tx: broadcast::Sender<BroadcastEvent>,
     pub next_event_id: Arc<AtomicU64>,
     pub counts_map: HashMap<SmolStr, u64>,
@@ -99,15 +101,15 @@ macro_rules! update_gauge_diff_impl {
     }};
 }
 
+const fn kb(v: u32) -> u32 {
+    v * 1024
+}
+const fn mb(v: u64) -> u64 {
+    v * 1024 * 1024
+}
+
 impl Db {
     pub fn open(cfg: &crate::config::Config) -> Result<Self> {
-        const fn kb(v: u32) -> u32 {
-            v * 1024
-        }
-        const fn mb(v: u64) -> u64 {
-            v * 1024 * 1024
-        }
-
         let db = Database::builder(&cfg.database_path)
             .cache_size(cfg.cache_size * 2_u64.pow(20) / 2)
             .manual_journal_persist(true)
@@ -152,7 +154,7 @@ impl Db {
             }
             None
         };
-        let dicts = ["repos", "blocks", "events"].into_iter().fold(
+        let dicts = ["repos", "blocks", "events", "backlinks"].into_iter().fold(
             std::collections::HashMap::new(),
             |mut acc, name| {
                 let Some(dict) = load_dict(name) else {
@@ -258,7 +260,7 @@ impl Db {
                 // cids arent compressable, most rkeys are TIDs so they will get compressed
                 // by prefix truncation anyway
                 .data_block_compression_policy(CompressionPolicy::disabled())
-                .data_block_restart_interval_policy(RestartIntervalPolicy::new([9, 18])),
+                .data_block_restart_interval_policy(RestartIntervalPolicy::new([16, 32])),
         )?;
         let cursors = open_ks(
             "cursors",
@@ -354,6 +356,23 @@ impl Db {
                 .data_block_restart_interval_policy(RestartIntervalPolicy::all(2)),
         )?;
 
+        #[cfg(feature = "backlinks")]
+        let backlinks = open_ks(
+            "backlinks",
+            opts()
+                // lets assume we hit backlinks, getBacklinks will use iterator anyway
+                // so we can disable bloom filter okay
+                .expect_point_read_hits(true)
+                .max_memtable_size(mb(cfg.db_records_memtable_size_mb))
+                // same as records basically
+                .data_block_size_policy(BlockSizePolicy::new([kb(16), kb(32)]))
+                .data_block_compression_policy(CompressionPolicy::new([
+                    CompressionType::None,
+                    get_compression("backlinks", 3),
+                ]))
+                .data_block_restart_interval_policy(RestartIntervalPolicy::new([16, 32])),
+        )?;
+
         // when adding new keyspaces, make sure to add them to the /stats endpoint
         // and also update any relevant /debug/* endpoints
 
@@ -411,6 +430,8 @@ impl Db {
             counts,
             filter,
             crawler,
+            #[cfg(feature = "backlinks")]
+            backlinks,
             event_tx,
             counts_map,
             next_event_id: Arc::new(AtomicU64::new(last_id + 1)),
@@ -422,6 +443,7 @@ impl Db {
             "blocks" => &self.blocks,
             "events" => &self.events,
             "repos" => &self.repos,
+            "backlinks" => &self.backlinks,
             _ => miette::bail!("unknown keyspace for training: {ks_name}"),
         };
 
@@ -523,6 +545,8 @@ impl Db {
             compact(self.filter.clone()),
             compact(self.crawler.clone()),
         )?;
+        #[cfg(feature = "backlinks")]
+        compact(self.backlinks.clone()).await?;
         Ok(())
     }
 

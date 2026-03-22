@@ -5,6 +5,8 @@ pub mod types;
 
 pub(crate) mod api;
 pub(crate) mod backfill;
+#[cfg(feature = "backlinks")]
+pub(crate) mod backlinks;
 pub(crate) mod crawler;
 pub(crate) mod db;
 pub(crate) mod ingest;

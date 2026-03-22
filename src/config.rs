@@ -157,6 +157,9 @@ pub struct Config {
     pub filter_signals: Option<Vec<String>>,
     pub filter_collections: Option<Vec<String>>,
     pub filter_excludes: Option<Vec<String>>,
+    /// enable backlinks indexing (only meaningful in non-ephemeral mode).
+    /// set via `HYDRANT_ENABLE_BACKLINKS=true`.
+    pub enable_backlinks: bool,
     /// crawler sources: each entry pairs a URL with a discovery mode.
     ///
     /// set via `HYDRANT_CRAWLER_URLS` as a comma-separated list of `[mode::]url` entries,
@@ -301,6 +304,8 @@ impl Config {
                 .collect()
         });
 
+        let enable_backlinks: bool = cfg!("ENABLE_BACKLINKS", false);
+
         let default_mode = CrawlerMode::default_for(full_network);
         let crawler_sources = match std::env::var("HYDRANT_CRAWLER_URLS") {
             Ok(s) => s
@@ -353,6 +358,7 @@ impl Config {
             filter_signals,
             filter_collections,
             filter_excludes,
+            enable_backlinks,
             crawler_sources,
         })
     }
@@ -467,6 +473,9 @@ impl fmt::Display for Config {
         }
         if let Some(excludes) = &self.filter_excludes {
             config_line!(f, "filter excludes", format_args!("{:?}", excludes))?;
+        }
+        if self.enable_backlinks {
+            config_line!(f, "backlinks", "enabled")?;
         }
         Ok(())
     }

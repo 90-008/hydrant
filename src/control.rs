@@ -74,6 +74,8 @@ pub struct Hydrant {
     pub filter: FilterControl,
     pub repos: ReposControl,
     pub db: DbControl,
+    #[cfg(feature = "backlinks")]
+    pub backlinks: crate::backlinks::BacklinksControl,
     pub(crate) state: Arc<AppState>,
     config: Arc<Config>,
     started: Arc<AtomicBool>,
@@ -148,6 +150,8 @@ impl Hydrant {
             filter: FilterControl(state.clone()),
             repos: ReposControl(state.clone()),
             db: DbControl(state.clone()),
+            #[cfg(feature = "backlinks")]
+            backlinks: crate::backlinks::BacklinksControl(state.clone()),
             state,
             config: Arc::new(config),
             started: Arc::new(AtomicBool::new(false)),

@@ -15,7 +15,8 @@ mod stream;
 mod xrpc;
 
 pub async fn serve(hydrant: Hydrant, port: u16) -> miette::Result<()> {
-    let app = Router::new()
+    #[allow(unused_mut)]
+    let mut app = Router::new()
         .route("/health", get(|| async { "OK" }))
         .route("/stats", get(stats::get_stats))
         .nest("/stream", stream::router())
@@ -23,7 +24,14 @@ pub async fn serve(hydrant: Hydrant, port: u16) -> miette::Result<()> {
         .merge(filter::router())
         .merge(repos::router())
         .merge(ingestion::router())
-        .merge(db::router())
+        .merge(db::router());
+
+    #[cfg(feature = "backlinks")]
+    {
+        app = app.merge(crate::backlinks::api::router());
+    }
+
+    let app = app
         .with_state(hydrant)
         .layer(TraceLayer::new_for_http())
         .layer(CorsLayer::permissive());

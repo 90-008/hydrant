@@ -627,6 +627,17 @@ async fn process_did<'i>(
                     if !ephemeral {
                         batch.insert(&app_state.db.blocks, block_key.clone(), val.as_ref());
                         batch.insert(&app_state.db.records, db_key, cid_raw);
+                        #[cfg(feature = "backlinks")]
+                        if let Ok(value) = serde_ipld_dagcbor::from_slice::<jacquard_common::Data>(val.as_ref()) {
+                            crate::backlinks::store::index_record(
+                                &mut batch,
+                                &app_state.db.backlinks,
+                                did.as_str(),
+                                collection,
+                                &rkey.to_smolstr(),
+                                &value,
+                            )?;
+                        }
                     }
 
                     added_blocks += 1;
@@ -662,6 +673,14 @@ async fn process_did<'i>(
                     &app_state.db.records,
                     keys::record_key(&did, &collection, &rkey),
                 );
+                #[cfg(feature = "backlinks")]
+                crate::backlinks::store::delete_record(
+                    &mut batch,
+                    &app_state.db.backlinks,
+                    did.as_str(),
+                    &collection,
+                    &rkey.to_smolstr(),
+                )?;
 
                 let event_id = app_state.db.next_event_id.fetch_add(1, Ordering::SeqCst);
                 let evt = StoredEvent {
