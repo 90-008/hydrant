@@ -9,6 +9,7 @@ mod crawler;
 mod db;
 mod debug;
 mod filter;
+mod firehose;
 mod ingestion;
 mod repos;
 mod stats;
@@ -26,6 +27,7 @@ pub async fn serve(hydrant: Hydrant, port: u16) -> miette::Result<()> {
         .merge(repos::router())
         .merge(ingestion::router())
         .merge(crawler::router())
+        .merge(firehose::router())
         .merge(db::router());
 
     #[cfg(feature = "backlinks")]

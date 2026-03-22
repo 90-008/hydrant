@@ -1,4 +1,4 @@
-use crate::db::{self, deser_repo_state};
+use crate::db::deser_repo_state;
 use crate::filter::{FilterHandle, FilterMode};
 use crate::ingest::stream::{FirehoseStream, SubscribeReposMessage, decode_frame};
 use crate::ingest::{BufferTx, IngestMessage};
@@ -8,6 +8,7 @@ use jacquard_common::IntoStatic;
 use jacquard_common::types::did::Did;
 use miette::{IntoDiagnostic, Result};
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tokio::sync::watch;
 use tracing::{Span, debug, error, info, trace};
@@ -46,7 +47,14 @@ impl FirehoseIngestor {
         loop {
             self.enabled.wait_enabled("firehose").await;
 
-            let start_cursor = db::get_firehose_cursor(&self.state.db, &self.relay_host).await?;
+            let start_cursor = self
+                .state
+                .relay_cursors
+                .peek_with(&self.relay_host, |_, c| {
+                    let val = c.load(Ordering::SeqCst);
+                    (val > 0).then_some(val)
+                })
+                .flatten();
 
             match start_cursor {
                 Some(c) => info!(cursor = %c, "resuming from cursor"),
@@ -160,7 +168,7 @@ impl FirehoseIngestor {
                     }
 
                     if !filter.signals.is_empty() {
-                        trace!(did = %did, "unknown — passing to worker for signal check");
+                        trace!(did = %did, "unknown, passing to worker for signal check");
                         Ok(true)
                     } else {
                         trace!(did = %did, "unknown and no signals configured, skipping");

@@ -155,6 +155,31 @@ directory, it will also be loaded automatically.
     the source to restart from the beginning when re-added.
   - returns `200 OK` if the source was found and removed, `404 Not Found` otherwise.
 
+#### firehose source management
+
+- `GET /firehose/sources`: list all currently active firehose relay sources.
+  - returns a JSON array of `{ "url": string, "persisted": bool }`.
+  - `persisted: true` means the source was added via the API and is stored in the
+    database, it will survive a restart. `persisted: false` means the source
+    came from `RELAY_HOSTS` and is not written to the database.
+- `POST /firehose/sources`: add a firehose relay at runtime.
+  - body: `{ "url": string }`.
+  - the source is persisted to the database before the ingestor task is started.
+  - if a relay with the same URL already exists, it is replaced: the running
+    task is stopped and a new one is started. any existing cursor state for that
+    URL is preserved.
+  - returns `201 Created` on success.
+- `DELETE /firehose/sources`: remove a firehose relay at runtime.
+  - body: `{ "url": string }`.
+  - the ingestor task is stopped immediately.
+  - if the source was added via the API (`persisted: true`), it is removed from
+    the database and will not reappear on restart. if it came from `RELAY_HOSTS`
+    (`persisted: false`), only the running task is stopped; the source reappears
+    on the next restart.
+  - cursor state is not cleared. use `DELETE /cursors` separately if you want
+    the relay to restart from the beginning when re-added.
+  - returns `200 OK` if the relay was found and removed, `404 Not Found` otherwise.
+
 #### database operations
 
 - `POST /db/train`: train zstd compression dictionaries for the `repos`,
@@ -165,8 +190,9 @@ directory, it will also be loaded automatically.
   in parallel. the crawler, firehose, and backfill worker are paused for the
   duration and restored on completion.
 - `DELETE /cursors`: reset all stored cursors for a given URL. body: `{ "key": "..." }`
-  where key is a URL. clears the relay crawler cursor, and any by-collection cursors
-  associated with that URL. causes the next crawler pass to restart from the beginning.
+  where key is a URL. clears both the firehose cursor and the relay crawler cursor,
+  as well as any by-collection cursors associated with that URL. causes the next
+  firehose connection and crawler pass to restart from the beginning.
 
 #### filter mode
 

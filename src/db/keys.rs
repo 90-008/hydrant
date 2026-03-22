@@ -193,6 +193,15 @@ pub fn firehose_cursor_key(relay: &str) -> Vec<u8> {
     key
 }
 
+pub const FIREHOSE_SOURCE_PREFIX: &[u8] = b"firehose|";
+
+pub fn firehose_source_key(url: &str) -> Vec<u8> {
+    let mut key = Vec::with_capacity(FIREHOSE_SOURCE_PREFIX.len() + url.len());
+    key.extend_from_slice(FIREHOSE_SOURCE_PREFIX);
+    key.extend_from_slice(url.as_bytes());
+    key
+}
+
 // key format: {collection}|{cid_bytes}
 pub fn block_key(collection: &str, cid: &[u8]) -> Vec<u8> {
     let mut key = Vec::with_capacity(collection.len() + 1 + cid.len());

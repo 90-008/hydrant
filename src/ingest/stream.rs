@@ -102,7 +102,7 @@ impl TryFrom<String> for Datetime {
         chrono::DateTime::parse_from_rfc3339(&s)
             .map(Self)
             .or_else(|_| {
-                // no timezone — warn and assume UTC
+                // no timezone, warn and assume UTC
                 tracing::warn!(
                     value = %s,
                     "datetime missing timezone suffix, assuming UTC"

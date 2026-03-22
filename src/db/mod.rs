@@ -854,3 +854,34 @@ pub fn get_record_count(db: &Db, did: &Did<'_>, collection: &str) -> Result<u64>
         .transpose()?;
     Ok(count.unwrap_or(0))
 }
+
+pub fn load_persisted_firehose_sources(db: &crate::db::Db) -> Result<Vec<Url>> {
+    use crate::db::keys::FIREHOSE_SOURCE_PREFIX;
+
+    let mut urls = Vec::new();
+    for entry in db.crawler.prefix(FIREHOSE_SOURCE_PREFIX) {
+        let (key, _) = entry.into_inner().into_diagnostic()?;
+        let url_bytes = &key[FIREHOSE_SOURCE_PREFIX.len()..];
+        let url_str = std::str::from_utf8(url_bytes).into_diagnostic()?;
+        let url = Url::parse(url_str).into_diagnostic()?;
+        urls.push(url);
+    }
+    Ok(urls)
+}
+
+pub fn load_persisted_crawler_sources(
+    db: &crate::db::Db,
+) -> Result<Vec<crate::config::CrawlerSource>> {
+    use crate::db::keys::CRAWLER_SOURCE_PREFIX;
+
+    let mut sources = Vec::new();
+    for entry in db.crawler.prefix(CRAWLER_SOURCE_PREFIX) {
+        let (key, val) = entry.into_inner().into_diagnostic()?;
+        let url_bytes = &key[CRAWLER_SOURCE_PREFIX.len()..];
+        let url_str = std::str::from_utf8(url_bytes).into_diagnostic()?;
+        let url = Url::parse(url_str).into_diagnostic()?;
+        let mode: crate::config::CrawlerMode = rmp_serde::from_slice(&val).into_diagnostic()?;
+        sources.push(crate::config::CrawlerSource { url, mode });
+    }
+    Ok(sources)
+}

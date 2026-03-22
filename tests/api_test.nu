@@ -45,7 +45,7 @@ def test-crawler-sources [url: string, pid: int] {
     if not $s.persisted {
         fail "expected persisted=true for dynamically added source" $pid
     }
-    print $"  ok: 1 source — url=($s.url), mode=($s.mode), persisted=($s.persisted)"
+    print $"  ok: 1 source, url=($s.url), mode=($s.mode), persisted=($s.persisted)"
 
     # posting the same URL with a different mode replaces the existing entry
     print "  POST /crawler/sources (should override)..."
@@ -212,6 +212,80 @@ def test-config-source-not-persisted [binary: string, db_path: string, port: int
     print "config source persistence test passed!"
 }
 
+def test-firehose-sources [url: string, pid: int] {
+    print "=== test: firehose sources ==="
+
+    # initial state: no sources (we start with HYDRANT_RELAY_HOSTS="")
+    print "  GET /firehose/sources (expect empty)..."
+    let initial = (http get $"($url)/firehose/sources")
+    if ($initial | length) != 0 {
+        fail $"expected empty list, got ($initial | length) entries" $pid
+    }
+    print "  ok: starts empty"
+
+    # add a relay source
+    print "  POST /firehose/sources..."
+    let resp_add = (http post -f -e -t application/json $"($url)/firehose/sources" {
+        url: "wss://test.bsky.network"
+    })
+    if $resp_add.status != 201 {
+        fail $"expected 201, got ($resp_add.status)" $pid
+    }
+    print "  ok: 201 Created"
+
+    # verify it appears
+    print "  GET /firehose/sources (expect 1 entry)..."
+    let sources = (http get $"($url)/firehose/sources")
+    if ($sources | length) != 1 {
+        fail $"expected 1 source, got ($sources | length)" $pid
+    }
+    let s = ($sources | first)
+    if not $s.persisted {
+        fail "expected persisted=true for dynamically added source" $pid
+    }
+    print $"  ok: 1 source, url=($s.url), persisted=($s.persisted)"
+
+    # posting the same URL replaces the existing entry
+    print "  POST /firehose/sources (should override)..."
+    let resp_replace = (http post -f -e -t application/json $"($url)/firehose/sources" {
+        url: "wss://test.bsky.network"
+    })
+    if $resp_replace.status != 201 {
+        fail $"expected 201, got ($resp_replace.status)" $pid
+    }
+    let after_replace = (http get $"($url)/firehose/sources")
+    if ($after_replace | length) != 1 {
+        fail $"expected 1 source after override, got ($after_replace | length)" $pid
+    }
+    print "  ok: duplicate add replaced existing entry"
+
+    # remove the source
+    print "  DELETE /firehose/sources..."
+    let resp_del = (http delete -f -e -t application/json $"($url)/firehose/sources" --data {
+        url: "wss://test.bsky.network"
+    })
+    if $resp_del.status != 200 {
+        fail $"expected 200, got ($resp_del.status)" $pid
+    }
+    let after_del = (http get $"($url)/firehose/sources")
+    if ($after_del | length) != 0 {
+        fail "expected empty list after delete" $pid
+    }
+    print "  ok: source removed"
+
+    # deleting a non-existent source returns 404
+    print "  DELETE /firehose/sources (should be 404)..."
+    let resp_del_missing = (http delete -f -e -t application/json $"($url)/firehose/sources" --data {
+        url: "wss://test.bsky.network"
+    })
+    if $resp_del_missing.status != 404 {
+        fail $"expected 404, got ($resp_del_missing.status)" $pid
+    }
+    print "  ok: 404 for non-existent source"
+
+    print "firehose source tests passed!"
+}
+
 def main [] {
     let port = 3007
     let url = $"http://localhost:($port)"
@@ -221,7 +295,7 @@ def main [] {
     let db = (mktemp -d -t hydrant_api_test.XXXXXX)
     print $"db: ($db)"
 
-    let instance = (with-env { HYDRANT_CRAWLER_URLS: "" } {
+    let instance = (with-env { HYDRANT_CRAWLER_URLS: "", HYDRANT_RELAY_HOSTS: "" } {
         start-hydrant $binary $db $port
     })
     if not (wait-for-api $url) {
@@ -229,6 +303,7 @@ def main [] {
     }
 
     test-crawler-sources $url $instance.pid
+    test-firehose-sources $url $instance.pid
 
     kill $instance.pid
     sleep 2sec

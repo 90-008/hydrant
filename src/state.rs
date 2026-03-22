@@ -1,5 +1,5 @@
 use std::sync::atomic::AtomicI64;
-use std::{collections::HashMap, time::Duration};
+use std::time::Duration;
 
 use miette::Result;
 use tokio::sync::{Notify, watch};
@@ -16,7 +16,9 @@ pub struct AppState {
     pub db: Db,
     pub resolver: Resolver,
     pub filter: FilterHandle,
-    pub relay_cursors: HashMap<Url, AtomicI64>,
+    /// per-relay firehose cursors. values use interior mutability so they can be
+    /// updated through the lock-free `peek_with` reads in the ingest worker.
+    pub relay_cursors: scc::HashIndex<Url, AtomicI64>,
     pub backfill_notify: Notify,
     pub crawler_enabled: watch::Sender<bool>,
     pub firehose_enabled: watch::Sender<bool>,
@@ -41,11 +43,10 @@ impl AppState {
 
         let filter = new_handle(filter_config);
 
-        let relay_cursors = config
-            .relays
-            .iter()
-            .map(|url| (url.clone(), AtomicI64::new(0)))
-            .collect();
+        let relay_cursors = scc::HashIndex::new();
+        for url in &config.relays {
+            let _ = relay_cursors.insert_sync(url.clone(), AtomicI64::new(0));
+        }
 
         let (crawler_enabled, _) = watch::channel(crawler_default);
         let (firehose_enabled, _) = watch::channel(config.enable_firehose);

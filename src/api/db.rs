@@ -39,6 +39,11 @@ pub async fn handle_reset_cursor(
         .reset_cursor(&body.key)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    hydrant
+        .firehose
+        .reset_cursor(&body.key)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(StatusCode::OK)
 }
 

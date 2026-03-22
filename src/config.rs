@@ -99,7 +99,7 @@ pub struct CrawlerSource {
 }
 
 impl CrawlerSource {
-    /// parse `[mode::]url` — mode prefix is optional, falls back to `default_mode`.
+    /// parse `[mode::]url`. mode prefix is optional, falls back to `default_mode`.
     fn parse(s: &str, default_mode: CrawlerMode) -> Option<Self> {
         if let Some((prefix, rest)) = s.split_once("::") {
             let mode = prefix.parse().ok()?;
@@ -391,22 +391,25 @@ impl Config {
             .then(Self::full_network)
             .unwrap_or_else(Self::default);
 
-        let relay_host: Url = cfg!("RELAY_HOST", defaults.relays[0].clone());
-        let relay_hosts = std::env::var("HYDRANT_RELAY_HOSTS")
-            .ok()
-            .and_then(|hosts| {
-                hosts
-                    .split(',')
-                    .map(|s| Url::parse(s.trim()))
-                    .collect::<Result<Vec<_>, _>>()
-                    .inspect_err(|e| tracing::warn!("invalid relay host URL: {e}"))
-                    .ok()
-            })
-            .unwrap_or_default();
-        let relay_hosts = relay_hosts
-            .is_empty()
-            .then(|| vec![relay_host])
-            .unwrap_or(relay_hosts);
+        let relay_hosts = match std::env::var("HYDRANT_RELAY_HOSTS") {
+            Ok(hosts) if !hosts.trim().is_empty() => hosts
+                .split(',')
+                .filter_map(|s| {
+                    let s = s.trim();
+                    (!s.is_empty())
+                        .then(|| {
+                            Url::parse(s)
+                                .inspect_err(|e| tracing::warn!("invalid relay host URL: {e}"))
+                                .ok()
+                        })
+                        .flatten()
+                })
+                .collect(),
+            // HYDRANT_RELAY_HOSTS explicitly set to ""
+            Ok(_) => vec![],
+            // not set at all, fall back to RELAY_HOST
+            Err(_) => vec![cfg!("RELAY_HOST", defaults.relays[0].clone())],
+        };
 
         let plc_urls: Vec<Url> = std::env::var("HYDRANT_PLC_URL")
             .ok()

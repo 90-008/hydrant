@@ -20,6 +20,7 @@ use smol_str::ToSmolStr;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
+use std::sync::atomic::Ordering::SeqCst;
 use thiserror::Error;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, trace, warn};
@@ -253,9 +254,9 @@ impl FirehoseWorker {
                                 db::check_poisoned_report(r);
                             }
                             error!(did = %did, err = %e, "error in check_repo_state");
-                            if let Some(cursor) = state.relay_cursors.get(&relay) {
-                                cursor.store(seq, std::sync::atomic::Ordering::SeqCst);
-                            }
+                            state
+                                .relay_cursors
+                                .peek_with(&relay, |_, c| c.store(seq, SeqCst));
                             continue;
                         }
                     };
@@ -307,14 +308,9 @@ impl FirehoseWorker {
                                                     did = %did, err = %e,
                                                     "failed to transition inactive repo to synced"
                                                 );
-                                                if let Some(cursor) =
-                                                    state.relay_cursors.get(&relay)
-                                                {
-                                                    cursor.store(
-                                                        seq,
-                                                        std::sync::atomic::Ordering::SeqCst,
-                                                    );
-                                                }
+                                                state
+                                                    .relay_cursors
+                                                    .peek_with(&relay, |_, c| c.store(seq, SeqCst));
                                                 continue;
                                             }
                                         }
@@ -359,9 +355,9 @@ impl FirehoseWorker {
                         }
                     }
 
-                    if let Some(cursor) = state.relay_cursors.get(&relay) {
-                        cursor.store(seq, std::sync::atomic::Ordering::SeqCst);
-                    }
+                    state
+                        .relay_cursors
+                        .peek_with(&relay, |_, c| c.store(seq, SeqCst));
                 }
             }
 
@@ -489,11 +485,7 @@ impl FirehoseWorker {
         *ctx.added_blocks += res.blocks_count;
         *ctx.records_delta += res.records_delta;
         ctx.broadcast_events.push(BroadcastEvent::Persisted(
-            ctx.state
-                .db
-                .next_event_id
-                .load(std::sync::atomic::Ordering::SeqCst)
-                - 1,
+            ctx.state.db.next_event_id.load(SeqCst) - 1,
         ));
 
         Ok(RepoProcessResult::Ok(repo_state))
