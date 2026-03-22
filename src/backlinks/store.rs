@@ -58,11 +58,10 @@ pub fn reverse_key(target: &str, collection: &str, path: &str, did: &str, rkey: 
 /// path should include the leading `.` (e.g. `.subject.uri`). always ends with `|`.
 pub fn reverse_scan_prefix(target: &str, collection: Option<&str>, path: Option<&str>) -> Vec<u8> {
     let col_len = collection.map_or(0, |c| c.len() + 1);
-    let path_len = if collection.is_some() {
-        path.map_or(0, |p| p.len() + 1)
-    } else {
-        0
-    };
+    let path_len = collection
+        .is_some()
+        .then(|| path.map_or(0, |p| p.len() + 1))
+        .unwrap_or(0);
     let mut prefix = Vec::with_capacity(2 + target.len() + 1 + col_len + path_len);
     prefix.push(b'r');
     prefix.push(SEP);
@@ -95,14 +94,11 @@ pub fn forward_did_prefix(did: &Did) -> Vec<u8> {
 /// reverse key format: `r|{target}|{collection}|{path}|{did}|{rkey}`
 /// parses the last four `|`-separated segments from the right.
 pub fn source_from_reverse_key(key: &[u8]) -> Option<(&str, &str, &str, &str)> {
-    let rkey_sep = key.iter().rposition(|&b| b == SEP)?;
-    let rkey = std::str::from_utf8(&key[rkey_sep + 1..]).ok()?;
-    let did_sep = key[..rkey_sep].iter().rposition(|&b| b == SEP)?;
-    let did = std::str::from_utf8(&key[did_sep + 1..rkey_sep]).ok()?;
-    let path_sep = key[..did_sep].iter().rposition(|&b| b == SEP)?;
-    let path = std::str::from_utf8(&key[path_sep + 1..did_sep]).ok()?;
-    let col_sep = key[..path_sep].iter().rposition(|&b| b == SEP)?;
-    let col = std::str::from_utf8(&key[col_sep + 1..path_sep]).ok()?;
+    let mut parts = key.rsplit(|&b| b == SEP);
+    let rkey = std::str::from_utf8(parts.next()?).ok()?;
+    let did = std::str::from_utf8(parts.next()?).ok()?;
+    let path = std::str::from_utf8(parts.next()?).ok()?;
+    let col = std::str::from_utf8(parts.next()?).ok()?;
     Some((col, path, did, rkey))
 }
 

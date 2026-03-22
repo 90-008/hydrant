@@ -1,7 +1,7 @@
 use jacquard_common::Data;
 use jacquard_common::types::string::AtprotoStr;
 use jacquard_common::types::uri::Uri;
-use smol_str::SmolStr;
+use smol_str::{SmolStr, format_smolstr};
 
 pub struct Link {
     /// dotted field path within the record, e.g. `.subject.uri` or `.facets[].features[app.bsky.richtext.facet#link].uri`
@@ -12,7 +12,7 @@ pub struct Link {
 /// extract all link targets from a record, with their field paths.
 ///
 /// paths follow the same convention as constellation:
-/// - start with `.` (root-level field `subject` → `.subject`)
+/// - start with `.` (root-level field `subject` -> `.subject`)
 /// - object keys: `{parent}.{key}`
 /// - plain array elements: `{parent}[]`
 /// - typed array elements (objects with `$type`): `{parent}[{$type}]`
@@ -50,18 +50,18 @@ fn walk(value: &Data<'_>, path: &str, links: &mut Vec<Link>) {
                             _ => None,
                         });
                         match type_tag {
-                            Some(t) => format!("{path}[{t}]"),
-                            None => format!("{path}[]"),
+                            Some(t) => format_smolstr!("{path}[{t}]"),
+                            None => format_smolstr!("{path}[]"),
                         }
                     }
-                    _ => format!("{path}[]"),
+                    _ => format_smolstr!("{path}[]"),
                 };
                 walk(item, &child_path, links);
             }
         }
         Data::Object(obj) => {
             for (k, v) in &obj.0 {
-                walk(v, &format!("{path}.{k}"), links);
+                walk(v, &format_smolstr!("{path}.{k}"), links);
             }
         }
         _ => {}

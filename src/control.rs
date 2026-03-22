@@ -61,7 +61,7 @@ pub type Event = MarshallableEvt<'static>;
 ///     let hydrant = Hydrant::from_env().await?;
 ///
 ///     tokio::select! {
-///         r = hydrant.run()        => r,
+///         r = hydrant.run()?        => r,
 ///         r = hydrant.serve(3000)  => r,
 ///     }
 /// }

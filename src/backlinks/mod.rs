@@ -148,7 +148,7 @@ impl BacklinksFetch {
             let mut next_cursor = None;
 
             for item in iter {
-                let (key, _) = item.into_inner().into_diagnostic()?;
+                let key = item.key().into_diagnostic()?;
                 if !key.starts_with(scan_prefix.as_slice()) {
                     break;
                 }
