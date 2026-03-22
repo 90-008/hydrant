@@ -1,14 +1,30 @@
 # hydrant
 
-`hydrant` is an AT Protocol indexer built on the `fjall` database. it's built to be flexible, supporting both full-network indexing and filtered indexing (e.g., by DID), allowing querying with XRPCs (not only `com.atproto.*`!), providing an ordered event stream, etc.
+`hydrant` is an AT Protocol indexer built on the `fjall` database. it's built to
+be flexible, supporting both full-network indexing and filtered indexing (e.g.,
+by DID), allowing querying with XRPCs (not only `com.atproto.*`!), providing an
+ordered event stream, etc.
 
-you can see [random.wisp.place](https://tangled.org/did:plc:dfl62fgb7wtjj3fcbb72naae/random.wisp.place) (standalone binary using http API) or the [statusphere example](./examples/statusphere.rs) (hydrant-as-library) for examples on how to use hydrant.
+you can see
+[random.wisp.place](https://tangled.org/did:plc:dfl62fgb7wtjj3fcbb72naae/random.wisp.place)
+(standalone binary using http API) or the [statusphere
+example](./examples/statusphere.rs) (hydrant-as-library) for examples on how to
+use hydrant.
 
-**WARNING: *the db format is not stable yet.*** it's in active development so if you are going to rely on the db format being stable, don't (eg. for query features, if you are using ephemeral mode this doesn't matter for example, or you dont mind losing your existing backfilled data in hydrant if you already processed them.).
+**WARNING: *the db format is not stable yet.*** it's in active development so if
+you are going to rely on the db format being stable, don't (eg. for query
+features, if you are using ephemeral mode this doesn't matter for example, or
+you dont mind losing your existing backfilled data in hydrant if you already
+processed them.).
 
 ## vs `tap`
 
-while [`tap`](https://github.com/bluesky-social/indigo/tree/main/cmd/tap) is designed as a firehose consumer and simply just propagates events while handling sync, `hydrant` is flexible, it allows you to directly query the database for records, and it also provides an ordered view of events, allowing the use of a cursor to fetch events from a specific point. it can act as both an indexer or an ephemeral view of some window of events.
+while [`tap`](https://github.com/bluesky-social/indigo/tree/main/cmd/tap) is
+designed as a firehose consumer and simply just propagates events while handling
+sync, `hydrant` is flexible, it allows you to directly query the database for
+records, and it also provides an ordered view of events, allowing the use of a
+cursor to fetch events from a specific point. it can act as both an indexer or
+an ephemeral view of some window of events.
 
 ### stream behavior
 
@@ -24,22 +40,28 @@ the `WS /stream` (hydrant) and `WS /channel` (tap) endpoints have different desi
 
 ### multiple relay support
 
-`hydrant` supports connecting to multiple relays simultaneously for firehose ingestion. when `RELAY_HOSTS` is configured with multiple URLs:
+`hydrant` supports connecting to multiple relays simultaneously for firehose
+ingestion. when `RELAY_HOSTS` is configured with multiple URLs:
 
 - one independent firehose stream loop is spawned per relay
 - each relay maintains its own firehose cursor state
 - all ingestion loops share the same worker pool and database
 
-commit events are de-duplicated according to the repo `rev`. account / identity events are de-duplicated using the `time` field.
-todo: decide what to do on relay-side account takedowns or if relays set the `time` field.
+commit events are de-duplicated according to the repo `rev`. account / identity
+events are de-duplicated using the `time` field. todo: decide what to do on
+relay-side account takedowns or if relays set the `time` field.
 
 ### crawler sources
 
-the crawler is configured separately from the firehose via `CRAWLER_URLS`. each source is a `[mode::]url` entry where the mode prefix is optional and defaults to `by_collection` in filter mode or `relay` in full-network mode.
+the crawler is configured separately from the firehose via `CRAWLER_URLS`. each
+source is a `[mode::]url` entry where the mode prefix is optional and defaults
+to `by_collection` in filter mode or `relay` in full-network mode.
 
-- `relay`: enumerates the network via `com.atproto.sync.listRepos`, then checks each repo's collections via `describeRepo`. used for full-network discovery.
-- `by_collection`: queries `com.atproto.sync.listReposByCollection` for each configured signal. more efficient for filtered indexing since it only surfaces repos that have matching records.
-cursors are stored per collection.
+- `relay`: enumerates the network via `com.atproto.sync.listRepos`, then checks
+  each repo's collections via `describeRepo`. used for full-network discovery.
+- `by_collection`: queries `com.atproto.sync.listReposByCollection` for each
+  configured signal. more efficient for filtered indexing since it only surfaces
+  repos that have matching records. cursors are stored per collection.
 
 ```
 CRAWLER_URLS=by_collection::https://lightrail.microcosm.blue,relay::wss://bsky.network
@@ -49,7 +71,9 @@ each source maintains its own cursor so restarts resume mid-pass.
 
 ## configuration
 
-`hydrant` is configured via environment variables. all variables are prefixed with `HYDRANT_` (except `RUST_LOG`).
+`hydrant` is configured via environment variables. all variables are prefixed
+with `HYDRANT_` (except `RUST_LOG`). if a `.env` file exists in the working
+directory, it will also be loaded automatically.
 
 | variable | default | description |
 | :--- | :--- | :--- |
@@ -91,15 +115,27 @@ each source maintains its own cursor so restarts resume mid-pass.
 
 - `GET /ingestion`: get the current ingestion status.
   - returns `{ "crawler": bool, "firehose": bool, "backfill": bool }`.
-- `PATCH /ingestion`: enable or disable ingestion components at runtime without restarting.
-  - body: `{ "crawler"?: bool, "firehose"?: bool, "backfill"?: bool }` — only provided fields are updated.
-  - when disabled, each component finishes its current task before pausing (e.g. the backfill worker completes any in-flight repo syncs, the firehose finishes processing the current message). they resume immediately when re-enabled.
+- `PATCH /ingestion`: enable or disable ingestion components at runtime without
+  restarting.
+  - body: `{ "crawler"?: bool, "firehose"?: bool, "backfill"?: bool }` — only
+    provided fields are updated.
+  - when disabled, each component finishes its current task before pausing (e.g.
+    the backfill worker completes any in-flight repo syncs, the firehose
+    finishes processing the current message). they resume immediately when
+    re-enabled.
 
 #### database operations
 
-- `POST /db/train`: train zstd compression dictionaries for the `repos`, `blocks`, and `events` keyspaces. dictionaries are written to disk; a restart is required to apply them. the crawler, firehose, and backfill worker are paused for the duration and restored on completion.
-- `POST /db/compact`: trigger a full major compaction of all database keyspaces in parallel. the crawler, firehose, and backfill worker are paused for the duration and restored on completion.
-- `DELETE /cursors`: reset all stored cursors for a given URL. body: `{ "key": "..." }` where key is a URL. clears the relay crawler cursor, and any by-collection cursors associated with that URL. causes the next crawler pass to restart from the beginning.
+- `POST /db/train`: train zstd compression dictionaries for the `repos`,
+  `blocks`, and `events` keyspaces. dictionaries are written to disk; a restart
+  is required to apply them. the crawler, firehose, and backfill worker are
+  paused for the duration and restored on completion.
+- `POST /db/compact`: trigger a full major compaction of all database keyspaces
+  in parallel. the crawler, firehose, and backfill worker are paused for the
+  duration and restored on completion.
+- `DELETE /cursors`: reset all stored cursors for a given URL. body: `{ "key": "..." }`
+  where key is a URL. clears the relay crawler cursor, and any by-collection cursors
+  associated with that URL. causes the next crawler pass to restart from the beginning.
 
 #### filter mode
 
@@ -139,7 +175,9 @@ each set field accepts one of two forms:
     - `limit`: max results (default 100, max 1000)
     - `cursor`: opaque key for paginating.
     - `partition`: `all` (default), `pending` (backfill queue), or `resync` (retries)
-- `GET /repos/{did}`: get the sync status and metadata of a specific repository. also returns the handle, PDS URL and the atproto signing key (these won't be available before the repo has been backfilled once at least).
+- `GET /repos/{did}`: get the sync status and metadata of a specific repository.
+  also returns the handle, PDS URL and the atproto signing key (these won't be
+  available before the repo has been backfilled once at least).
 - `PUT /repos`: explicitly track repositories. accepts an NDJSON body of `{"did": "..."}` (or JSON array of the same).
 - `DELETE /repos`: untrack repositories. accepts an NDJSON body of `{"did": "..."}` (or JSON array of the same).
 
@@ -182,9 +220,11 @@ returns `{ count }`.
 
 ### blue.microcosm.links.*
 
-hydrant implements a subset of [microcosm constellation](https://constellation.microcosm.blue/) when it's built with the `backlinks` cargo feature (`cargo build --features backlinks`).
+hydrant implements a subset of [microcosm constellation](https://constellation.microcosm.blue/) 
+when it's built with the `backlinks` cargo feature (`cargo build --features backlinks`).
 
-when enabled, hydrant indexes all AT URI and DID references found inside stored records into a reverse index. this lets you efficiently answer "what records link to this subject?".
+when enabled, hydrant indexes all AT URI and DID references found inside stored records into a 
+reverse index. this lets you efficiently answer "what records link to this subject?".
 
 #### blue.microcosm.links.getBacklinks
 
@@ -200,7 +240,8 @@ return records that link to a given subject.
 
 returns `{ backlinks: [{ uri, cid }], cursor? }`.
 
-results are ordered by source record rkey (ascending by default, descending when `reverse=true`). the cursor is stable across new insertions for TID rkey records.
+results are ordered by source record rkey (ascending by default, descending when `reverse=true`). 
+the cursor is stable across new insertions for TID rkey records.
 
 #### blue.microcosm.links.getBacklinksCount
 

@@ -5,6 +5,33 @@ use std::str::FromStr;
 use std::time::Duration;
 use url::Url;
 
+/// loads `.env` from the current directory, setting any variables not already in the environment.
+fn load_dotenv() {
+    let Ok(contents) = std::fs::read_to_string(".env") else {
+        return;
+    };
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((key, val)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        let val = val.trim();
+        let val = val
+            .strip_prefix('"')
+            .and_then(|v| v.strip_suffix('"'))
+            .or_else(|| val.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')))
+            .unwrap_or(val);
+        if std::env::var(key).is_err() {
+            // SAFETY: single-threaded at startup; no other threads are reading env yet.
+            unsafe { std::env::set_var(key, val) };
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CrawlerMode {
     /// enumerate via `com.atproto.sync.listRepos`, then check signals with `describeRepo`.
@@ -316,8 +343,10 @@ impl Config {
         }
     }
 
-    /// reads and builds the config from environment variables.
+    /// reads and builds the config from environment variables, loading `.env` first if present.
     pub fn from_env() -> Result<Self> {
+        load_dotenv();
+
         macro_rules! cfg {
             (@val $key:expr) => {
                 std::env::var(concat!("HYDRANT_", $key))
