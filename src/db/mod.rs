@@ -443,15 +443,17 @@ impl Db {
             "blocks" => &self.blocks,
             "events" => &self.events,
             "repos" => &self.repos,
+            #[cfg(feature = "backlinks")]
             "backlinks" => &self.backlinks,
             _ => miette::bail!("unknown keyspace for training: {ks_name}"),
         };
 
         let dict_size = match ks_name {
-            "blocks" => 32_768,
-            "events" => 16_384,
-            "repos" => 16_384,
-            _ => 16_384,
+            "blocks" => kb(128),
+            "events" => kb(64),
+            "repos" => kb(64),
+            "backlinks" => kb(64),
+            _ => kb(32),
         };
 
         let samples: Vec<Vec<u8>> = if ks_name == "blocks" {
@@ -505,7 +507,8 @@ impl Db {
             "training zstd dictionary for keyspace {ks_name} ({} samples, {dict_size} bytes limit)...",
             samples.len(),
         );
-        let dict_bytes = lsm_tree::train_zstd_dict(&samples, dict_size).into_diagnostic()?;
+        let dict_bytes =
+            lsm_tree::train_zstd_dict(&samples, dict_size as usize).into_diagnostic()?;
         let path = self.path.join(format!("dict_{ks_name}.bin"));
         std::fs::write(&path, &dict_bytes).into_diagnostic()?;
         tracing::info!(
