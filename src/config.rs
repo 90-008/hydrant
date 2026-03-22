@@ -100,8 +100,11 @@ impl fmt::Display for Compression {
 
 #[derive(Debug, Clone, Copy)]
 pub enum SignatureVerification {
+    /// verify all commits, from the firehose and when backfilling a repo from a PDS.
     Full,
+    /// only verify commits when backfilling a repo from a PDS.
     BackfillOnly,
+    /// don't verify anything.
     None,
 }
 
@@ -129,37 +132,50 @@ impl fmt::Display for SignatureVerification {
 
 #[derive(Debug, Clone)]
 pub struct Config {
+    /// path to the database folder. set via `HYDRANT_DATABASE_PATH`.
     pub database_path: PathBuf,
-    pub relays: Vec<Url>,
-    pub plc_urls: Vec<Url>,
+    /// if `true`, discovers and indexes all repositories in the network.
+    /// set via `HYDRANT_FULL_NETWORK`.
     pub full_network: bool,
+    /// if `true`, no records are stored; events are deleted after `ephemeral_ttl`.
+    /// set via `HYDRANT_EPHEMERAL`.
     pub ephemeral: bool,
+    /// how long events are retained in ephemeral mode before deletion.
+    /// set via `HYDRANT_EPHEMERAL_TTL` (humantime duration, e.g. `60min`).
     pub ephemeral_ttl: Duration,
-    pub cursor_save_interval: Duration,
-    pub repo_fetch_timeout: Duration,
-    pub cache_size: u64,
-    pub backfill_concurrency_limit: usize,
-    pub data_compression: Compression,
-    pub journal_compression: Compression,
-    pub verify_signatures: SignatureVerification,
-    pub identity_cache_size: u64,
+
+    /// relay URLs used for firehose ingestion. set via `HYDRANT_RELAY_HOST` (single)
+    /// or `HYDRANT_RELAY_HOSTS` (comma-separated; takes precedence).
+    pub relays: Vec<Url>,
+    /// base URL(s) of the PLC directory (comma-separated for multiple).
+    /// defaults to `https://plc.wtf`, or `https://plc.directory` in full-network mode.
+    /// set via `HYDRANT_PLC_URL`.
+    pub plc_urls: Vec<Url>,
+    /// whether to ingest events from relay firehose subscriptions.
+    /// set via `HYDRANT_ENABLE_FIREHOSE`.
     pub enable_firehose: bool,
-    pub enable_crawler: Option<bool>,
+    /// number of concurrent workers processing firehose events.
+    /// set via `HYDRANT_FIREHOSE_WORKERS`.
     pub firehose_workers: usize,
-    pub db_worker_threads: usize,
-    pub db_max_journaling_size_mb: u64,
-    pub db_blocks_memtable_size_mb: u64,
-    pub db_repos_memtable_size_mb: u64,
-    pub db_events_memtable_size_mb: u64,
-    pub db_records_memtable_size_mb: u64,
+    /// how often the firehose cursor is persisted to disk.
+    /// set via `HYDRANT_CURSOR_SAVE_INTERVAL` (humantime duration, e.g. `3sec`).
+    pub cursor_save_interval: Duration,
+    /// timeout for fetching a full repository CAR during backfill.
+    /// set via `HYDRANT_REPO_FETCH_TIMEOUT` (humantime duration, e.g. `5min`).
+    pub repo_fetch_timeout: Duration,
+    /// maximum number of concurrent backfill tasks.
+    /// set via `HYDRANT_BACKFILL_CONCURRENCY_LIMIT`.
+    pub backfill_concurrency_limit: usize,
+
+    /// whether to run the network crawler. `None` defers to the default for the current mode.
+    /// set via `HYDRANT_ENABLE_CRAWLER`.
+    pub enable_crawler: Option<bool>,
+    /// maximum number of repos allowed in the backfill pending queue before the crawler pauses.
+    /// set via `HYDRANT_CRAWLER_MAX_PENDING_REPOS`.
     pub crawler_max_pending_repos: usize,
+    /// pending queue size at which the crawler resumes after being paused.
+    /// set via `HYDRANT_CRAWLER_RESUME_PENDING_REPOS`.
     pub crawler_resume_pending_repos: usize,
-    pub filter_signals: Option<Vec<String>>,
-    pub filter_collections: Option<Vec<String>>,
-    pub filter_excludes: Option<Vec<String>>,
-    /// enable backlinks indexing (only meaningful in non-ephemeral mode).
-    /// set via `HYDRANT_ENABLE_BACKLINKS=true`.
-    pub enable_backlinks: bool,
     /// crawler sources: each entry pairs a URL with a discovery mode.
     ///
     /// set via `HYDRANT_CRAWLER_URLS` as a comma-separated list of `[mode::]url` entries,
@@ -168,6 +184,72 @@ pub struct Config {
     /// `by_collection` otherwise). defaults to the relay hosts with the default mode.
     /// set to an empty string to disable crawling entirely.
     pub crawler_sources: Vec<CrawlerSource>,
+
+    /// signature verification level for incoming commits.
+    /// set via `HYDRANT_VERIFY_SIGNATURES` (`full`, `backfill-only`, or `none`).
+    pub verify_signatures: SignatureVerification,
+    /// number of resolved identities to keep in the in-memory LRU cache.
+    /// set via `HYDRANT_IDENTITY_CACHE_SIZE`.
+    pub identity_cache_size: u64,
+
+    /// NSID patterns that trigger auto-discovery in filter mode (e.g. `app.bsky.feed.post`).
+    /// set via `HYDRANT_FILTER_SIGNALS` as a comma-separated list.
+    pub filter_signals: Option<Vec<String>>,
+    /// NSID patterns used to filter which record collections are stored.
+    /// if `None`, all collections are stored. set via `HYDRANT_FILTER_COLLECTIONS`.
+    pub filter_collections: Option<Vec<String>>,
+    /// DIDs that are always skipped, regardless of mode.
+    /// set via `HYDRANT_FILTER_EXCLUDES` as a comma-separated list.
+    pub filter_excludes: Option<Vec<String>>,
+
+    /// enable backlinks indexing (only meaningful in non-ephemeral mode).
+    /// set via `HYDRANT_ENABLE_BACKLINKS=true`.
+    pub enable_backlinks: bool,
+
+    /// db internals, tune only if you know what you're doing.
+    ///
+    /// size of the fjall block cache in MB. set via `HYDRANT_CACHE_SIZE`.
+    pub cache_size: u64,
+    /// db internals, tune only if you know what you're doing.
+    ///
+    /// compression algorithm for data keyspaces (blocks, records, repos, events).
+    /// set via `HYDRANT_DATA_COMPRESSION` (`lz4`, `zstd`, or `none`).
+    pub data_compression: Compression,
+    /// db internals, tune only if you know what you're doing.
+    ///
+    /// compression algorithm for the fjall journal.
+    /// set via `HYDRANT_JOURNAL_COMPRESSION` (`lz4`, `zstd`, or `none`).
+    pub journal_compression: Compression,
+    /// db internals, tune only if you know what you're doing.
+    ///
+    /// number of background threads used by the fjall storage engine.
+    /// set via `HYDRANT_DB_WORKER_THREADS`.
+    pub db_worker_threads: usize,
+    /// db internals, tune only if you know what you're doing.
+    ///
+    /// maximum total size of the fjall journal in MB before a flush is forced.
+    /// set via `HYDRANT_DB_MAX_JOURNALING_SIZE_MB`.
+    pub db_max_journaling_size_mb: u64,
+    /// db internals, tune only if you know what you're doing.
+    ///
+    /// in-memory write buffer (memtable) size for the blocks keyspace in MB.
+    /// set via `HYDRANT_DB_BLOCKS_MEMTABLE_SIZE_MB`.
+    pub db_blocks_memtable_size_mb: u64,
+    /// db internals, tune only if you know what you're doing.
+    ///
+    /// in-memory write buffer (memtable) size for the repos keyspace in MB.
+    /// set via `HYDRANT_DB_REPOS_MEMTABLE_SIZE_MB`.
+    pub db_repos_memtable_size_mb: u64,
+    /// db internals, tune only if you know what you're doing.
+    ///
+    /// in-memory write buffer (memtable) size for the events keyspace in MB.
+    /// set via `HYDRANT_DB_EVENTS_MEMTABLE_SIZE_MB`.
+    pub db_events_memtable_size_mb: u64,
+    /// db internals, tune only if you know what you're doing.
+    ///
+    /// in-memory write buffer (memtable) size for the records keyspace in MB.
+    /// set via `HYDRANT_DB_RECORDS_MEMTABLE_SIZE_MB`.
+    pub db_records_memtable_size_mb: u64,
 }
 
 impl Default for Config {
@@ -175,38 +257,38 @@ impl Default for Config {
         const BASE_MEMTABLE_MB: u64 = 32;
         Self {
             database_path: PathBuf::from("./hydrant.db"),
-            relays: vec![Url::parse("wss://relay.fire.hose.cam/").unwrap()],
-            plc_urls: vec![Url::parse("https://plc.wtf").unwrap()],
             full_network: false,
             ephemeral: false,
             ephemeral_ttl: Duration::from_secs(3600),
+            relays: vec![Url::parse("wss://relay.fire.hose.cam/").unwrap()],
+            plc_urls: vec![Url::parse("https://plc.wtf").unwrap()],
+            enable_firehose: true,
+            firehose_workers: 8,
             cursor_save_interval: Duration::from_secs(3),
             repo_fetch_timeout: Duration::from_secs(300),
-            cache_size: 256,
             backfill_concurrency_limit: 16,
-            data_compression: Compression::Lz4,
-            journal_compression: Compression::Lz4,
+            enable_crawler: None,
+            crawler_max_pending_repos: 2000,
+            crawler_resume_pending_repos: 1000,
+            crawler_sources: vec![CrawlerSource {
+                url: Url::parse("https://lightrail.microcosm.blue").unwrap(),
+                mode: CrawlerMode::ByCollection,
+            }],
             verify_signatures: SignatureVerification::Full,
             identity_cache_size: 1_000_000,
-            enable_firehose: true,
-            enable_crawler: None,
-            firehose_workers: 8,
+            filter_signals: None,
+            filter_collections: None,
+            filter_excludes: None,
+            enable_backlinks: false,
+            cache_size: 256,
+            data_compression: Compression::Lz4,
+            journal_compression: Compression::Lz4,
             db_worker_threads: 4,
             db_max_journaling_size_mb: 400,
             db_blocks_memtable_size_mb: BASE_MEMTABLE_MB,
             db_repos_memtable_size_mb: BASE_MEMTABLE_MB / 2,
             db_events_memtable_size_mb: BASE_MEMTABLE_MB,
             db_records_memtable_size_mb: BASE_MEMTABLE_MB / 3 * 2,
-            crawler_max_pending_repos: 2000,
-            crawler_resume_pending_repos: 1000,
-            filter_signals: None,
-            filter_collections: None,
-            filter_excludes: None,
-            enable_backlinks: false,
-            crawler_sources: vec![CrawlerSource {
-                url: Url::parse("https://lightrail.microcosm.blue").unwrap(),
-                mode: CrawlerMode::ByCollection,
-            }],
         }
     }
 }
@@ -218,18 +300,18 @@ impl Config {
         Self {
             full_network: true,
             plc_urls: vec![Url::parse("https://plc.directory").unwrap()],
-            backfill_concurrency_limit: 64,
             firehose_workers: 24,
-            db_worker_threads: 8,
-            db_max_journaling_size_mb: 1024,
-            db_blocks_memtable_size_mb: BASE_MEMTABLE_MB,
-            db_events_memtable_size_mb: BASE_MEMTABLE_MB,
-            db_repos_memtable_size_mb: BASE_MEMTABLE_MB / 2,
-            db_records_memtable_size_mb: BASE_MEMTABLE_MB / 3 * 2,
+            backfill_concurrency_limit: 64,
             crawler_sources: vec![CrawlerSource {
                 url: Url::parse("wss://relay.fire.hose.cam/").unwrap(),
                 mode: CrawlerMode::Relay,
             }],
+            db_worker_threads: 8,
+            db_max_journaling_size_mb: 1024,
+            db_blocks_memtable_size_mb: BASE_MEMTABLE_MB,
+            db_repos_memtable_size_mb: BASE_MEMTABLE_MB / 2,
+            db_events_memtable_size_mb: BASE_MEMTABLE_MB,
+            db_records_memtable_size_mb: BASE_MEMTABLE_MB / 3 * 2,
             ..Self::default()
         }
     }
@@ -387,35 +469,35 @@ impl Config {
 
         Ok(Self {
             database_path,
-            relays: relay_hosts,
-            plc_urls,
+            full_network,
             ephemeral,
             ephemeral_ttl,
-            full_network,
+            relays: relay_hosts,
+            plc_urls,
+            enable_firehose,
+            firehose_workers,
             cursor_save_interval,
             repo_fetch_timeout,
-            cache_size,
             backfill_concurrency_limit,
-            data_compression,
-            journal_compression,
+            enable_crawler,
+            crawler_max_pending_repos,
+            crawler_resume_pending_repos,
+            crawler_sources,
             verify_signatures,
             identity_cache_size,
-            enable_firehose,
-            enable_crawler,
-            firehose_workers,
+            filter_signals,
+            filter_collections,
+            filter_excludes,
+            enable_backlinks,
+            cache_size,
+            data_compression,
+            journal_compression,
             db_worker_threads,
             db_max_journaling_size_mb,
             db_blocks_memtable_size_mb,
             db_repos_memtable_size_mb,
             db_events_memtable_size_mb,
             db_records_memtable_size_mb,
-            crawler_max_pending_repos,
-            crawler_resume_pending_repos,
-            filter_signals,
-            filter_collections,
-            filter_excludes,
-            enable_backlinks,
-            crawler_sources,
         })
     }
 }
