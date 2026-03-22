@@ -80,7 +80,7 @@ each source maintains its own cursor so restarts resume mid-pass.
 | `CRAWLER_MAX_PENDING_REPOS` | `2000` | max pending repos for crawler. |
 | `CRAWLER_RESUME_PENDING_REPOS` | `1000` | resume threshold for crawler pending repos. |
 
-## api
+## REST api
 
 ### management
 
@@ -143,21 +143,33 @@ each set field accepts one of two forms:
 - `PUT /repos`: explicitly track repositories. accepts an NDJSON body of `{"did": "..."}` (or JSON array of the same).
 - `DELETE /repos`: untrack repositories. accepts an NDJSON body of `{"did": "..."}` (or JSON array of the same).
 
-### data access (xrpc)
+### event stream
+
+- `GET /stream`: subscribe to the event stream.
+  - query parameters:
+    - `cursor` (optional): start streaming from a specific event ID.
+
+### stats
+
+- `GET /stats`: get stats about the database:
+  - `counts`: counts of repos, records, events, and errors, etc.
+  - `sizes`: sizes of the database keyspaces on disk, in bytes.
+
+## data access (xrpc)
 
 `hydrant` implements the following XRPC endpoints under `/xrpc/`:
 
-#### com.atproto.*
+### com.atproto.*
 
 the following are implemented currently:
 - `com.atproto.repo.getRecord`
 - `com.atproto.repo.listRecords`
 
-#### systems.gaze.hydrant.*
+### systems.gaze.hydrant.*
 
 these are some non-standard XRPCs that might be useful.
 
-##### systems.gaze.hydrant.countRecords
+#### systems.gaze.hydrant.countRecords
 
 return the total number of stored records in a collection.
 
@@ -168,13 +180,13 @@ return the total number of stored records in a collection.
 
 returns `{ count }`.
 
-#### blue.microcosm.links.*
+### blue.microcosm.links.*
 
 hydrant implements a subset of [microcosm constellation](https://constellation.microcosm.blue/) when it's built with the `backlinks` cargo feature (`cargo build --features backlinks`).
 
 when enabled, hydrant indexes all AT URI and DID references found inside stored records into a reverse index. this lets you efficiently answer "what records link to this subject?".
 
-##### blue.microcosm.links.getBacklinks
+#### blue.microcosm.links.getBacklinks
 
 return records that link to a given subject.
 
@@ -190,7 +202,7 @@ returns `{ backlinks: [{ uri, cid }], cursor? }`.
 
 results are ordered by source record rkey (ascending by default, descending when `reverse=true`). the cursor is stable across new insertions for TID rkey records.
 
-##### blue.microcosm.links.getBacklinksCount
+#### blue.microcosm.links.getBacklinksCount
 
 return the number of records that link to a given subject.
 
@@ -200,15 +212,3 @@ return the number of records that link to a given subject.
 | `source` | no | filter by source collection (same format as `getBacklinks`). |
 
 returns `{ count }`.
-
-### event stream
-
-- `GET /stream`: subscribe to the event stream.
-  - query parameters:
-    - `cursor` (optional): start streaming from a specific event ID.
-
-### stats
-
-- `GET /stats`: get stats about the database:
-  - `counts`: counts of repos, records, events, and errors, etc.
-  - `sizes`: sizes of the database keyspaces on disk, in bytes.
