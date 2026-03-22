@@ -69,6 +69,11 @@ CRAWLER_URLS=by_collection::https://lightrail.microcosm.blue,relay::wss://bsky.n
 
 each source maintains its own cursor so restarts resume mid-pass.
 
+sources can also be added and removed at runtime via the `/crawler/sources` API
+(see below). dynamically added sources are persisted to the database and survive
+restarts. `CRAWLER_URLS` sources are startup-only: they are not written to the
+database and will always reappear after a restart regardless of runtime changes.
+
 ## configuration
 
 `hydrant` is configured via environment variables. all variables are prefixed
@@ -117,12 +122,38 @@ directory, it will also be loaded automatically.
   - returns `{ "crawler": bool, "firehose": bool, "backfill": bool }`.
 - `PATCH /ingestion`: enable or disable ingestion components at runtime without
   restarting.
-  - body: `{ "crawler"?: bool, "firehose"?: bool, "backfill"?: bool }` — only
-    provided fields are updated.
+  - body: `{ "crawler"?: bool, "firehose"?: bool, "backfill"?: bool }`. only provided fields are updated.
   - when disabled, each component finishes its current task before pausing (e.g.
     the backfill worker completes any in-flight repo syncs, the firehose
     finishes processing the current message). they resume immediately when
     re-enabled.
+
+#### crawler source management
+
+- `GET /crawler/sources`: list all currently active crawler sources.
+  - returns a JSON array of `{ "url": string, "mode": "relay" | "by_collection", "persisted": bool }`.
+  - `persisted: true` means the source was added via the API and is stored in the
+    database, it will survive a restart. `persisted: false` means the source
+    came from `CRAWLER_URLS` and is not written to the database.
+- `POST /crawler/sources`: add a crawler source at runtime.
+  - body: `{ "url": string, "mode": "relay" | "by_collection" }`.
+  - the source is written to the database before the producer task is started, so
+    it is safe to add sources and then immediately restart without losing them.
+  - if a source with the same URL already exists (whether from `CRAWLER_URLS` or
+    a previous `POST`), it is replaced: the running task is stopped and a new one
+    is started with the new mode. any cursor state for that URL is preserved.
+  - returns `201 Created` on success.
+- `DELETE /crawler/sources`: remove a crawler source at runtime.
+  - body: `{ "url": string }`.
+  - the producer task is stopped immediately.
+  - if the source was added via the API (`persisted: true`), it is removed from
+    the database and will not reappear on restart. if it came from `CRAWLER_URLS`
+    (`persisted: false`), only the running task is stopped, the source will
+    reappear on the next restart since `CRAWLER_URLS` is re-applied at startup.
+    (unless you remove it manually from your configuration of course).
+  - cursor state is not cleared. use `DELETE /cursors` separately if you want
+    the source to restart from the beginning when re-added.
+  - returns `200 OK` if the source was found and removed, `404 Not Found` otherwise.
 
 #### database operations
 
@@ -159,15 +190,15 @@ the `mode` field controls what gets indexed:
 
 each set field accepts one of two forms:
 
-- **replace**: an array replaces the entire set — `["did:plc:abc", "did:web:example.org"]`
-- **patch**: an object maps items to `true` (add) or `false` (remove) — `{"did:plc:abc": true, "did:web:example.org": false}`
+- **replace**: an array replaces the entire set, eg. `["did:plc:abc", "did:web:example.org"]`
+- **patch**: an object maps items to `true` (add) or `false` (remove), eg. `{"did:plc:abc": true, "did:web:example.org": false}`
 
 #### NSID patterns
 
 `signals` and `collections` support an optional `.*` suffix to match an entire namespace:
 
-- `app.bsky.feed.post` — exact match only
-- `app.bsky.feed.*` — matches any collection under `app.bsky.feed`
+- `app.bsky.feed.post`: exact match only
+- `app.bsky.feed.*`: matches any collection under `app.bsky.feed`
 
 ### repository management
 

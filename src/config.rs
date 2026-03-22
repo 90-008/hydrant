@@ -1,4 +1,6 @@
 use miette::Result;
+use serde::{Deserialize, Serialize};
+use smol_str::ToSmolStr;
 use std::fmt;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -42,11 +44,28 @@ pub enum CrawlerMode {
 
 impl CrawlerMode {
     fn default_for(full_network: bool) -> Self {
-        if full_network {
-            Self::Relay
-        } else {
-            Self::ByCollection
-        }
+        full_network
+            .then_some(Self::Relay)
+            .unwrap_or(Self::ByCollection)
+    }
+}
+
+impl Serialize for CrawlerMode {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.to_smolstr())
+    }
+}
+
+impl<'de> Deserialize<'de> for CrawlerMode {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        FromStr::from_str(&s).map_err(serde::de::Error::custom)
     }
 }
 

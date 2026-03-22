@@ -19,7 +19,7 @@ use throttle::Throttler;
 
 pub(crate) use by_collection::ByCollectionProducer;
 pub(crate) use relay::{RelayProducer, RetryProducer, SignalChecker};
-pub(crate) use worker::CrawlerWorker;
+pub(crate) use worker::{CrawlerBatch, CrawlerWorker};
 
 // -- InFlight ------------------------------------------------------------
 

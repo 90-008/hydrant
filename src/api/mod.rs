@@ -5,6 +5,7 @@ use std::{net::SocketAddr, sync::Arc};
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
+mod crawler;
 mod db;
 mod debug;
 mod filter;
@@ -24,6 +25,7 @@ pub async fn serve(hydrant: Hydrant, port: u16) -> miette::Result<()> {
         .merge(filter::router())
         .merge(repos::router())
         .merge(ingestion::router())
+        .merge(crawler::router())
         .merge(db::router());
 
     #[cfg(feature = "backlinks")]

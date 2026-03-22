@@ -144,7 +144,12 @@ impl Hydrant {
         let state = Arc::new(state);
 
         Ok(Self {
-            crawler: CrawlerHandle(state.clone()),
+            crawler: CrawlerHandle {
+                state: state.clone(),
+                shared: Arc::new(std::sync::OnceLock::new()),
+                tasks: Arc::new(scc::HashMap::new()),
+                persisted: Arc::new(scc::HashSet::new()),
+            },
             firehose: FirehoseHandle(state.clone()),
             backfill: BackfillHandle(state.clone()),
             filter: FilterControl(state.clone()),
@@ -175,6 +180,7 @@ impl Hydrant {
     pub fn run(&self) -> Result<impl Future<Output = Result<()>>> {
         let state = self.state.clone();
         let config = self.config.clone();
+        let crawler = self.crawler.clone();
 
         if self.started.swap(true, Ordering::SeqCst) {
             miette::bail!("Hydrant::run() called more than once");
@@ -329,16 +335,12 @@ impl Hydrant {
                 }
             }
 
-            // 11. spawn crawler components
-            if !config.crawler_sources.is_empty() {
-                use crate::config::CrawlerMode;
+            // 11. spawn crawler infrastructure (always, to support dynamic source management)
+            {
                 use crate::crawler::throttle::Throttler;
                 use crate::crawler::{
-                    ByCollectionProducer, CrawlerStats, CrawlerWorker, InFlight, RelayProducer,
-                    RetryProducer, SignalChecker,
+                    CrawlerStats, CrawlerWorker, InFlight, RetryProducer, SignalChecker,
                 };
-                use std::time::Duration;
-                use tracing::Instrument;
 
                 let http = reqwest::Client::builder()
                     .user_agent(concat!(
@@ -402,61 +404,60 @@ impl Hydrant {
                     .run(),
                 );
 
-                let crawler_rx = state.crawler_enabled.subscribe();
-                for source in config.crawler_sources.iter().cloned() {
-                    let http = http.clone();
-                    let state = state.clone();
-                    let in_flight = in_flight.clone();
-                    let tx = tx.clone();
-                    let stats = stats.clone();
-                    let enabled = crawler_rx.clone();
-                    match source.mode {
-                        CrawlerMode::Relay => {
-                            info!(relay = %source.url, enabled = *state.crawler_enabled.borrow(), "starting relay crawler");
-                            let span = tracing::info_span!("crawl", url = %source.url);
-                            tokio::spawn(
-                                RelayProducer {
-                                    relay_url: source.url,
-                                    checker: checker.clone(),
-                                    in_flight,
-                                    tx,
-                                    enabled,
-                                    stats,
-                                }
-                                .run()
-                                .instrument(span),
-                            );
-                        }
-                        CrawlerMode::ByCollection => {
-                            info!(
-                                host = source.url.host_str(),
-                                enabled = *state.crawler_enabled.borrow(),
-                                "starting by-collection crawler"
-                            );
-                            let span =
-                                tracing::info_span!("by_collection", host = source.url.host_str());
-                            tokio::spawn(
-                                async move {
-                                    loop {
-                                        let producer = ByCollectionProducer {
-                                            index_url: source.url.clone(),
-                                            http: http.clone(),
-                                            state: state.clone(),
-                                            in_flight: in_flight.clone(),
-                                            tx: tx.clone(),
-                                            enabled: enabled.clone(),
-                                            stats: stats.clone(),
-                                        };
-                                        if let Err(e) = producer.run().await {
-                                            error!(err = ?e, "by-collection crawler fatal error, restarting in 30s");
-                                            tokio::time::sleep(Duration::from_secs(30)).await;
-                                        }
-                                    }
-                                }
-                                .instrument(span),
-                            );
-                        }
+                // set shared objects so CrawlerHandle methods can use them
+                crawler
+                    .shared
+                    .set(CrawlerShared {
+                        http,
+                        checker,
+                        in_flight,
+                        tx,
+                        stats,
+                    })
+                    .ok()
+                    .expect("crawler shared already set");
+                let shared = crawler.shared.get().unwrap();
+
+                // spawn initial sources from config
+                for source in config.crawler_sources.iter() {
+                    let enabled_rx = state.crawler_enabled.subscribe();
+                    let handle = spawn_crawler_producer(
+                        source,
+                        &shared.http,
+                        &state,
+                        &shared.checker,
+                        &shared.in_flight,
+                        &shared.tx,
+                        &shared.stats,
+                        enabled_rx,
+                    );
+                    let _ = crawler.tasks.insert_async(source.url.clone(), handle).await;
+                }
+
+                // load and spawn any sources persisted in the database
+                let db = state.db.clone();
+                let persisted_sources =
+                    tokio::task::spawn_blocking(move || load_persisted_crawler_sources(&db))
+                        .await
+                        .into_diagnostic()??;
+
+                for source in &persisted_sources {
+                    let _ = crawler.persisted.insert_async(source.url.clone()).await;
+                    if crawler.tasks.contains_async(&source.url).await {
+                        continue;
                     }
+                    let enabled_rx = state.crawler_enabled.subscribe();
+                    let handle = spawn_crawler_producer(
+                        source,
+                        &shared.http,
+                        &state,
+                        &shared.checker,
+                        &shared.in_flight,
+                        &shared.tx,
+                        &shared.stats,
+                        enabled_rx,
+                    );
+                    let _ = crawler.tasks.insert_async(source.url.clone(), handle).await;
                 }
             }
 
@@ -625,8 +626,6 @@ impl axum::extract::FromRef<Hydrant> for Arc<AppState> {
     }
 }
 
-// --- event stream ---
-
 /// a stream of [`Event`]s. returned by [`Hydrant::subscribe`].
 ///
 /// implements [`futures::Stream`] and can be used with `StreamExt::next`,
@@ -642,8 +641,6 @@ impl Stream for EventStream {
     }
 }
 
-// --- stats ---
-
 /// database statistics returned by [`Hydrant::stats`].
 #[derive(serde::Serialize)]
 pub struct StatsResponse {
@@ -653,7 +650,125 @@ pub struct StatsResponse {
     pub sizes: BTreeMap<&'static str, u64>,
 }
 
-// --- ingestion handles ---
+struct ProducerHandle {
+    mode: crate::config::CrawlerMode,
+    abort: tokio::task::AbortHandle,
+}
+
+impl Drop for ProducerHandle {
+    fn drop(&mut self) {
+        self.abort.abort();
+    }
+}
+
+struct CrawlerShared {
+    http: reqwest::Client,
+    checker: crate::crawler::SignalChecker,
+    in_flight: crate::crawler::InFlight,
+    tx: mpsc::Sender<crate::crawler::CrawlerBatch>,
+    stats: crate::crawler::CrawlerStats,
+}
+
+/// a snapshot of a single crawler source's runtime state.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CrawlerSourceInfo {
+    pub url: Url,
+    pub mode: crate::config::CrawlerMode,
+    /// whether this source is persisted in the database (i.e. it was dynamically added
+    /// and will survive restarts). config-sourced entries have `persisted: false`.
+    pub persisted: bool,
+}
+
+fn spawn_crawler_producer(
+    source: &crate::config::CrawlerSource,
+    http: &reqwest::Client,
+    state: &Arc<AppState>,
+    checker: &crate::crawler::SignalChecker,
+    in_flight: &crate::crawler::InFlight,
+    tx: &mpsc::Sender<crate::crawler::CrawlerBatch>,
+    stats: &crate::crawler::CrawlerStats,
+    enabled: watch::Receiver<bool>,
+) -> ProducerHandle {
+    use crate::config::CrawlerMode;
+    use crate::crawler::{ByCollectionProducer, RelayProducer};
+    use std::time::Duration;
+    use tracing::Instrument;
+
+    let abort = match source.mode {
+        CrawlerMode::Relay => {
+            info!(relay = %source.url, enabled = *state.crawler_enabled.borrow(), "starting relay crawler");
+            let span = tracing::info_span!("crawl", url = %source.url);
+            tokio::spawn(
+                RelayProducer {
+                    relay_url: source.url.clone(),
+                    checker: checker.clone(),
+                    in_flight: in_flight.clone(),
+                    tx: tx.clone(),
+                    enabled,
+                    stats: stats.clone(),
+                }
+                .run()
+                .instrument(span),
+            )
+            .abort_handle()
+        }
+        CrawlerMode::ByCollection => {
+            info!(
+                host = source.url.host_str(),
+                enabled = *state.crawler_enabled.borrow(),
+                "starting by-collection crawler"
+            );
+            let span = tracing::info_span!("by_collection", host = source.url.host_str());
+            let http = http.clone();
+            let state = state.clone();
+            let in_flight = in_flight.clone();
+            let tx = tx.clone();
+            let stats = stats.clone();
+            let url = source.url.clone();
+            tokio::spawn(
+                async move {
+                    loop {
+                        let producer = ByCollectionProducer {
+                            index_url: url.clone(),
+                            http: http.clone(),
+                            state: state.clone(),
+                            in_flight: in_flight.clone(),
+                            tx: tx.clone(),
+                            enabled: enabled.clone(),
+                            stats: stats.clone(),
+                        };
+                        if let Err(e) = producer.run().await {
+                            error!(err = ?e, "by-collection crawler fatal error, restarting in 30s");
+                            tokio::time::sleep(Duration::from_secs(30)).await;
+                        }
+                    }
+                }
+                .instrument(span),
+            )
+            .abort_handle()
+        }
+    };
+    ProducerHandle {
+        mode: source.mode,
+        abort,
+    }
+}
+
+/// load all crawler sources persisted in the database.
+fn load_persisted_crawler_sources(db: &crate::db::Db) -> Result<Vec<crate::config::CrawlerSource>> {
+    use crate::db::keys::CRAWLER_SOURCE_PREFIX;
+
+    let mut sources = Vec::new();
+    for entry in db.crawler.prefix(CRAWLER_SOURCE_PREFIX) {
+        let (key, val) = entry.into_inner().into_diagnostic()?;
+        let url_bytes = &key[CRAWLER_SOURCE_PREFIX.len()..];
+        let url_str = std::str::from_utf8(url_bytes).into_diagnostic()?;
+        let url = Url::parse(url_str).into_diagnostic()?;
+        let mode: crate::config::CrawlerMode = rmp_serde::from_slice(&val).into_diagnostic()?;
+        sources.push(crate::config::CrawlerSource { url, mode });
+    }
+    Ok(sources)
+}
 
 /// runtime control over the crawler component.
 ///
@@ -665,26 +780,34 @@ pub struct StatsResponse {
 /// disabling the crawler does not affect in-progress repo checks. each one completes
 /// its current PDS request before pausing.
 #[derive(Clone)]
-pub struct CrawlerHandle(Arc<AppState>);
+pub struct CrawlerHandle {
+    state: Arc<AppState>,
+    /// set once by [`Hydrant::run`]; `None` means run() has not been called yet.
+    shared: Arc<std::sync::OnceLock<CrawlerShared>>,
+    /// per-source running tasks, keyed by url.
+    tasks: Arc<scc::HashMap<Url, ProducerHandle>>,
+    /// set of urls persisted in the database (dynamically added sources).
+    persisted: Arc<scc::HashSet<Url>>,
+}
 
 impl CrawlerHandle {
     /// enable the crawler (enables all configured producers). no-op if already enabled.
     pub fn enable(&self) {
-        self.0.crawler_enabled.send_replace(true);
+        self.state.crawler_enabled.send_replace(true);
     }
     /// disable the crawler (disables all configured producers).
     /// in-progress repo checks finish before the crawler pauses.
     pub fn disable(&self) {
-        self.0.crawler_enabled.send_replace(false);
+        self.state.crawler_enabled.send_replace(false);
     }
     /// returns the current enabled state of the crawler.
     pub fn is_enabled(&self) -> bool {
-        *self.0.crawler_enabled.borrow()
+        *self.state.crawler_enabled.borrow()
     }
 
     /// delete all cursor entries associated with the given URL.
     pub async fn reset_cursor(&self, url: &str) -> Result<()> {
-        let db = self.0.db.clone();
+        let db = self.state.db.clone();
         let point_keys = [keys::crawler_cursor_key(url)];
         let by_collection_prefix = keys::by_collection_cursor_prefix(url);
         tokio::task::spawn_blocking(move || {
@@ -693,7 +816,7 @@ impl CrawlerHandle {
                 batch.remove(&db.cursors, k);
             }
             for entry in db.cursors.prefix(&by_collection_prefix) {
-                let (k, _) = entry.into_inner().into_diagnostic()?;
+                let k = entry.key().into_diagnostic()?;
                 batch.remove(&db.cursors, k);
             }
             batch.commit().into_diagnostic()
@@ -702,6 +825,97 @@ impl CrawlerHandle {
         .into_diagnostic()??;
         Ok(())
     }
+
+    /// return info on all currently active crawler sources.
+    ///
+    /// returns an empty list if called before [`Hydrant::run`].
+    pub async fn list_sources(&self) -> Vec<CrawlerSourceInfo> {
+        let mut sources = Vec::new();
+        self.tasks
+            .iter_async(|url, h| {
+                sources.push(CrawlerSourceInfo {
+                    url: url.clone(),
+                    mode: h.mode,
+                    persisted: self.persisted.contains_sync(url),
+                });
+                true
+            })
+            .await;
+        sources
+    }
+
+    /// add a new crawler source at runtime.
+    ///
+    /// the source is persisted to the database and will be re-spawned on restart.
+    /// if a source with the same URL already exists, it is replaced (the old task is
+    /// aborted and a new one is started with the new mode).
+    ///
+    /// returns an error if called before [`Hydrant::run`].
+    pub async fn add_source(&self, source: crate::config::CrawlerSource) -> Result<()> {
+        let Some(shared) = self.shared.get() else {
+            miette::bail!("crawler not yet started: call Hydrant::run() first");
+        };
+
+        let db = self.state.db.clone();
+        let key = keys::crawler_source_key(source.url.as_str());
+        let val = rmp_serde::to_vec(&source.mode).into_diagnostic()?;
+        tokio::task::spawn_blocking(move || db.crawler.insert(key, val).into_diagnostic())
+            .await
+            .into_diagnostic()??;
+
+        let enabled_rx = self.state.crawler_enabled.subscribe();
+        let handle = spawn_crawler_producer(
+            &source,
+            &shared.http,
+            &self.state,
+            &shared.checker,
+            &shared.in_flight,
+            &shared.tx,
+            &shared.stats,
+            enabled_rx,
+        );
+
+        let _ = self.persisted.insert_async(source.url.clone()).await;
+        match self.tasks.entry_async(source.url).await {
+            scc::hash_map::Entry::Vacant(e) => {
+                e.insert_entry(handle);
+            }
+            scc::hash_map::Entry::Occupied(mut e) => {
+                *e.get_mut() = handle;
+            }
+        }
+        Ok(())
+    }
+
+    /// remove a crawler source at runtime by URL.
+    ///
+    /// aborts the running producer task and removes the source from the database if it
+    /// was dynamically added. config-sourced entries are aborted but not persisted, so
+    /// they will reappear on restart.
+    ///
+    /// returns `true` if a source with the given URL was found and removed.
+    /// returns an error if called before [`Hydrant::run`].
+    pub async fn remove_source(&self, url: &Url) -> Result<bool> {
+        if self.shared.get().is_none() {
+            miette::bail!("crawler not yet started: call Hydrant::run() first");
+        }
+
+        // dropping the ProducerHandle aborts the task via Drop
+        if self.tasks.remove_async(url).await.is_none() {
+            return Ok(false);
+        }
+
+        // remove from DB if it was a persisted source
+        if self.persisted.remove_async(url).await.is_some() {
+            let db = self.state.db.clone();
+            let key = keys::crawler_source_key(url.as_str());
+            tokio::task::spawn_blocking(move || db.crawler.remove(key).into_diagnostic())
+                .await
+                .into_diagnostic()??;
+        }
+
+        Ok(true)
+    }
 }
 
 /// runtime control over the firehose ingestor component.
@@ -709,11 +923,11 @@ impl CrawlerHandle {
 pub struct FirehoseHandle(Arc<AppState>);
 
 impl FirehoseHandle {
-    /// enable the firehose. no-op if already enabled.
+    /// enable the firehose, no-op if already enabled.
     pub fn enable(&self) {
         self.0.firehose_enabled.send_replace(true);
     }
-    /// disable the firehose. the current message finishes processing before the connection closes.
+    /// disable the firehose, the current message finishes processing before the connection closes.
     pub fn disable(&self) {
         self.0.firehose_enabled.send_replace(false);
     }
@@ -732,11 +946,11 @@ impl FirehoseHandle {
 pub struct BackfillHandle(Arc<AppState>);
 
 impl BackfillHandle {
-    /// enable the backfill worker. no-op if already enabled.
+    /// enable the backfill worker, no-op if already enabled.
     pub fn enable(&self) {
         self.0.backfill_enabled.send_replace(true);
     }
-    /// disable the backfill worker. in-flight repos complete before pausing.
+    /// disable the backfill worker, in-flight repos complete before pausing.
     pub fn disable(&self) {
         self.0.backfill_enabled.send_replace(false);
     }

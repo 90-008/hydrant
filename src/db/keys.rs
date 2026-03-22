@@ -178,6 +178,15 @@ pub fn by_collection_cursor_prefix(url: &str) -> Vec<u8> {
     prefix
 }
 
+pub const CRAWLER_SOURCE_PREFIX: &[u8] = b"src|";
+
+pub fn crawler_source_key(url: &str) -> Vec<u8> {
+    let mut key = Vec::with_capacity(CRAWLER_SOURCE_PREFIX.len() + url.len());
+    key.extend_from_slice(CRAWLER_SOURCE_PREFIX);
+    key.extend_from_slice(url.as_bytes());
+    key
+}
+
 pub fn firehose_cursor_key(relay: &str) -> Vec<u8> {
     let mut key = b"firehose_cursor|".to_vec();
     key.extend_from_slice(relay.as_bytes());
