@@ -111,88 +111,10 @@ directory, it will also be loaded automatically.
 
 ## REST api
 
-### management
+### filter management
 
 - `GET /filter`: get the current filter configuration.
 - `PATCH /filter`: update the filter configuration.
-
-#### ingestion control
-
-- `GET /ingestion`: get the current ingestion status.
-  - returns `{ "crawler": bool, "firehose": bool, "backfill": bool }`.
-- `PATCH /ingestion`: enable or disable ingestion components at runtime without
-  restarting.
-  - body: `{ "crawler"?: bool, "firehose"?: bool, "backfill"?: bool }`. only provided fields are updated.
-  - when disabled, each component finishes its current task before pausing (e.g.
-    the backfill worker completes any in-flight repo syncs, the firehose
-    finishes processing the current message). they resume immediately when
-    re-enabled.
-
-#### crawler source management
-
-- `GET /crawler/sources`: list all currently active crawler sources.
-  - returns a JSON array of `{ "url": string, "mode": "relay" | "by_collection", "persisted": bool }`.
-  - `persisted: true` means the source was added via the API and is stored in the
-    database, it will survive a restart. `persisted: false` means the source
-    came from `CRAWLER_URLS` and is not written to the database.
-- `POST /crawler/sources`: add a crawler source at runtime.
-  - body: `{ "url": string, "mode": "relay" | "by_collection" }`.
-  - the source is written to the database before the producer task is started, so
-    it is safe to add sources and then immediately restart without losing them.
-  - if a source with the same URL already exists (whether from `CRAWLER_URLS` or
-    a previous `POST`), it is replaced: the running task is stopped and a new one
-    is started with the new mode. any cursor state for that URL is preserved.
-  - returns `201 Created` on success.
-- `DELETE /crawler/sources`: remove a crawler source at runtime.
-  - body: `{ "url": string }`.
-  - the producer task is stopped immediately.
-  - if the source was added via the API (`persisted: true`), it is removed from
-    the database and will not reappear on restart. if it came from `CRAWLER_URLS`
-    (`persisted: false`), only the running task is stopped, the source will
-    reappear on the next restart since `CRAWLER_URLS` is re-applied at startup.
-    (unless you remove it manually from your configuration of course).
-  - cursor state is not cleared. use `DELETE /cursors` separately if you want
-    the source to restart from the beginning when re-added.
-  - returns `200 OK` if the source was found and removed, `404 Not Found` otherwise.
-
-#### firehose source management
-
-- `GET /firehose/sources`: list all currently active firehose relay sources.
-  - returns a JSON array of `{ "url": string, "persisted": bool }`.
-  - `persisted: true` means the source was added via the API and is stored in the
-    database, it will survive a restart. `persisted: false` means the source
-    came from `RELAY_HOSTS` and is not written to the database.
-- `POST /firehose/sources`: add a firehose relay at runtime.
-  - body: `{ "url": string }`.
-  - the source is persisted to the database before the ingestor task is started.
-  - if a relay with the same URL already exists, it is replaced: the running
-    task is stopped and a new one is started. any existing cursor state for that
-    URL is preserved.
-  - returns `201 Created` on success.
-- `DELETE /firehose/sources`: remove a firehose relay at runtime.
-  - body: `{ "url": string }`.
-  - the ingestor task is stopped immediately.
-  - if the source was added via the API (`persisted: true`), it is removed from
-    the database and will not reappear on restart. if it came from `RELAY_HOSTS`
-    (`persisted: false`), only the running task is stopped; the source reappears
-    on the next restart.
-  - cursor state is not cleared. use `DELETE /cursors` separately if you want
-    the relay to restart from the beginning when re-added.
-  - returns `200 OK` if the relay was found and removed, `404 Not Found` otherwise.
-
-#### database operations
-
-- `POST /db/train`: train zstd compression dictionaries for the `repos`,
-  `blocks`, and `events` keyspaces. dictionaries are written to disk; a restart
-  is required to apply them. the crawler, firehose, and backfill worker are
-  paused for the duration and restored on completion.
-- `POST /db/compact`: trigger a full major compaction of all database keyspaces
-  in parallel. the crawler, firehose, and backfill worker are paused for the
-  duration and restored on completion.
-- `DELETE /cursors`: reset all stored cursors for a given URL. body: `{ "key": "..." }`
-  where key is a URL. clears both the firehose cursor and the relay crawler cursor,
-  as well as any by-collection cursors associated with that URL. causes the next
-  firehose connection and crawler pass to restart from the beginning.
 
 #### filter mode
 
@@ -225,6 +147,84 @@ each set field accepts one of two forms:
 
 - `app.bsky.feed.post`: exact match only
 - `app.bsky.feed.*`: matches any collection under `app.bsky.feed`
+
+### ingestion control
+
+- `GET /ingestion`: get the current ingestion status.
+  - returns `{ "crawler": bool, "firehose": bool, "backfill": bool }`.
+- `PATCH /ingestion`: enable or disable ingestion components at runtime without
+  restarting.
+  - body: `{ "crawler"?: bool, "firehose"?: bool, "backfill"?: bool }`. only provided fields are updated.
+  - when disabled, each component finishes its current task before pausing (e.g.
+    the backfill worker completes any in-flight repo syncs, the firehose
+    finishes processing the current message). they resume immediately when
+    re-enabled.
+
+### crawler source management
+
+- `GET /crawler/sources`: list all currently active crawler sources.
+  - returns a JSON array of `{ "url": string, "mode": "relay" | "by_collection", "persisted": bool }`.
+  - `persisted: true` means the source was added via the API and is stored in the
+    database, it will survive a restart. `persisted: false` means the source
+    came from `CRAWLER_URLS` and is not written to the database.
+- `POST /crawler/sources`: add a crawler source at runtime.
+  - body: `{ "url": string, "mode": "relay" | "by_collection" }`.
+  - the source is written to the database before the producer task is started, so
+    it is safe to add sources and then immediately restart without losing them.
+  - if a source with the same URL already exists (whether from `CRAWLER_URLS` or
+    a previous `POST`), it is replaced: the running task is stopped and a new one
+    is started with the new mode. any cursor state for that URL is preserved.
+  - returns `201 Created` on success.
+- `DELETE /crawler/sources`: remove a crawler source at runtime.
+  - body: `{ "url": string }`.
+  - the producer task is stopped immediately.
+  - if the source was added via the API (`persisted: true`), it is removed from
+    the database and will not reappear on restart. if it came from `CRAWLER_URLS`
+    (`persisted: false`), only the running task is stopped, the source will
+    reappear on the next restart since `CRAWLER_URLS` is re-applied at startup.
+    (unless you remove it manually from your configuration of course).
+  - cursor state is not cleared. use `DELETE /cursors` separately if you want
+    the source to restart from the beginning when re-added.
+  - returns `200 OK` if the source was found and removed, `404 Not Found` otherwise.
+
+### firehose source management
+
+- `GET /firehose/sources`: list all currently active firehose relay sources.
+  - returns a JSON array of `{ "url": string, "persisted": bool }`.
+  - `persisted: true` means the source was added via the API and is stored in the
+    database, it will survive a restart. `persisted: false` means the source
+    came from `RELAY_HOSTS` and is not written to the database.
+- `POST /firehose/sources`: add a firehose relay at runtime.
+  - body: `{ "url": string }`.
+  - the source is persisted to the database before the ingestor task is started.
+  - if a relay with the same URL already exists, it is replaced: the running
+    task is stopped and a new one is started. any existing cursor state for that
+    URL is preserved.
+  - returns `201 Created` on success.
+- `DELETE /firehose/sources`: remove a firehose relay at runtime.
+  - body: `{ "url": string }`.
+  - the ingestor task is stopped immediately.
+  - if the source was added via the API (`persisted: true`), it is removed from
+    the database and will not reappear on restart. if it came from `RELAY_HOSTS`
+    (`persisted: false`), only the running task is stopped; the source reappears
+    on the next restart.
+  - cursor state is not cleared. use `DELETE /cursors` separately if you want
+    the relay to restart from the beginning when re-added.
+  - returns `200 OK` if the relay was found and removed, `404 Not Found` otherwise.
+
+### database operations
+
+- `POST /db/train`: train zstd compression dictionaries for the `repos`,
+  `blocks`, and `events` keyspaces. dictionaries are written to disk; a restart
+  is required to apply them. the crawler, firehose, and backfill worker are
+  paused for the duration and restored on completion.
+- `POST /db/compact`: trigger a full major compaction of all database keyspaces
+  in parallel. the crawler, firehose, and backfill worker are paused for the
+  duration and restored on completion.
+- `DELETE /cursors`: reset all stored cursors for a given URL. body: `{ "key": "..." }`
+  where key is a URL. clears both the firehose cursor and the relay crawler cursor,
+  as well as any by-collection cursors associated with that URL. causes the next
+  firehose connection and crawler pass to restart from the beginning.
 
 ### repository management
 
