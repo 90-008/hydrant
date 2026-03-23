@@ -3,8 +3,8 @@ use common.nu *
 
 def main [] {
     let did = "did:web:guestbook.gaze.systems"
-    let port = 3003
-    let debug_port = $port + 1
+    let port = resolve-test-port 3003
+    let debug_port = resolve-test-debug-port ($port + 1)
     let url = $"http://localhost:($port)"
     let debug_url = $"http://localhost:($debug_port)"
     let db_path = (mktemp -d -t hydrant_debug_test.XXXXXX)
@@ -76,15 +76,15 @@ def main [] {
                  print "PASSED: /debug/iter on events returns JSON objects"
             }
 
-            # 4. Test size in /stats
-            print "testing size in /stats"
+            # 4. Test sizes in /stats
+            print "testing sizes in /stats"
             let stats = http get $"($url)/stats"
-            if ($stats.size | is-empty) {
-                print "FAILED: /stats returned empty size"
+            if ($stats.sizes | is-empty) {
+                print "FAILED: /stats returned empty sizes"
                 exit 1
             }
-            if not ("repos" in ($stats.size | columns)) {
-                print "FAILED: /stats missing 'repos' in size"
+            if not ("repos" in ($stats.sizes | columns)) {
+                print "FAILED: /stats missing 'repos' in sizes"
                 exit 1
             }
             print "PASSED: /stats returns keyspace sizes"

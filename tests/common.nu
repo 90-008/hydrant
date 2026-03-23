@@ -1,3 +1,45 @@
+# print a failure message, kill any running hydrant pids, and exit with code 1.
+export def fail [msg: string, ...pids: int] {
+    print $"  FAILED: ($msg)"
+    for pid in $pids {
+        try { kill $pid }
+    }
+    exit 1
+}
+
+# pipe a full http response (obtained via -f -e flags) through this to assert an expected
+# status code. on mismatch, prints the status, response body, kills any supplied pids, and exits.
+# on success, returns the response record so callers can inspect fields further.
+export def assert-status [expected: int, label: string, ...pids: int] {
+    let resp = $in
+    if $resp.status != $expected {
+        print $"  ($label): expected status ($expected), got ($resp.status)"
+        try { print $"  body: ($resp.body)" }
+        for pid in $pids { try { kill $pid } }
+        exit 1
+    }
+    $resp
+}
+
+# resolve the api port this test instance should use.
+export def resolve-test-port [default: int] {
+    $env | get --optional HYDRANT_API_PORT | default ($default | into string) | into int
+}
+
+# resolve the debug port this test instance should use.
+export def resolve-test-debug-port [default: int] {
+    $env | get --optional HYDRANT_DEBUG_PORT | default ($default | into string) | into int
+}
+
+# resolve the mock relay port for tests that need one.
+export def resolve-test-mock-port [default: int] {
+    $env | get --optional HYDRANT_TEST_MOCK_PORT | default ($default | into string) | into int
+}
+
+export def resolve-binary [default: string] {
+    $env | get --optional HYDRANT_BINARY | default $default
+}
+
 export def load-env-file [] {
     if (".env" | path exists) {
         let content = (open .env)
@@ -51,6 +93,9 @@ export def activate-account [pds_url: string, jwt: string] {
 
 # build the hydrant binary
 export def build-hydrant [] {
+    if ($env | get --optional HYDRANT_BINARY | is-not-empty) {
+        return $env.HYDRANT_BINARY
+    }
     print "building hydrant..."
     cargo build
     "target/debug/hydrant"
@@ -58,6 +103,9 @@ export def build-hydrant [] {
 
 # build the hydrant binary with extra cargo features (space-separated string)
 export def build-hydrant-features [features: string] {
+    if ($env | get --optional HYDRANT_BINARY | is-not-empty) {
+        return $env.HYDRANT_BINARY
+    }
     print $"building hydrant with features: ($features)..."
     cargo build --features $features
     "target/debug/hydrant"
@@ -74,7 +122,7 @@ export def start-hydrant [binary: string, db_path: string, port: int] {
         HYDRANT_FULL_NETWORK: "false",
         HYDRANT_API_PORT: ($port | into string),
         HYDRANT_ENABLE_DEBUG: "true",
-        HYDRANT_DEBUG_PORT: ($port + 1 | into string),
+        HYDRANT_DEBUG_PORT: (resolve-test-debug-port ($port + 1) | into string),
         HYDRANT_PLC_URL: "https://plc.gaze.systems",
         RUST_LOG: "debug,hyper=error,tokio=error,h2=error,tower=error,rustls=error"
     } | merge $hydrant_vars

@@ -9,8 +9,8 @@ def main [] {
     }
 
     # 2. setup ports and paths
-    let port = 3010
-    let mock_port = 3012
+    let port = resolve-test-port 3010
+    let mock_port = resolve-test-mock-port 3012
     let url = $"http://localhost:($port)"
     let mock_url = $"http://localhost:($mock_port)"
     let db_path = (mktemp -d -t hydrant_throttling.XXXXXX)
@@ -26,9 +26,6 @@ def main [] {
         | into int
     )
     print $"mock relay pid: ($mock_pid)"
-
-    # give mock relay a moment
-    sleep 1sec
 
     # 4. start hydrant with low throttling limits
     let binary = build-hydrant
@@ -86,7 +83,6 @@ def main [] {
             
             # now check logs for throttling message
             print "checking logs for throttling message..."
-            sleep 2sec # give logging a moment
             
             let logs = (open $log_file | str replace --all "\n" " ")
             if ($logs | str contains "throttling: above max pending") {
@@ -104,8 +100,8 @@ def main [] {
                     {"did": "did:web:mock4.com"}
                 ]' $"($url)/repos"
                 
-                print "waiting for crawler to wake up (max 10s)..."
-                sleep 15sec
+                print "waiting for crawler to wake up..."
+                sleep 1sec
                 
                 # check logs for resumption message
                 let logs_after = (open $log_file | str replace --all "\n" " ")

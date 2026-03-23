@@ -1,15 +1,6 @@
 #!/usr/bin/env nu
 use common.nu *
 
-# print a failure message, kill any running hydrant instances, and exit.
-def fail [msg: string, ...pids: int] {
-    print $"  FAILED: ($msg)"
-    for pid in $pids {
-        try { kill $pid }
-    }
-    exit 1
-}
-
 def test-crawler-sources [url: string, pid: int] {
     print "=== test: crawler sources ==="
 
@@ -23,13 +14,10 @@ def test-crawler-sources [url: string, pid: int] {
 
     # add a relay source
     print "  POST /crawler/sources (relay)..."
-    let resp_add = (http post -f -e -t application/json $"($url)/crawler/sources" {
+    http post -f -e -t application/json $"($url)/crawler/sources" {
         url: "https://bsky.network",
         mode: "relay"
-    })
-    if $resp_add.status != 201 {
-        fail $"expected 201, got ($resp_add.status)" $pid
-    }
+    } | assert-status 201 "POST /crawler/sources" $pid
     print "  ok: 201 Created"
 
     # verify the source appears with correct fields
@@ -49,13 +37,10 @@ def test-crawler-sources [url: string, pid: int] {
 
     # posting the same URL with a different mode replaces the existing entry
     print "  POST /crawler/sources (should override)..."
-    let resp_replace = (http post -f -e -t application/json $"($url)/crawler/sources" {
+    http post -f -e -t application/json $"($url)/crawler/sources" {
         url: "https://bsky.network",
         mode: "by_collection"
-    })
-    if $resp_replace.status != 201 {
-        fail $"expected 201, got ($resp_replace.status)" $pid
-    }
+    } | assert-status 201 "POST /crawler/sources override" $pid
     let after_replace = (http get $"($url)/crawler/sources")
     if ($after_replace | length) != 1 {
         fail $"expected 1 source after override, got ($after_replace | length)" $pid
@@ -67,12 +52,9 @@ def test-crawler-sources [url: string, pid: int] {
 
     # remove the source
     print "  DELETE /crawler/sources..."
-    let resp_del = (http delete -f -e -t application/json $"($url)/crawler/sources" --data {
+    http delete -f -e -t application/json $"($url)/crawler/sources" --data {
         url: "https://bsky.network"
-    })
-    if $resp_del.status != 200 {
-        fail $"expected 200, got ($resp_del.status)" $pid
-    }
+    } | assert-status 200 "DELETE /crawler/sources" $pid
     let after_del = (http get $"($url)/crawler/sources")
     if ($after_del | length) != 0 {
         fail "expected empty list after delete" $pid
@@ -81,12 +63,9 @@ def test-crawler-sources [url: string, pid: int] {
 
     # deleting a non-existent source returns 404
     print "  DELETE /crawler/sources (should be 404)..."
-    let resp_del_missing = (http delete -f -e -t application/json $"($url)/crawler/sources" --data {
+    http delete -f -e -t application/json $"($url)/crawler/sources" --data {
         url: "https://bsky.network"
-    })
-    if $resp_del_missing.status != 404 {
-        fail $"expected 404, got ($resp_del_missing.status)" $pid
-    }
+    } | assert-status 404 "DELETE /crawler/sources missing" $pid
     print "  ok: 404 for non-existent source"
 
     print "crawler source tests passed!"
@@ -175,12 +154,9 @@ def test-config-source-not-persisted [binary: string, db_path: string, port: int
 
     # the task can be stopped at runtime
     print "  deleting config source at runtime..."
-    let resp = (http delete -f -e -t application/json $"($url)/crawler/sources" --data {
+    http delete -f -e -t application/json $"($url)/crawler/sources" --data {
         url: $crawler_url
-    })
-    if $resp.status != 200 {
-        fail $"expected 200, got ($resp.status)" $instance.pid
-    }
+    } | assert-status 200 "DELETE /crawler/sources runtime" $instance.pid
     let after_del = (http get $"($url)/crawler/sources")
     if ($after_del | length) != 0 {
         fail "expected source to be gone after runtime delete" $instance.pid
@@ -225,12 +201,9 @@ def test-firehose-sources [url: string, pid: int] {
 
     # add a relay source
     print "  POST /firehose/sources..."
-    let resp_add = (http post -f -e -t application/json $"($url)/firehose/sources" {
+    http post -f -e -t application/json $"($url)/firehose/sources" {
         url: "wss://test.bsky.network"
-    })
-    if $resp_add.status != 201 {
-        fail $"expected 201, got ($resp_add.status)" $pid
-    }
+    } | assert-status 201 "POST /firehose/sources" $pid
     print "  ok: 201 Created"
 
     # verify it appears
@@ -247,12 +220,9 @@ def test-firehose-sources [url: string, pid: int] {
 
     # posting the same URL replaces the existing entry
     print "  POST /firehose/sources (should override)..."
-    let resp_replace = (http post -f -e -t application/json $"($url)/firehose/sources" {
+    http post -f -e -t application/json $"($url)/firehose/sources" {
         url: "wss://test.bsky.network"
-    })
-    if $resp_replace.status != 201 {
-        fail $"expected 201, got ($resp_replace.status)" $pid
-    }
+    } | assert-status 201 "POST /firehose/sources override" $pid
     let after_replace = (http get $"($url)/firehose/sources")
     if ($after_replace | length) != 1 {
         fail $"expected 1 source after override, got ($after_replace | length)" $pid
@@ -261,12 +231,9 @@ def test-firehose-sources [url: string, pid: int] {
 
     # remove the source
     print "  DELETE /firehose/sources..."
-    let resp_del = (http delete -f -e -t application/json $"($url)/firehose/sources" --data {
+    http delete -f -e -t application/json $"($url)/firehose/sources" --data {
         url: "wss://test.bsky.network"
-    })
-    if $resp_del.status != 200 {
-        fail $"expected 200, got ($resp_del.status)" $pid
-    }
+    } | assert-status 200 "DELETE /firehose/sources" $pid
     let after_del = (http get $"($url)/firehose/sources")
     if ($after_del | length) != 0 {
         fail "expected empty list after delete" $pid
@@ -275,24 +242,21 @@ def test-firehose-sources [url: string, pid: int] {
 
     # deleting a non-existent source returns 404
     print "  DELETE /firehose/sources (should be 404)..."
-    let resp_del_missing = (http delete -f -e -t application/json $"($url)/firehose/sources" --data {
+    http delete -f -e -t application/json $"($url)/firehose/sources" --data {
         url: "wss://test.bsky.network"
-    })
-    if $resp_del_missing.status != 404 {
-        fail $"expected 404, got ($resp_del_missing.status)" $pid
-    }
+    } | assert-status 404 "DELETE /firehose/sources missing" $pid
     print "  ok: 404 for non-existent source"
 
     print "firehose source tests passed!"
 }
 
 def main [] {
-    let port = 3007
+    let port = resolve-test-port 3007
     let url = $"http://localhost:($port)"
 
     let binary = build-hydrant
 
-    let db = (mktemp -d -t hydrant_api_test.XXXXXX)
+    let db = (mktemp -d -t hydrant_api.XXXXXX)
     print $"db: ($db)"
 
     let instance = (with-env { HYDRANT_CRAWLER_URLS: "", HYDRANT_RELAY_HOSTS: "" } {
@@ -308,13 +272,13 @@ def main [] {
     kill $instance.pid
     sleep 2sec
 
-    let db_persist = (mktemp -d -t hydrant_api_test.XXXXXX)
+    let db_persist = (mktemp -d -t hydrant_api.XXXXXX)
     print $"db: ($db_persist)"
     test-source-persistence $binary $db_persist $port
 
     sleep 1sec
 
-    let db_config = (mktemp -d -t hydrant_api_test.XXXXXX)
+    let db_config = (mktemp -d -t hydrant_api.XXXXXX)
     print $"db: ($db_config)"
     test-config-source-not-persisted $binary $db_config $port
 

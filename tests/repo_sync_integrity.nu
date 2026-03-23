@@ -96,9 +96,10 @@ def check-count [hydrant_url: string, debug_url: string, did: string] {
 def main [] {
     let did = "did:plc:dfl62fgb7wtjj3fcbb72naae"
     let pds = "https://zwsp.xyz"
-    let port = 3001
+    let port = resolve-test-port 3001
     let url = $"http://localhost:($port)"
-    let debug_url = $"http://127.0.0.1:($port + 1)"
+    let debug_port = resolve-test-debug-port ($port + 1)
+    let debug_url = $"http://127.0.0.1:($debug_port)"
     let db_path = (mktemp -d -t hydrant_test.XXXXXX)
 
     print $"testing backfill integrity for ($did)..."

@@ -109,17 +109,18 @@ Hydrant uses multiple `fjall` keyspaces:
 ## Safe commands
 
 ### Testing
-- `nu tests/repo_sync_integrity.nu` - Runs the full integration test suite using Nushell. This builds the binary, starts a temporary instance, performs a backfill against a real PDS, and verifies record integrity.
+- `nu tests/run_all.nu` - Runs all tests in parallel with automatically assigned free ports. Pass `--skip-creds` to skip tests requiring `.env` credentials, or `--only=[<name>...]` to run a subset.
+- `nu tests/repo_sync_integrity.nu` - Performs a backfill against a real PDS, and verifies record integrity compared to hydrant.
 - `nu tests/verify_crawler.nu` - Verifies full-network crawler functionality using a mock relay.
-- `nu tests/throttling_test.nu` - Verifies crawler throttling logic when pending queue is full.
-- `nu tests/stream_test.nu` - Tests WebSocket streaming functionality. Verifies both live event streaming during backfill and historical replay with cursor.
-- `nu tests/authenticated_stream_test.nu` - Tests authenticated event streaming. Verifies that create, update, and delete actions on a real account are correctly streamed by Hydrant in the correct order. Requires `TEST_REPO` and `TEST_PASSWORD` in `.env`.
+- `nu tests/throttling.nu` - Verifies crawler throttling logic when pending queue is full.
+- `nu tests/stream.nu` - Tests WebSocket streaming functionality. Verifies both live event streaming during backfill and historical replay with cursor.
+- `nu tests/authenticated_stream.nu` - Tests authenticated event streaming. Verifies that create, update, and delete actions on a real account are correctly streamed by Hydrant in the correct order. Requires `TEST_REPO` and `TEST_PASSWORD` in `.env`.
 - `nu tests/debug_endpoints.nu` - Tests debug/introspection endpoints (`/debug/iter`, `/debug/get`) and verifies DB content and serialization.
-- `nu tests/api_test.nu` - Tests management API endpoints (filter, repos, ingestion, sources).
-- `nu tests/repos_api_test.nu` - Tests the `/repos` API endpoints including pagination and single-repo lookup.
-- `nu tests/signal_filter_test.nu` - Verifies signal-based filtered indexing.
-- `nu tests/collection_index_test.nu` - Tests collection-indexed crawling via `listReposByCollection`.
-- `nu tests/backlinks_test.nu` - Tests backlinks indexing and XRPC query endpoints (requires `backlinks` feature).
+- `nu tests/api.nu` - Tests management API endpoints (filter, repos, ingestion, sources).
+- `nu tests/repos_api.nu` - Tests the `/repos` API endpoints including pagination and single-repo lookup.
+- `nu tests/signal_filter.nu` - Verifies signal-based filtered indexing.
+- `nu tests/by_collection.nu` - Tests by-collection crawling via `listReposByCollection`.
+- `nu tests/backlinks.nu` - Tests backlinks indexing and XRPC query endpoints (requires `backlinks` feature).
 - `nu tests/ephemeral_gc.nu` - Tests ephemeral mode TTL expiration and event watermark cleanup.
 
 ## Rust code style

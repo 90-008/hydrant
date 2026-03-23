@@ -36,8 +36,7 @@ def run-auth-test [did: string, password: string, pds_url: string, relays: strin
         } catch {
             print "warning: failed to add repo (might already be tracked), continuing..."
         }
-
-        sleep 5sec
+        wait-for-backfill $url
 
         # 5. perform actions
         let collection = "app.bsky.feed.post"
@@ -91,6 +90,7 @@ def run-auth-test [did: string, password: string, pds_url: string, relays: strin
 
         # 6. verify
         sleep 3sec
+
         print "stopping listener..."
         try { kill -9 $stream_pid }
 
@@ -173,8 +173,8 @@ def main [] {
     let password = ($env_vars | get --optional TEST_PASSWORD)
 
     if ($did | is-empty) or ($password | is-empty) {
-        print "error: TEST_REPO and TEST_PASSWORD must be set in .env"
-        exit 1
+        print "SKIP: TEST_REPO and TEST_PASSWORD not set in .env"
+        exit 0
     }
 
     let pds_url = resolve-pds $did
@@ -182,14 +182,16 @@ def main [] {
     # ensure build
     build-hydrant | ignore
 
+    let port = resolve-test-port 3005
+
     print "=== running single-relay test ==="
     let relay1 = "wss://relay.fire.hose.cam"
-    let success1 = run-auth-test $did $password $pds_url $relay1 3005
+    let success1 = run-auth-test $did $password $pds_url $relay1 $port
 
     print ""
     print "=== running multi-relay test ==="
     let relay_multi = "wss://relay.fire.hose.cam,wss://relay3.fr.hose.cam,wss://relay1.us-west.bsky.network,wss://relay1.us-east.bsky.network"
-    let success2 = run-auth-test $did $password $pds_url $relay_multi 3015
+    let success2 = run-auth-test $did $password $pds_url $relay_multi $port
 
     if $success1 and $success2 {
         print ""

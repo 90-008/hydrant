@@ -8,7 +8,7 @@
 use common.nu *
 
 def main [] {
-    let port = 3015
+    let port = resolve-test-port 3015
     let url = $"http://localhost:($port)"
     let db_path = (mktemp -d -t hydrant_collection_index_test.XXXXXX)
     let collection = "app.bsky.graph.starterpack"

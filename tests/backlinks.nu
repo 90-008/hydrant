@@ -180,7 +180,7 @@ def check-reverse-ordering [url: string, subject: string, expected_count: int] {
 
 def main [] {
     let did = "did:plc:dfl62fgb7wtjj3fcbb72naae"
-    let port = 3020
+    let port = resolve-test-port 3020
     let url = $"http://localhost:($port)"
     let db_path = (mktemp -d -t hydrant_backlinks_test.XXXXXX)
 

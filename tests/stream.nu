@@ -3,7 +3,7 @@ use common.nu *
 
 def main [] {
     let did = "did:web:guestbook.gaze.systems"
-    let port = 3002
+    let port = resolve-test-port 3002
     let url = $"http://localhost:($port)"
     let ws_url = $"ws://localhost:($port)/stream"
     let db_path = (mktemp -d -t hydrant_stream_test.XXXXXX)

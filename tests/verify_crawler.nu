@@ -9,10 +9,11 @@ def main [] {
     }
 
     # 2. setup ports and paths
-    let port = 3006
-    let mock_port = 3008
+    let port = resolve-test-port 3006
+    let mock_port = resolve-test-mock-port 3008
     let url = $"http://localhost:($port)"
-    let debug_url = $"http://localhost:($port + 1)"
+    let debug_port = resolve-test-debug-port ($port + 1)
+    let debug_url = $"http://localhost:($debug_port)"
     let mock_url = $"http://localhost:($mock_port)"
     let db_path = (mktemp -d -t hydrant_full_net.XXXXXX)
 
@@ -46,7 +47,7 @@ def main [] {
             HYDRANT_DISABLE_BACKFILL: "true",
             HYDRANT_API_PORT: ($port | into string),
             HYDRANT_ENABLE_DEBUG: "true", # for stats checking
-            HYDRANT_DEBUG_PORT: ($port + 1 | into string),
+            HYDRANT_DEBUG_PORT: (resolve-test-debug-port ($port + 1) | into string),
             HYDRANT_LOG_LEVEL: "debug",
             HYDRANT_CURSOR_SAVE_INTERVAL: "1" # faster save
         } {

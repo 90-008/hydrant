@@ -2,9 +2,8 @@
 use common.nu *
 
 # start hydrant in ephemeral mode
-def run-ephemeral-instance [name: string, scenario_closure: closure] {
-    let port = 3006
-    let debug_port = $port + 1
+def run-ephemeral-instance [name: string, port: int, scenario_closure: closure] {
+    let debug_port = resolve-test-debug-port ($port + 1)
     let url = $"http://localhost:($port)"
     let debug_url = $"http://localhost:($debug_port)"
     let db_path = (mktemp -d -t hydrant_ephemeral_gc_test.XXXXXX)
@@ -46,10 +45,11 @@ def trigger-ttl-tick [debug_url: string] {
 }
 
 def main [] {
+    let port = resolve-test-port 3006
     let repo1 = "did:web:guestbook.gaze.systems"
 
     # verify TTL tick runs without error when no events are eligible for expiry
-    run-ephemeral-instance "TTL tick is safe with no eligible events" { |url, debug_url|
+    run-ephemeral-instance "TTL tick is safe with no eligible events" $port { |url, debug_url|
         print $"adding repo ($repo1)..."
         http put -t application/json $"($url)/repos" [{ did: ($repo1) }]
 
@@ -71,7 +71,7 @@ def main [] {
     }
 
     # plant a past watermark, trigger the real TTL path, and verify all events and blocks are gone
-    run-ephemeral-instance "TTL tick with past watermark deletes events and blocks" { |url, debug_url|
+    run-ephemeral-instance "TTL tick with past watermark deletes events and blocks" $port { |url, debug_url|
         print $"adding repo ($repo1)..."
         http put -t application/json $"($url)/repos" [{ did: ($repo1) }]
 

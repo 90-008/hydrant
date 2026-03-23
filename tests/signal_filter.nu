@@ -7,11 +7,11 @@ def main [] {
     let password = ($env_vars | get --optional TEST_PASSWORD)
 
     if ($did | is-empty) or ($password | is-empty) {
-        print "error: TEST_REPO and TEST_PASSWORD must be set in .env"
-        exit 1
+        print "SKIP: TEST_REPO and TEST_PASSWORD not set in .env"
+        exit 0
     }
 
-    let port = 3011
+    let port = resolve-test-port 3011
     let url = $"http://localhost:($port)"
     let db_path = (mktemp -d -t hydrant_signal_test.XXXXXX)
     
@@ -103,6 +103,11 @@ def main [] {
         }
     } else {
         print "hydrant failed to start"
+        if ($instance.log | path exists) {
+            print "--- hydrant log ---"
+            print (open $instance.log)
+            print "-------------------"
+        }
     }
 
     print "stopping hydrant..."
