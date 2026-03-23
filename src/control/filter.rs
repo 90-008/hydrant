@@ -148,11 +148,11 @@ pub struct FilterPatch {
     /// if set, replaces the current indexing mode.
     pub mode: Option<FilterMode>,
     /// if set, replaces or patches the signals set.
-    pub signals: Option<SetUpdate>,
+    pub(crate) signals: Option<SetUpdate>,
     /// if set, replaces or patches the collections set.
-    pub collections: Option<SetUpdate>,
+    pub(crate) collections: Option<SetUpdate>,
     /// if set, replaces or patches the excludes set.
-    pub excludes: Option<SetUpdate>,
+    pub(crate) excludes: Option<SetUpdate>,
 }
 
 impl FilterPatch {

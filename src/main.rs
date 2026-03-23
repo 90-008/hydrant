@@ -1,6 +1,33 @@
-use hydrant::config::{AppConfig, Config};
+use hydrant::config::Config;
 use hydrant::control::Hydrant;
 use mimalloc::MiMalloc;
+
+struct AppConfig {
+    api_port: u16,
+    enable_debug: bool,
+    debug_port: u16,
+}
+
+impl AppConfig {
+    fn from_env() -> Self {
+        macro_rules! cfg {
+            ($key:expr, $default:expr) => {
+                std::env::var(concat!("HYDRANT_", $key))
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or($default)
+            };
+        }
+        let api_port = cfg!("API_PORT", 3000u16);
+        let enable_debug = cfg!("ENABLE_DEBUG", false);
+        let debug_port = cfg!("DEBUG_PORT", api_port + 1);
+        Self {
+            api_port,
+            enable_debug,
+            debug_port,
+        }
+    }
+}
 
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;

@@ -553,34 +553,6 @@ impl Config {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct AppConfig {
-    pub api_port: u16,
-    pub enable_debug: bool,
-    pub debug_port: u16,
-}
-
-impl AppConfig {
-    pub fn from_env() -> Self {
-        macro_rules! cfg {
-            ($key:expr, $default:expr) => {
-                std::env::var(concat!("HYDRANT_", $key))
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or($default)
-            };
-        }
-        let api_port = cfg!("API_PORT", 3000u16);
-        let enable_debug = cfg!("ENABLE_DEBUG", false);
-        let debug_port = cfg!("DEBUG_PORT", api_port + 1);
-        Self {
-            api_port,
-            enable_debug,
-            debug_port,
-        }
-    }
-}
-
 macro_rules! config_line {
     ($f:expr, $label:expr, $value:expr) => {
         writeln!($f, "  {:<width$}{}", $label, $value, width = LABEL_WIDTH)

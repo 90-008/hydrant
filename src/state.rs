@@ -15,7 +15,7 @@ use crate::{
 pub struct AppState {
     pub db: Db,
     pub resolver: Resolver,
-    pub filter: FilterHandle,
+    pub(crate) filter: FilterHandle,
     /// per-relay firehose cursors. values use interior mutability so they can be
     /// updated through the lock-free `peek_with` reads in the ingest worker.
     pub relay_cursors: scc::HashIndex<Url, AtomicI64>,

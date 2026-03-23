@@ -50,7 +50,7 @@ pub struct Db {
     pub crawler: Keyspace,
     #[cfg(feature = "backlinks")]
     pub backlinks: Keyspace,
-    pub event_tx: broadcast::Sender<BroadcastEvent>,
+    pub(crate) event_tx: broadcast::Sender<BroadcastEvent>,
     pub next_event_id: Arc<AtomicU64>,
     pub counts_map: HashMap<SmolStr, u64>,
 }
@@ -617,7 +617,7 @@ impl Db {
             .unwrap_or(0)
     }
 
-    pub fn update_gauge_diff(
+    pub(crate) fn update_gauge_diff(
         &self,
         old: &crate::types::GaugeState,
         new: &crate::types::GaugeState,
@@ -625,7 +625,7 @@ impl Db {
         update_gauge_diff_impl!(self, old, new, update_count);
     }
 
-    pub async fn update_gauge_diff_async(
+    pub(crate) async fn update_gauge_diff_async(
         &self,
         old: &crate::types::GaugeState,
         new: &crate::types::GaugeState,
@@ -633,7 +633,7 @@ impl Db {
         update_gauge_diff_impl!(self, old, new, update_count_async, await);
     }
 
-    pub fn update_repo_state<F, T>(
+    pub(crate) fn update_repo_state<F, T>(
         batch: &mut OwnedWriteBatch,
         repos: &Keyspace,
         did: &Did<'_>,
@@ -655,7 +655,7 @@ impl Db {
         }
     }
 
-    pub async fn update_repo_state_async<F, T>(
+    pub(crate) async fn update_repo_state_async<F, T>(
         &self,
         did: &Did<'_>,
         f: F,
@@ -681,7 +681,7 @@ impl Db {
         .into_diagnostic()?
     }
 
-    pub fn repo_gauge_state(
+    pub(crate) fn repo_gauge_state(
         repo_state: &RepoState,
         resync_bytes: Option<&[u8]>,
     ) -> crate::types::GaugeState {
@@ -707,7 +707,7 @@ impl Db {
         }
     }
 
-    pub async fn repo_gauge_state_async(
+    pub(crate) async fn repo_gauge_state_async(
         &self,
         repo_state: &RepoState<'_>,
         did_key: &[u8],

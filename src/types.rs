@@ -37,7 +37,7 @@ impl Display for RepoStatus {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(bound(deserialize = "'i: 'de"))]
-pub struct RepoState<'i> {
+pub(crate) struct RepoState<'i> {
     pub status: RepoStatus,
     pub rev: Option<DbTid>,
     pub data: Option<IpldCid>,
@@ -129,14 +129,14 @@ impl<'i> IntoStatic for RepoState<'i> {
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub enum ResyncErrorKind {
+pub(crate) enum ResyncErrorKind {
     Ratelimited,
     Transport,
     Generic,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum ResyncState {
+pub(crate) enum ResyncState {
     Error {
         kind: ResyncErrorKind,
         retry_count: u32,
@@ -202,7 +202,7 @@ pub struct MarshallableEvt<'i> {
 }
 
 #[derive(Clone, Debug)]
-pub enum BroadcastEvent {
+pub(crate) enum BroadcastEvent {
     #[allow(dead_code)]
     Persisted(u64),
     Ephemeral(Box<MarshallableEvt<'static>>),
@@ -244,7 +244,7 @@ pub struct AccountEvt<'i> {
 use jacquard_common::bytes::Bytes;
 
 #[derive(Serialize, Deserialize, Clone)]
-pub enum StoredData {
+pub(crate) enum StoredData {
     Nothing,
     Ptr(IpldCid),
     #[serde(with = "serde_bytes_squared")]
@@ -275,7 +275,7 @@ impl Debug for StoredData {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(bound(deserialize = "'i: 'de"))]
-pub struct StoredEvent<'i> {
+pub(crate) struct StoredEvent<'i> {
     #[serde(default)]
     pub live: bool,
     #[serde(borrow)]
@@ -304,7 +304,7 @@ mod serde_bytes_squared {
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
-pub enum GaugeState {
+pub(crate) enum GaugeState {
     Synced,
     Pending,
     Resync(Option<ResyncErrorKind>),
