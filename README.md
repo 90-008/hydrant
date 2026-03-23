@@ -9,7 +9,7 @@ you can see
 [random.wisp.place](https://tangled.org/did:plc:dfl62fgb7wtjj3fcbb72naae/random.wisp.place)
 (standalone binary using http API) or the [statusphere
 example](./examples/statusphere.rs) (hydrant-as-library) for examples on how to
-use hydrant.
+use hydrant (for rust docs look at https://hydrant.gaze.systems/ for now).
 
 **WARNING: *the db format is not stable yet.*** it's in active development so if
 you are going to rely on the db format being stable, don't (eg. for query
