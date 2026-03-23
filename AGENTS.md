@@ -34,19 +34,36 @@ Key design goals:
 ## System architecture
 
 Hydrant consists of several components:
-- **[`hydrant::ingest::firehose`]**: Connects to an upstream Firehose (Relay) and filters events. It manages the transition between discovery and synchronization.
+- **[`hydrant::ingest::firehose`]**: Connects to one or more upstream Firehose relays and filters events. It manages the transition between discovery and synchronization. Multiple relay sources are supported and can be managed at runtime via the API.
 - **[`hydrant::ingest::worker`]**: Processes buffered Firehose messages concurrently using sharded workers. Verifies signatures, updates repository state (handling account status events like deactivations), detects gaps for backfill, and persists records.
-- **[`hydrant::crawler`]**: Periodically enumerates the network via `com.atproto.sync.listRepos` to discover new repositories. In `Full` mode it is enabled by default; in `Filter` mode it is opt-in via `HYDRANT_ENABLE_CRAWLER`.
+- **[`hydrant::crawler`]**: Enumerates the network to discover repositories. Supports two modes: `Relay` (via `com.atproto.sync.listRepos`) and `ByCollection` (via `com.atproto.sync.listReposByCollection`). Multiple sources can be configured, each with their own mode and cursor. In `Full` mode the relay crawler is enabled by default; `Filter` mode requires opt-in via `HYDRANT_ENABLE_CRAWLER`.
 - **[`hydrant::resolver`]**: Manages DID resolution and key lookups. Supports multiple PLC directory sources with failover and caching.
 - **[`hydrant::backfill`]**: A dedicated worker that fetches full repository CAR files. Uses LIFO prioritization and adaptive concurrency to manage backfill load efficiently.
-- **[`hydrant::api`]**: An Axum-based XRPC server implementing repository read methods (`getRecord`, `listRecords`) and system stats. It also provides a WebSocket event stream and management APIs:
+- **[`hydrant::backlinks`]** (feature-gated): Maintains a reverse index of record references. Exposes `blue.microcosm.links.getBacklinks` and `blue.microcosm.links.getBacklinksCount` XRPC endpoints.
+- **[`hydrant::api`]**: An Axum-based XRPC server implementing repository read methods (`getRecord`, `listRecords`, `countRecords`) and system stats. It also provides a WebSocket event stream and management APIs:
     - `/filter` (`GET`/`PATCH`): Configure indexing mode, signals, and collection patterns.
-    - `/repos` (`GET`/`PUT`/`DELETE`): Repository management.
+    - `/repos` (`GET`/`PUT`/`DELETE`): Repository management (supports pagination).
+    - `/ingestion` (`GET`/`PATCH`): Pause/resume crawler, firehose, and backfill components at runtime.
+    - `/crawler/sources` (`GET`/`POST`/`DELETE`): Manage crawler relay sources at runtime.
+    - `/firehose/sources` (`GET`/`POST`/`DELETE`): Manage firehose relay sources at runtime.
+    - `/db/train` (`POST`): Train per-keyspace zstd dictionaries.
+    - `/db/compact` (`POST`): Trigger manual database compaction.
+    - `/cursors` (`DELETE`): Reset cursors.
 - Persistence worker (in `src/main.rs`): Manages periodic background flushes of the LSM-tree and cursor state.
 
 ### Lazy event inflation
 
 To minimize latency in `apply_commit` and the backfill worker, events are stored in a compact `StoredEvent` format. The expansion into full TAP-compatible JSON (including fetching record content from the CAS and DAG-CBOR parsing) is performed lazily within the WebSocket stream handler.
+
+### Library API
+
+Hydrant can be used as an embedded library. The public surface is exposed via `src/lib.rs`:
+- `hydrant::config` — configuration structs and builder helpers
+- `hydrant::control` — high-level `Hydrant` handle, `RepoHandle`, `RepoManager`
+- `hydrant::filter` — filter types and operations
+- `hydrant::types` — shared data types (`RepoState`, etc.)
+
+See `examples/statusphere.rs` for a usage example.
 
 ## General conventions
 
@@ -68,8 +85,9 @@ To minimize latency in `apply_commit` and the backfill worker, events are stored
 
 ### Storage and serialization
 - **State**: Use `rmp-serde` (MessagePack) for all internal state (`RepoState`, `ErrorState`, `StoredEvent`).
-- **Blocks**: Store IPLD blocks as raw DAG-CBOR bytes in the CAS. This avoids expensive transcoding and allows direct serving of block content.
+- **Blocks**: Store IPLD blocks as raw DAG-CBOR bytes in the CAS, keyed by `{collection}|{CID bytes}`. The collection prefix enables per-collection zstd dictionary training for better compression ratios.
 - **Cursors**: Store cursors as big-endian bytes (`u64`/`i64`).
+- **Compression**: Configurable via `HYDRANT_DATA_COMPRESSION` (`lz4`, `zstd`, `none`). Per-keyspace zstd dictionaries can be trained via `POST /db/train` and are stored as `dict_{keyspace}.bin` in the database directory.
 - **Keyspaces**: Use the `keys.rs` module to maintain consistent composite key formats.
 
 ## Database schema (keyspaces)
@@ -77,15 +95,16 @@ To minimize latency in `apply_commit` and the backfill worker, events are stored
 Hydrant uses multiple `fjall` keyspaces:
 - `repos`: Maps `{DID}` -> `RepoState` (MessagePack).
 - `records`: Maps `{DID}|{COL}|{RKey}` -> `{CID}` (Binary).
-- `blocks`: Maps `{CID}` -> `Block Data` (Raw CBOR).
-- `events`: Maps `{ID}` (u64) -> `StoredEvent` (MessagePack). This is the source for the JSON stream API.
-- `cursors`: Maps `firehose_cursor` or `crawler_cursor` -> `Value` (u64/i64 BE Bytes).
-- `pending`: Queue of `{Timestamp}|{DID}` -> `Empty` (Backfill queue).
+- `blocks`: Maps `{collection}|{CID bytes}` -> `Block Data` (Raw CBOR). The collection prefix enables per-collection zstd dictionary training.
+- `events`: Maps `{ID}` (u64 BE) -> `StoredEvent` (MessagePack). This is the source for the JSON stream API.
+- `cursors`: Maps per-relay cursor keys -> `Value` (u64/i64 BE Bytes). Keys: `firehose_cursor|{relay}`, `crawler_cursor|{relay}`, `by_collection_cursor|{url}|{collection}`.
+- `pending`: Queue of `{ID}` (u64 BE) -> `Empty` (Backfill queue).
 - `resync`: Maps `{DID}` -> `ResyncState` (MessagePack) for retry logic/tombstones.
 - `resync_buffer`: Maps `{DID}|{Rev}` -> `Commit` (MessagePack). Used to buffer live events during backfill.
 - `counts`: Maps `k|{NAME}` or `r|{DID}|{COL}` -> `Count` (u64 BE Bytes).
 - `filter`: Stores filter config. Handled by the `db::filter` module. Includes mode key `m` -> `FilterMode` (MessagePack), and set entries for signals (`s|{NSID}`), collections (`c|{NSID}`), and excludes (`x|{DID}`) -> empty value.
-- `crawler`: Stores crawler state with prefixed keys. Failed crawl entries use `f|{DID}` -> empty value, representing repos that failed signal checking during crawl discovery.
+- `crawler`: Stores crawler and firehose source URLs with prefixed keys. Retry entries use `ret|{DID}` -> empty value. Crawler sources use `src|{URL}` -> empty value. Firehose sources use `firehose|{URL}` -> empty value.
+- `backlinks` (feature-gated): Reverse index of record references for the backlinks feature.
 
 ## Safe commands
 
@@ -96,6 +115,12 @@ Hydrant uses multiple `fjall` keyspaces:
 - `nu tests/stream_test.nu` - Tests WebSocket streaming functionality. Verifies both live event streaming during backfill and historical replay with cursor.
 - `nu tests/authenticated_stream_test.nu` - Tests authenticated event streaming. Verifies that create, update, and delete actions on a real account are correctly streamed by Hydrant in the correct order. Requires `TEST_REPO` and `TEST_PASSWORD` in `.env`.
 - `nu tests/debug_endpoints.nu` - Tests debug/introspection endpoints (`/debug/iter`, `/debug/get`) and verifies DB content and serialization.
+- `nu tests/api_test.nu` - Tests management API endpoints (filter, repos, ingestion, sources).
+- `nu tests/repos_api_test.nu` - Tests the `/repos` API endpoints including pagination and single-repo lookup.
+- `nu tests/signal_filter_test.nu` - Verifies signal-based filtered indexing.
+- `nu tests/collection_index_test.nu` - Tests collection-indexed crawling via `listReposByCollection`.
+- `nu tests/backlinks_test.nu` - Tests backlinks indexing and XRPC query endpoints (requires `backlinks` feature).
+- `nu tests/ephemeral_gc.nu` - Tests ephemeral mode TTL expiration and event watermark cleanup.
 
 ## Rust code style
 
