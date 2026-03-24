@@ -29,6 +29,8 @@ processed them.).
 
 <small>[<- back to toc](#table-of-contents)</small>
 
+you can read [this blogpost](https://90008.leaflet.pub/3mhp3t4kuw22e) or read on below.
+
 while [`tap`](https://github.com/bluesky-social/indigo/tree/main/cmd/tap) is
 designed as a firehose consumer and simply just propagates events while handling
 sync, `hydrant` is flexible, it allows you to directly query the database for
