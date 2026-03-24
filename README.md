@@ -1,3 +1,11 @@
+#### table-of-contents
+
+-> [hydrant](#hydrant)</br>
+-> [vs tap](#vs-tap)</br>
+-> [configuration](#configuration)</br>
+-> [rest api](#rest-api) | [filter](#filter-management) | [ingestion](#ingestion-control) | [crawler](#crawler-management) | [firehose](#firehose-management) | [repos](#repository-management)</br>
+-> [xrpc api](#data-access-xrpc) | [backlinks](#bluemicrocosmlinks) | [atproto](#comatproto) | [custom](#systemsgazehydrant)
+
 # hydrant
 
 `hydrant` is an AT Protocol indexer built on the `fjall` database. it's built to
@@ -17,7 +25,9 @@ features, if you are using ephemeral mode this doesn't matter for example, or
 you dont mind losing your existing backfilled data in hydrant if you already
 processed them.).
 
-## vs `tap`
+## vs tap
+
+<small>[<- back to toc](#table-of-contents)</small>
 
 while [`tap`](https://github.com/bluesky-social/indigo/tree/main/cmd/tap) is
 designed as a firehose consumer and simply just propagates events while handling
@@ -76,6 +86,8 @@ database and will always reappear after a restart regardless of runtime changes.
 
 ## configuration
 
+<small>[<- back to toc](#table-of-contents)</small>
+
 `hydrant` is configured via environment variables. all variables are prefixed
 with `HYDRANT_` (except `RUST_LOG`). if a `.env` file exists in the working
 directory, it will also be loaded automatically.
@@ -111,7 +123,23 @@ directory, it will also be loaded automatically.
 
 ## REST api
 
+<small>[<- back to toc](#table-of-contents)</small>
+
+### event stream
+
+- `GET /stream`: subscribe to the event stream.
+  - query parameters:
+    - `cursor` (optional): start streaming from a specific event ID.
+
+### stats
+
+- `GET /stats`: get stats about the database:
+  - `counts`: counts of repos, records, events, and errors, etc.
+  - `sizes`: sizes of the database keyspaces on disk, in bytes.
+
 ### filter management
+
+<small>[<- back to toc](#table-of-contents)</small>
 
 - `GET /filter`: get the current filter configuration.
 - `PATCH /filter`: update the filter configuration.
@@ -150,6 +178,8 @@ each set field accepts one of two forms:
 
 ### ingestion control
 
+<small>[<- back to toc](#table-of-contents)</small>
+
 - `GET /ingestion`: get the current ingestion status.
   - returns `{ "crawler": bool, "firehose": bool, "backfill": bool }`.
 - `PATCH /ingestion`: enable or disable ingestion components at runtime without
@@ -160,7 +190,9 @@ each set field accepts one of two forms:
     finishes processing the current message). they resume immediately when
     re-enabled.
 
-### crawler source management
+### crawler management
+
+<small>[<- back to toc](#table-of-contents)</small>
 
 - `GET /crawler/sources`: list all currently active crawler sources.
   - returns a JSON array of `{ "url": string, "mode": "relay" | "by_collection", "persisted": bool }`.
@@ -187,7 +219,9 @@ each set field accepts one of two forms:
     the source to restart from the beginning when re-added.
   - returns `200 OK` if the source was found and removed, `404 Not Found` otherwise.
 
-### firehose source management
+### firehose management
+
+<small>[<- back to toc](#table-of-contents)</small>
 
 - `GET /firehose/sources`: list all currently active firehose relay sources.
   - returns a JSON array of `{ "url": string, "persisted": bool }`.
@@ -212,6 +246,20 @@ each set field accepts one of two forms:
     the relay to restart from the beginning when re-added.
   - returns `200 OK` if the relay was found and removed, `404 Not Found` otherwise.
 
+### repository management
+
+<small>[<- back to toc](#table-of-contents)</small>
+
+- `GET /repos`: get an NDJSON stream of repositories and their sync status. supports pagination and filtering:
+    - `limit`: max results (default 100, max 1000)
+    - `cursor`: opaque key for paginating.
+    - `partition`: `all` (default), `pending` (backfill queue), or `resync` (retries)
+- `GET /repos/{did}`: get the sync status and metadata of a specific repository.
+  also returns the handle, PDS URL and the atproto signing key (these won't be
+  available before the repo has been backfilled once at least).
+- `PUT /repos`: explicitly track repositories. accepts an NDJSON body of `{"did": "..."}` (or JSON array of the same).
+- `DELETE /repos`: untrack repositories. accepts an NDJSON body of `{"did": "..."}` (or JSON array of the same).
+
 ### database operations
 
 - `POST /db/train`: train zstd compression dictionaries for the `repos`,
@@ -226,41 +274,25 @@ each set field accepts one of two forms:
   as well as any by-collection cursors associated with that URL. causes the next
   firehose connection and crawler pass to restart from the beginning.
 
-### repository management
-
-- `GET /repos`: get an NDJSON stream of repositories and their sync status. supports pagination and filtering:
-    - `limit`: max results (default 100, max 1000)
-    - `cursor`: opaque key for paginating.
-    - `partition`: `all` (default), `pending` (backfill queue), or `resync` (retries)
-- `GET /repos/{did}`: get the sync status and metadata of a specific repository.
-  also returns the handle, PDS URL and the atproto signing key (these won't be
-  available before the repo has been backfilled once at least).
-- `PUT /repos`: explicitly track repositories. accepts an NDJSON body of `{"did": "..."}` (or JSON array of the same).
-- `DELETE /repos`: untrack repositories. accepts an NDJSON body of `{"did": "..."}` (or JSON array of the same).
-
-### event stream
-
-- `GET /stream`: subscribe to the event stream.
-  - query parameters:
-    - `cursor` (optional): start streaming from a specific event ID.
-
-### stats
-
-- `GET /stats`: get stats about the database:
-  - `counts`: counts of repos, records, events, and errors, etc.
-  - `sizes`: sizes of the database keyspaces on disk, in bytes.
-
 ## data access (xrpc)
+
+<small>[<- back to toc](#table-of-contents)</small>
 
 `hydrant` implements the following XRPC endpoints under `/xrpc/`:
 
 ### com.atproto.*
+
+<small>[<- back to toc](#table-of-contents)</small>
+
+these are standard atproto endpoints. you can look at [the atproto api reference](https://docs.bsky.app/docs/category/http-reference) for more info.
 
 the following are implemented currently:
 - `com.atproto.repo.getRecord`
 - `com.atproto.repo.listRecords`
 
 ### systems.gaze.hydrant.*
+
+<small>[<- back to toc](#table-of-contents)</small>
 
 these are some non-standard XRPCs that might be useful.
 
@@ -276,6 +308,8 @@ return the total number of stored records in a collection.
 returns `{ count }`.
 
 ### blue.microcosm.links.*
+
+<small>[<- back to toc](#table-of-contents)</small>
 
 hydrant implements a subset of [microcosm constellation](https://constellation.microcosm.blue/) 
 when it's built with the `backlinks` cargo feature (`cargo build --features backlinks`).
