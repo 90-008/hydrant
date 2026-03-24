@@ -144,8 +144,6 @@ fn is_tls_cert_error(io_err: &std::io::Error) -> bool {
     false
 }
 
-// -- SignalChecker --------------------------------------------------------
-
 /// shared describeRepo signal-checking logic used by both relay and retry producers.
 #[derive(Clone)]
 pub(crate) struct SignalChecker {
@@ -315,7 +313,7 @@ impl SignalChecker {
     /// into `batch`, and returns a vec containing only the guards for confirmed DIDs.
     ///
     /// guards for non-confirmed DIDs are dropped here, releasing their in-flight slots.
-    /// confirmed DIDs' retry entries are NOT removed here — the worker removes them
+    /// confirmed DIDs' retry entries are NOT removed here. the worker removes them
     /// atomically with the pending insert.
     pub(super) async fn check_signals_batch(
         &self,
@@ -387,8 +385,6 @@ impl SignalChecker {
             .collect())
     }
 }
-
-// -- RelayProducer --------------------------------------------------------
 
 pub(crate) struct RelayProducer {
     pub(crate) relay_url: Url,
@@ -465,7 +461,7 @@ impl RelayProducer {
                 }
             };
 
-            let filter = self.checker.state.filter.load();
+            let filter = self.checker.state.filter.load_full();
 
             struct ParseResult {
                 unknown_dids: Vec<Did<'static>>,

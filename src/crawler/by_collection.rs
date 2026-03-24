@@ -35,21 +35,19 @@ impl ByCollectionProducer {
 
             let filter = self.state.filter.load();
             if filter.signals.is_empty() {
-                debug!("no signals configured, by-collection crawler sleeping 5m");
-                tokio::time::sleep(Duration::from_secs(300)).await;
+                trace!("no signals configured, by-collection crawler sleeping 1s");
+                tokio::time::sleep(Duration::from_secs(1)).await;
                 continue;
             }
-
-            let signals: Vec<String> = filter.signals.iter().map(|s| s.to_string()).collect();
-            drop(filter);
+            let filter = arc_swap::Guard::into_inner(filter);
 
             info!(
                 host = self.index_url.host_str(),
-                signal_count = signals.len(),
+                signal_count = filter.signals.len(),
                 "starting by-collection discovery pass"
             );
 
-            for collection in &signals {
+            for collection in &filter.signals {
                 self.enabled.wait_enabled("by-collection crawler").await;
                 let span = tracing::info_span!("by_collection", %collection);
                 use tracing::Instrument as _;
