@@ -215,9 +215,12 @@ each set field accepts one of two forms:
     (`persisted: false`), only the running task is stopped, the source will
     reappear on the next restart since `CRAWLER_URLS` is re-applied at startup.
     (unless you remove it manually from your configuration of course).
-  - cursor state is not cleared. use `DELETE /cursors` separately if you want
+  - cursor state is not cleared. use `DELETE /crawler/cursors` separately if you want
     the source to restart from the beginning when re-added.
   - returns `200 OK` if the source was found and removed, `404 Not Found` otherwise.
+- `DELETE /crawler/cursors`: reset stored cursors for a given crawler URL. body: `{ "key": "..." }`
+  where key is a URL. clears the relay crawler cursor as well as any by-collection
+  cursors associated with that URL. causes the next crawler pass to restart from the beginning.
 
 ### firehose management
 
@@ -242,9 +245,11 @@ each set field accepts one of two forms:
     the database and will not reappear on restart. if it came from `RELAY_HOSTS`
     (`persisted: false`), only the running task is stopped; the source reappears
     on the next restart.
-  - cursor state is not cleared. use `DELETE /cursors` separately if you want
+  - cursor state is not cleared. use `DELETE /firehose/cursors` separately if you want
     the relay to restart from the beginning when re-added.
   - returns `200 OK` if the relay was found and removed, `404 Not Found` otherwise.
+- `DELETE /firehose/cursors`: reset the stored cursor for a given firehose relay URL. body: `{ "key": "..." }`
+  where key is a URL. causes the next firehose connection to restart from the beginning.
 
 ### repository management
 
@@ -269,10 +274,6 @@ each set field accepts one of two forms:
 - `POST /db/compact`: trigger a full major compaction of all database keyspaces
   in parallel. the crawler, firehose, and backfill worker are paused for the
   duration and restored on completion.
-- `DELETE /cursors`: reset all stored cursors for a given URL. body: `{ "key": "..." }`
-  where key is a URL. clears both the firehose cursor and the relay crawler cursor,
-  as well as any by-collection cursors associated with that URL. causes the next
-  firehose connection and crawler pass to restart from the beginning.
 
 ## data access (xrpc)
 
