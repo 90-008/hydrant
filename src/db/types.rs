@@ -368,6 +368,7 @@ pub struct DidKey<'b>(
 );
 
 impl DidKey<'_> {
+    #[allow(dead_code)]
     pub fn from_did_key(s: &str) -> miette::Result<Self> {
         let multibase_str = s
             .strip_prefix("did:key:")

@@ -4,7 +4,7 @@ use axum::{
     Json, Router,
     body::Body,
     extract::{Path, Query, State},
-    http::{StatusCode, header},
+    http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{delete, get, post, put},
 };
@@ -35,6 +35,7 @@ pub struct GetReposParams {
 pub async fn handle_get_repos(
     State(hydrant): State<Hydrant>,
     Query(params): Query<GetReposParams>,
+    headers: HeaderMap,
 ) -> Result<Response, (StatusCode, String)> {
     let limit = params.limit.unwrap_or(100).min(1000);
     let partition = params.partition.unwrap_or_else(|| "all".to_string());
@@ -113,6 +114,10 @@ pub async fn handle_get_repos(
     .await
     .map_err(internal)??;
 
+    if prefers_json(&headers) {
+        return Ok(Json(items).into_response());
+    }
+
     use futures::StreamExt;
 
     let stream = futures::stream::iter(items.into_iter().map(|item| {
@@ -144,9 +149,10 @@ pub async fn handle_get_repo(
 
 pub async fn handle_put_repos(
     State(hydrant): State<Hydrant>,
-    req: axum::extract::Request,
-) -> Result<Json<Vec<String>>, (StatusCode, String)> {
-    let items = parse_body(req).await?;
+    headers: HeaderMap,
+    body: Body,
+) -> Result<Response, (StatusCode, String)> {
+    let items = parse_body(body, &headers).await?;
 
     let dids: Vec<Did<'static>> = items
         .into_iter()
@@ -159,14 +165,15 @@ pub async fn handle_put_repos(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    Ok(Json(queued.into_iter().map(|d| d.to_string()).collect()))
+    Ok(did_list_response(queued, &headers))
 }
 
 pub async fn handle_delete_repos(
     State(hydrant): State<Hydrant>,
-    req: axum::extract::Request,
-) -> Result<Json<Vec<String>>, (StatusCode, String)> {
-    let items = parse_body(req).await?;
+    headers: HeaderMap,
+    body: Body,
+) -> Result<Response, (StatusCode, String)> {
+    let items = parse_body(body, &headers).await?;
 
     let dids: Vec<Did<'static>> = items
         .into_iter()
@@ -179,14 +186,15 @@ pub async fn handle_delete_repos(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    Ok(Json(untracked.into_iter().map(|d| d.to_string()).collect()))
+    Ok(did_list_response(untracked, &headers))
 }
 
 pub async fn handle_post_resync(
     State(hydrant): State<Hydrant>,
-    req: axum::extract::Request,
-) -> Result<Json<Vec<String>>, (StatusCode, String)> {
-    let items = parse_body(req).await?;
+    headers: HeaderMap,
+    body: Body,
+) -> Result<Response, (StatusCode, String)> {
+    let items = parse_body(body, &headers).await?;
 
     let dids: Vec<Did<'static>> = items
         .into_iter()
@@ -199,18 +207,44 @@ pub async fn handle_post_resync(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    Ok(Json(queued.into_iter().map(|d| d.to_string()).collect()))
+    Ok(did_list_response(queued, &headers))
 }
 
-async fn parse_body(req: axum::extract::Request) -> Result<Vec<RepoRequest>, (StatusCode, String)> {
-    let content_type = req
-        .headers()
+fn prefers_json(headers: &HeaderMap) -> bool {
+    let contains_json = |h: axum::http::HeaderName| {
+        headers
+            .get(h)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.contains("application/json"))
+    };
+    contains_json(header::ACCEPT) || contains_json(header::CONTENT_TYPE)
+}
+
+fn did_list_response(dids: Vec<Did<'static>>, headers: &HeaderMap) -> Response {
+    if prefers_json(headers) {
+        let body: Vec<String> = dids.into_iter().map(|d| d.to_string()).collect();
+        Json(body).into_response()
+    } else {
+        let body = dids
+            .iter()
+            .filter_map(|d| serde_json::to_string(&d.as_str()).ok())
+            .map(|s| format!("{s}\n"))
+            .collect::<String>();
+        ([(header::CONTENT_TYPE, "application/x-ndjson")], body).into_response()
+    }
+}
+
+async fn parse_body(
+    body: Body,
+    headers: &HeaderMap,
+) -> Result<Vec<RepoRequest>, (StatusCode, String)> {
+    let content_type = headers
         .get(header::CONTENT_TYPE)
         .and_then(|h| h.to_str().ok())
         .unwrap_or("")
         .to_string();
 
-    let body_bytes = axum::body::to_bytes(req.into_body(), usize::MAX)
+    let body_bytes = axum::body::to_bytes(body, usize::MAX)
         .await
         .map_err(bad_request)?;
 
