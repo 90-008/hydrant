@@ -321,7 +321,9 @@ impl FirehoseWorker {
                             match Self::process_message(&mut ctx, &msg, did, repo_state, pre_status)
                             {
                                 Ok(RepoProcessResult::Ok(_)) => {}
-                                Ok(RepoProcessResult::Deleted) => {}
+                                Ok(RepoProcessResult::Deleted) => {
+                                    state.db.update_count("repos", -1);
+                                }
                                 Ok(RepoProcessResult::NeedsBackfill(Some(commit))) => {
                                     if let Err(e) =
                                         ops::persist_to_resync_buffer(&state.db, did, commit)

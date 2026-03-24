@@ -593,7 +593,18 @@ impl Db {
         if delta >= 0 {
             *entry = entry.saturating_add(delta as u64);
         } else {
-            *entry = entry.saturating_sub(delta.unsigned_abs());
+            let decrement = delta.unsigned_abs();
+            if *entry < decrement {
+                error!(
+                    key,
+                    current = *entry,
+                    decrement,
+                    "count underflow !!! this is a bug"
+                );
+                *entry = 0;
+            } else {
+                *entry -= decrement;
+            }
         }
     }
 
@@ -606,7 +617,18 @@ impl Db {
         if delta >= 0 {
             *entry = entry.saturating_add(delta as u64);
         } else {
-            *entry = entry.saturating_sub(delta.unsigned_abs());
+            let decrement = delta.unsigned_abs();
+            if *entry < decrement {
+                error!(
+                    key,
+                    current = *entry,
+                    decrement,
+                    "count underflow !!! this is a bug"
+                );
+                *entry = 0;
+            } else {
+                *entry -= decrement;
+            }
         }
     }
 

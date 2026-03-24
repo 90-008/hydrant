@@ -118,7 +118,12 @@ impl BackfillWorker {
 
                 let permit = match self.semaphore.clone().try_acquire_owned() {
                     Ok(p) => p,
-                    Err(_) => break,
+                    Err(_) => {
+                        // remove before breaking so the DID isn't permanently stuck in
+                        // in_flight with no task to clean it up
+                        self.in_flight.remove_sync(&did);
+                        break;
+                    }
                 };
 
                 let guard = InFlightGuard {
@@ -445,7 +450,9 @@ async fn process_did<'i>(
                     error!(err = %e, "failed to wipe repo during backfill");
                 }
                 batch.commit().into_diagnostic()?;
-                return Ok(Some(previous_state)); // stop backfill
+                // return None so did_task handles the repos/pending count decrements
+                // and skips sending BackfillFinished (nothing to drain for a deleted repo)
+                return Ok(None);
             }
 
             let inactive_status = match e {
