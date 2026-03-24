@@ -111,20 +111,27 @@ impl BackfillWorker {
                     }
                 };
 
+                // check before trying to acquire a permit so we dont acquire a permit
+                // for no reason, the read will be cheap anyhow
                 if self.in_flight.contains_sync(&did) {
                     continue;
                 }
-                let _ = self.in_flight.insert_sync(did.clone().into_static());
 
                 let permit = match self.semaphore.clone().try_acquire_owned() {
                     Ok(p) => p,
-                    Err(_) => {
-                        // remove before breaking so the DID isn't permanently stuck in
-                        // in_flight with no task to clean it up
-                        self.in_flight.remove_sync(&did);
-                        break;
-                    }
+                    Err(_) => break,
                 };
+
+                // only mark as in flight if we can acquire a permit
+                if self
+                    .in_flight
+                    .insert_sync(did.clone().into_static())
+                    .is_err()
+                {
+                    // a task is already running, weh
+                    // so we don't need this one anymore...
+                    break;
+                }
 
                 let guard = InFlightGuard {
                     did: did.clone().into_static(),
