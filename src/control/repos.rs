@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
+use fjall::OwnedWriteBatch;
 use jacquard_common::cowstr::ToCowStr;
 use jacquard_common::types::cid::{Cid, IpldCid};
 use jacquard_common::types::ident::AtIdentifier;
@@ -13,7 +14,7 @@ use smol_str::ToSmolStr;
 use url::Url;
 
 use crate::db::types::DbRkey;
-use crate::db::{self, keys, ser_repo_state};
+use crate::db::{self, Db, keys, ser_repo_state};
 use crate::state::AppState;
 use crate::types::{GaugeState, RepoState, RepoStatus};
 
@@ -84,49 +85,117 @@ impl ReposControl {
         })
     }
 
-    /// fetch the current state of a single repository. returns `None` if hydrant
-    /// has never seen this DID.
+    /// fetch the current state of repository.
+    /// returns `None` if hydrant has never seen this repository.
     pub async fn info(&self, did: &Did<'_>) -> Result<Option<RepoInfo>> {
         self.get(did)?.info().await
     }
 
-    /// explicitly track one or more repositories, enqueuing them for backfill if needed.
+    fn _resync(
+        db: &Db,
+        did: &Did<'_>,
+        batch: &mut OwnedWriteBatch,
+        transitions: &mut Vec<(GaugeState, GaugeState)>,
+    ) -> Result<bool> {
+        let did_key = keys::repo_key(did);
+        let repo_bytes = db.repos.get(&did_key).into_diagnostic()?;
+        let existing = repo_bytes
+            .as_deref()
+            .map(db::deser_repo_state)
+            .transpose()?;
+
+        if let Some(mut repo_state) = existing {
+            let resync = db.resync.get(&did_key).into_diagnostic()?;
+            let old = db::Db::repo_gauge_state(&repo_state, resync.as_deref());
+            repo_state.tracked = true;
+            repo_state.status = RepoStatus::Backfilling;
+            batch.insert(&db.repos, &did_key, ser_repo_state(&repo_state)?);
+            batch.insert(
+                &db.pending,
+                keys::pending_key(repo_state.index_id),
+                &did_key,
+            );
+            batch.remove(&db.resync, &did_key);
+            transitions.push((old, GaugeState::Pending));
+            return Ok(true);
+        }
+
+        Ok(false)
+    }
+
+    /// request one or more repositories to be resynced.
     ///
-    /// - if a DID is new, a fresh [`RepoState`] is created and backfill is queued.
-    /// - if a DID is already known but untracked, it is marked tracked and re-enqueued.
-    /// - if a DID is already tracked, this is a no-op.
-    pub async fn track(&self, dids: impl IntoIterator<Item = Did<'_>>) -> Result<()> {
+    /// note that they may not immediately start backfilling if:
+    /// - other repos already filled the backfill concurrency limit,
+    /// - or there are many repos pending already.
+    pub async fn resync(
+        &self,
+        dids: impl IntoIterator<Item = Did<'_>>,
+    ) -> Result<Vec<Did<'static>>> {
         let dids: Vec<Did<'static>> = dids.into_iter().map(|d| d.into_static()).collect();
         let state = self.0.clone();
 
-        let (new_count, transitions) = tokio::task::spawn_blocking(move || {
+        let (queued, transitions) = tokio::task::spawn_blocking(move || {
+            let db = &state.db;
+            let mut batch = db.inner.batch();
+            let mut queued: Vec<Did<'static>> = Vec::new();
+            let mut transitions: Vec<(GaugeState, GaugeState)> = Vec::new();
+
+            for did in dids {
+                if Self::_resync(db, &did, &mut batch, &mut transitions)? {
+                    queued.push(did);
+                }
+            }
+
+            batch.commit().into_diagnostic()?;
+            Ok::<_, miette::Report>((queued, transitions))
+        })
+        .await
+        .into_diagnostic()??;
+
+        for (old, new) in transitions {
+            self.0.db.update_gauge_diff_async(&old, &new).await;
+        }
+        if !queued.is_empty() {
+            self.0.notify_backfill();
+        }
+
+        Ok(queued)
+    }
+
+    /// explicitly track one or more repositories, enqueuing them for backfill if needed.
+    ///
+    /// - if a repo is new, a fresh [`RepoState`] is created and backfill is queued.
+    /// - if a repo is already known but untracked, it is marked tracked and re-enqueued.
+    /// - if a repo is already tracked, this is a no-op.
+    pub async fn track(
+        &self,
+        dids: impl IntoIterator<Item = Did<'_>>,
+    ) -> Result<Vec<Did<'static>>> {
+        let dids: Vec<Did<'static>> = dids.into_iter().map(|d| d.into_static()).collect();
+        let state = self.0.clone();
+
+        let (new_count, queued, transitions) = tokio::task::spawn_blocking(move || {
             let db = &state.db;
             let mut batch = db.inner.batch();
             let mut added = 0i64;
+            let mut queued: Vec<Did<'static>> = Vec::new();
             let mut transitions: Vec<(GaugeState, GaugeState)> = Vec::new();
             let mut rng = rand::rng();
 
-            for did in &dids {
-                let did_key = keys::repo_key(did);
+            for did in dids {
+                let did_key = keys::repo_key(&did);
                 let repo_bytes = db.repos.get(&did_key).into_diagnostic()?;
                 let existing = repo_bytes
                     .as_deref()
                     .map(db::deser_repo_state)
                     .transpose()?;
 
-                if let Some(mut repo_state) = existing {
-                    if !repo_state.tracked {
-                        let resync = db.resync.get(&did_key).into_diagnostic()?;
-                        let old = db::Db::repo_gauge_state(&repo_state, resync.as_deref());
-                        repo_state.tracked = true;
-                        batch.insert(&db.repos, &did_key, ser_repo_state(&repo_state)?);
-                        batch.insert(
-                            &db.pending,
-                            keys::pending_key(repo_state.index_id),
-                            &did_key,
-                        );
-                        batch.remove(&db.resync, &did_key);
-                        transitions.push((old, GaugeState::Pending));
+                if let Some(repo_state) = existing {
+                    // the double read here is an ok tradeoff, the block will be in read-cache anyway
+                    if !repo_state.tracked && Self::_resync(db, &did, &mut batch, &mut transitions)?
+                    {
+                        queued.push(did);
                     }
                 } else {
                     let repo_state = RepoState::backfilling(rng.next_u64());
@@ -137,12 +206,13 @@ impl ReposControl {
                         &did_key,
                     );
                     added += 1;
+                    queued.push(did);
                     transitions.push((GaugeState::Synced, GaugeState::Pending));
                 }
             }
 
             batch.commit().into_diagnostic()?;
-            Ok::<_, miette::Report>((added, transitions))
+            Ok::<_, miette::Report>((added, queued, transitions))
         })
         .await
         .into_diagnostic()??;
@@ -154,23 +224,27 @@ impl ReposControl {
             self.0.db.update_gauge_diff_async(&old, &new).await;
         }
         self.0.notify_backfill();
-        Ok(())
+        Ok(queued)
     }
 
     /// stop tracking one or more repositories. hydrant will stop processing new events
     /// for them and remove them from the pending/resync queues, but existing indexed
     /// records are **not** deleted.
-    pub async fn untrack(&self, dids: impl IntoIterator<Item = Did<'_>>) -> Result<()> {
+    pub async fn untrack(
+        &self,
+        dids: impl IntoIterator<Item = Did<'_>>,
+    ) -> Result<Vec<Did<'static>>> {
         let dids: Vec<Did<'static>> = dids.into_iter().map(|d| d.into_static()).collect();
         let state = self.0.clone();
 
-        let gauge_decrements = tokio::task::spawn_blocking(move || {
+        let (untracked, gauge_decrements) = tokio::task::spawn_blocking(move || {
             let db = &state.db;
             let mut batch = db.inner.batch();
+            let mut untracked: Vec<Did<'static>> = Vec::new();
             let mut gauge_decrements = Vec::new();
 
-            for did in &dids {
-                let did_key = keys::repo_key(did);
+            for did in dids {
+                let did_key = keys::repo_key(&did);
                 let repo_bytes = db.repos.get(&did_key).into_diagnostic()?;
                 let existing = repo_bytes
                     .as_deref()
@@ -189,12 +263,13 @@ impl ReposControl {
                         if old != GaugeState::Synced {
                             gauge_decrements.push(old);
                         }
+                        untracked.push(did);
                     }
                 }
             }
 
             batch.commit().into_diagnostic()?;
-            Ok::<_, miette::Report>(gauge_decrements)
+            Ok::<_, miette::Report>((untracked, gauge_decrements))
         })
         .await
         .into_diagnostic()??;
@@ -205,7 +280,7 @@ impl ReposControl {
                 .update_gauge_diff_async(&gauge, &GaugeState::Synced)
                 .await;
         }
-        Ok(())
+        Ok(untracked)
     }
 }
 

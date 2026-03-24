@@ -6,7 +6,7 @@ use axum::{
     extract::{Path, Query, State},
     http::{StatusCode, header},
     response::{IntoResponse, Response},
-    routing::{delete, get, put},
+    routing::{delete, get, post, put},
 };
 use jacquard_common::types::did::Did;
 use serde::Deserialize;
@@ -14,6 +14,7 @@ use serde::Deserialize;
 pub fn router() -> Router<Hydrant> {
     Router::new()
         .route("/repos", get(handle_get_repos))
+        .route("/repos/resync", post(handle_post_resync))
         .route("/repos/{did}", get(handle_get_repo))
         .route("/repos", put(handle_put_repos))
         .route("/repos", delete(handle_delete_repos))
@@ -144,7 +145,7 @@ pub async fn handle_get_repo(
 pub async fn handle_put_repos(
     State(hydrant): State<Hydrant>,
     req: axum::extract::Request,
-) -> Result<StatusCode, (StatusCode, String)> {
+) -> Result<Json<Vec<String>>, (StatusCode, String)> {
     let items = parse_body(req).await?;
 
     let dids: Vec<Did<'static>> = items
@@ -152,19 +153,19 @@ pub async fn handle_put_repos(
         .filter_map(|item| Did::new_owned(&item.did).ok())
         .collect();
 
-    hydrant
+    let queued = hydrant
         .repos
         .track(dids)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    Ok(StatusCode::OK)
+    Ok(Json(queued.into_iter().map(|d| d.to_string()).collect()))
 }
 
 pub async fn handle_delete_repos(
     State(hydrant): State<Hydrant>,
     req: axum::extract::Request,
-) -> Result<StatusCode, (StatusCode, String)> {
+) -> Result<Json<Vec<String>>, (StatusCode, String)> {
     let items = parse_body(req).await?;
 
     let dids: Vec<Did<'static>> = items
@@ -172,13 +173,33 @@ pub async fn handle_delete_repos(
         .filter_map(|item| Did::new_owned(&item.did).ok())
         .collect();
 
-    hydrant
+    let untracked = hydrant
         .repos
         .untrack(dids)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    Ok(StatusCode::OK)
+    Ok(Json(untracked.into_iter().map(|d| d.to_string()).collect()))
+}
+
+pub async fn handle_post_resync(
+    State(hydrant): State<Hydrant>,
+    req: axum::extract::Request,
+) -> Result<Json<Vec<String>>, (StatusCode, String)> {
+    let items = parse_body(req).await?;
+
+    let dids: Vec<Did<'static>> = items
+        .into_iter()
+        .filter_map(|item| Did::new_owned(&item.did).ok())
+        .collect();
+
+    let queued = hydrant
+        .repos
+        .resync(dids)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(queued.into_iter().map(|d| d.to_string()).collect()))
 }
 
 async fn parse_body(req: axum::extract::Request) -> Result<Vec<RepoRequest>, (StatusCode, String)> {

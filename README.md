@@ -263,7 +263,16 @@ each set field accepts one of two forms:
   also returns the handle, PDS URL and the atproto signing key (these won't be
   available before the repo has been backfilled once at least).
 - `PUT /repos`: explicitly track repositories. accepts an NDJSON body of `{"did": "..."}` (or JSON array of the same).
-- `DELETE /repos`: untrack repositories. accepts an NDJSON body of `{"did": "..."}` (or JSON array of the same).
+  only affects repositories that are not known or are untracked.
+  returns a JSON array of the DIDs that were tracked.
+- `DELETE /repos`: untrack repositories.
+  accepts an NDJSON body of `{"did": "..."}` (or JSON array of the same).
+  only affects repositories that are currently tracked.
+  returns a JSON array of the DIDs that were untracked.
+- `POST /repos/resync`: force a new backfill for one or more repositories.
+  accepts an NDJSON body of `{"did": "..."}` (or JSON array of the same).
+  only affects repositories hydrant already knows about.
+  returns a JSON array of the DIDs that were queued.
 
 ### database operations
 
