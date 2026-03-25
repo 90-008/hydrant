@@ -104,7 +104,9 @@ impl ReposControl {
             .map(db::deser_repo_state)
             .transpose()?;
 
-        if let Some(mut repo_state) = existing {
+        if let Some(mut repo_state) = existing
+            && repo_state.status != RepoStatus::Backfilling
+        {
             let resync = db.resync.get(&did_key).into_diagnostic()?;
             let old = db::Db::repo_gauge_state(&repo_state, resync.as_deref());
             repo_state.tracked = true;
