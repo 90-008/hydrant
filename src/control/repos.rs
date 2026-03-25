@@ -8,12 +8,12 @@ use jacquard_common::types::ident::AtIdentifier;
 use jacquard_common::types::string::{Did, Handle, Rkey};
 use jacquard_common::types::tid::Tid;
 use jacquard_common::{CowStr, Data, IntoStatic};
-use miette::{IntoDiagnostic, Result};
+use miette::{Context, IntoDiagnostic, Result};
 use rand::Rng;
 use smol_str::ToSmolStr;
 use url::Url;
 
-use crate::db::types::DbRkey;
+use crate::db::types::{DbRkey, TrimmedDid};
 use crate::db::{self, Db, keys, ser_repo_state};
 use crate::state::AppState;
 use crate::types::{GaugeState, RepoState, RepoStatus};
@@ -67,7 +67,93 @@ pub struct RepoInfo {
 pub struct ReposControl(pub(super) Arc<AppState>);
 
 impl ReposControl {
-    /// gets a handle for a repository to allow acting upon it.
+    /// iterates through all repositories, returning their state.
+    pub fn iter(&self, cursor: Option<&Did<'_>>) -> impl Iterator<Item = Result<RepoInfo>> {
+        let start_bound = if let Some(cursor) = cursor {
+            let did_key = keys::repo_key(cursor);
+            std::ops::Bound::Excluded(did_key)
+        } else {
+            std::ops::Bound::Unbounded
+        };
+
+        self.0
+            .db
+            .repos
+            .range((start_bound, std::ops::Bound::Unbounded))
+            .map(|g| {
+                let (k, v) = g.into_inner().into_diagnostic()?;
+                let repo_state = crate::db::deser_repo_state(&v)?;
+                let did = TrimmedDid::try_from(k.as_ref())?.to_did();
+                Ok(repo_state_to_info(did, repo_state))
+            })
+    }
+
+    #[allow(dead_code)]
+    /// iterates through pending repositories, returning their state.
+    fn iter_pending(&self, cursor: Option<u64>) -> impl Iterator<Item = Result<(u64, RepoInfo)>> {
+        let start_bound = if let Some(cursor) = cursor {
+            std::ops::Bound::Excluded(cursor.to_be_bytes().to_vec())
+        } else {
+            std::ops::Bound::Unbounded
+        };
+
+        let repos = self.0.db.repos.clone();
+        self.0
+            .db
+            .pending
+            .range((start_bound, std::ops::Bound::Unbounded))
+            .map(move |g| {
+                let (id_raw, did_key) = g.into_inner().into_diagnostic()?;
+                let id = u64::from_be_bytes(
+                    id_raw
+                        .as_ref()
+                        .try_into()
+                        .into_diagnostic()
+                        .wrap_err("can't parse pending key")?,
+                );
+                let Some(bytes) = repos.get(&did_key).into_diagnostic()? else {
+                    // stale pending that we forgot to delete? shouldn't happen though
+                    tracing::warn!(id, did = ?did_key, "stale pending???");
+                    return Ok(None);
+                };
+                let repo_state = crate::db::deser_repo_state(&bytes)?;
+                let did = TrimmedDid::try_from(did_key.as_ref())?.to_did();
+                Ok(Some((id, repo_state_to_info(did, repo_state))))
+            })
+            .map(|b| b.transpose())
+            .flatten()
+    }
+
+    #[allow(dead_code)]
+    fn iter_resync(&self, cursor: Option<&Did<'_>>) -> impl Iterator<Item = Result<RepoInfo>> {
+        let start_bound = if let Some(cursor) = cursor {
+            let did_key = keys::repo_key(cursor);
+            std::ops::Bound::Excluded(did_key)
+        } else {
+            std::ops::Bound::Unbounded
+        };
+
+        let repos = self.0.db.repos.clone();
+        self.0
+            .db
+            .resync
+            .range((start_bound, std::ops::Bound::Unbounded))
+            .map(move |g| {
+                let did_key = g.key().into_diagnostic()?;
+                let Some(bytes) = repos.get(&did_key).into_diagnostic()? else {
+                    // stale pending that we forgot to delete? shouldn't happen though
+                    tracing::warn!(did = ?did_key, "stale resync???");
+                    return Ok(None);
+                };
+                let repo_state = crate::db::deser_repo_state(&bytes)?;
+                let did = TrimmedDid::try_from(did_key.as_ref())?.to_did();
+                Ok(Some(repo_state_to_info(did, repo_state)))
+            })
+            .map(|b| b.transpose())
+            .flatten()
+    }
+
+    /// gets a handle for a repository to read from it.
     pub fn get<'i>(&self, did: &Did<'i>) -> Result<RepoHandle<'i>> {
         Ok(RepoHandle {
             state: self.0.clone(),

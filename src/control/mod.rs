@@ -7,7 +7,6 @@ mod stream;
 pub use crawler::{CrawlerHandle, CrawlerSourceInfo};
 pub use filter::{FilterControl, FilterPatch, FilterSnapshot};
 pub use firehose::{FirehoseHandle, FirehoseSourceInfo};
-pub(crate) use repos::repo_state_to_info;
 pub use repos::{ListedRecord, Record, RecordList, RepoHandle, RepoInfo, ReposControl};
 
 use std::collections::BTreeMap;

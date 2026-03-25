@@ -1,5 +1,6 @@
-use crate::control::{Hydrant, RepoInfo, repo_state_to_info};
-use crate::db::keys;
+use std::str::FromStr;
+
+use crate::control::{Hydrant, RepoInfo};
 use axum::{
     Json, Router,
     body::Body,
@@ -9,6 +10,7 @@ use axum::{
     routing::{delete, get, post, put},
 };
 use jacquard_common::types::did::Did;
+use miette::IntoDiagnostic;
 use serde::Deserialize;
 
 pub fn router() -> Router<Hydrant> {
@@ -29,7 +31,6 @@ pub struct RepoRequest {
 pub struct GetReposParams {
     pub limit: Option<usize>,
     pub cursor: Option<String>,
-    pub partition: Option<String>,
 }
 
 pub async fn handle_get_repos(
@@ -38,81 +39,23 @@ pub async fn handle_get_repos(
     headers: HeaderMap,
 ) -> Result<Response, (StatusCode, String)> {
     let limit = params.limit.unwrap_or(100).min(1000);
-    let partition = params.partition.unwrap_or_else(|| "all".to_string());
+    let cursor = params
+        .cursor
+        .map(|c| Did::from_str(&c))
+        .transpose()
+        .map_err(bad_request)?;
 
     let items = tokio::task::spawn_blocking(move || {
-        let db = &hydrant.state.db;
-
-        let to_info = |k: &[u8], v: &[u8]| -> Result<RepoInfo, (StatusCode, String)> {
-            let repo_state = crate::db::deser_repo_state(v).map_err(internal)?;
-            let did = crate::db::types::TrimmedDid::try_from(k)
-                .map_err(internal)?
-                .to_did();
-
-            Ok(repo_state_to_info(did, repo_state))
-        };
-
-        let results = match partition.as_str() {
-            "all" | "resync" => {
-                let is_all = partition == "all";
-                let ks = if is_all { &db.repos } else { &db.resync };
-
-                let start_bound = if let Some(cursor) = params.cursor {
-                    let did = Did::new_owned(&cursor).map_err(bad_request)?;
-                    let did_key = keys::repo_key(&did);
-                    std::ops::Bound::Excluded(did_key)
-                } else {
-                    std::ops::Bound::Unbounded
-                };
-
-                let mut items = Vec::new();
-                for item in ks
-                    .range((start_bound, std::ops::Bound::Unbounded))
-                    .take(limit)
-                {
-                    let (k, v) = item.into_inner().map_err(internal)?;
-
-                    let repo_state_bytes = if is_all {
-                        v
-                    } else {
-                        db.repos.get(&k).map_err(internal)?.ok_or_else(|| {
-                            internal(format!("repository state missing for {}", partition))
-                        })?
-                    };
-
-                    items.push(to_info(&k, &repo_state_bytes)?);
-                }
-                Ok::<_, (StatusCode, String)>(items)
-            }
-            "pending" => {
-                let start_bound = if let Some(cursor) = params.cursor {
-                    let id = cursor.parse::<u64>().map_err(bad_request)?;
-                    std::ops::Bound::Excluded(id.to_be_bytes().to_vec())
-                } else {
-                    std::ops::Bound::Unbounded
-                };
-
-                let mut items = Vec::new();
-                for item in db
-                    .pending
-                    .range((start_bound, std::ops::Bound::Unbounded))
-                    .take(limit)
-                {
-                    let (_, did_key) = item.into_inner().map_err(internal)?;
-
-                    if let Ok(Some(v)) = db.repos.get(&did_key) {
-                        items.push(to_info(&did_key, &v)?);
-                    }
-                }
-                Ok(items)
-            }
-            _ => Err((StatusCode::BAD_REQUEST, "invalid partition".to_string())),
-        }?;
-
-        Ok::<_, (StatusCode, String)>(results)
+        hydrant
+            .repos
+            .iter(cursor.as_ref())
+            .take(limit)
+            .collect::<miette::Result<Vec<_>>>()
     })
     .await
-    .map_err(internal)??;
+    .into_diagnostic()
+    .flatten()
+    .map_err(internal)?;
 
     if prefers_json(&headers) {
         return Ok(Json(items).into_response());
@@ -201,11 +144,7 @@ pub async fn handle_post_resync(
         .filter_map(|item| Did::new_owned(&item.did).ok())
         .collect();
 
-    let queued = hydrant
-        .repos
-        .resync(dids)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let queued = hydrant.repos.resync(dids).await.map_err(internal)?;
 
     Ok(did_list_response(queued, &headers))
 }

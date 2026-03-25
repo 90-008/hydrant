@@ -269,8 +269,7 @@ all `/repos` endpoints that return lists respond with NDJSON by default. send `A
 
 - `GET /repos`: get a list of repositories and their sync status. supports pagination and filtering:
     - `limit`: max results (default 100, max 1000)
-    - `cursor`: opaque key for paginating.
-    - `partition`: `all` (default), `pending` (backfill queue), or `resync` (retries)
+    - `cursor`: did key for paginating.
 - `GET /repos/{did}`: get the sync status and metadata of a specific repository.
   also returns the handle, PDS URL and the atproto signing key (these won't be
   available before the repo has been backfilled once at least).
