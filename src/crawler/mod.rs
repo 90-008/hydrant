@@ -49,6 +49,12 @@ pub(super) struct InFlightGuard {
     pub(super) did: Did<'static>,
 }
 
+impl InFlightGuard {
+    fn as_did(&self) -> &Did<'static> {
+        &self.did
+    }
+}
+
 impl std::ops::Deref for InFlightGuard {
     type Target = Did<'static>;
     fn deref(&self) -> &Did<'static> {

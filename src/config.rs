@@ -7,6 +7,29 @@ use std::str::FromStr;
 use std::time::Duration;
 use url::Url;
 
+/// this is for internal use only, please don't use this macro.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __cfg {
+    (@val $key:expr) => {
+        std::env::var(concat!("HYDRANT_", $key))
+    };
+    ($key:expr, $default:expr, sec) => {
+        cfg!(@val $key)
+            .ok()
+            .and_then(|s| humantime::parse_duration(&s).ok())
+            .unwrap_or($default)
+    };
+    ($key:expr, $default:expr) => {
+        cfg!(@val $key)
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or($default.to_owned())
+            .into()
+    };
+}
+use crate::__cfg as cfg;
+
 /// loads `.env` from the current directory, setting any variables not already in the environment.
 fn load_dotenv() {
     let Ok(contents) = std::fs::read_to_string(".env") else {
@@ -366,25 +389,6 @@ impl Config {
     /// reads and builds the config from environment variables, loading `.env` first if present.
     pub fn from_env() -> Result<Self> {
         load_dotenv();
-
-        macro_rules! cfg {
-            (@val $key:expr) => {
-                std::env::var(concat!("HYDRANT_", $key))
-            };
-            ($key:expr, $default:expr, sec) => {
-                cfg!(@val $key)
-                    .ok()
-                    .and_then(|s| humantime::parse_duration(&s).ok())
-                    .unwrap_or($default)
-            };
-            ($key:expr, $default:expr) => {
-                cfg!(@val $key)
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or($default.to_owned())
-                    .into()
-            };
-        }
 
         // full_network is read first since it determines which defaults to use.
         let full_network: bool = cfg!("FULL_NETWORK", false);

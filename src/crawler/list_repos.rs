@@ -381,7 +381,7 @@ impl SignalChecker {
         let valid_set: std::collections::HashSet<&Did<'static>> = valid.iter().collect();
         Ok(in_flight
             .into_iter()
-            .filter(|g| valid_set.contains(&**g))
+            .filter(|g| valid_set.contains(g.as_did()))
             .collect())
     }
 }

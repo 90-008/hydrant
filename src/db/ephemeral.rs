@@ -32,7 +32,7 @@ pub fn ephemeral_ttl_tick(db: &Db, ttl: &Duration) -> miette::Result<()> {
     let cutoff_key = keys::event_watermark_key(cutoff_ts);
     let cutoff_event_id = db
         .cursors
-        .range(..=cutoff_key.clone())
+        .range(..=cutoff_key.as_slice())
         .next_back()
         .map(|g| g.into_inner().into_diagnostic())
         .transpose()?

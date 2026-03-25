@@ -57,8 +57,8 @@ pub struct RepoInfo {
 /// control over which repositories are tracked and access to their state.
 ///
 /// in `filter` mode, a repo is only indexed if it either matches a signal or is
-/// explicitly tracked via [`ReposControl::track`]. in `full` mode all repos are indexed
-/// and tracking is implicit.
+/// explicitly tracked via [`ReposControl::track`]. in `full` mode all repos are
+/// indexed and tracking is implicit.
 ///
 /// tracking a DID that hydrant has never seen enqueues an immediate backfill.
 /// tracking a DID that hydrant already knows about (but has marked untracked)
