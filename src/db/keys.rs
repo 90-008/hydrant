@@ -110,14 +110,18 @@ pub fn count_keyspace_key(name: &str) -> Vec<u8> {
 
 pub const COUNT_COLLECTION_PREFIX: &[u8] = &[b'r', SEP];
 
-// key format: r|{DID}|{collection} (DID trimmed)
-pub fn count_collection_key(did: &Did, collection: &str) -> Vec<u8> {
+pub fn did_collection_prefix(did: &Did) -> Vec<u8> {
     let repo = TrimmedDid::from(did);
-    let mut key =
-        Vec::with_capacity(COUNT_COLLECTION_PREFIX.len() + repo.len() + 1 + collection.len());
+    let mut key = Vec::with_capacity(COUNT_COLLECTION_PREFIX.len() + repo.len() + 1);
     key.extend_from_slice(COUNT_COLLECTION_PREFIX);
     repo.write_to_vec(&mut key);
     key.push(SEP);
+    key
+}
+
+// key format: r|{DID}|{collection} (DID trimmed)
+pub fn count_collection_key(did: &Did, collection: &str) -> Vec<u8> {
+    let mut key = did_collection_prefix(did);
     key.extend_from_slice(collection.as_bytes());
     key
 }

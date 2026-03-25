@@ -1,8 +1,8 @@
-mod crawler;
-mod filter;
-mod firehose;
-mod repos;
-mod stream;
+pub(crate) mod crawler;
+pub(crate) mod filter;
+pub(crate) mod firehose;
+pub(crate) mod repos;
+pub(crate) mod stream;
 
 pub use crawler::{CrawlerHandle, CrawlerSourceInfo};
 pub use filter::{FilterControl, FilterPatch, FilterSnapshot};

@@ -4,7 +4,7 @@
 -> [vs tap](#vs-tap) | [stream](#stream-behavior) | [multi-relay](#multiple-relay-support) | [crawler sources](#crawler-sources)</br>
 -> [configuration](#configuration)</br>
 -> [rest api](#rest-api) | [filter](#filter-management) | [ingestion](#ingestion-control) | [crawler](#crawler-management) | [firehose](#firehose-management) | [repos](#repository-management)</br>
--> [xrpc api](#data-access-xrpc) | [backlinks](#bluemicrocosmlinks) | [atproto](#comatproto) | [custom](#systemsgazehydrant)
+-> [xrpc api](#data-access-xrpc) | [backlinks](#bluemicrocosmlinks) | [identity](#bluemicrocosmidentity) | [atproto](#comatproto) | [custom](#systemsgazehydrant)
 
 # hydrant
 
@@ -328,6 +328,19 @@ return the total number of stored records in a collection.
 
 returns `{ count }`.
 
+#### systems.gaze.hydrant.describeRepo
+
+return account and identity information about this repo.
+this is equal to `com.atproto.repo.describeRepo`, except we don't return the full DID document.
+the handle is bi-directionally verified, if its invalid or the handle does not exist we return
+"handle.invalid".
+
+| param | required | description |
+| :--- | :--- | :--- |
+| `identifier` | yes | DID or handle of the repository. |
+
+returns `{ did, handle, pds, collections }`.
+
 ### blue.microcosm.links.*
 
 <small>[<- back to toc](#table-of-contents)</small>
@@ -365,3 +378,11 @@ return the number of records that link to a given subject.
 | `source` | no | filter by source collection (same format as `getBacklinks`). |
 
 returns `{ count }`.
+
+### blue.microcosm.identity.*
+
+<small>[<- back to toc](#table-of-contents)</small>
+
+#### blue.microcosm.identity.resolveMiniDoc
+
+see [here](https://slingshot.microcosm.blue/#tag/slingshot-specific-queries/GET/xrpc/blue.microcosm.identity.resolveMiniDoc) for this XRPC's documentation.

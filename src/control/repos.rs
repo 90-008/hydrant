@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
@@ -5,6 +6,7 @@ use fjall::OwnedWriteBatch;
 use jacquard_common::cowstr::ToCowStr;
 use jacquard_common::types::cid::{Cid, IpldCid};
 use jacquard_common::types::ident::AtIdentifier;
+use jacquard_common::types::nsid::Nsid;
 use jacquard_common::types::string::{Did, Handle, Rkey};
 use jacquard_common::types::tid::Tid;
 use jacquard_common::{CowStr, Data, IntoStatic};
@@ -13,7 +15,7 @@ use rand::Rng;
 use smol_str::ToSmolStr;
 use url::Url;
 
-use crate::db::types::{DbRkey, TrimmedDid};
+use crate::db::types::{DbRkey, DidKey, TrimmedDid};
 use crate::db::{self, Db, keys, ser_repo_state};
 use crate::state::AppState;
 use crate::types::{GaugeState, RepoState, RepoStatus};
@@ -37,14 +39,17 @@ pub struct RepoInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data: Option<IpldCid>,
     /// the handle for the DID of this repository.
+    ///
+    /// note that this handle is not bi-directionally verified.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub handle: Option<Handle<'static>>,
     /// the URL for the PDS in which this repository is hosted on.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pds: Option<Url>,
     /// ATProto signing key of this repository.
+    #[serde(serialize_with = "crate::util::opt_did_key_serialize_str")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub signing_key: Option<String>,
+    pub signing_key: Option<DidKey<'static>>,
     /// when this repository was last touched (status update, commit ingested, etc.).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_updated_at: Option<DateTime<Utc>>,
@@ -154,11 +159,11 @@ impl ReposControl {
     }
 
     /// gets a handle for a repository to read from it.
-    pub fn get<'i>(&self, did: &Did<'i>) -> Result<RepoHandle<'i>> {
-        Ok(RepoHandle {
+    pub fn get<'i>(&self, did: &Did<'i>) -> RepoHandle<'i> {
+        RepoHandle {
             state: self.0.clone(),
             did: did.clone(),
-        })
+        }
     }
 
     /// same as [`ReposControl::get`] but allows you to pass in an identifier that can be
@@ -171,10 +176,10 @@ impl ReposControl {
         })
     }
 
-    /// fetch the current state of repository.
+    /// fetch the current state of a repository.
     /// returns `None` if hydrant has never seen this repository.
     pub async fn info(&self, did: &Did<'_>) -> Result<Option<RepoInfo>> {
-        self.get(did)?.info().await
+        self.get(did).info().await
     }
 
     fn _resync(
@@ -384,7 +389,7 @@ pub(crate) fn repo_state_to_info(did: Did<'static>, s: RepoState<'_>) -> RepoInf
         data: s.data,
         handle: s.handle.map(|h| h.into_static()),
         pds: s.pds.and_then(|p| p.parse().ok()),
-        signing_key: s.signing_key.map(|k| k.encode()),
+        signing_key: s.signing_key.map(|k| k.into_static()),
         last_updated_at: DateTime::from_timestamp_secs(s.last_updated_at),
         last_message_at: s.last_message_time.and_then(DateTime::from_timestamp_secs),
     }
@@ -407,6 +412,31 @@ pub struct RecordList {
     pub cursor: Option<Rkey<'static>>,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum MiniDocError {
+    #[error("repo is not synced yet")]
+    NotSynced,
+    #[error("repo not found")]
+    RepoNotFound,
+    #[error("could not resolve identity")]
+    CouldNotResolveIdentity,
+    #[error("{0}")]
+    Other(miette::Error),
+}
+
+/// a mini doc with a bi-directionally verified handle.
+pub struct MiniDoc<'i> {
+    /// the did.
+    pub did: Did<'i>,
+    /// the handle. if verification fails or no handle is found,
+    /// this will be "handle.invalid".
+    pub handle: Handle<'i>,
+    /// the url of the PDS of this repo.
+    pub pds: Url,
+    /// the atproto signing key of this repo.
+    pub signing_key: DidKey<'i>,
+}
+
 /// handle to access data related to this repository.
 #[derive(Clone)]
 pub struct RepoHandle<'i> {
@@ -415,6 +445,8 @@ pub struct RepoHandle<'i> {
 }
 
 impl<'i> RepoHandle<'i> {
+    /// fetch the current state of this repository.
+    /// returns `None` if hydrant has never seen this repository.
     pub async fn info(&self) -> Result<Option<RepoInfo>> {
         let did_key = keys::repo_key(&self.did);
         let state = self.state.clone();
@@ -429,6 +461,87 @@ impl<'i> RepoHandle<'i> {
         .into_diagnostic()?
     }
 
+    /// returns the collections of this repository and the number of records it has in each.
+    pub async fn collections(&self) -> Result<HashMap<Nsid<'static>, u64>> {
+        let did = self.did.clone().into_static();
+        let state = self.state.clone();
+
+        tokio::task::spawn_blocking(move || {
+            let prefix = keys::did_collection_prefix(&did);
+            let mut res = HashMap::new();
+            for item in state.db.counts.prefix(&prefix) {
+                let (k, v) = item.into_inner().into_diagnostic()?;
+                let col = k
+                    .strip_prefix(prefix.as_slice())
+                    .ok_or_else(|| miette::miette!("invalid collection count key: {k:?}"))
+                    .and_then(|r| std::str::from_utf8(r).into_diagnostic())
+                    .and_then(|n| Nsid::new(n).into_diagnostic())?
+                    .into_static();
+                let count = u64::from_be_bytes(
+                    v.as_ref()
+                        .try_into()
+                        .into_diagnostic()
+                        .wrap_err("expected to be count (8 bytes)")?,
+                );
+                res.insert(col, count);
+            }
+            Ok(res)
+        })
+        .await
+        .into_diagnostic()?
+    }
+
+    /// returns a bi-directionally validated mini doc.
+    pub async fn mini_doc(&self) -> Result<MiniDoc<'static>, MiniDocError> {
+        fn invalid_handle() -> Handle<'static> {
+            unsafe { Handle::unchecked("handle.invalid") }
+        }
+
+        let Some(info) = self.info().await.map_err(MiniDocError::Other)? else {
+            return Err(MiniDocError::RepoNotFound);
+        };
+
+        if info.status == RepoStatus::Backfilling {
+            return Err(MiniDocError::NotSynced);
+        }
+
+        let pds = info
+            .pds
+            .ok_or_else(|| MiniDocError::CouldNotResolveIdentity)?;
+        let signing_key = info
+            .signing_key
+            .ok_or_else(|| MiniDocError::CouldNotResolveIdentity)?
+            .into_static();
+
+        let handle = if let Some(handle_unverified) = info.handle {
+            let id = AtIdentifier::Handle(handle_unverified);
+            let handle_did = self
+                .state
+                .resolver
+                .resolve_did(&id)
+                .await
+                .into_diagnostic()
+                .map_err(MiniDocError::Other)?;
+
+            (handle_did == self.did)
+                .then(|| match id {
+                    AtIdentifier::Handle(h) => h,
+                    _ => unreachable!("can only be handle"),
+                })
+                .unwrap_or_else(invalid_handle)
+        } else {
+            invalid_handle()
+        };
+
+        Ok(MiniDoc {
+            did: self.did.clone().into_static(),
+            handle,
+            pds,
+            signing_key,
+        })
+    }
+
+    /// gets a record from this repository.
     pub async fn get_record(&self, collection: &str, rkey: &str) -> Result<Option<Record>> {
         let did = self.did.clone().into_static();
         let db_key = keys::record_key(&did, collection, &DbRkey::new(rkey));
@@ -464,6 +577,7 @@ impl<'i> RepoHandle<'i> {
         .into_diagnostic()?
     }
 
+    /// lists records from this repository.
     pub async fn list_records(
         &self,
         collection: &str,
@@ -559,6 +673,7 @@ impl<'i> RepoHandle<'i> {
         })
     }
 
+    /// gets how many records of a collection this repository has.
     pub async fn count_records(&self, collection: &str) -> Result<u64> {
         let did = self.did.clone().into_static();
         let state = self.state.clone();

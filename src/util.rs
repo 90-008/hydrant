@@ -8,7 +8,7 @@ use tokio::sync::watch;
 use tracing::info;
 use url::Url;
 
-use crate::types::RepoStatus;
+use crate::{db::types::DidKey, types::RepoStatus};
 
 /// outcome of [`RetryWithBackoff::retry`] when the operation does not succeed.
 pub enum RetryOutcome<E> {
@@ -149,6 +149,20 @@ pub fn deser_status_code<'de, D: Deserializer<'de>>(
 pub fn opt_cid_serialize_str<S: Serializer>(v: &Option<cid::Cid>, s: S) -> Result<S::Ok, S::Error> {
     match v {
         Some(cid) => s.serialize_some(cid.to_string().as_str()),
+        None => s.serialize_none(),
+    }
+}
+
+pub fn did_key_serialize_str<S: Serializer>(v: &DidKey<'_>, s: S) -> Result<S::Ok, S::Error> {
+    s.serialize_str(&v.encode())
+}
+
+pub fn opt_did_key_serialize_str<S: Serializer>(
+    v: &Option<DidKey<'_>>,
+    s: S,
+) -> Result<S::Ok, S::Error> {
+    match v {
+        Some(k) => s.serialize_some(k.encode().as_str()),
         None => s.serialize_none(),
     }
 }

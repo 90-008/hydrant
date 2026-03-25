@@ -1,4 +1,5 @@
 use crate::api::xrpc::count_records::CountRecords;
+use crate::api::xrpc::describe_repo::DescribeRepo;
 use crate::control::Hydrant;
 use axum::extract::FromRequest;
 use axum::response::IntoResponse;
@@ -9,6 +10,7 @@ use jacquard_api::com_atproto::repo::{
     list_records::{ListRecordsOutput, ListRecordsRequest, Record as RepoRecord},
 };
 use jacquard_common::types::ident::AtIdentifier;
+use jacquard_common::xrpc::XrpcResp;
 use jacquard_common::xrpc::{XrpcEndpoint, XrpcMethod};
 use jacquard_common::{IntoStatic, xrpc::XrpcRequest};
 use jacquard_common::{
@@ -20,6 +22,7 @@ use smol_str::ToSmolStr;
 use std::fmt::Display;
 
 mod count_records;
+mod describe_repo;
 mod get_record;
 mod list_records;
 
@@ -28,6 +31,7 @@ pub fn router() -> Router<Hydrant> {
         .route(GetRecordRequest::PATH, get(get_record::handle))
         .route(ListRecordsRequest::PATH, get(list_records::handle))
         .route(CountRecords::PATH, get(count_records::handle))
+        .route(DescribeRepo::PATH, get(describe_repo::handle))
 }
 
 #[derive(Debug)]
@@ -107,6 +111,22 @@ fn bad_request<E: std::error::Error + IntoStatic>(
             nsid,
             method: "GET",
             http_status: StatusCode::BAD_REQUEST,
+        }),
+    }
+}
+
+fn upstream_error<E: std::error::Error + IntoStatic>(
+    nsid: &'static str,
+    message: impl Display,
+) -> XrpcErrorResponse<E> {
+    XrpcErrorResponse {
+        status: StatusCode::BAD_GATEWAY,
+        error: XrpcError::Generic(GenericXrpcError {
+            error: "UpstreamError".into(),
+            message: Some(message.to_smolstr()),
+            nsid,
+            method: "GET",
+            http_status: StatusCode::BAD_GATEWAY,
         }),
     }
 }
