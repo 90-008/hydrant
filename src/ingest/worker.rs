@@ -115,6 +115,8 @@ impl FirehoseWorker {
         let mut shards = Vec::with_capacity(self.num_shards);
 
         for i in 0..self.num_shards {
+            // unbounded here so we dont block other shards potentially
+            // if one has a small lag or something
             let (tx, rx) = mpsc::unbounded_channel();
             shards.push(tx);
 
@@ -131,7 +133,7 @@ impl FirehoseWorker {
                 .into_diagnostic()?;
         }
 
-        info!("started {} ingest shards", self.num_shards);
+        info!(num = self.num_shards, "started shards");
 
         let _g = handle.enter();
 
@@ -148,21 +150,21 @@ impl FirehoseWorker {
                 IngestMessage::BackfillFinished(did) => did,
             };
 
+            // todo: consider using a different hasher?
             let mut hasher = DefaultHasher::new();
             did.hash(&mut hasher);
             let hash = hasher.finish();
             let shard_idx = (hash as usize) % self.num_shards;
 
             if let Err(e) = shards[shard_idx].send(msg) {
-                error!(shard = shard_idx, err = %e, "failed to send message to shard");
-                // break if send fails; receiver likely closed
+                error!(shard = shard_idx, err = %e, "failed to send message to shard, shard panicked?");
                 break;
             }
         }
 
-        error!("firehose worker dispatcher shutting down");
-
-        Ok(())
+        Err(miette::miette!(
+            "firehose worker dispatcher shutting down, shard died?"
+        ))
     }
 
     #[inline(always)]
@@ -357,6 +359,7 @@ impl FirehoseWorker {
                         }
                     }
 
+                    // todo: consider not using seqcst
                     state
                         .relay_cursors
                         .peek_with(&relay, |_, c| c.store(seq, SeqCst));
