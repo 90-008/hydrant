@@ -48,17 +48,17 @@ pub(super) fn spawn_crawler_producer(
     enabled: watch::Receiver<bool>,
 ) -> ProducerHandle {
     use crate::config::CrawlerMode;
-    use crate::crawler::{ByCollectionProducer, RelayProducer};
+    use crate::crawler::{ByCollectionProducer, ListReposProducer};
     use std::time::Duration;
     use tracing::Instrument;
 
     let abort = match source.mode {
-        CrawlerMode::Relay => {
+        CrawlerMode::ListRepos => {
             info!(relay = %source.url, enabled = *state.crawler_enabled.borrow(), "starting relay crawler");
             let span = tracing::info_span!("crawl", url = %source.url);
             tokio::spawn(
-                RelayProducer {
-                    relay_url: source.url.clone(),
+                ListReposProducer {
+                    url: source.url.clone(),
                     checker: checker.clone(),
                     in_flight: in_flight.clone(),
                     tx: tx.clone(),

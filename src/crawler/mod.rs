@@ -11,17 +11,15 @@ use tracing::info;
 use url::Url;
 
 mod by_collection;
-mod relay;
+mod list_repos;
 pub mod throttle;
 mod worker;
 
 use throttle::Throttler;
 
 pub(crate) use by_collection::ByCollectionProducer;
-pub(crate) use relay::{RelayProducer, RetryProducer, SignalChecker};
+pub(crate) use list_repos::{ListReposProducer, RetryProducer, SignalChecker};
 pub(crate) use worker::{CrawlerBatch, CrawlerWorker};
-
-// -- InFlight ------------------------------------------------------------
 
 #[derive(Clone)]
 pub(crate) struct InFlight(Arc<HashSet<Did<'static>>>);
@@ -134,7 +132,7 @@ impl CrawlerStats {
                     let relay_host = relay_host.clone();
                     let state = self.0.state.clone();
                     async move {
-                        let cursor = relay::cursor_display(&state, &relay_host).await;
+                        let cursor = list_repos::cursor_display(&state, &relay_host).await;
                         format!("{domain}={cursor}").into()
                     }
                 })

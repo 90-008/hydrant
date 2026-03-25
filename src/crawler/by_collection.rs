@@ -28,7 +28,6 @@ pub(crate) struct ByCollectionProducer {
 }
 
 impl ByCollectionProducer {
-    /// hourly loop: runs one full pass per configured signal, then sleeps.
     pub(crate) async fn run(mut self) -> Result<()> {
         loop {
             self.enabled.wait_enabled("by-collection crawler").await;
@@ -47,6 +46,8 @@ impl ByCollectionProducer {
                 "starting by-collection discovery pass"
             );
 
+            // todo: make this parallel or make use of lightrail taking multiple collections
+            // https://github.com/bluesky-social/atproto/pull/4733
             for collection in &filter.signals {
                 self.enabled.wait_enabled("by-collection crawler").await;
                 let span = tracing::info_span!("by_collection", %collection);

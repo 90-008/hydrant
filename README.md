@@ -67,16 +67,17 @@ relay-side account takedowns or if relays set the `time` field.
 
 the crawler is configured separately from the firehose via `CRAWLER_URLS`. each
 source is a `[mode::]url` entry where the mode prefix is optional and defaults
-to `by_collection` in filter mode or `relay` in full-network mode.
+to `by_collection` in filter mode or `list_repos` in full-network mode.
 
-- `relay`: enumerates the network via `com.atproto.sync.listRepos`, then checks
-  each repo's collections via `describeRepo`. used for full-network discovery.
+- `list_repos`: enumerates the network via `com.atproto.sync.listRepos`, checks
+  each repo's collections via `describeRepo`.
 - `by_collection`: queries `com.atproto.sync.listReposByCollection` for each
   configured signal. more efficient for filtered indexing since it only surfaces
-  repos that have matching records. cursors are stored per collection.
+  repos that have matching records. cursors are stored per collection. note that
+  it won't crawl anything if no signals are specified.
 
 ```
-CRAWLER_URLS=by_collection::https://lightrail.microcosm.blue,relay::wss://bsky.network
+CRAWLER_URLS=by_collection::https://lightrail.microcosm.blue,list_repos::wss://bsky.network
 ```
 
 each source maintains its own cursor so restarts resume mid-pass.
@@ -221,7 +222,7 @@ each set field accepts one of two forms:
     the source to restart from the beginning when re-added.
   - returns `200 OK` if the source was found and removed, `404 Not Found` otherwise.
 - `DELETE /crawler/cursors`: reset stored cursors for a given crawler URL. body: `{ "key": "..." }`
-  where key is a URL. clears the relay crawler cursor as well as any by-collection
+  where key is a URL. clears the list-repos crawler cursor as well as any by-collection
   cursors associated with that URL. causes the next crawler pass to restart from the beginning.
 
 ### firehose management

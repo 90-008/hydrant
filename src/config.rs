@@ -36,16 +36,17 @@ fn load_dotenv() {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CrawlerMode {
-    /// enumerate via `com.atproto.sync.listRepos`, then check signals with `describeRepo`.
-    Relay,
+    /// enumerate via `com.atproto.sync.listRepos`, check signals with `describeRepo`.
+    ListRepos,
     /// enumerate via `com.atproto.sync.listReposByCollection` for each configured signal.
+    /// note: if no signals are specified, this won't crawl for any repos.
     ByCollection,
 }
 
 impl CrawlerMode {
     fn default_for(full_network: bool) -> Self {
         full_network
-            .then_some(Self::Relay)
+            .then_some(Self::ListRepos)
             .unwrap_or(Self::ByCollection)
     }
 }
@@ -73,7 +74,7 @@ impl FromStr for CrawlerMode {
     type Err = miette::Error;
     fn from_str(s: &str) -> Result<Self> {
         match s {
-            "relay" => Ok(Self::Relay),
+            "list_repos" | "list-repos" => Ok(Self::ListRepos),
             "by_collection" | "by-collection" => Ok(Self::ByCollection),
             _ => Err(miette::miette!(
                 "invalid crawler mode: expected 'relay' or 'by_collection'"
@@ -85,7 +86,7 @@ impl FromStr for CrawlerMode {
 impl fmt::Display for CrawlerMode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Relay => write!(f, "relay"),
+            Self::ListRepos => write!(f, "list_repos"),
             Self::ByCollection => write!(f, "by_collection"),
         }
     }
@@ -350,7 +351,7 @@ impl Config {
             backfill_concurrency_limit: 64,
             crawler_sources: vec![CrawlerSource {
                 url: Url::parse("wss://relay.fire.hose.cam/").unwrap(),
-                mode: CrawlerMode::Relay,
+                mode: CrawlerMode::ListRepos,
             }],
             db_worker_threads: 8,
             db_max_journaling_size_mb: 1024,
@@ -507,11 +508,11 @@ impl Config {
                 .filter_map(|s| CrawlerSource::parse(s, default_mode))
                 .collect(),
             Err(_) => match default_mode {
-                CrawlerMode::Relay => relay_hosts
+                CrawlerMode::ListRepos => relay_hosts
                     .iter()
                     .map(|url| CrawlerSource {
                         url: url.clone(),
-                        mode: CrawlerMode::Relay,
+                        mode: CrawlerMode::ListRepos,
                     })
                     .collect(),
                 CrawlerMode::ByCollection => defaults.crawler_sources.clone(),

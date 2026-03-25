@@ -386,8 +386,8 @@ impl SignalChecker {
     }
 }
 
-pub(crate) struct RelayProducer {
-    pub(crate) relay_url: Url,
+pub(crate) struct ListReposProducer {
+    pub(crate) url: Url,
     pub(crate) checker: SignalChecker,
     pub(crate) in_flight: InFlight,
     pub(crate) tx: mpsc::Sender<CrawlerBatch>,
@@ -395,18 +395,18 @@ pub(crate) struct RelayProducer {
     pub(crate) stats: CrawlerStats,
 }
 
-impl RelayProducer {
+impl ListReposProducer {
     pub(crate) async fn run(mut self) -> Result<()> {
         loop {
             if let Err(e) = self.crawl().await {
-                error!(err = ?e, relay = %self.relay_url, "fatal relay crawl error, restarting in 30s");
+                error!(err = ?e, relay = %self.url, "fatal relay crawl error, restarting in 30s");
                 tokio::time::sleep(Duration::from_secs(30)).await;
             }
         }
     }
 
     async fn get_cursor(&self) -> Result<Option<SmolStr>> {
-        let key = crawler_cursor_key(self.relay_url.as_str());
+        let key = crawler_cursor_key(self.url.as_str());
         let cursor_bytes = Db::get(self.checker.state.db.cursors.clone(), &key).await?;
         Ok(cursor_bytes
             .as_deref()
@@ -415,7 +415,7 @@ impl RelayProducer {
 
     async fn crawl(&mut self) -> Result<()> {
         let db = &self.checker.state.db;
-        let base = base_url(&self.relay_url)?;
+        let base = base_url(&self.url)?;
 
         let mut cursor = self.get_cursor().await?;
         match &cursor {
@@ -559,7 +559,7 @@ impl RelayProducer {
                 .as_ref()
                 .map(|c| -> Result<CursorUpdate> {
                     Ok(CursorUpdate {
-                        key: crawler_cursor_key(self.relay_url.as_str()),
+                        key: crawler_cursor_key(self.url.as_str()),
                         value: rmp_serde::to_vec(c.as_str())
                             .into_diagnostic()
                             .wrap_err("cant serialize cursor")?,
