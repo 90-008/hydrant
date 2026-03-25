@@ -287,9 +287,9 @@ pub async fn handle_debug_compact(
     let state_clone = state.clone();
 
     tokio::task::spawn_blocking(move || {
-        let _ = ks.remove(b"dummy_tombstone123");
-        let _ = state_clone.db.persist();
-        let _ = ks.rotate_memtable_and_wait();
+        ks.remove(b"dummy_tombstone123")?;
+        state_clone.db.inner.persist(fjall::PersistMode::Buffer)?;
+        ks.rotate_memtable_and_wait()?;
         ks.major_compact()
     })
     .await
