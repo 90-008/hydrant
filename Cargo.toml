@@ -25,18 +25,19 @@ lsm-tree = { git = "https://github.com/90-008/lsm-tree.git", features = ["lz4", 
 serde_ipld_dagcbor = "0.6"
 serde_urlencoded = "0.7"
 
-url = "2.5"
+bytes = { version = "1.11.1", features = ["serde"] }
+url = { version = "2.5", features = ["serde"] }
 smol_str = "0.3"
 futures = "0.3"
-reqwest = { version = "0.13.2", features = ["json", "rustls", "stream", "gzip", "brotli", "zstd", "http2"], default-features = false }
+reqwest = { version = "0.12.8", features = ["json", "rustls-tls", "stream", "gzip", "brotli", "zstd", "http2"], default-features = false }
 axum = { version = "0.8.8", features = ["ws", "macros"] }
 tower-http = { version = "0.6.6", features = ["cors", "trace"] }
 
-jacquard-common = { git = "https://tangled.org/ptr.pet/jacquard", default-features = false, features = ["tracing", "std", "crypto"] }
-jacquard-api = { git = "https://tangled.org/ptr.pet/jacquard" }
-jacquard-identity = { git = "https://tangled.org/ptr.pet/jacquard", features = ["dns", "tracing"] }
-jacquard-repo = { git = "https://tangled.org/ptr.pet/jacquard" }
-jacquard-derive = { git = "https://tangled.org/ptr.pet/jacquard" }
+jacquard-common = { version = "0.11", default-features = false, features = ["tracing", "std", "crypto"] }
+jacquard-api = { version = "0.11" }
+jacquard-identity = { version = "0.11", features = ["dns", "tracing"] }
+jacquard-repo = { version = "0.11" }
+jacquard-derive = { version = "0.11" }
 chrono = { version = "0.4.43", features = ["serde"] }
 humantime = "2.3.0"
 

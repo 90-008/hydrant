@@ -241,7 +241,7 @@ pub struct AccountEvt<'i> {
     pub status: Option<CowStr<'i>>,
 }
 
-use jacquard_common::bytes::Bytes;
+use bytes::Bytes;
 
 #[derive(Serialize, Deserialize, Clone)]
 pub(crate) enum StoredData {
@@ -291,7 +291,7 @@ pub(crate) struct StoredEvent<'i> {
 }
 
 mod serde_bytes_squared {
-    use jacquard_common::bytes::Bytes;
+    use bytes::Bytes;
     use serde::{Deserialize, Deserializer, Serializer};
 
     pub fn serialize<S: Serializer>(v: impl AsRef<[u8]>, s: S) -> Result<S::Ok, S::Error> {

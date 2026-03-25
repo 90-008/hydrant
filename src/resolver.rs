@@ -1,4 +1,5 @@
 use std::ops::Not;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -18,6 +19,8 @@ use scc::HashCache;
 use smol_str::SmolStr;
 use thiserror::Error;
 use url::Url;
+
+use crate::util::url_to_fluent_uri;
 
 #[derive(Debug, Diagnostic, Error)]
 pub enum ResolverError {
@@ -72,7 +75,9 @@ impl Resolver {
 
         for url in plc_urls {
             let mut opts = ResolverOptions::default();
-            opts.plc_source = PlcSource::PlcDirectory { base: url };
+            opts.plc_source = PlcSource::PlcDirectory {
+                base: url_to_fluent_uri(&url),
+            };
             opts.request_timeout = Some(Duration::from_secs(3));
 
             jacquards.push(JacquardResolver::new(http.clone(), opts).with_system_dns());
@@ -171,7 +176,11 @@ impl Resolver {
             .then(|| handles.remove(0).into_static());
         let key = doc.atproto_public_key().ok().flatten();
 
-        let mini = MiniDoc { pds, handle, key };
+        let mini = MiniDoc {
+            pds: Url::from_str(pds.as_str()).expect("that url is valid"),
+            handle,
+            key,
+        };
         let _ = self.inner.cache.put_async(did_static, mini.clone()).await;
         Ok(mini)
     }

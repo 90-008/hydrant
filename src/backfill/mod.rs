@@ -32,7 +32,7 @@ use tracing::{Instrument, debug, error, info, trace, warn};
 pub mod manager;
 
 use crate::ingest::{BufferTx, IngestMessage};
-use crate::util::WatchEnabledExt;
+use crate::util::{WatchEnabledExt, url_to_fluent_uri};
 
 pub struct BackfillWorker {
     state: Arc<AppState>,
@@ -445,7 +445,7 @@ async fn process_did<'i>(
     // 2. fetch repo (car)
     let start = Instant::now();
     let req = GetRepo::new().did(did.clone()).build();
-    let resp = http.xrpc(pds).send(&req).await?;
+    let resp = http.xrpc(url_to_fluent_uri(&pds)).send(&req).await?;
 
     let car_bytes = match resp.into_output() {
         Ok(o) => o,

@@ -1,8 +1,8 @@
 use std::convert::Infallible;
 use std::option::Option;
 
+use bytes::Bytes;
 use futures::StreamExt;
-use jacquard_common::bytes::Bytes;
 use jacquard_common::error::DecodeError;
 use jacquard_common::{
     CowStr,

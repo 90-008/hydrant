@@ -1,10 +1,12 @@
 use std::time::Duration;
 
+use jacquard_common::deps::fluent_uri;
 use rand::RngExt;
 use reqwest::StatusCode;
 use serde::{Deserialize, Deserializer, Serializer};
 use tokio::sync::watch;
 use tracing::info;
+use url::Url;
 
 use crate::types::RepoStatus;
 
@@ -153,4 +155,10 @@ pub fn opt_cid_serialize_str<S: Serializer>(v: &Option<cid::Cid>, s: S) -> Resul
 
 pub fn repo_status_serialize_str<S: Serializer>(v: &RepoStatus, s: S) -> Result<S::Ok, S::Error> {
     s.serialize_str(&v.to_string())
+}
+
+pub fn url_to_fluent_uri(url: &Url) -> fluent_uri::Uri<String> {
+    fluent_uri::Uri::parse(url.as_str())
+        .expect("that url is validated")
+        .to_owned()
 }

@@ -1,6 +1,6 @@
 use data_encoding::BASE32_NOPAD;
 use fjall::UserKey;
-use jacquard_common::types::crypto::{PublicKey, code_of, encode_uvarint};
+use jacquard_common::types::crypto::{PublicKey, encode_uvarint};
 use jacquard_common::types::string::Did;
 use jacquard_common::types::tid::Tid;
 use jacquard_common::{CowStr, IntoStatic};
@@ -392,6 +392,15 @@ impl std::fmt::Display for DidKey<'_> {
 
 impl From<PublicKey<'_>> for DidKey<'static> {
     fn from(value: PublicKey<'_>) -> Self {
+        use jacquard_common::types::crypto::KeyCodec;
+        fn code_of(codec: KeyCodec) -> u64 {
+            match codec {
+                KeyCodec::Ed25519 => 0xED,
+                KeyCodec::Secp256k1 => 0xE7,
+                KeyCodec::P256 => 0x1200,
+                KeyCodec::Unknown(c) => c,
+            }
+        }
         let mut bytes = Vec::with_capacity(8 + value.bytes.len());
         bytes.append(&mut encode_uvarint(code_of(value.codec)));
         bytes.extend_from_slice(&value.bytes);
