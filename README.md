@@ -89,9 +89,10 @@ CRAWLER_URLS=by_collection::https://lightrail.microcosm.blue,list_repos::wss://b
 each source maintains its own cursor so restarts resume mid-pass.
 
 sources can also be added and removed at runtime via the `/crawler/sources` API
-(see below). dynamically added sources are persisted to the database and survive
-restarts. `CRAWLER_URLS` sources are startup-only: they are not written to the
-database and will always reappear after a restart regardless of runtime changes.
+(see [here](#crawler-management)). dynamically added sources are persisted to the
+database and survive restarts. `CRAWLER_URLS` sources are startup-only: they are
+not written to the database and will always reappear after a restart regardless of
+runtime changes (unless you change the config of course).
 
 ## configuration
 
