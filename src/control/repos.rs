@@ -130,6 +130,9 @@ impl ReposControl {
     /// note that they may not immediately start backfilling if:
     /// - other repos already filled the backfill concurrency limit,
     /// - or there are many repos pending already.
+    ///
+    /// this will also clear any error state the repo may have been in,
+    /// allowing it to resync again.
     pub async fn resync(
         &self,
         dids: impl IntoIterator<Item = Did<'_>>,

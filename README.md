@@ -1,7 +1,7 @@
 #### table-of-contents
 
 -> [hydrant](#hydrant)</br>
--> [vs tap](#vs-tap)</br>
+-> [vs tap](#vs-tap) | [stream](#stream-behavior) | [multi-relay](#multiple-relay-support) | [crawler sources](#crawler-sources)</br>
 -> [configuration](#configuration)</br>
 -> [rest api](#rest-api) | [filter](#filter-management) | [ingestion](#ingestion-control) | [crawler](#crawler-management) | [firehose](#firehose-management) | [repos](#repository-management)</br>
 -> [xrpc api](#data-access-xrpc) | [backlinks](#bluemicrocosmlinks) | [atproto](#comatproto) | [custom](#systemsgazehydrant)
@@ -40,6 +40,8 @@ an ephemeral view of some window of events.
 
 ### stream behavior
 
+<small>[<- back to toc](#table-of-contents)</small>
+
 the `WS /stream` (hydrant) and `WS /channel` (tap) endpoints have different designs:
 
 | aspect | `tap` (`/channel`) | `hydrant` (`/stream`) |
@@ -51,6 +53,8 @@ the `WS /stream` (hydrant) and `WS /channel` (tap) endpoints have different desi
 | event types | `record`, `identity` (includes status) | `record`, `identity` (handle, cache-buster), `account` (status) |
 
 ### multiple relay support
+
+<small>[<- back to toc](#table-of-contents)</small>
 
 `hydrant` supports connecting to multiple relays simultaneously for firehose
 ingestion. when `RELAY_HOSTS` is configured with multiple URLs:
@@ -64,6 +68,8 @@ events are de-duplicated using the `time` field. todo: decide what to do on
 relay-side account takedowns or if relays set the `time` field.
 
 ### crawler sources
+
+<small>[<- back to toc](#table-of-contents)</small>
 
 the crawler is configured separately from the firehose via `CRAWLER_URLS`. each
 source is a `[mode::]url` entry where the mode prefix is optional and defaults

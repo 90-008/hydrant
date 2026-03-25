@@ -557,11 +557,11 @@ impl Hydrant {
     ///
     /// - if `cursor` is `None`, streaming starts from the current head (live tail only).
     /// - if `cursor` is `Some(id)`, all persisted `record` events from that ID onward are
-    ///   replayed first, then live events follow seamlessly.
+    ///   replayed first, then the stream will switch to live tailing.
     ///
-    /// `identity` and `account` events are ephemeral and are never replayed from a cursor -
-    /// only live occurrences are delivered. use [`ReposControl::get`] to fetch current
-    /// identity/account state for a specific DID.
+    /// `identity` and `account` events are ephemeral and are never replayed from a cursor,
+    /// only live ones are delivered. use [`ReposControl::info`] to fetch current state for
+    /// a specific repository.
     ///
     /// multiple concurrent subscribers each receive a full independent copy of the stream.
     /// the stream ends when the `EventStream` is dropped.
@@ -651,8 +651,8 @@ impl Hydrant {
 
     /// returns a future that runs the debug HTTP API server on `127.0.0.1:{port}`.
     ///
-    /// exposes internal inspection endpoints (`/debug/get`, `/debug/iter`, etc.)
-    /// that are not safe to expose publicly. binds only to loopback.
+    /// exposes internal inspection endpoints (`/debug/get`, `/debug/iter`, etc.).
+    /// binds only to loopback.
     pub fn serve_debug(&self, port: u16) -> impl Future<Output = Result<()>> {
         let state = self.state.clone();
         async move { crate::api::serve_debug(state, port).await }
@@ -734,7 +734,7 @@ impl DbControl {
 
     /// train zstd compression dictionaries for the `repos`, `blocks`, and `events` keyspaces.
     ///
-    /// dictionaries are written to `dict_{name}.bin` files next to the database.
+    /// dictionaries are written to `dict_{name}.bin` files inside the database folder.
     /// a restart is required to apply them. training samples data blocks from the
     /// existing database, so the database must have a reasonable amount of data first.
     pub async fn train_dicts(&self) -> Result<()> {
