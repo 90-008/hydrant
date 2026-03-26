@@ -159,6 +159,10 @@ async fn handle_stream(index: Arc<StatusIndex>, repos: ReposControl, mut stream:
 
 #[tokio::main]
 async fn main() -> miette::Result<()> {
+    rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .ok();
+
     tracing_subscriber::fmt()
         .with_env_filter("hydrant=info")
         .init();
