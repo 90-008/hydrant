@@ -8,6 +8,7 @@ pub use crawler::{CrawlerHandle, CrawlerSourceInfo};
 pub use filter::{FilterControl, FilterPatch, FilterSnapshot};
 pub use firehose::{FirehoseHandle, FirehoseSourceInfo};
 pub use repos::{ListedRecord, Record, RecordList, RepoHandle, RepoInfo, ReposControl};
+use smol_str::{SmolStr, ToSmolStr};
 
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -17,14 +18,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
 
 use futures::{FutureExt, Stream};
-use miette::{IntoDiagnostic, Result};
+use miette::{IntoDiagnostic, Result, WrapErr};
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, error, info};
 
 use crate::backfill::BackfillWorker;
 use crate::config::{Config, SignatureVerification};
 use crate::db::{
-    self, filter as db_filter, load_persisted_crawler_sources, load_persisted_firehose_sources,
+    self, filter as db_filter, keys, load_persisted_crawler_sources,
+    load_persisted_firehose_sources,
 };
 use crate::filter::FilterMode;
 use crate::ingest::worker::FirehoseWorker;
@@ -34,6 +36,12 @@ use crate::types::MarshallableEvt;
 use crawler::{CrawlerShared, spawn_crawler_producer};
 use firehose::{FirehoseShared, spawn_firehose_ingestor};
 use stream::event_stream_thread;
+
+/// infromation about a host hydrant is consuming from.
+pub struct Host {
+    pub name: SmolStr,
+    pub seq: i64,
+}
 
 /// an event emitted by the hydrant event stream.
 ///
@@ -655,6 +663,92 @@ impl Hydrant {
     pub fn serve_debug(&self, port: u16) -> impl Future<Output = Result<()>> {
         let state = self.state.clone();
         async move { crate::api::serve_debug(state, port).await }
+    }
+
+    /// get the status of a (firehose) host we are consuming from.
+    ///
+    /// returns the seq we are on for this host.
+    pub async fn get_host_status(&self, hostname: &str) -> Result<Option<Host>> {
+        let db = self.state.db.clone();
+        let hostname = hostname.to_smolstr();
+
+        tokio::task::spawn_blocking(move || {
+            let key = keys::firehose_cursor_key(&hostname);
+            let Some(seq) = db.cursors.get(&key).into_diagnostic()? else {
+                return Ok(None);
+            };
+            let seq = i64::from_be_bytes(
+                seq.as_ref()
+                    .try_into()
+                    .into_diagnostic()
+                    .wrap_err("cursor value is not 8 bytes")?,
+            );
+
+            Ok(Some(Host {
+                name: hostname.into(),
+                seq,
+            }))
+        })
+        .await
+        .into_diagnostic()?
+    }
+
+    /// enumerates all hosts hydrant is consuming from.
+    ///
+    /// returns hosts enumerated in this pagination and the cursor to paginate from.
+    pub async fn list_hosts(
+        &self,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<(Vec<Host>, Option<SmolStr>)> {
+        let db = self.state.db.clone();
+        let cursor = cursor.map(str::to_string);
+
+        tokio::task::spawn_blocking(move || {
+            let prefix_end = {
+                let mut end = keys::FIREHOSE_CURSOR_PREFIX.to_vec();
+                *end.last_mut().unwrap() += 1;
+                end
+            };
+            let start_bound = match cursor.as_deref() {
+                Some(host) => std::ops::Bound::Excluded(keys::firehose_cursor_key(host)),
+                None => std::ops::Bound::Included(keys::FIREHOSE_CURSOR_PREFIX.to_vec()),
+            };
+
+            // fetch one extra item to detect whether there is a next page
+            let mut hosts: Vec<Host> = Vec::with_capacity(limit + 1);
+            for item in db
+                .cursors
+                .range((start_bound, std::ops::Bound::Excluded(prefix_end)))
+                .take(limit + 1)
+            {
+                let (k, v) = item.into_inner().into_diagnostic()?;
+                let hostname = std::str::from_utf8(&k[keys::FIREHOSE_CURSOR_PREFIX.len()..])
+                    .into_diagnostic()
+                    .wrap_err("firehose cursor key contains non-utf8 hostname")?;
+                let seq = i64::from_be_bytes(
+                    v.as_ref()
+                        .try_into()
+                        .into_diagnostic()
+                        .wrap_err("cursor value is not 8 bytes")?,
+                );
+                hosts.push(Host {
+                    name: hostname.into(),
+                    seq,
+                });
+            }
+
+            let next_cursor = if hosts.len() > limit {
+                hosts.pop();
+                hosts.last().map(|h| h.name.clone())
+            } else {
+                None
+            };
+
+            Ok((hosts, next_cursor))
+        })
+        .await
+        .into_diagnostic()?
     }
 }
 

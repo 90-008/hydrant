@@ -24,6 +24,7 @@ pub mod compaction;
 pub mod ephemeral;
 pub mod filter;
 pub mod keys;
+pub mod migration;
 pub mod types;
 
 use tokio::sync::broadcast;
@@ -376,47 +377,9 @@ impl Db {
         // when adding new keyspaces, make sure to add them to the /stats endpoint
         // and also update any relevant /debug/* endpoints
 
-        let mut last_id = 0;
-        if let Some(guard) = events.iter().next_back() {
-            let k = guard.key().into_diagnostic()?;
-            last_id = u64::from_be_bytes(
-                k.as_ref()
-                    .try_into()
-                    .into_diagnostic()
-                    .wrap_err("expected to be id (8 bytes)")?,
-            );
-        }
-
-        // load counts into memory
-        let counts_map = HashMap::new();
-        for guard in counts.prefix(keys::COUNT_KS_PREFIX) {
-            let (k, v) = guard.into_inner().into_diagnostic()?;
-            let name = std::str::from_utf8(&k[keys::COUNT_KS_PREFIX.len()..])
-                .into_diagnostic()
-                .wrap_err("expected valid utf8 for ks count key")?;
-            let _ = counts_map.insert_sync(
-                SmolStr::new(name),
-                u64::from_be_bytes(v.as_ref().try_into().unwrap()),
-            );
-        }
-        // ensure critical counts are initialized
-        for ks_name in ["repos", "pending", "resync"] {
-            let _ = counts_map
-                .entry_sync(SmolStr::new(ks_name))
-                .or_insert_with(|| {
-                    let ks = match ks_name {
-                        "repos" => &repos,
-                        "pending" => &pending,
-                        "resync" => &resync,
-                        _ => unreachable!(),
-                    };
-                    ks.iter().count() as u64
-                });
-        }
-
         let (event_tx, _) = broadcast::channel(10000);
 
-        Ok(Self {
+        let this = Self {
             inner: db,
             path: cfg.database_path.clone(),
             repos,
@@ -433,9 +396,39 @@ impl Db {
             #[cfg(feature = "backlinks")]
             backlinks,
             event_tx,
-            counts_map,
-            next_event_id: Arc::new(AtomicU64::new(last_id + 1)),
-        })
+            counts_map: HashMap::new(),
+            next_event_id: Arc::new(AtomicU64::new(0)),
+        };
+
+        migration::run(&this)?;
+
+        let mut last_id = 0;
+        if let Some(guard) = this.events.iter().next_back() {
+            let k = guard.key().into_diagnostic()?;
+            last_id = u64::from_be_bytes(
+                k.as_ref()
+                    .try_into()
+                    .into_diagnostic()
+                    .wrap_err("expected to be id (8 bytes)")?,
+            );
+        }
+        // relaxed is fine since we are just initializing the db
+        this.next_event_id
+            .store(last_id + 1, std::sync::atomic::Ordering::Relaxed);
+
+        // load counts into memory
+        for guard in this.counts.prefix(keys::COUNT_KS_PREFIX) {
+            let (k, v) = guard.into_inner().into_diagnostic()?;
+            let name = std::str::from_utf8(&k[keys::COUNT_KS_PREFIX.len()..])
+                .into_diagnostic()
+                .wrap_err("expected valid utf8 for ks count key")?;
+            let _ = this.counts_map.insert_sync(
+                SmolStr::new(name),
+                u64::from_be_bytes(v.as_ref().try_into().unwrap()),
+            );
+        }
+
+        Ok(this)
     }
 
     pub fn train_dict(&self, ks_name: &str) -> Result<()> {
@@ -751,24 +744,15 @@ impl Db {
 pub fn set_firehose_cursor(db: &Db, relay: &Url, cursor: i64) -> Result<()> {
     db.cursors
         .insert(
-            keys::firehose_cursor_key(relay.as_str()),
+            keys::firehose_cursor_key_from_url(relay),
             cursor.to_be_bytes(),
         )
         .into_diagnostic()
 }
 
 pub async fn get_firehose_cursor(db: &Db, relay: &Url) -> Result<Option<i64>> {
-    let per_relay_key = keys::firehose_cursor_key(relay.as_str());
-    if let Some(v) = Db::get(db.cursors.clone(), per_relay_key).await? {
-        return Ok(Some(i64::from_be_bytes(
-            v.as_ref()
-                .try_into()
-                .into_diagnostic()
-                .wrap_err("cursor is not 8 bytes")?,
-        )));
-    }
-
-    Db::get(db.cursors.clone(), keys::CURSOR_KEY)
+    let key = keys::firehose_cursor_key_from_url(relay);
+    Db::get(db.cursors.clone(), key)
         .await?
         .map(|v| {
             Ok(i64::from_be_bytes(

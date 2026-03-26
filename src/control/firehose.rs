@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use miette::{IntoDiagnostic, Result};
+use miette::{Context, IntoDiagnostic, Result};
 use tokio::sync::watch;
 use tracing::{error, info};
 use url::Url;
@@ -98,20 +98,21 @@ impl FirehoseHandle {
 
     /// reset the stored cursor for the given relay URL.
     ///
-    /// clears the `firehose_cursor|{url}` entry from the cursors keyspace and zeroes the
-    /// in-memory cursor. the next connection will tail live events from the current head.
+    /// clears the `firehose_cursor|{host}|{scheme}` entry from the cursors keyspace and zeroes
+    /// the in-memory cursor. the next connection will tail live events from the current head.
     pub async fn reset_cursor(&self, url: &str) -> Result<()> {
+        let relay_url = Url::parse(url)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("invalid relay url: {url:?}"))?;
+        let key = keys::firehose_cursor_key_from_url(&relay_url);
         let db = self.state.db.clone();
-        let key = keys::firehose_cursor_key(url);
         tokio::task::spawn_blocking(move || db.cursors.remove(key).into_diagnostic())
             .await
             .into_diagnostic()??;
 
-        if let Ok(relay_url) = Url::parse(url) {
-            self.state.relay_cursors.peek_with(&relay_url, |_, c| {
-                c.store(0, Ordering::SeqCst);
-            });
-        }
+        self.state.relay_cursors.peek_with(&relay_url, |_, c| {
+            c.store(0, Ordering::SeqCst);
+        });
         Ok(())
     }
 

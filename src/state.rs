@@ -44,9 +44,6 @@ impl AppState {
         let filter = new_handle(filter_config);
 
         let relay_cursors = scc::HashIndex::new();
-        for url in &config.relays {
-            let _ = relay_cursors.insert_sync(url.clone(), AtomicI64::new(0));
-        }
 
         let (crawler_enabled, _) = watch::channel(crawler_default);
         let (firehose_enabled, _) = watch::channel(config.enable_firehose);

@@ -310,6 +310,8 @@ these are standard atproto endpoints. you can look at [the atproto api reference
 the following are implemented currently:
 - `com.atproto.repo.getRecord`
 - `com.atproto.repo.listRecords`
+- `com.atproto.sync.getHostStatus`
+- `com.atproto.sync.listHosts`
 
 ### systems.gaze.hydrant.*
 

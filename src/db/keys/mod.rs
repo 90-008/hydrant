@@ -3,12 +3,17 @@ use smol_str::SmolStr;
 
 use crate::db::types::{DbRkey, DbTid, TrimmedDid};
 
+pub mod v1;
+
+pub use v1::{firehose_cursor_key, firehose_cursor_key_from_url};
+
 /// separator used for composite keys
 pub const SEP: u8 = b'|';
 
-pub const CURSOR_KEY: &[u8] = b"firehose_cursor";
-
 pub const EVENT_WATERMARK_PREFIX: &[u8] = b"ewm|";
+
+/// THIS SHOULD ALWAYS BE STABLE. DO NOT CHANGE
+pub const VERSIONING_KEY: &[u8] = b"db_version";
 
 // key format: {DID}
 pub fn repo_key<'a>(did: &'a Did) -> Vec<u8> {
@@ -160,26 +165,28 @@ pub fn crawler_retry_parse_key(key: &[u8]) -> miette::Result<TrimmedDid<'_>> {
     TrimmedDid::try_from(&key[CRAWLER_RETRY_PREFIX.len()..])
 }
 
+pub const CRAWLER_CURSOR_PREFIX: &[u8] = b"crawler_cursor|";
+
 pub fn crawler_cursor_key(relay: &str) -> Vec<u8> {
-    let mut key = b"crawler_cursor|".to_vec();
+    let mut key = CRAWLER_CURSOR_PREFIX.to_vec();
     key.extend_from_slice(relay.as_bytes());
     key
 }
 
-pub fn by_collection_cursor_key(url: &str, collection: &str) -> Vec<u8> {
-    let mut key = b"by_collection_cursor|".to_vec();
-    key.extend_from_slice(url.as_bytes());
-    key.push(SEP);
-    key.extend_from_slice(collection.as_bytes());
-    key
-}
+pub const BY_COLLECTION_CURSOR_PREFIX: &[u8] = b"by_collection_cursor|";
 
 /// prefix for all by-collection cursors belonging to a given index URL.
 pub fn by_collection_cursor_prefix(url: &str) -> Vec<u8> {
-    let mut prefix = b"by_collection_cursor|".to_vec();
+    let mut prefix = BY_COLLECTION_CURSOR_PREFIX.to_vec();
     prefix.extend_from_slice(url.as_bytes());
     prefix.push(SEP);
     prefix
+}
+
+pub fn by_collection_cursor_key(url: &str, collection: &str) -> Vec<u8> {
+    let mut key = by_collection_cursor_prefix(url);
+    key.extend_from_slice(collection.as_bytes());
+    key
 }
 
 pub const CRAWLER_SOURCE_PREFIX: &[u8] = b"src|";
@@ -191,11 +198,7 @@ pub fn crawler_source_key(url: &str) -> Vec<u8> {
     key
 }
 
-pub fn firehose_cursor_key(relay: &str) -> Vec<u8> {
-    let mut key = b"firehose_cursor|".to_vec();
-    key.extend_from_slice(relay.as_bytes());
-    key
-}
+pub const FIREHOSE_CURSOR_PREFIX: &[u8] = b"firehose_cursor|";
 
 pub const FIREHOSE_SOURCE_PREFIX: &[u8] = b"firehose|";
 
