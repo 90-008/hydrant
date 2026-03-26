@@ -8,17 +8,10 @@ use crate::db::{Db, keys};
 
 /// migrates firehose cursors from `firehose_cursor|{url}` to `firehose_cursor|{host}`.
 pub(super) fn stable_firehose_cursors(db: &Db, batch: &mut OwnedWriteBatch) -> Result<()> {
-    let entries: Vec<(Vec<u8>, Vec<u8>)> = db
-        .cursors
-        .prefix(keys::FIREHOSE_CURSOR_PREFIX)
-        .map(|item| {
-            let (k, v) = item.into_inner().into_diagnostic()?;
-            Ok((k.to_vec(), v.to_vec()))
-        })
-        .collect::<Result<_>>()?;
-
-    for (old_key, value) in entries {
-        let suffix = &old_key[keys::FIREHOSE_CURSOR_PREFIX.len()..];
+    let prefix = keys::FIREHOSE_CURSOR_PREFIX;
+    for item in db.cursors.prefix(prefix) {
+        let (old_key, value) = item.into_inner().into_diagnostic()?;
+        let suffix = &old_key[prefix.len()..];
         // old-format: suffix is a full URL containing "://" (e.g. "wss://bsky.network")
         // new-format (v1): suffix is just a hostname, no "://"
         if !suffix.windows(3).any(|w| w == b"://") {
@@ -32,8 +25,8 @@ pub(super) fn stable_firehose_cursors(db: &Db, batch: &mut OwnedWriteBatch) -> R
             .wrap_err_with(|| format!("firehose cursor key contains invalid url {url_str:?}"))?;
 
         let new_key = keys::v1::firehose_cursor_key_from_url(&url);
-        batch.insert(&db.cursors, &new_key, &value);
-        batch.remove(&db.cursors, &old_key);
+        batch.insert(&db.cursors, &new_key, value);
+        batch.remove(&db.cursors, old_key);
     }
 
     Ok(())
