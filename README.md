@@ -19,11 +19,8 @@ you can see
 example](./examples/statusphere.rs) (hydrant-as-library) for examples on how to
 use hydrant (for rust docs look at https://hydrant.gaze.systems/ for now).
 
-**WARNING: *the db format is not stable yet.*** it's in active development so if
-you are going to rely on the db format being stable, don't (eg. for query
-features, if you are using ephemeral mode this doesn't matter for example, or
-you dont mind losing your existing backfilled data in hydrant if you already
-processed them.).
+**WARNING: *the db format is only partially stable.*** we provide migrations in hydrant
+itself, so nothing should go wrong! you should still probably keep backups just in case!
 
 ## vs tap
 
