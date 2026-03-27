@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+use jacquard_common::Data;
 use jacquard_common::IntoStatic;
 use jacquard_common::types::crypto::PublicKey;
 use jacquard_common::types::ident::AtIdentifier;
@@ -203,6 +204,44 @@ impl Resolver {
             .key
             .ok_or_else(|| NoSigningKeyError(did))
             .into_diagnostic()?)
+    }
+
+    /// resolves the full DID document as raw [`Data`] without caching, and
+    /// extracts the first `alsoKnownAs` handle if present.
+    pub async fn resolve_raw_doc(
+        &self,
+        did: &Did<'_>,
+    ) -> Result<(Data<'static>, Option<Handle<'static>>), ResolverError> {
+        let doc_resp = self
+            .req(did.starts_with("did:plc:"), |j| j.resolve_did_doc(did))
+            .await?;
+
+        let handle = {
+            let parsed = doc_resp.parse();
+            parsed.ok().and_then(|doc| {
+                let mut handles = doc.handles();
+                handles
+                    .is_empty()
+                    .not()
+                    .then(|| handles.remove(0).into_static())
+            })
+        };
+
+        let data: Data<'_> = serde_json::from_slice(&doc_resp.buffer)
+            .map_err(|e| ResolverError::Generic(miette::miette!("failed to parse DID doc: {e}")))?;
+
+        Ok((data.into_static(), handle))
+    }
+
+    /// returns `true` if the given handle bi-directionally resolves to `did`.
+    pub async fn verify_handle(
+        &self,
+        did: &Did<'_>,
+        handle: &Handle<'_>,
+    ) -> Result<bool, ResolverError> {
+        let id = AtIdentifier::Handle(handle.clone().into_static());
+        let resolved_did = self.resolve_did(&id).await?;
+        Ok(resolved_did.as_str() == did.as_str())
     }
 }
 

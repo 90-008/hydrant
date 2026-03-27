@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use jacquard_common::deps::fluent_uri;
+use jacquard_common::{deps::fluent_uri, types::string::Handle};
 use rand::RngExt;
 use reqwest::StatusCode;
 use serde::{Deserialize, Deserializer, Serializer};
@@ -175,4 +175,8 @@ pub fn url_to_fluent_uri(url: &Url) -> fluent_uri::Uri<String> {
     fluent_uri::Uri::parse(url.as_str())
         .expect("that url is validated")
         .to_owned()
+}
+
+pub(crate) fn invalid_handle() -> Handle<'static> {
+    unsafe { Handle::unchecked("handle.invalid") }
 }

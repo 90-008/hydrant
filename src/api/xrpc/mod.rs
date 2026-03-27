@@ -6,6 +6,7 @@ use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::{Json, Router, extract::State, http::StatusCode};
 use jacquard_api::com_atproto::repo::{
+    describe_repo::DescribeRepoRequest as AtprotoDescribeRepoRequest,
     get_record::{GetRecordError, GetRecordOutput, GetRecordRequest},
     list_records::{ListRecordsOutput, ListRecordsRequest, Record as RepoRecord},
 };
@@ -27,6 +28,7 @@ use serde::{Deserialize, Serialize};
 use smol_str::ToSmolStr;
 use std::fmt::Display;
 
+mod com_atproto_describe_repo;
 mod count_records;
 mod describe_repo;
 mod get_host_status;
@@ -44,6 +46,10 @@ pub fn router() -> Router<Hydrant> {
         .route(ListRecordsRequest::PATH, get(list_records::handle))
         .route(CountRecords::PATH, get(count_records::handle))
         .route(DescribeRepo::PATH, get(describe_repo::handle))
+        .route(
+            AtprotoDescribeRepoRequest::PATH,
+            get(com_atproto_describe_repo::handle),
+        )
         .route(GetHostStatusRequest::PATH, get(get_host_status::handle))
         .route(ListHostsRequest::PATH, get(list_hosts::handle))
         .route(GetLatestCommitRequest::PATH, get(get_latest_commit::handle))

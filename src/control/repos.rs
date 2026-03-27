@@ -20,6 +20,7 @@ use crate::db::types::{DbRkey, DidKey, TrimmedDid};
 use crate::db::{self, Db, keys, ser_repo_state};
 use crate::state::AppState;
 use crate::types::{GaugeState, RepoState, RepoStatus};
+use crate::util::invalid_handle;
 
 /// information about a tracked or known repository. returned by [`ReposControl`] methods.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -513,10 +514,6 @@ impl<'i> RepoHandle<'i> {
 
     /// returns a bi-directionally validated mini doc.
     pub async fn mini_doc(&self) -> Result<MiniDoc<'static>, MiniDocError> {
-        fn invalid_handle() -> Handle<'static> {
-            unsafe { Handle::unchecked("handle.invalid") }
-        }
-
         let Some(info) = self.info().await.map_err(MiniDocError::Other)? else {
             return Err(MiniDocError::RepoNotFound);
         };
@@ -533,22 +530,15 @@ impl<'i> RepoHandle<'i> {
             .ok_or_else(|| MiniDocError::CouldNotResolveIdentity)?
             .into_static();
 
-        let handle = if let Some(handle_unverified) = info.handle {
-            let id = AtIdentifier::Handle(handle_unverified);
-            let handle_did = self
+        let handle = if let Some(h) = info.handle {
+            let is_valid = self
                 .state
                 .resolver
-                .resolve_did(&id)
+                .verify_handle(&self.did, &h)
                 .await
                 .into_diagnostic()
                 .map_err(MiniDocError::Other)?;
-
-            (handle_did == self.did)
-                .then(|| match id {
-                    AtIdentifier::Handle(h) => h,
-                    _ => unreachable!("can only be handle"),
-                })
-                .unwrap_or_else(invalid_handle)
+            is_valid.then_some(h).unwrap_or_else(invalid_handle)
         } else {
             invalid_handle()
         };
