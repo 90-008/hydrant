@@ -72,8 +72,10 @@ pub struct RepoInfo {
 pub struct ReposControl(pub(super) Arc<AppState>);
 
 impl ReposControl {
-    /// iterates through all repositories, returning their state.
-    pub fn iter(&self, cursor: Option<&Did<'_>>) -> impl Iterator<Item = Result<RepoInfo>> {
+    pub(crate) fn iter_states(
+        &self,
+        cursor: Option<&Did<'_>>,
+    ) -> impl Iterator<Item = Result<(Did<'static>, RepoState<'static>)>> {
         let start_bound = if let Some(cursor) = cursor {
             let did_key = keys::repo_key(cursor);
             std::ops::Bound::Excluded(did_key)
@@ -87,10 +89,16 @@ impl ReposControl {
             .range((start_bound, std::ops::Bound::Unbounded))
             .map(|g| {
                 let (k, v) = g.into_inner().into_diagnostic()?;
-                let repo_state = crate::db::deser_repo_state(&v)?;
+                let repo_state = crate::db::deser_repo_state(&v)?.into_static();
                 let did = TrimmedDid::try_from(k.as_ref())?.to_did();
-                Ok(repo_state_to_info(did, repo_state))
+                Ok((did, repo_state))
             })
+    }
+
+    /// iterates through all repositories, returning their state.
+    pub fn iter(&self, cursor: Option<&Did<'_>>) -> impl Iterator<Item = Result<RepoInfo>> {
+        self.iter_states(cursor)
+            .map(|r| r.map(|(did, s)| repo_state_to_info(did, s)))
     }
 
     #[allow(dead_code)]
@@ -445,20 +453,27 @@ pub struct RepoHandle<'i> {
 }
 
 impl<'i> RepoHandle<'i> {
-    /// fetch the current state of this repository.
-    /// returns `None` if hydrant has never seen this repository.
-    pub async fn info(&self) -> Result<Option<RepoInfo>> {
+    pub(crate) async fn state(&self) -> Result<Option<RepoState<'static>>> {
         let did_key = keys::repo_key(&self.did);
-        let state = self.state.clone();
-        let did = self.did.clone().into_static();
+        let app_state = self.state.clone();
 
         tokio::task::spawn_blocking(move || {
-            let bytes = state.db.repos.get(&did_key).into_diagnostic()?;
-            let state = bytes.as_deref().map(db::deser_repo_state).transpose()?;
-            Ok(state.map(|s| repo_state_to_info(did, s)))
+            let bytes = app_state.db.repos.get(&did_key).into_diagnostic()?;
+            bytes
+                .as_deref()
+                .map(db::deser_repo_state)
+                .transpose()
+                .map(|opt| opt.map(IntoStatic::into_static))
         })
         .await
         .into_diagnostic()?
+    }
+
+    /// fetch the current state of this repository.
+    /// returns `None` if hydrant has never seen this repository.
+    pub async fn info(&self) -> Result<Option<RepoInfo>> {
+        let did = self.did.clone().into_static();
+        Ok(self.state().await?.map(|s| repo_state_to_info(did, s)))
     }
 
     /// returns the collections of this repository and the number of records it has in each.

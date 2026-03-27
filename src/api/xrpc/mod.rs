@@ -10,7 +10,9 @@ use jacquard_api::com_atproto::repo::{
     list_records::{ListRecordsOutput, ListRecordsRequest, Record as RepoRecord},
 };
 use jacquard_api::com_atproto::sync::get_host_status::GetHostStatusRequest;
+use jacquard_api::com_atproto::sync::get_repo_status::GetRepoStatusRequest;
 use jacquard_api::com_atproto::sync::list_hosts::ListHostsRequest;
+use jacquard_api::com_atproto::sync::list_repos::ListReposRequest;
 use jacquard_common::types::ident::AtIdentifier;
 use jacquard_common::xrpc::XrpcResp;
 use jacquard_common::xrpc::{XrpcEndpoint, XrpcMethod};
@@ -27,8 +29,10 @@ mod count_records;
 mod describe_repo;
 mod get_host_status;
 mod get_record;
+mod get_repo_status;
 mod list_hosts;
 mod list_records;
+mod list_repos;
 
 pub fn router() -> Router<Hydrant> {
     Router::new()
@@ -38,6 +42,8 @@ pub fn router() -> Router<Hydrant> {
         .route(DescribeRepo::PATH, get(describe_repo::handle))
         .route(GetHostStatusRequest::PATH, get(get_host_status::handle))
         .route(ListHostsRequest::PATH, get(list_hosts::handle))
+        .route(GetRepoStatusRequest::PATH, get(get_repo_status::handle))
+        .route(ListReposRequest::PATH, get(list_repos::handle))
 }
 
 #[derive(Debug)]
