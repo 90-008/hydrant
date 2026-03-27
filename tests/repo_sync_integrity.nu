@@ -128,12 +128,12 @@ def parse-goat-inspect []: string -> record {
 }
 
 # fetch a getRepo CAR and return its `goat repo inspect` info
-def fetch-car-info [url: string, did: string] {
+def fetch-car-info [url: string, did: string, label: string] {
     let car = http get $"($url)/xrpc/com.atproto.sync.getRepo?did=($did)"
     let tmp = (mktemp --suffix ".car")
     $car | save --force $tmp
+    print $"  ($label) car: ($tmp)"
     let info = (nix-shell -p atproto-goat --run $"goat repo inspect ($tmp)" | parse-goat-inspect)
-    rm $tmp
     $info
 }
 
@@ -141,12 +141,12 @@ def fetch-car-info [url: string, did: string] {
 def check-car [hydrant_url: string, pds_url: string, did: string] {
     print "checking getRepo CAR..."
 
-    let h = try { fetch-car-info $hydrant_url $did } catch {
+    let h = try { fetch-car-info $hydrant_url $did "hydrant" } catch {
         print "  error fetching CAR from hydrant"
         return false
     }
 
-    let p = try { fetch-car-info $pds_url $did } catch {
+    let p = try { fetch-car-info $pds_url $did "pds" } catch {
         print "  error fetching CAR from pds"
         return false
     }
