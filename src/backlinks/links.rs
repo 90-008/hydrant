@@ -1,6 +1,6 @@
 use jacquard_common::Data;
 use jacquard_common::types::string::AtprotoStr;
-use jacquard_common::types::uri::Uri;
+use jacquard_common::types::uri::UriValue;
 use smol_str::{SmolStr, format_smolstr};
 
 pub struct Link {
@@ -32,8 +32,8 @@ fn walk(value: &Data<'_>, path: &str, links: &mut Vec<Link>) {
             let target = match s {
                 AtprotoStr::AtUri(uri) => uri.as_str(),
                 AtprotoStr::Did(did) => did.as_str(),
-                AtprotoStr::Uri(Uri::At(uri)) => uri.as_str(),
-                AtprotoStr::Uri(Uri::Did(did)) => did.as_str(),
+                AtprotoStr::Uri(UriValue::At(uri)) => uri.as_str(),
+                AtprotoStr::Uri(UriValue::Did(did)) => did.as_str(),
                 _ => return,
             };
             links.push(Link {
