@@ -314,6 +314,7 @@ the following are implemented currently:
 - `com.atproto.sync.listHosts`
 - `com.atproto.sync.getRepoStatus`
 - `com.atproto.sync.listRepos`
+- `com.atproto.sync.getLatestCommit`
 
 ### systems.gaze.hydrant.*
 

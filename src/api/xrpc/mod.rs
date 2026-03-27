@@ -10,6 +10,7 @@ use jacquard_api::com_atproto::repo::{
     list_records::{ListRecordsOutput, ListRecordsRequest, Record as RepoRecord},
 };
 use jacquard_api::com_atproto::sync::get_host_status::GetHostStatusRequest;
+use jacquard_api::com_atproto::sync::get_latest_commit::GetLatestCommitRequest;
 use jacquard_api::com_atproto::sync::get_repo_status::GetRepoStatusRequest;
 use jacquard_api::com_atproto::sync::list_hosts::ListHostsRequest;
 use jacquard_api::com_atproto::sync::list_repos::ListReposRequest;
@@ -28,6 +29,7 @@ use std::fmt::Display;
 mod count_records;
 mod describe_repo;
 mod get_host_status;
+mod get_latest_commit;
 mod get_record;
 mod get_repo_status;
 mod list_hosts;
@@ -42,6 +44,7 @@ pub fn router() -> Router<Hydrant> {
         .route(DescribeRepo::PATH, get(describe_repo::handle))
         .route(GetHostStatusRequest::PATH, get(get_host_status::handle))
         .route(ListHostsRequest::PATH, get(list_hosts::handle))
+        .route(GetLatestCommitRequest::PATH, get(get_latest_commit::handle))
         .route(GetRepoStatusRequest::PATH, get(get_repo_status::handle))
         .route(ListReposRequest::PATH, get(list_repos::handle))
 }
