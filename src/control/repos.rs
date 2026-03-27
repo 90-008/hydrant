@@ -389,12 +389,16 @@ impl ReposControl {
 }
 
 pub(crate) fn repo_state_to_info(did: Did<'static>, s: RepoState<'_>) -> RepoInfo {
+    let (rev, data) = s
+        .root
+        .map(|c| (Some(c.rev.to_tid()), Some(c.data)))
+        .unwrap_or_default();
     RepoInfo {
         did,
         status: s.status,
         tracked: s.tracked,
-        rev: s.rev.map(|r| r.to_tid()),
-        data: s.data,
+        rev,
+        data,
         handle: s.handle.map(|h| h.into_static()),
         pds: s.pds.and_then(|p| p.parse().ok()),
         signing_key: s.signing_key.map(|k| k.into_static()),

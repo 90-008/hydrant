@@ -41,7 +41,7 @@ pub async fn handle(
     }
 
     // return whatever we last recorded; if we haven't synced at all yet, we have nothing to give
-    let (Some(data), Some(rev_db)) = (state.data, state.rev) else {
+    let Some(commit) = state.root else {
         return Err(XrpcErrorResponse {
             status: StatusCode::NOT_FOUND,
             error: XrpcError::Xrpc(GetLatestCommitError::RepoNotFound(Some(CowStr::Borrowed(
@@ -51,8 +51,8 @@ pub async fn handle(
     };
 
     Ok(Json(GetLatestCommitOutput {
-        cid: Cid::from(data),
-        rev: rev_db.to_tid(),
+        cid: Cid::from(commit.data),
+        rev: commit.rev.to_tid(),
         extra_data: None,
     }))
 }

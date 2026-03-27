@@ -34,7 +34,7 @@ pub async fn handle(
             let (did, state) = item?;
 
             // skip repos that haven't been synced at least once
-            let (Some(data), Some(rev_db)) = (state.data, state.rev) else {
+            let Some(commit) = state.root else {
                 continue;
             };
 
@@ -42,8 +42,8 @@ pub async fn handle(
             repos.push(Repo {
                 active: Some(active),
                 did: did.clone(),
-                head: Cid::from(data),
-                rev: rev_db.to_tid(),
+                head: Cid::from(commit.data),
+                rev: commit.rev.to_tid(),
                 status,
                 extra_data: None,
             });

@@ -256,17 +256,16 @@ pub fn apply_commit<'commit, 's>(
         .get(&parsed.root)
         .ok_or_else(|| miette::miette!("root block missing from CAR"))?;
 
-    let repo_commit = jacquard_repo::commit::Commit::from_cbor(root_bytes).into_diagnostic()?;
+    let root_commit = jacquard_repo::commit::Commit::from_cbor(root_bytes).into_diagnostic()?;
 
     if let Some(key) = signing_key {
-        repo_commit
+        root_commit
             .verify(key)
             .map_err(|e| miette::miette!("signature verification failed for {did}: {e}"))?;
         trace!(did = %did, "signature verified");
     }
 
-    repo_state.rev = Some((&commit.rev).into());
-    repo_state.data = Some(repo_commit.data);
+    repo_state.root = Some(root_commit.into());
     repo_state.touch();
 
     batch.insert(&db.repos, keys::repo_key(did), ser_repo_state(&repo_state)?);

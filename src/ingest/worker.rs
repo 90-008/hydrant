@@ -435,19 +435,20 @@ impl FirehoseWorker {
         repo_state.advance_message_time(commit.time.0.timestamp_millis());
 
         // skip replayed events (already seen revision)
-        if matches!(repo_state.rev, Some(ref rev) if commit.rev.as_str() <= rev.to_tid().as_str()) {
+        if matches!(repo_state.root, Some(ref root) if commit.rev.as_str() <= root.rev.to_tid().as_str())
+        {
             debug!(
                 did = %did,
                 commit_rev = %commit.rev,
-                state_rev = %repo_state.rev.as_ref().map(|r| r.to_tid()).expect("we checked in if"),
+                state_rev = %repo_state.root.as_ref().map(|c| c.rev.to_tid()).expect("we checked in if"),
                 "skipping replayed event"
             );
             return Ok(RepoProcessResult::Ok(repo_state));
         }
 
-        if let (Some(repo), Some(prev_commit)) = (&repo_state.data, &commit.prev_data)
-            && repo
-                != &prev_commit
+        if let (Some(repo_commit), Some(prev_commit)) = (&repo_state.root, &commit.prev_data)
+            && repo_commit.data
+                != prev_commit
                     .0
                     .to_ipld()
                     .into_diagnostic()
@@ -455,7 +456,7 @@ impl FirehoseWorker {
         {
             warn!(
                 did = %did,
-                repo = %repo,
+                repo = %repo_commit.data,
                 prev_commit = %prev_commit.0,
                 "gap detected, triggering backfill"
             );
@@ -508,15 +509,13 @@ impl FirehoseWorker {
 
         match ops::verify_sync_event(sync.blocks.as_ref(), Self::fetch_key(ctx, did)?.as_ref()) {
             Ok((root, rev)) => {
-                if let Some(current_data) = &repo_state.data {
-                    if current_data == &root.to_ipld().expect("valid cid") {
+                if let Some(current_commit) = &repo_state.root {
+                    if current_commit.data == root.to_ipld().expect("valid cid") {
                         debug!(did = %did, "skipping noop sync");
                         return Ok(RepoProcessResult::Ok(repo_state));
                     }
-                }
 
-                if let Some(current_rev) = &repo_state.rev {
-                    if rev.as_str() <= current_rev.to_tid().as_str() {
+                    if rev.as_str() <= current_commit.rev.to_tid().as_str() {
                         debug!(did = %did, "skipping replayed sync");
                         return Ok(RepoProcessResult::Ok(repo_state));
                     }

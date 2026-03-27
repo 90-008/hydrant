@@ -32,7 +32,7 @@ pub async fn handle(
     let (active, status) = repo_status_to_api(state.status);
 
     // rev is only meaningful when the repo is active and has been synced at least once
-    let rev = active.then(|| state.rev.map(|r| r.to_tid())).flatten();
+    let rev = active.then(|| state.root.map(|c| c.rev.to_tid())).flatten();
 
     Ok(Json(GetRepoStatusOutput {
         active,

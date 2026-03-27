@@ -1,12 +1,12 @@
-use crate::db::types::{DbAction, DbRkey, DbTid, TrimmedDid};
+use crate::db::types::{DbAction, DbRkey, TrimmedDid};
 use crate::db::{self, Db, keys, ser_repo_state};
 use crate::filter::FilterMode;
 use crate::ops;
 use crate::resolver::ResolverError;
 use crate::state::AppState;
 use crate::types::{
-    AccountEvt, BroadcastEvent, GaugeState, RepoState, RepoStatus, ResyncErrorKind, ResyncState,
-    StoredData, StoredEvent,
+    AccountEvt, BroadcastEvent, Commit, GaugeState, RepoState, RepoStatus, ResyncErrorKind,
+    ResyncState, StoredData, StoredEvent,
 };
 
 use fjall::Slice;
@@ -545,6 +545,8 @@ async fn process_did<'i>(
         trace!("signature verified");
     }
 
+    let root_commit = Commit::from(root_commit);
+
     // 5. walk mst
     let start = Instant::now();
     let mst: Mst<MemoryBlockStore> = Mst::load(store, root_commit.data, None);
@@ -664,7 +666,7 @@ async fn process_did<'i>(
                     let evt = StoredEvent {
                         live: false,
                         did: TrimmedDid::from(&did),
-                        rev: DbTid::from(&rev),
+                        rev,
                         collection: CowStr::Borrowed(collection),
                         rkey,
                         action,
@@ -700,7 +702,7 @@ async fn process_did<'i>(
                 let evt = StoredEvent {
                     live: false,
                     did: TrimmedDid::from(&did),
-                    rev: DbTid::from(&rev),
+                    rev,
                     collection: CowStr::Borrowed(&collection),
                     rkey,
                     action: DbAction::Delete,
@@ -720,8 +722,7 @@ async fn process_did<'i>(
 
             // 6. update data, status is updated in worker shard
             state.tracked = true;
-            state.rev = Some((&rev).into());
-            state.data = Some(root_commit.data);
+            state.root = Some(root_commit);
             state.touch();
 
             batch.insert(

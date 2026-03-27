@@ -5,12 +5,15 @@ use crate::db::Db;
 use crate::db::keys::VERSIONING_KEY;
 
 mod v1;
+mod v2;
 
 type MigrationFn = fn(&Db, &mut OwnedWriteBatch) -> Result<()>;
 
 /// ordered list of migrations. migration at index `i` upgrades the schema from version `i` to `i+1`.
-const MIGRATIONS: &[(&str, MigrationFn)] =
-    &[("stable_firehose_cursors", v1::stable_firehose_cursors)];
+const MIGRATIONS: &[(&str, MigrationFn)] = &[
+    ("stable_firehose_cursors", v1::stable_firehose_cursors),
+    ("repo_state_root_commit", v2::repo_state_root_commit),
+];
 
 fn read_version(db: &Db) -> Result<u64> {
     db.counts

@@ -12,15 +12,56 @@ use smol_str::{SmolStr, ToSmolStr};
 use crate::db::types::{DbAction, DbRkey, DbTid, DidKey, TrimmedDid};
 use crate::resolver::MiniDoc;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub enum RepoStatus {
-    Backfilling,
-    Synced,
-    Error(SmolStr),
-    Deactivated,
-    Takendown,
-    Suspended,
+pub(crate) mod v2 {
+    use super::*;
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub enum RepoStatus {
+        Backfilling,
+        Synced,
+        Error(SmolStr),
+        Deactivated,
+        Takendown,
+        Suspended,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub(crate) struct Commit {
+        pub version: i64,
+        pub rev: DbTid,
+        pub data: IpldCid,
+        pub prev: Option<IpldCid>,
+        #[serde(with = "jacquard_common::serde_bytes_helper")]
+        pub sig: Bytes,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(bound(deserialize = "'i: 'de"))]
+    pub(crate) struct RepoState<'i> {
+        pub status: RepoStatus,
+        pub root: Option<Commit>,
+        // todo: is this actually valid? the spec says this is informal and intermadiate
+        // services may change it. we should probably document it. if we cant use this
+        // then how do we dedup account / identity ops?
+        /// ms since epoch of the last firehose message we processed for this repo.
+        /// used to deduplicate identity / account events that can arrive from multiple relays at
+        /// different wall-clock times but represent the same underlying PDS event.
+        pub last_message_time: Option<i64>,
+        /// this is when we *ingested* any last updates
+        pub last_updated_at: i64, // unix timestamp
+        /// whether we are ingesting events for this repo
+        pub tracked: bool,
+        /// index id in pending keyspace
+        pub index_id: u64,
+        #[serde(borrow)]
+        pub signing_key: Option<DidKey<'i>>,
+        #[serde(borrow)]
+        pub pds: Option<CowStr<'i>>,
+        #[serde(borrow)]
+        pub handle: Option<Handle<'i>>,
+    }
 }
+pub(crate) use v2::*;
 
 impl Display for RepoStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -35,40 +76,23 @@ impl Display for RepoStatus {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(bound(deserialize = "'i: 'de"))]
-pub(crate) struct RepoState<'i> {
-    pub status: RepoStatus,
-    pub rev: Option<DbTid>,
-    pub data: Option<IpldCid>,
-    // todo: is this actually valid? the spec says this is informal and intermadiate
-    // services may change it. we should probably document it. if we cant use this
-    // then how do we dedup account / identity ops?
-    /// ms since epoch of the last firehose message we processed for this repo.
-    /// used to deduplicate identity / account events that can arrive from multiple relays at
-    /// different wall-clock times but represent the same underlying PDS event.
-    #[serde(default)]
-    pub last_message_time: Option<i64>,
-    /// this is when we *ingested* any last updates
-    pub last_updated_at: i64, // unix timestamp
-    /// whether we are ingesting events for this repo
-    pub tracked: bool,
-    /// index id in pending keyspace
-    pub index_id: u64,
-    #[serde(borrow)]
-    pub signing_key: Option<DidKey<'i>>,
-    #[serde(borrow)]
-    pub pds: Option<CowStr<'i>>,
-    #[serde(borrow)]
-    pub handle: Option<Handle<'i>>,
+impl<'c> From<jacquard_repo::commit::Commit<'c>> for Commit {
+    fn from(value: jacquard_repo::commit::Commit<'c>) -> Self {
+        Self {
+            data: value.data,
+            prev: value.prev,
+            rev: DbTid::from(&value.rev),
+            sig: value.sig,
+            version: value.version,
+        }
+    }
 }
 
 impl<'i> RepoState<'i> {
     pub fn backfilling(index_id: u64) -> Self {
         Self {
             status: RepoStatus::Backfilling,
-            rev: None,
-            data: None,
+            root: None,
             last_updated_at: chrono::Utc::now().timestamp(),
             index_id,
             tracked: true,
@@ -115,8 +139,7 @@ impl<'i> IntoStatic for RepoState<'i> {
     fn into_static(self) -> Self::Output {
         RepoState {
             status: self.status,
-            rev: self.rev,
-            data: self.data,
+            root: self.root,
             last_updated_at: self.last_updated_at,
             index_id: self.index_id,
             tracked: self.tracked,
@@ -247,7 +270,7 @@ use bytes::Bytes;
 pub(crate) enum StoredData {
     Nothing,
     Ptr(IpldCid),
-    #[serde(with = "serde_bytes_squared")]
+    #[serde(with = "jacquard_common::serde_bytes_helper")]
     Block(Bytes),
 }
 
@@ -288,19 +311,6 @@ pub(crate) struct StoredEvent<'i> {
     #[serde(default)]
     #[serde(skip_serializing_if = "StoredData::is_nothing")]
     pub data: StoredData,
-}
-
-mod serde_bytes_squared {
-    use bytes::Bytes;
-    use serde::{Deserialize, Deserializer, Serializer};
-
-    pub fn serialize<S: Serializer>(v: impl AsRef<[u8]>, s: S) -> Result<S::Ok, S::Error> {
-        s.serialize_bytes(serde_bytes::Bytes::new(v.as_ref()))
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Bytes, D::Error> {
-        serde_bytes::ByteBuf::deserialize(d).map(|b| b.into_vec().into())
-    }
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
