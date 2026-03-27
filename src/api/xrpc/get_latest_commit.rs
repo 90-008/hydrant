@@ -1,7 +1,7 @@
 use jacquard_api::com_atproto::sync::get_latest_commit::{
     GetLatestCommitError, GetLatestCommitOutput, GetLatestCommitRequest, GetLatestCommitResponse,
 };
-use jacquard_common::{CowStr, types::cid::Cid};
+use jacquard_common::{CowStr, cowstr::ToCowStr, types::cid::Cid};
 
 use crate::types::RepoStatus;
 
@@ -50,9 +50,15 @@ pub async fn handle(
         });
     };
 
+    let Some(atp_commit) = commit.into_atp_commit(req.did) else {
+        return Err(internal_error(nsid, "repo needs migration"));
+    };
+
+    let commit_cid = atp_commit.to_cid().map_err(|e| internal_error(nsid, e))?;
+
     Ok(Json(GetLatestCommitOutput {
-        cid: Cid::from(commit.data),
-        rev: commit.rev.to_tid(),
+        cid: Cid::Str(commit_cid.to_cowstr().into_static()),
+        rev: atp_commit.rev,
         extra_data: None,
     }))
 }

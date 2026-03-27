@@ -5,6 +5,7 @@ use jacquard_common::types::nsid::Nsid;
 use jacquard_common::types::string::{Did, Rkey};
 use jacquard_common::types::tid::Tid;
 use jacquard_common::{CowStr, IntoStatic, types::string::Handle};
+use jacquard_repo::commit::Commit as AtpCommit;
 use serde::{Deserialize, Serialize, Serializer};
 use serde_json::Value;
 use smol_str::{SmolStr, ToSmolStr};
@@ -76,8 +77,8 @@ impl Display for RepoStatus {
     }
 }
 
-impl<'c> From<jacquard_repo::commit::Commit<'c>> for Commit {
-    fn from(value: jacquard_repo::commit::Commit<'c>) -> Self {
+impl<'c> From<AtpCommit<'c>> for Commit {
+    fn from(value: AtpCommit<'c>) -> Self {
         Self {
             data: value.data,
             prev: value.prev,
@@ -85,6 +86,23 @@ impl<'c> From<jacquard_repo::commit::Commit<'c>> for Commit {
             sig: value.sig,
             version: value.version,
         }
+    }
+}
+
+impl Commit {
+    pub(crate) fn into_atp_commit<'i>(self, did: Did<'i>) -> Option<AtpCommit<'i>> {
+        // from a migration
+        if self.version < 0 {
+            return None;
+        }
+        Some(AtpCommit {
+            did,
+            rev: self.rev.to_tid(),
+            data: self.data,
+            prev: self.prev,
+            sig: self.sig,
+            version: self.version,
+        })
     }
 }
 

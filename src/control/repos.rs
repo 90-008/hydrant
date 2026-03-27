@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use fjall::OwnedWriteBatch;
+use futures::TryFutureExt;
 use jacquard_common::cowstr::ToCowStr;
 use jacquard_common::types::cid::{Cid, IpldCid};
 use jacquard_common::types::ident::AtIdentifier;
@@ -34,7 +35,7 @@ pub struct RepoInfo {
     /// the revision of the root commit of this repository.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rev: Option<Tid>,
-    /// the CID of the root commit of this repository.
+    /// the CID of the MST root of this repository.
     #[serde(serialize_with = "crate::util::opt_cid_serialize_str")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data: Option<IpldCid>,
@@ -690,6 +691,144 @@ impl<'i> RepoHandle<'i> {
                 Rkey::new_cow(CowStr::Owned(rkey.to_smolstr())).expect("that rkey is validated")
             }),
         })
+    }
+
+    /// generates a streaming CAR v1 response body for this repository.
+    ///
+    /// returns `None` if the repo has no commit yet (still backfilling) or is an
+    /// unmigrated repo that does not have the necessary data to reconstruct the
+    /// root commit from.
+    ///
+    /// ## notes
+    /// - calling this if you are using collection allowlist will always result
+    /// in an error since the commit root won't match the reconstructed CID.
+    /// - calling this for big repositories will incur more resource cost due to
+    /// hydrant's structure, the whole MST is always reconstructed.
+    pub async fn generate_car(
+        &self,
+    ) -> Result<Option<impl futures::Stream<Item = std::io::Result<bytes::Bytes>> + Send + 'static>>
+    {
+        use iroh_car::{CarHeader, CarWriter};
+        use jacquard_repo::{BlockStore, MemoryBlockStore, Mst};
+        use miette::WrapErr;
+        use std::sync::Arc;
+
+        let commit = match self.state().await? {
+            Some(state) => match state.root {
+                Some(c) => c,
+                None => return Ok(None),
+            },
+            None => return Ok(None),
+        };
+
+        let atp_commit = match commit.into_atp_commit(self.did.clone().into_static()) {
+            Some(c) => c,
+            None => return Ok(None),
+        };
+        let commit_cid = atp_commit.to_cid().into_diagnostic()?;
+        let commit_cbor = atp_commit.to_cbor().into_diagnostic()?;
+
+        let did = self.did.clone().into_static();
+        let app_state = self.state.clone();
+
+        // build mst and populate the block store in a single blocking pass
+        let store = Arc::new(MemoryBlockStore::new());
+        let mst = Mst::new(store.clone());
+        let handle = tokio::runtime::Handle::current();
+
+        let mst = tokio::task::spawn_blocking(move || -> Result<_> {
+            let mut mst = mst;
+            let prefix = keys::record_prefix_did(&did);
+
+            for guard in app_state.db.records.prefix(&prefix) {
+                let (key, cid_bytes) = guard.into_inner().into_diagnostic()?;
+
+                let rest = &key[prefix.len()..];
+                let mut parts = rest.splitn(2, |b: &u8| *b == keys::SEP);
+                let collection_raw = parts
+                    .next()
+                    .ok_or_else(|| miette::miette!("missing collection in record key"))?;
+                let rkey_raw = parts
+                    .next()
+                    .ok_or_else(|| miette::miette!("missing rkey in record key"))?;
+
+                let collection = std::str::from_utf8(collection_raw)
+                    .into_diagnostic()
+                    .wrap_err("collection is not valid utf8")?;
+                let rkey = keys::parse_rkey(rkey_raw)?;
+                let mst_key = format!("{collection}/{rkey}");
+
+                let ipld_cid = cid::Cid::read_bytes(cid_bytes.as_ref())
+                    .into_diagnostic()
+                    .wrap_err_with(|| format!("invalid cid bytes for record {mst_key}"))?;
+
+                let block_key = keys::block_key(collection, cid_bytes.as_ref());
+                let block_bytes = app_state
+                    .db
+                    .blocks
+                    .get(&block_key)
+                    .into_diagnostic()?
+                    .ok_or_else(|| miette::miette!("block missing for record {mst_key}"))?;
+
+                handle
+                    .block_on(mst.add_mut(&mst_key, ipld_cid))
+                    .into_diagnostic()?;
+                // we use put_many here to skip calculating the CID again
+                handle
+                    .block_on(mst.storage().put_many([(
+                        ipld_cid,
+                        bytes::Bytes::copy_from_slice(block_bytes.as_ref()),
+                    )]))
+                    .into_diagnostic()?;
+            }
+
+            handle.block_on(mst.persist()).into_diagnostic()?;
+
+            Result::<_>::Ok(mst)
+        })
+        .await
+        .into_diagnostic()??;
+
+        // sanity check: rebuilt root should match stored commit data in full-index mode
+        let computed_root = mst.get_pointer().await.into_diagnostic()?;
+        if computed_root != atp_commit.data {
+            tracing::warn!(
+                computed = %computed_root,
+                stored = %atp_commit.data,
+                did = %self.did,
+                "mst root mismatch (expected in filter mode)",
+            );
+        }
+
+        store
+            .put_many([(commit_cid, bytes::Bytes::from(commit_cbor))])
+            .await
+            .into_diagnostic()?;
+
+        // stream the car directly to the response
+        let (reader, writer) = tokio::io::duplex(64 * 1024);
+        tokio::spawn(
+            async move {
+                let header = CarHeader::new_v1(vec![commit_cid]);
+                let mut car_writer = CarWriter::new(header, writer);
+
+                // write commit first, then mst nodes + leaf blocks
+                let commit_data = store.get(&commit_cid).await?;
+                if let Some(data) = commit_data {
+                    car_writer
+                        .write(commit_cid, &data)
+                        .await
+                        .into_diagnostic()?;
+                }
+                mst.write_blocks_to_car(&mut car_writer).await?;
+                car_writer.finish().await.into_diagnostic()?;
+
+                Result::<_, miette::Report>::Ok(())
+            }
+            .inspect_err(|e| tracing::error!("can't generate car: {e}")),
+        );
+
+        Ok(Some(tokio_util::io::ReaderStream::new(reader)))
     }
 
     /// gets how many records of a collection this repository has.

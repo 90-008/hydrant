@@ -38,12 +38,22 @@ pub async fn handle(
                 continue;
             };
 
+            let Some(atp_commit) = commit.into_atp_commit(did.clone()) else {
+                tracing::warn!(did = %did, "repo needs migration");
+                continue;
+            };
+
+            let Ok(commit_cid) = atp_commit.to_cid() else {
+                tracing::warn!(did = %did, "failed to compute commit CID");
+                continue;
+            };
+
             let (active, status) = repo_status_to_api(state.status);
             repos.push(Repo {
                 active: Some(active),
                 did: did.clone(),
-                head: Cid::from(commit.data),
-                rev: commit.rev.to_tid(),
+                head: Cid::from(commit_cid),
+                rev: atp_commit.rev,
                 status,
                 extra_data: None,
             });

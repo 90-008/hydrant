@@ -1,3 +1,5 @@
+use jacquard_common::{cowstr::ToCowStr, types::cid::Cid};
+
 use super::*;
 
 pub async fn handle(
@@ -26,7 +28,7 @@ pub async fn handle(
             req.rkey.0.as_str(),
         )
         .unwrap(),
-        cid: Some(record.cid),
+        cid: Some(Cid::Str(record.cid.to_cowstr().into_static())),
         value: record.value,
         extra_data: Default::default(),
     }))

@@ -39,7 +39,7 @@ export def check-consistency [hydrant_url: string, pds_url: string, did: string]
             for i in 0..($hydrant_count - 1) {
                 let h_record = ($hydrant_records | get $i)
                 let p_record = ($pds_records | get $i)
-                
+
                 if $h_record.cid != $p_record.cid {
                     let h_rkey = ($h_record.uri | split row "/" | last)
                     let p_rkey = ($p_record.uri | split row "/" | last)
@@ -61,12 +61,12 @@ def check-count [hydrant_url: string, debug_url: string, did: string] {
          "app.bsky.feed.post"
          "app.bsky.actor.profile"
     ]
-    
+
     mut success = true
 
     for coll in $collections {
         print $"  checking count for ($coll)..."
-        
+
         # 1. get cached count from API
         let api_count = try {
             (http get $"($hydrant_url)/xrpc/systems.gaze.hydrant.countRecords?identifier=($did)&collection=($coll)").count
@@ -93,6 +93,83 @@ def check-count [hydrant_url: string, debug_url: string, did: string] {
     $success
 }
 
+# sanity check: compare getLatestCommit cid and rev between hydrant and pds
+def check-latest-commit [hydrant_url: string, pds_url: string, did: string] {
+    print "checking getLatestCommit..."
+
+    let hydrant_commit = try {
+        http get $"($hydrant_url)/xrpc/com.atproto.sync.getLatestCommit?did=($did)"
+    } catch {
+        print "  error fetching getLatestCommit from hydrant"
+        return false
+    }
+
+    let pds_commit = try {
+        http get $"($pds_url)/xrpc/com.atproto.sync.getLatestCommit?did=($did)"
+    } catch {
+        print "  error fetching getLatestCommit from pds"
+        return false
+    }
+
+    print $"  hydrant: cid=($hydrant_commit.cid) rev=($hydrant_commit.rev)"
+    print $"  pds:     cid=($pds_commit.cid) rev=($pds_commit.rev)"
+
+    if $hydrant_commit.cid != $pds_commit.cid or $hydrant_commit.rev != $pds_commit.rev {
+        print "  MISMATCH: commit differs!"
+        return false
+    }
+
+    print "  ok"
+    true
+}
+
+# parse `goat repo inspect` output into a record
+def parse-goat-inspect []: string -> record {
+    $in | lines | parse "{key}: {value}" | transpose -r -d
+}
+
+# fetch getRepo CARs from hydrant and pds and compare via `goat repo inspect`
+def check-car [hydrant_url: string, pds_url: string, did: string] {
+    print "checking getRepo CAR..."
+
+    let hydrant_car = try {
+        http get $"($hydrant_url)/xrpc/com.atproto.sync.getRepo?did=($did)"
+    } catch {
+        print "  error fetching CAR from hydrant"
+        return false
+    }
+
+    let pds_car = try {
+        http get $"($pds_url)/xrpc/com.atproto.sync.getRepo?did=($did)"
+    } catch {
+        print "  error fetching CAR from pds"
+        return false
+    }
+
+    let h_tmp = (mktemp --suffix ".car")
+    let p_tmp = (mktemp --suffix ".car")
+    $hydrant_car | save --force $h_tmp
+    $pds_car | save --force $p_tmp
+
+    print $"hydrant car: ($h_tmp)"
+    print $"pds car: ($p_tmp)"
+
+    let h_info = (nix-shell -p atproto-goat --run $"goat repo inspect ($h_tmp)" | parse-goat-inspect)
+    let p_info = (nix-shell -p atproto-goat --run $"goat repo inspect ($p_tmp)" | parse-goat-inspect)
+    rm $h_tmp $p_tmp
+
+    print $"  hydrant: data=($h_info.'Data CID') rev=($h_info.Revision)"
+    print $"  pds:     data=($p_info.'Data CID') rev=($p_info.Revision)"
+
+    if $h_info.'Data CID' != $p_info.'Data CID' or $h_info.Revision != $p_info.Revision {
+        print "  MISMATCH: CARs differ!"
+        return false
+    }
+
+    print "  ok"
+    true
+}
+
 def main [] {
     let did = "did:plc:dfl62fgb7wtjj3fcbb72naae"
     let pds = "https://zwsp.xyz"
@@ -109,22 +186,23 @@ def main [] {
     let instance = start-hydrant $binary $db_path $port
 
     mut success = false
-    
+
     if (wait-for-api $url) {
         # track the repo via API
         print $"adding repo ($did) to tracking..."
         http put -t application/json $"($url)/repos" [ { did: ($did) } ]
 
         if (wait-for-backfill $url) {
-            # Run both consistency checks
             let integrity_passed = (check-consistency $url $pds $did)
             let count_passed = (check-count $url $debug_url $did)
+            let commit_passed = (check-latest-commit $url $pds $did)
+            let car_passed = if $commit_passed { check-car $url $pds $did } else { false }
 
-            if $integrity_passed and $count_passed {
+            if $integrity_passed and $count_passed and $commit_passed and $car_passed {
                 print "all integrity checks passed!"
                 $success = true
             } else {
-                print $"integrity checks failed. consistency: ($integrity_passed), count: ($count_passed)"
+                print $"integrity checks failed. consistency: ($integrity_passed), count: ($count_passed), commit: ($commit_passed), car: ($car_passed)"
             }
         } else {
             print "backfill failed or timed out."
@@ -136,6 +214,6 @@ def main [] {
     let hydrant_pid = $instance.pid
     print $"stopping hydrant - pid: ($hydrant_pid)..."
     try { kill $hydrant_pid }
-    
+
     if not $success { exit 1 }
 }
