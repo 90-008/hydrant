@@ -93,34 +93,33 @@ def check-count [hydrant_url: string, debug_url: string, did: string] {
     $success
 }
 
-# sanity check: compare getLatestCommit cid and rev between hydrant and pds
+# compare getLatestCommit between hydrant and pds; returns the commit record on success, null on failure
 def check-latest-commit [hydrant_url: string, pds_url: string, did: string] {
     print "checking getLatestCommit..."
 
-    let hydrant_commit = try {
+    let h = try {
         http get $"($hydrant_url)/xrpc/com.atproto.sync.getLatestCommit?did=($did)"
     } catch {
         print "  error fetching getLatestCommit from hydrant"
-        return false
+        return null
     }
 
-    let pds_commit = try {
+    let p = try {
         http get $"($pds_url)/xrpc/com.atproto.sync.getLatestCommit?did=($did)"
     } catch {
         print "  error fetching getLatestCommit from pds"
-        return false
+        return null
     }
 
-    print $"  hydrant: cid=($hydrant_commit.cid) rev=($hydrant_commit.rev)"
-    print $"  pds:     cid=($pds_commit.cid) rev=($pds_commit.rev)"
+    print $"  cid=($h.cid) rev=($h.rev)"
 
-    if $hydrant_commit.cid != $pds_commit.cid or $hydrant_commit.rev != $pds_commit.rev {
-        print "  MISMATCH: commit differs!"
-        return false
+    if $h.cid != $p.cid or $h.rev != $p.rev {
+        print $"  MISMATCH: hydrant cid=($h.cid) rev=($h.rev) vs pds cid=($p.cid) rev=($p.rev)"
+        return null
     }
 
     print "  ok"
-    true
+    $h
 }
 
 # parse `goat repo inspect` output into a record
@@ -128,40 +127,34 @@ def parse-goat-inspect []: string -> record {
     $in | lines | parse "{key}: {value}" | transpose -r -d
 }
 
+# fetch a getRepo CAR and return its `goat repo inspect` info
+def fetch-car-info [url: string, did: string] {
+    let car = http get $"($url)/xrpc/com.atproto.sync.getRepo?did=($did)"
+    let tmp = (mktemp --suffix ".car")
+    $car | save --force $tmp
+    let info = (nix-shell -p atproto-goat --run $"goat repo inspect ($tmp)" | parse-goat-inspect)
+    rm $tmp
+    $info
+}
+
 # fetch getRepo CARs from hydrant and pds and compare via `goat repo inspect`
 def check-car [hydrant_url: string, pds_url: string, did: string] {
     print "checking getRepo CAR..."
 
-    let hydrant_car = try {
-        http get $"($hydrant_url)/xrpc/com.atproto.sync.getRepo?did=($did)"
-    } catch {
+    let h = try { fetch-car-info $hydrant_url $did } catch {
         print "  error fetching CAR from hydrant"
         return false
     }
 
-    let pds_car = try {
-        http get $"($pds_url)/xrpc/com.atproto.sync.getRepo?did=($did)"
-    } catch {
+    let p = try { fetch-car-info $pds_url $did } catch {
         print "  error fetching CAR from pds"
         return false
     }
 
-    let h_tmp = (mktemp --suffix ".car")
-    let p_tmp = (mktemp --suffix ".car")
-    $hydrant_car | save --force $h_tmp
-    $pds_car | save --force $p_tmp
+    print $"  hydrant: data=($h.'Data CID') prev=($h.'Prev CID') rev=($h.Revision)"
+    print $"  pds:     data=($p.'Data CID') prev=($p.'Prev CID') rev=($p.Revision)"
 
-    print $"hydrant car: ($h_tmp)"
-    print $"pds car: ($p_tmp)"
-
-    let h_info = (nix-shell -p atproto-goat --run $"goat repo inspect ($h_tmp)" | parse-goat-inspect)
-    let p_info = (nix-shell -p atproto-goat --run $"goat repo inspect ($p_tmp)" | parse-goat-inspect)
-    rm $h_tmp $p_tmp
-
-    print $"  hydrant: data=($h_info.'Data CID') rev=($h_info.Revision)"
-    print $"  pds:     data=($p_info.'Data CID') rev=($p_info.Revision)"
-
-    if $h_info.'Data CID' != $p_info.'Data CID' or $h_info.Revision != $p_info.Revision {
+    if $h.'Data CID' != $p.'Data CID' or $h.'Prev CID' != $p.'Prev CID' or $h.Revision != $p.Revision {
         print "  MISMATCH: CARs differ!"
         return false
     }
@@ -195,7 +188,8 @@ def main [] {
         if (wait-for-backfill $url) {
             let integrity_passed = (check-consistency $url $pds $did)
             let count_passed = (check-count $url $debug_url $did)
-            let commit_passed = (check-latest-commit $url $pds $did)
+            let commit = (check-latest-commit $url $pds $did)
+            let commit_passed = $commit != null
             let car_passed = if $commit_passed { check-car $url $pds $did } else { false }
 
             if $integrity_passed and $count_passed and $commit_passed and $car_passed {
