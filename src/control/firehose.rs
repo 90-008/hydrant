@@ -12,6 +12,7 @@ use crate::state::AppState;
 
 pub(super) struct FirehoseIngestorHandle {
     abort: tokio::task::AbortHandle,
+    pub(super) is_pds: bool,
 }
 
 impl Drop for FirehoseIngestorHandle {
@@ -31,10 +32,13 @@ pub struct FirehoseSourceInfo {
     pub url: Url,
     /// true if added via the API and persisted to the database; false for `RELAY_HOSTS` sources.
     pub persisted: bool,
+    /// true when this is a direct PDS connection; enables host authority enforcement.
+    pub is_pds: bool,
 }
 
 pub(super) async fn spawn_firehose_ingestor(
     relay_url: &Url,
+    is_pds: bool,
     state: &Arc<AppState>,
     shared: &FirehoseShared,
     enabled: watch::Receiver<bool>,
@@ -48,12 +52,13 @@ pub(super) async fn spawn_firehose_ingestor(
         .insert_async(relay_url.clone(), AtomicI64::new(start.unwrap_or(0)))
         .await;
 
-    info!(relay = %relay_url, cursor = ?start, "starting firehose ingestor");
+    info!(relay = %relay_url, is_pds, cursor = ?start, "starting firehose ingestor");
 
     let ingestor = FirehoseIngestor::new(
         state.clone(),
         shared.buffer_tx.clone(),
         relay_url.clone(),
+        is_pds,
         state.filter.clone(),
         enabled,
         shared.verify_signatures,
@@ -67,7 +72,7 @@ pub(super) async fn spawn_firehose_ingestor(
     })
     .abort_handle();
 
-    Ok(FirehoseIngestorHandle { abort })
+    Ok(FirehoseIngestorHandle { abort, is_pds })
 }
 
 /// runtime control over the firehose ingestor component.
@@ -120,10 +125,11 @@ impl FirehoseHandle {
     pub async fn list_sources(&self) -> Vec<FirehoseSourceInfo> {
         let mut sources = Vec::new();
         self.tasks
-            .iter_async(|url, _| {
+            .iter_async(|url, handle| {
                 sources.push(FirehoseSourceInfo {
                     url: url.clone(),
                     persisted: self.persisted.contains_sync(url),
+                    is_pds: handle.is_pds,
                 });
                 true
             })
@@ -138,19 +144,21 @@ impl FirehoseHandle {
     /// is started. any cursor state for that URL is preserved.
     ///
     /// returns an error if called before [`Hydrant::run`].
-    pub async fn add_source(&self, url: Url) -> Result<()> {
+    pub async fn add_source(&self, url: Url, is_pds: bool) -> Result<()> {
         let Some(shared) = self.shared.get() else {
             miette::bail!("firehose not yet started: call Hydrant::run() first");
         };
 
         let db = self.state.db.clone();
         let key = keys::firehose_source_key(url.as_str());
-        tokio::task::spawn_blocking(move || db.crawler.insert(key, b"").into_diagnostic())
+        let value = rmp_serde::to_vec(&crate::db::FirehoseSourceMeta { is_pds })
+            .map_err(|e| miette::miette!("failed to serialize firehose source meta: {e}"))?;
+        tokio::task::spawn_blocking(move || db.crawler.insert(key, value).into_diagnostic())
             .await
             .into_diagnostic()??;
 
         let enabled_rx = self.state.firehose_enabled.subscribe();
-        let handle = spawn_firehose_ingestor(&url, &self.state, shared, enabled_rx).await?;
+        let handle = spawn_firehose_ingestor(&url, is_pds, &self.state, shared, enabled_rx).await?;
 
         let _ = self.persisted.insert_async(url.clone()).await;
         match self.tasks.entry_async(url).await {

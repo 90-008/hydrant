@@ -56,7 +56,7 @@ export def load-env-file [] {
 }
 
 export def resolve-pds [did: string] {
-    let doc = (http get $"https://plc.wtf/($did)" | from json)
+    let doc = (http get $"https://plc.gaze.systems/($did)" | from json)
     ($doc.service | where type == "AtprotoPersonalDataServer" | first).serviceEndpoint
 }
 

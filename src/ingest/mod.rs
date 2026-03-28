@@ -14,6 +14,9 @@ use url::Url;
 pub enum IngestMessage {
     Firehose {
         relay: Url,
+        /// true when `relay` is a direct PDS connection (not an aggregating relay).
+        /// enables host authority enforcement in the worker.
+        is_pds: bool,
         msg: SubscribeReposMessage<'static>,
     },
     BackfillFinished(Did<'static>),

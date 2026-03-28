@@ -64,6 +64,20 @@ commit events are de-duplicated according to the repo `rev`. account / identity
 events are de-duplicated using the `time` field. todo: decide what to do on
 relay-side account takedowns or if relays set the `time` field.
 
+#### direct PDS connections
+
+a firehose source can also be a direct connection to a PDS rather than a relay.
+prefix the URL with `pds::` to mark it as such:
+
+```
+HYDRANT_RELAY_HOSTS=wss://bsky.network,pds::wss://pds.example.com
+```
+
+only when a source is marked as a direct PDS (`is_pds: true`), hydrant enforces
+host authority. relays (`is_pds: false`, the default) are exempt from this check,
+since they forward commits from many PDSes by design. this means you will trust
+the relay on this though.
+
 ### crawler sources
 
 <small>[<- back to toc](#table-of-contents)</small>
@@ -104,7 +118,7 @@ directory, it will also be loaded automatically.
 | `DATABASE_PATH` | `./hydrant.db` | path to the database folder. |
 | `RUST_LOG` | `info` | log filter directives (e.g., `debug`, `hydrant=trace`). [`tracing` env-filter syntax](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html). |
 | `RELAY_HOST` | `wss://relay.fire.hose.cam/` | URL of the relay (firehose only). |
-| `RELAY_HOSTS` | | comma-separated list of relay URLs (firehose only). if unset, falls back to `RELAY_HOST`. |
+| `RELAY_HOSTS` | | comma-separated list of firehose sources (firehose only). if unset, falls back to `RELAY_HOST`. prefix a URL with `pds::` to mark it as a direct PDS connection (e.g. `pds::wss://pds.example.com`). bare URLs are treated as relays. |
 | `CRAWLER_URLS` | relay hosts in full-network mode, `https://lightrail.microcosm.blue` in filter mode | comma-separated list of `[mode::]url` crawler sources. mode is `relay` or `by_collection`; bare URLs use the default mode. set to empty string to disable crawling. |
 | `PLC_URL` | `https://plc.wtf`, `https://plc.directory` if full network | base URL(s) of the PLC directory (comma-separated for multiple). |
 | `EPHEMERAL` | `false` | if enabled, no records are stored. events are deleted after a certain duration (`EPHEMERAL_TTL`). |
@@ -233,15 +247,16 @@ each set field accepts one of two forms:
 
 <small>[<- back to toc](#table-of-contents)</small>
 
-- `GET /firehose/sources`: list all currently active firehose relay sources.
-  - returns a JSON array of `{ "url": string, "persisted": bool }`.
+- `GET /firehose/sources`: list all currently active firehose sources.
+  - returns a JSON array of `{ "url": string, "persisted": bool, "is_pds": bool }`.
   - `persisted: true` means the source was added via the API and is stored in the
     database, it will survive a restart. `persisted: false` means the source
     came from `RELAY_HOSTS` and is not written to the database.
-- `POST /firehose/sources`: add a firehose relay at runtime.
-  - body: `{ "url": string }`.
+  - `is_pds: true` means the source is a direct PDS connection with host authority enforcement enabled.
+- `POST /firehose/sources`: add a firehose source at runtime.
+  - body: `{ "url": string, "is_pds": bool }`. `is_pds` defaults to `false`.
   - the source is persisted to the database before the ingestor task is started.
-  - if a relay with the same URL already exists, it is replaced: the running
+  - if a source with the same URL already exists, it is replaced: the running
     task is stopped and a new one is started. any existing cursor state for that
     URL is preserved.
   - returns `201 Created` on success.

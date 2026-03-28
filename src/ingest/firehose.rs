@@ -18,6 +18,7 @@ pub struct FirehoseIngestor {
     state: Arc<AppState>,
     buffer_tx: BufferTx,
     relay_host: Url,
+    is_pds: bool,
     filter: FilterHandle,
     enabled: watch::Receiver<bool>,
     _verify_signatures: bool,
@@ -28,6 +29,7 @@ impl FirehoseIngestor {
         state: Arc<AppState>,
         buffer_tx: BufferTx,
         relay_host: Url,
+        is_pds: bool,
         filter: FilterHandle,
         enabled: watch::Receiver<bool>,
         verify_signatures: bool,
@@ -36,6 +38,7 @@ impl FirehoseIngestor {
             state,
             buffer_tx,
             relay_host,
+            is_pds,
             filter,
             enabled,
             _verify_signatures: verify_signatures,
@@ -130,6 +133,7 @@ impl FirehoseIngestor {
 
         if let Err(e) = self.buffer_tx.send(IngestMessage::Firehose {
             relay: self.relay_host.clone(),
+            is_pds: self.is_pds,
             msg: msg.into_static(),
         }) {
             error!(err = %e, "failed to send message to buffer processor");

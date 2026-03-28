@@ -122,6 +122,31 @@ pub struct CrawlerSource {
     pub mode: CrawlerMode,
 }
 
+/// a single firehose source: a URL and whether it is a direct PDS connection.
+///
+/// set via `HYDRANT_RELAY_HOSTS` as a comma-separated list of `[pds::]url` entries.
+/// e.g. `wss://bsky.network,pds::wss://pds.example.com`.
+/// a bare URL (no `pds::` prefix) is treated as an aggregating relay (`is_pds = false`).
+#[derive(Debug, Clone)]
+pub struct FirehoseSource {
+    pub url: Url,
+    /// true when this is a direct PDS connection; enables host authority enforcement.
+    pub is_pds: bool,
+}
+
+impl FirehoseSource {
+    /// parse `[pds::]url`. the `pds::` prefix marks the source as a direct PDS connection.
+    pub fn parse(s: &str) -> Option<Self> {
+        if let Some(url_str) = s.strip_prefix("pds::") {
+            let url = Url::parse(url_str).ok()?;
+            Some(Self { url, is_pds: true })
+        } else {
+            let url = Url::parse(s).ok()?;
+            Some(Self { url, is_pds: false })
+        }
+    }
+}
+
 impl CrawlerSource {
     /// parse `[mode::]url`. mode prefix is optional, falls back to `default_mode`.
     fn parse(s: &str, default_mode: CrawlerMode) -> Option<Self> {
@@ -214,9 +239,10 @@ pub struct Config {
     /// set via `HYDRANT_EPHEMERAL_TTL` (humantime duration, e.g. `60min`).
     pub ephemeral_ttl: Duration,
 
-    /// relay URLs used for firehose ingestion. set via `HYDRANT_RELAY_HOST` (single)
+    /// firehose sources for ingestion. set via `HYDRANT_RELAY_HOST` (single)
     /// or `HYDRANT_RELAY_HOSTS` (comma-separated; takes precedence).
-    pub relays: Vec<Url>,
+    /// prefix a URL with `pds::` to mark it as a direct PDS connection.
+    pub relays: Vec<FirehoseSource>,
     /// base URL(s) of the PLC directory (comma-separated for multiple).
     /// defaults to `https://plc.wtf`, or `https://plc.directory` in full-network mode.
     /// set via `HYDRANT_PLC_URL`.
@@ -337,7 +363,10 @@ impl Default for Config {
             full_network: false,
             ephemeral: false,
             ephemeral_ttl: Duration::from_secs(3600),
-            relays: vec![Url::parse("wss://relay.fire.hose.cam/").unwrap()],
+            relays: vec![FirehoseSource {
+                url: Url::parse("wss://relay.fire.hose.cam/").unwrap(),
+                is_pds: false,
+            }],
             plc_urls: vec![Url::parse("https://plc.wtf").unwrap()],
             enable_firehose: true,
             firehose_workers: 8,
@@ -412,17 +441,23 @@ impl Config {
                     let s = s.trim();
                     (!s.is_empty())
                         .then(|| {
-                            Url::parse(s)
-                                .inspect_err(|e| tracing::warn!("invalid relay host URL: {e}"))
-                                .ok()
+                            FirehoseSource::parse(s).or_else(|| {
+                                tracing::warn!("invalid relay host URL: {s}");
+                                None
+                            })
                         })
                         .flatten()
                 })
                 .collect(),
             // HYDRANT_RELAY_HOSTS explicitly set to ""
             Ok(_) => vec![],
-            // not set at all, fall back to RELAY_HOST
-            Err(_) => vec![cfg!("RELAY_HOST", defaults.relays[0].clone())],
+            // not set at all, fall back to RELAY_HOST (bare URL, no pds:: prefix support here)
+            Err(_) => match std::env::var("HYDRANT_RELAY_HOST") {
+                Ok(s) if !s.trim().is_empty() => {
+                    FirehoseSource::parse(s.trim()).into_iter().collect()
+                }
+                _ => defaults.relays.clone(),
+            },
         };
 
         let plc_urls: Vec<Url> = std::env::var("HYDRANT_PLC_URL")
@@ -525,8 +560,8 @@ impl Config {
             Err(_) => match default_mode {
                 CrawlerMode::ListRepos => relay_hosts
                     .iter()
-                    .map(|url| CrawlerSource {
-                        url: url.clone(),
+                    .map(|source| CrawlerSource {
+                        url: source.url.clone(),
                         mode: CrawlerMode::ListRepos,
                     })
                     .collect(),
@@ -582,7 +617,21 @@ impl fmt::Display for Config {
         const LABEL_WIDTH: usize = 27;
 
         writeln!(f, "hydrant configuration:")?;
-        config_line!(f, "relay hosts", format_args!("{:?}", self.relays))?;
+        config_line!(
+            f,
+            "relay hosts",
+            format_args!(
+                "{:?}",
+                self.relays
+                    .iter()
+                    .map(|s| if s.is_pds {
+                        format!("pds::{}", s.url)
+                    } else {
+                        s.url.to_string()
+                    })
+                    .collect::<Vec<_>>()
+            )
+        )?;
         config_line!(f, "plc urls", format_args!("{:?}", self.plc_urls))?;
         config_line!(f, "full network indexing", self.full_network)?;
         config_line!(f, "verify signatures", self.verify_signatures)?;

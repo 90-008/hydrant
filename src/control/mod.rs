@@ -350,35 +350,53 @@ impl Hydrant {
                     relay_count = relay_hosts.len(),
                     hosts = relay_hosts
                         .iter()
-                        .map(|h| h.as_str())
+                        .map(|h| h.url.as_str())
                         .collect::<Vec<_>>()
                         .join(", "),
                     "starting firehose ingestor(s)"
                 );
-                for relay_url in &relay_hosts {
+                for source in &relay_hosts {
                     let enabled_rx = state.firehose_enabled.subscribe();
-                    let handle =
-                        spawn_firehose_ingestor(relay_url, &state, fire_shared, enabled_rx).await?;
-                    let _ = firehose.tasks.insert_async(relay_url.clone(), handle).await;
+                    let handle = spawn_firehose_ingestor(
+                        &source.url,
+                        source.is_pds,
+                        &state,
+                        fire_shared,
+                        enabled_rx,
+                    )
+                    .await?;
+                    let _ = firehose
+                        .tasks
+                        .insert_async(source.url.clone(), handle)
+                        .await;
                 }
             }
 
-            let persisted_relay_urls = tokio::task::spawn_blocking({
+            let persisted_sources = tokio::task::spawn_blocking({
                 let state = state.clone();
                 move || load_persisted_firehose_sources(&state.db)
             })
             .await
             .into_diagnostic()??;
 
-            for relay_url in &persisted_relay_urls {
-                let _ = firehose.persisted.insert_async(relay_url.clone()).await;
-                if firehose.tasks.contains_async(relay_url).await {
+            for source in &persisted_sources {
+                let _ = firehose.persisted.insert_async(source.url.clone()).await;
+                if firehose.tasks.contains_async(&source.url).await {
                     continue;
                 }
                 let enabled_rx = state.firehose_enabled.subscribe();
-                let handle =
-                    spawn_firehose_ingestor(relay_url, &state, fire_shared, enabled_rx).await?;
-                let _ = firehose.tasks.insert_async(relay_url.clone(), handle).await;
+                let handle = spawn_firehose_ingestor(
+                    &source.url,
+                    source.is_pds,
+                    &state,
+                    fire_shared,
+                    enabled_rx,
+                )
+                .await?;
+                let _ = firehose
+                    .tasks
+                    .insert_async(source.url.clone(), handle)
+                    .await;
             }
 
             // 11. spawn crawler infrastructure (always, to support dynamic source management)

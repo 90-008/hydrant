@@ -24,6 +24,10 @@ pub async fn list_sources(State(hydrant): State<Hydrant>) -> Json<Vec<FirehoseSo
 #[derive(Deserialize)]
 pub struct AddSourceRequest {
     pub url: Url,
+    /// true to treat this as a direct PDS connection; enables host authority enforcement.
+    /// defaults to false (aggregating relay).
+    #[serde(default)]
+    pub is_pds: bool,
 }
 
 pub async fn add_source(
@@ -32,7 +36,7 @@ pub async fn add_source(
 ) -> Result<StatusCode, (StatusCode, String)> {
     hydrant
         .firehose
-        .add_source(body.url)
+        .add_source(body.url, body.is_pds)
         .await
         .map(|_| StatusCode::CREATED)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))

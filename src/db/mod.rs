@@ -861,18 +861,31 @@ pub fn get_record_count(db: &Db, did: &Did<'_>, collection: &str) -> Result<u64>
     Ok(count.unwrap_or(0))
 }
 
-pub fn load_persisted_firehose_sources(db: &crate::db::Db) -> Result<Vec<Url>> {
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+pub(crate) struct FirehoseSourceMeta {
+    #[serde(default)]
+    pub(crate) is_pds: bool,
+}
+
+pub fn load_persisted_firehose_sources(
+    db: &crate::db::Db,
+) -> Result<Vec<crate::config::FirehoseSource>> {
     use crate::db::keys::FIREHOSE_SOURCE_PREFIX;
 
-    let mut urls = Vec::new();
+    let mut sources = Vec::new();
     for entry in db.crawler.prefix(FIREHOSE_SOURCE_PREFIX) {
-        let (key, _) = entry.into_inner().into_diagnostic()?;
+        let (key, val) = entry.into_inner().into_diagnostic()?;
         let url_bytes = &key[FIREHOSE_SOURCE_PREFIX.len()..];
         let url_str = std::str::from_utf8(url_bytes).into_diagnostic()?;
         let url = Url::parse(url_str).into_diagnostic()?;
-        urls.push(url);
+        let meta: FirehoseSourceMeta = rmp_serde::from_slice(&val)
+            .map_err(|e| miette::miette!("failed to deserialize firehose source meta: {e}"))?;
+        sources.push(crate::config::FirehoseSource {
+            url,
+            is_pds: meta.is_pds,
+        });
     }
-    Ok(urls)
+    Ok(sources)
 }
 
 pub fn load_persisted_crawler_sources(

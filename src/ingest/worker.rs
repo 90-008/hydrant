@@ -52,6 +52,15 @@ impl From<miette::Report> for IngestError {
     }
 }
 
+enum HostAuthorityOutcome {
+    /// stored pds matched the source host immediately.
+    Authorized,
+    /// pds migrated: doc now points to this host, but our stored state was stale. trigger backfill.
+    Migration,
+    /// host did not match even after doc resolution. reject the message.
+    WrongHost,
+}
+
 // gate returned by check_repo_state, tells the shard loop what to do with the message
 enum ProcessGate<'s, 'c> {
     // did not exist in db, newly queued for backfill, drop
@@ -249,8 +258,10 @@ impl FirehoseWorker {
                         }
                     }
                 }
-                IngestMessage::Firehose { relay, msg } => {
+                IngestMessage::Firehose { relay, is_pds, msg } => {
                     let _span = tracing::info_span!("firehose", relay = %relay).entered();
+                    // only enforce host authority when the source is a direct PDS connection
+                    let source_host = is_pds.then(|| relay.host_str()).flatten();
                     let (did, seq) = match &msg {
                         SubscribeReposMessage::Commit(c) => (&c.repo, c.seq),
                         SubscribeReposMessage::Identity(i) => (&i.did, i.seq),
@@ -330,8 +341,14 @@ impl FirehoseWorker {
                                 }
                             }
 
-                            match Self::process_message(&mut ctx, &msg, did, repo_state, pre_status)
-                            {
+                            match Self::process_message(
+                                &mut ctx,
+                                &msg,
+                                did,
+                                repo_state,
+                                pre_status,
+                                source_host,
+                            ) {
                                 Ok(RepoProcessResult::Ok(_)) => {}
                                 Ok(RepoProcessResult::Deleted) => {
                                     state.db.update_count("repos", -1);
@@ -411,15 +428,16 @@ impl FirehoseWorker {
         did: &Did,
         repo_state: RepoState<'s>,
         pre_status: RepoStatus,
+        source_host: Option<&str>,
     ) -> Result<RepoProcessResult<'s, 'c>, IngestError> {
         match msg {
             SubscribeReposMessage::Commit(commit) => {
                 trace!(did = %did, "processing commit");
-                Self::handle_commit(ctx, did, repo_state, commit)
+                Self::handle_commit(ctx, did, repo_state, commit, source_host)
             }
             SubscribeReposMessage::Sync(sync) => {
                 debug!(did = %did, "processing sync");
-                Self::handle_sync(ctx, did, repo_state, sync)
+                Self::handle_sync(ctx, did, repo_state, sync, source_host)
             }
             SubscribeReposMessage::Identity(identity) => {
                 debug!(did = %did, "processing identity");
@@ -441,10 +459,38 @@ impl FirehoseWorker {
         did: &Did,
         mut repo_state: RepoState<'s>,
         commit: &'c Commit<'c>,
+        source_host: Option<&str>,
     ) -> Result<RepoProcessResult<'s, 'c>, IngestError> {
         repo_state.advance_message_time(commit.time.0.timestamp_millis());
 
-        // TODO phase 2: host authority check (source_host not available in indexer mode)
+        if let Some(host) = source_host {
+            match Self::check_host_authority(ctx, did, &mut repo_state, host)? {
+                HostAuthorityOutcome::Authorized => {}
+                HostAuthorityOutcome::Migration => {
+                    // pds migrated: our data may be stale, backfill from the new host
+                    warn!(did = %did, source_host = host, "pds migration detected, triggering backfill");
+                    let mut batch = ctx.state.db.inner.batch();
+                    let _repo_state = ops::update_repo_status(
+                        &mut batch,
+                        &ctx.state.db,
+                        did,
+                        repo_state,
+                        RepoStatus::Backfilling,
+                    )?;
+                    batch.commit().into_diagnostic()?;
+                    ctx.state
+                        .db
+                        .update_gauge_diff(&GaugeState::Synced, &GaugeState::Pending);
+                    ctx.state.notify_backfill();
+                    return Ok(RepoProcessResult::NeedsBackfill(Some(commit)));
+                }
+                // todo: ideally ban pds
+                HostAuthorityOutcome::WrongHost => {
+                    warn!(did = %did, source_host = host, pds = ?repo_state.pds, "commit rejected: wrong host");
+                    return Ok(RepoProcessResult::Ok(repo_state));
+                }
+            }
+        }
 
         // validate the commit: stale rev, size limits, future rev, CAR parse, field
         // consistency, signature, and chain-break detection
@@ -536,10 +582,22 @@ impl FirehoseWorker {
         did: &Did,
         mut repo_state: RepoState<'s>,
         sync: &'c Sync<'c>,
+        source_host: Option<&str>,
     ) -> Result<RepoProcessResult<'s, 'c>, IngestError> {
         repo_state.advance_message_time(sync.time.0.timestamp_millis());
 
-        // TODO phase 2: host authority check
+        if let Some(host) = source_host {
+            match Self::check_host_authority(ctx, did, &mut repo_state, host)? {
+                HostAuthorityOutcome::Authorized | HostAuthorityOutcome::Migration => {
+                    // migration is fine here — sync already triggers a backfill below
+                }
+                // todo: ideally ban pds
+                HostAuthorityOutcome::WrongHost => {
+                    warn!(did = %did, source_host = host, pds = ?repo_state.pds, "sync rejected: wrong host");
+                    return Ok(RepoProcessResult::Ok(repo_state));
+                }
+            }
+        }
 
         // validate: size limit, CAR parse, field consistency, signature
         let signing_key = Self::fetch_key(ctx, did)?;
@@ -864,7 +922,8 @@ impl FirehoseWorker {
             let (key, value) = guard.into_inner().into_diagnostic()?;
             let commit: Commit = rmp_serde::from_slice(&value).into_diagnostic()?;
 
-            let res = Self::handle_commit(ctx, did, repo_state, &commit);
+            // buffered commits have already been source-checked on arrival; skip host check
+            let res = Self::handle_commit(ctx, did, repo_state, &commit, None);
             let res = match res {
                 Ok(r) => r,
                 Err(e) => {
@@ -891,6 +950,43 @@ impl FirehoseWorker {
         }
 
         Ok(RepoProcessResult::Ok(repo_state))
+    }
+
+    /// check that `source_host` is the authoritative PDS for `did`.
+    ///
+    /// - `Authorized`: stored pds matched immediately (fast path).
+    /// - `Migration`: stored pds was wrong but doc resolved to this host; caller should backfill.
+    /// - `WrongHost`: host did not match even after doc resolution; caller should reject.
+    fn check_host_authority(
+        ctx: &mut WorkerContext,
+        did: &Did,
+        repo_state: &mut RepoState,
+        source_host: &str,
+    ) -> Result<HostAuthorityOutcome, IngestError> {
+        let pds_host = repo_state
+            .pds
+            .as_deref()
+            .and_then(|pds| url::Url::parse(pds).ok())
+            .and_then(|u| u.host_str().map(str::to_owned));
+
+        if pds_host.as_deref() == Some(source_host) {
+            return Ok(HostAuthorityOutcome::Authorized);
+        }
+
+        // unknown pds or host mismatch — resolve doc to verify or detect a migration
+        Self::refresh_doc(ctx, repo_state, did)?;
+
+        let updated_host = repo_state
+            .pds
+            .as_deref()
+            .and_then(|pds| url::Url::parse(pds).ok())
+            .and_then(|u| u.host_str().map(str::to_owned));
+
+        if updated_host.as_deref() == Some(source_host) {
+            Ok(HostAuthorityOutcome::Migration)
+        } else {
+            Ok(HostAuthorityOutcome::WrongHost)
+        }
     }
 
     // refreshes the handle, pds url and signing key of a did

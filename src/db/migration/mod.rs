@@ -6,6 +6,7 @@ use crate::db::keys::VERSIONING_KEY;
 
 mod v1;
 mod v2;
+mod v3;
 
 type MigrationFn = fn(&Db, &mut OwnedWriteBatch) -> Result<()>;
 
@@ -13,6 +14,7 @@ type MigrationFn = fn(&Db, &mut OwnedWriteBatch) -> Result<()>;
 const MIGRATIONS: &[(&str, MigrationFn)] = &[
     ("stable_firehose_cursors", v1::stable_firehose_cursors),
     ("repo_state_root_commit", v2::repo_state_root_commit),
+    ("firehose_source_is_pds", v3::firehose_source_is_pds),
 ];
 
 fn read_version(db: &Db) -> Result<u64> {
