@@ -2,6 +2,7 @@ use tokio::sync::mpsc;
 
 pub mod firehose;
 pub mod stream;
+pub mod validation;
 pub mod worker;
 
 use jacquard_common::types::did::Did;

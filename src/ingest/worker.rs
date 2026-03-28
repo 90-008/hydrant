@@ -1,6 +1,9 @@
 use crate::db::{self, keys};
 use crate::filter::FilterMode;
 use crate::ingest::stream::{Account, Commit, Identity, SubscribeReposMessage, Sync};
+use crate::ingest::validation::{
+    CommitValidationError, SyncValidationError, ValidationOptions, validate_commit, validate_sync,
+};
 use crate::ingest::{BufferRx, IngestMessage};
 use crate::ops;
 use crate::resolver::{NoSigningKeyError, ResolverError};
@@ -14,7 +17,7 @@ use jacquard_common::cowstr::ToCowStr;
 use jacquard_common::types::crypto::PublicKey;
 use jacquard_common::types::did::Did;
 use jacquard_repo::error::CommitError;
-use miette::{Context, Diagnostic, IntoDiagnostic, Result};
+use miette::{Diagnostic, IntoDiagnostic, Result};
 use rand::Rng;
 use smol_str::ToSmolStr;
 use std::collections::hash_map::DefaultHasher;
@@ -78,6 +81,7 @@ pub struct FirehoseWorker {
     verify_signatures: bool,
     ephemeral: bool,
     num_shards: usize,
+    validation_opts: Arc<ValidationOptions>,
 }
 
 struct WorkerContext<'a> {
@@ -89,6 +93,7 @@ struct WorkerContext<'a> {
     records_delta: &'a mut i64,
     broadcast_events: &'a mut Vec<BroadcastEvent>,
     handle: &'a tokio::runtime::Handle,
+    validation_opts: &'a ValidationOptions,
 }
 
 impl FirehoseWorker {
@@ -98,6 +103,7 @@ impl FirehoseWorker {
         verify_signatures: bool,
         ephemeral: bool,
         num_shards: usize,
+        validation_opts: ValidationOptions,
     ) -> Self {
         Self {
             state,
@@ -105,6 +111,7 @@ impl FirehoseWorker {
             verify_signatures,
             ephemeral,
             num_shards,
+            validation_opts: Arc::new(validation_opts),
         }
     }
 
@@ -124,11 +131,12 @@ impl FirehoseWorker {
             let verify = self.verify_signatures;
             let ephemeral = self.ephemeral;
             let handle = handle.clone();
+            let validation_opts = self.validation_opts.clone();
 
             std::thread::Builder::new()
                 .name(format!("ingest-shard-{i}"))
                 .spawn(move || {
-                    Self::shard(i, rx, state, verify, ephemeral, handle);
+                    Self::shard(i, rx, state, verify, ephemeral, handle, validation_opts);
                 })
                 .into_diagnostic()?;
         }
@@ -175,6 +183,7 @@ impl FirehoseWorker {
         verify_signatures: bool,
         ephemeral: bool,
         handle: tokio::runtime::Handle,
+        validation_opts: Arc<ValidationOptions>,
     ) {
         let _guard = handle.enter();
         debug!(shard = id, "shard started");
@@ -197,6 +206,7 @@ impl FirehoseWorker {
                 handle: &handle,
                 verify_signatures,
                 ephemeral,
+                validation_opts: &validation_opts,
             };
 
             match msg {
@@ -434,33 +444,59 @@ impl FirehoseWorker {
     ) -> Result<RepoProcessResult<'s, 'c>, IngestError> {
         repo_state.advance_message_time(commit.time.0.timestamp_millis());
 
-        // skip replayed events (already seen revision)
-        if matches!(repo_state.root, Some(ref root) if commit.rev.as_str() <= root.rev.to_tid().as_str())
-        {
-            debug!(
-                did = %did,
-                commit_rev = %commit.rev,
-                state_rev = %repo_state.root.as_ref().map(|c| c.rev.to_tid()).expect("we checked in if"),
-                "skipping replayed event"
-            );
-            return Ok(RepoProcessResult::Ok(repo_state));
-        }
+        // TODO phase 2: host authority check (source_host not available in indexer mode)
 
-        if let (Some(repo_commit), Some(prev_commit)) = (&repo_state.root, &commit.prev_data)
-            && repo_commit.data
-                != prev_commit
-                    .0
-                    .to_ipld()
-                    .into_diagnostic()
-                    .wrap_err("invalid cid from relay")?
-        {
+        // validate the commit: stale rev, size limits, future rev, CAR parse, field
+        // consistency, signature, and chain-break detection
+        let signing_key = Self::fetch_key(ctx, did)?;
+        let validated = match validate_commit(
+            commit,
+            Some(&repo_state),
+            signing_key.as_ref(),
+            ctx.validation_opts,
+            ctx.handle,
+        ) {
+            Ok(v) => v,
+            Err(CommitValidationError::StaleRev) => {
+                debug!(
+                    did = %did,
+                    commit_rev = %commit.rev,
+                    "skipping replayed commit"
+                );
+                return Ok(RepoProcessResult::Ok(repo_state));
+            }
+            Err(CommitValidationError::SigFailure { .. }) => {
+                // refresh key and retry once
+                Self::refresh_doc(ctx, &mut repo_state, did)?;
+                let refreshed_key = Self::fetch_key(ctx, did)?;
+                match validate_commit(
+                    commit,
+                    Some(&repo_state),
+                    refreshed_key.as_ref(),
+                    ctx.validation_opts,
+                    ctx.handle,
+                ) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warn!(did = %did, err = %e, "commit rejected after key refresh");
+                        return Ok(RepoProcessResult::Ok(repo_state));
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(did = %did, err = %e, "commit rejected");
+                return Ok(RepoProcessResult::Ok(repo_state));
+            }
+        };
+
+        // chain break: prev_data or since mismatch against last known state → backfill
+        if let Some(cb) = &validated.chain_break {
             warn!(
                 did = %did,
-                repo = %repo_commit.data,
-                prev_commit = %prev_commit.0,
-                "gap detected, triggering backfill"
+                since_mismatch = cb.since_mismatch,
+                prev_data_mismatch = cb.prev_data_mismatch,
+                "chain break detected, triggering backfill"
             );
-
             let mut batch = ctx.state.db.inner.batch();
             let _repo_state = ops::update_repo_status(
                 &mut batch,
@@ -477,13 +513,11 @@ impl FirehoseWorker {
             return Ok(RepoProcessResult::NeedsBackfill(Some(commit)));
         }
 
-        let signing_key = Self::fetch_key(ctx, did)?;
         let res = ops::apply_commit(
             &mut ctx.batch,
             &ctx.state.db,
             repo_state,
-            commit,
-            signing_key.as_ref(),
+            validated,
             &ctx.state.filter.load(),
             ctx.ephemeral,
         )?;
@@ -505,43 +539,58 @@ impl FirehoseWorker {
     ) -> Result<RepoProcessResult<'s, 'c>, IngestError> {
         repo_state.advance_message_time(sync.time.0.timestamp_millis());
 
-        Self::refresh_doc(ctx, &mut repo_state, did)?;
+        // TODO phase 2: host authority check
 
-        match ops::verify_sync_event(sync.blocks.as_ref(), Self::fetch_key(ctx, did)?.as_ref()) {
-            Ok((root, rev)) => {
-                if let Some(current_commit) = &repo_state.root {
-                    if current_commit.data == root.to_ipld().expect("valid cid") {
-                        debug!(did = %did, "skipping noop sync");
-                        return Ok(RepoProcessResult::Ok(repo_state));
-                    }
-
-                    if rev.as_str() <= current_commit.rev.to_tid().as_str() {
-                        debug!(did = %did, "skipping replayed sync");
+        // validate: size limit, CAR parse, field consistency, signature
+        let signing_key = Self::fetch_key(ctx, did)?;
+        let validated = match validate_sync(sync, signing_key.as_ref(), ctx.handle) {
+            Ok(v) => v,
+            Err(SyncValidationError::SigFailure { .. }) => {
+                // refresh key and retry once (same pattern as handle_commit)
+                Self::refresh_doc(ctx, &mut repo_state, did)?;
+                let refreshed_key = Self::fetch_key(ctx, did)?;
+                match validate_sync(sync, refreshed_key.as_ref(), ctx.handle) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warn!(did = %did, err = %e, "sync rejected after key refresh");
                         return Ok(RepoProcessResult::Ok(repo_state));
                     }
                 }
-
-                warn!(did = %did, "sync event, triggering backfill");
-                let mut batch = ctx.state.db.inner.batch();
-                repo_state = ops::update_repo_status(
-                    &mut batch,
-                    &ctx.state.db,
-                    did,
-                    repo_state,
-                    RepoStatus::Backfilling,
-                )?;
-                batch.commit().into_diagnostic()?;
-                ctx.state
-                    .db
-                    .update_gauge_diff(&GaugeState::Synced, &GaugeState::Pending);
-                ctx.state.notify_backfill();
-                Ok(RepoProcessResult::Ok(repo_state))
             }
             Err(e) => {
-                error!(did = %did, err = %e, "failed to process sync event");
-                Ok(RepoProcessResult::Ok(repo_state))
+                warn!(did = %did, err = %e, "sync rejected");
+                return Ok(RepoProcessResult::Ok(repo_state));
+            }
+        };
+
+        // skip noop syncs (data CID unchanged)
+        if let Some(current_commit) = &repo_state.root {
+            if current_commit.data == validated.data_cid.to_ipld().expect("valid cid") {
+                debug!(did = %did, "skipping noop sync");
+                return Ok(RepoProcessResult::Ok(repo_state));
+            }
+
+            if validated.rev.as_str() <= current_commit.rev.to_tid().as_str() {
+                debug!(did = %did, "skipping replayed sync");
+                return Ok(RepoProcessResult::Ok(repo_state));
             }
         }
+
+        warn!(did = %did, "sync event, triggering backfill");
+        let mut batch = ctx.state.db.inner.batch();
+        repo_state = ops::update_repo_status(
+            &mut batch,
+            &ctx.state.db,
+            did,
+            repo_state,
+            RepoStatus::Backfilling,
+        )?;
+        batch.commit().into_diagnostic()?;
+        ctx.state
+            .db
+            .update_gauge_diff(&GaugeState::Synced, &GaugeState::Pending);
+        ctx.state.notify_backfill();
+        Ok(RepoProcessResult::Ok(repo_state))
     }
 
     fn handle_identity<'s>(

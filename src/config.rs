@@ -100,7 +100,7 @@ impl FromStr for CrawlerMode {
             "list_repos" | "list-repos" => Ok(Self::ListRepos),
             "by_collection" | "by-collection" => Ok(Self::ByCollection),
             _ => Err(miette::miette!(
-                "invalid crawler mode: expected 'relay' or 'by_collection'"
+                "invalid crawler mode: expected 'list_repos' or 'by_collection'"
             )),
         }
     }
@@ -261,6 +261,13 @@ pub struct Config {
     /// number of resolved identities to keep in the in-memory LRU cache.
     /// set via `HYDRANT_IDENTITY_CACHE_SIZE`.
     pub identity_cache_size: u64,
+    /// enable MST inversion validation on incoming commits (expensive).
+    /// set via `HYDRANT_VERIFY_MST`.
+    pub verify_mst: bool,
+    /// clock drift window for future-rev rejection, in seconds.
+    /// commits with a rev timestamp more than this many seconds in the future are rejected.
+    /// set via `HYDRANT_REV_CLOCK_SKEW`. default: 300 (5 minutes).
+    pub rev_clock_skew_secs: i64,
 
     /// NSID patterns that trigger auto-discovery in filter mode (e.g. `app.bsky.feed.post`).
     /// set via `HYDRANT_FILTER_SIGNALS` as a comma-separated list.
@@ -346,6 +353,8 @@ impl Default for Config {
             }],
             verify_signatures: SignatureVerification::Full,
             identity_cache_size: 1_000_000,
+            verify_mst: false,
+            rev_clock_skew_secs: 300,
             filter_signals: None,
             filter_collections: None,
             filter_excludes: None,
@@ -438,6 +447,8 @@ impl Config {
 
         let verify_signatures = cfg!("VERIFY_SIGNATURES", defaults.verify_signatures);
         let identity_cache_size = cfg!("IDENTITY_CACHE_SIZE", defaults.identity_cache_size);
+        let verify_mst: bool = cfg!("VERIFY_MST", defaults.verify_mst);
+        let rev_clock_skew_secs: i64 = cfg!("REV_CLOCK_SKEW", defaults.rev_clock_skew_secs);
         let enable_firehose = cfg!("ENABLE_FIREHOSE", defaults.enable_firehose);
         let enable_crawler = std::env::var("HYDRANT_ENABLE_CRAWLER")
             .ok()
@@ -541,6 +552,8 @@ impl Config {
             crawler_sources,
             verify_signatures,
             identity_cache_size,
+            verify_mst,
+            rev_clock_skew_secs,
             filter_signals,
             filter_collections,
             filter_excludes,

@@ -12,9 +12,8 @@ def test-repos [url: string] {
     }
     print $"    count: ($items | length)"
 
-    # 2. test partition=all
-    print "  testing partition=all..."
-    let all_items = (http get $"($url)/repos?partition=all" | from json -o)
+    # 2. test
+    let all_items = (http get $"($url)/repos" | from json -o)
     print $"    count: ($all_items | length)"
 
     # 3. test cursor (if we have enough items)
@@ -30,16 +29,6 @@ def test-repos [url: string] {
             print $"    next did: ($next_did)"
         }
     }
-
-    # 4. test partition=pending
-    print "  testing partition=pending..."
-    let pending_items = (http get $"($url)/repos?partition=pending" | from json -o)
-    print $"    pending count: ($pending_items | length)"
-
-    # 5. test partition=resync
-    print "  testing partition=resync..."
-    let resync_items = (http get $"($url)/repos?partition=resync" | from json -o)
-    print $"    resync count: ($resync_items | length)"
 
     print "all /repos pagination and filtering tests passed!"
 }
@@ -61,11 +50,6 @@ def test-errors [url: string] {
     print "  testing GET /repos with invalid cursor..."
     http get -f -e $"($url)/repos?cursor=invalid"
     | assert-status 400 "GET /repos invalid cursor"
-
-    # invalid partition in GET
-    print "  testing GET /repos with invalid partition..."
-    http get -f -e $"($url)/repos?partition=invalid"
-    | assert-status 400 "GET /repos invalid partition"
 
     print "all /repos error handling tests passed!"
 }

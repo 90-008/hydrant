@@ -12,11 +12,11 @@ def test-crawler-sources [url: string, pid: int] {
     }
     print "  ok: starts empty"
 
-    # add a relay source
-    print "  POST /crawler/sources (relay)..."
+    # add a list_repos source
+    print "  POST /crawler/sources (list_repos)..."
     http post -f -e -t application/json $"($url)/crawler/sources" {
         url: "https://bsky.network",
-        mode: "relay"
+        mode: "list_repos"
     } | assert-status 201 "POST /crawler/sources" $pid
     print "  ok: 201 Created"
 
@@ -27,8 +27,8 @@ def test-crawler-sources [url: string, pid: int] {
         fail $"expected 1 source, got ($sources | length)" $pid
     }
     let s = ($sources | first)
-    if $s.mode != "relay" {
-        fail $"expected mode=relay, got ($s.mode)" $pid
+    if $s.mode != "list_repos" {
+        fail $"expected mode=list_repos, got ($s.mode)" $pid
     }
     if not $s.persisted {
         fail "expected persisted=true for dynamically added source" $pid

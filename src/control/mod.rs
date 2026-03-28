@@ -518,6 +518,10 @@ impl Hydrant {
                         matches!(config.verify_signatures, SignatureVerification::Full),
                         config.ephemeral,
                         config.firehose_workers,
+                        crate::ingest::validation::ValidationOptions {
+                            verify_mst: config.verify_mst,
+                            rev_clock_skew_secs: config.rev_clock_skew_secs,
+                        },
                     )
                     .run(handle)
                 }

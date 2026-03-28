@@ -4,22 +4,18 @@ use fjall::Slice;
 use jacquard_common::CowStr;
 #[cfg(feature = "backlinks")]
 use jacquard_common::Data;
-use jacquard_common::IntoStatic;
-use jacquard_common::types::cid::Cid;
-use jacquard_common::types::crypto::PublicKey;
 use jacquard_common::types::did::Did;
-use jacquard_repo::car::reader::parse_car_bytes;
 use miette::{Context, IntoDiagnostic, Result};
 use rand::{Rng, rng};
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
-use std::time::Instant;
-use tracing::{debug, trace};
+use tracing::debug;
 
 use crate::db::types::{DbAction, DbRkey, DbTid, TrimmedDid};
 use crate::db::{self, Db, keys, ser_repo_state};
 use crate::filter::FilterConfig;
 use crate::ingest::stream::Commit;
+use crate::ingest::validation::ValidatedCommit;
 use crate::types::StoredData;
 use crate::types::{
     AccountEvt, BroadcastEvent, IdentityEvt, MarshallableEvt, RepoState, RepoStatus, ResyncState,
@@ -197,75 +193,26 @@ pub fn update_repo_status<'batch, 's>(
     Ok(repo_state)
 }
 
-pub fn verify_sync_event(blocks: &[u8], key: Option<&PublicKey>) -> Result<(Cid<'static>, String)> {
-    let parsed = tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current()
-            .block_on(parse_car_bytes(blocks))
-            .into_diagnostic()
-    })?;
-
-    let root_bytes = parsed
-        .blocks
-        .get(&parsed.root)
-        .ok_or_else(|| miette::miette!("root block missing from CAR"))?;
-
-    let repo_commit = jacquard_repo::commit::Commit::from_cbor(root_bytes).into_diagnostic()?;
-
-    if let Some(key) = key {
-        repo_commit
-            .verify(key)
-            .map_err(|e| miette::miette!("signature verification failed: {e}"))?;
-    }
-
-    Ok((
-        Cid::ipld(repo_commit.data).into_static(),
-        repo_commit.rev.to_string(),
-    ))
-}
-
 pub struct ApplyCommitResults<'s> {
     pub repo_state: RepoState<'s>,
     pub records_delta: i64,
     pub blocks_count: i64,
 }
 
-pub fn apply_commit<'commit, 's>(
+pub fn apply_commit<'s>(
     batch: &mut OwnedWriteBatch,
     db: &Db,
     mut repo_state: RepoState<'s>,
-    commit: &'commit Commit<'commit>,
-    signing_key: Option<&PublicKey>,
+    validated: ValidatedCommit<'_>,
     filter: &FilterConfig,
     ephemeral: bool,
 ) -> Result<ApplyCommitResults<'s>> {
+    let commit = validated.commit;
+    let parsed = validated.parsed_blocks;
     let did = &commit.repo;
     debug!(did = %did, commit = %commit.commit, "applying commit");
 
-    // 1. parse CAR blocks and store them in CAS
-    let start = Instant::now();
-    let parsed = tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current()
-            .block_on(parse_car_bytes(commit.blocks.as_ref()))
-            .into_diagnostic()
-    })?;
-
-    trace!(did = %did, elapsed = ?start.elapsed(), "parsed car");
-
-    let root_bytes = parsed
-        .blocks
-        .get(&parsed.root)
-        .ok_or_else(|| miette::miette!("root block missing from CAR"))?;
-
-    let root_commit = jacquard_repo::commit::Commit::from_cbor(root_bytes).into_diagnostic()?;
-
-    if let Some(key) = signing_key {
-        root_commit
-            .verify(key)
-            .map_err(|e| miette::miette!("signature verification failed for {did}: {e}"))?;
-        trace!(did = %did, "signature verified");
-    }
-
-    repo_state.root = Some(root_commit.into());
+    repo_state.root = Some(validated.commit_obj.into());
     repo_state.touch();
 
     batch.insert(&db.repos, keys::repo_key(did), ser_repo_state(&repo_state)?);
