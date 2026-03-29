@@ -16,6 +16,7 @@ use crate::resolver::MiniDoc;
 pub(crate) mod v2 {
     use super::*;
 
+    // todo: add desynchronized and throttled fields
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
     pub enum RepoStatus {
         Backfilling,
@@ -39,6 +40,7 @@ pub(crate) mod v2 {
     #[derive(Debug, Clone, Serialize, Deserialize)]
     #[serde(bound(deserialize = "'i: 'de"))]
     pub(crate) struct RepoState<'i> {
+        // todo: add active field
         pub status: RepoStatus,
         pub root: Option<Commit>,
         // todo: is this actually valid? the spec says this is informal and intermadiate
@@ -242,6 +244,7 @@ pub struct MarshallableEvt<'i> {
     pub account: Option<AccountEvt<'i>>,
 }
 
+#[cfg(feature = "events")]
 #[derive(Clone, Debug)]
 pub(crate) enum BroadcastEvent {
     #[allow(dead_code)]
@@ -342,4 +345,12 @@ impl GaugeState {
     pub fn is_resync(&self) -> bool {
         matches!(self, GaugeState::Resync(_))
     }
+}
+
+#[cfg(feature = "relay")]
+#[derive(Clone)]
+pub(crate) enum RelayBroadcast {
+    Persisted(#[allow(dead_code)] u64),
+    #[allow(dead_code)]
+    Ephemeral(bytes::Bytes),
 }

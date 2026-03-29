@@ -1,6 +1,6 @@
 use crate::db::deser_repo_state;
 use crate::filter::{FilterHandle, FilterMode};
-use crate::ingest::stream::{FirehoseStream, SubscribeReposMessage, decode_frame};
+use crate::ingest::stream::{FirehoseError, FirehoseStream, SubscribeReposMessage, decode_frame};
 use crate::ingest::{BufferTx, IngestMessage};
 use crate::state::AppState;
 use crate::util::WatchEnabledExt;
@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tokio::sync::watch;
-use tracing::{Span, debug, error, info, trace};
+use tracing::{Span, debug, error, info, trace, warn};
 use url::Url;
 
 pub struct FirehoseIngestor {
@@ -52,7 +52,7 @@ impl FirehoseIngestor {
 
             let start_cursor = self
                 .state
-                .relay_cursors
+                .firehose_cursors
                 .peek_with(&self.relay_host, |_, c| {
                     let val = c.load(Ordering::SeqCst);
                     (val > 0).then_some(val)
@@ -90,7 +90,23 @@ impl FirehoseIngestor {
                         match decode_frame(&bytes) {
                             Ok(msg) => self.handle_message(msg).await,
                             Err(e) => {
-                                error!(err = %e, "firehose stream error");
+                                match e {
+                                    // dont disconnect on unknown op or type
+                                    FirehoseError::UnknownOp(op) => {
+                                        warn!(op = %op, "unknown frame op");
+                                        continue;
+                                    },
+                                    FirehoseError::UnknownType(t) => {
+                                        warn!(ty = %t, "unknown frame type");
+                                        continue;
+                                    },
+                                    // everything else is a hard error
+                                    FirehoseError::RelayError { error, message } => {
+                                        let message = message.unwrap_or_else(|| "<no message>".to_owned());
+                                        error!(err = %error, "relay sent error: {message}");
+                                    },
+                                    e => error!(err = %e, "firehose stream error"),
+                                }
                                 break true;
                             }
                         }

@@ -256,7 +256,7 @@ pub struct Commit<'a> {
     pub too_big: bool,
 }
 
-#[derive(serde::Deserialize, Debug, Clone, jacquard_derive::IntoStatic)]
+#[derive(serde::Deserialize, serde::Serialize, Debug, Clone, jacquard_derive::IntoStatic)]
 #[serde(rename_all = "camelCase")]
 pub struct Identity<'a> {
     #[serde(borrow)]
@@ -377,7 +377,7 @@ impl jacquard_common::IntoStatic for AccountStatus<'_> {
     }
 }
 
-#[derive(serde::Deserialize, Debug, Clone, jacquard_derive::IntoStatic)]
+#[derive(serde::Deserialize, serde::Serialize, Debug, Clone, jacquard_derive::IntoStatic)]
 #[serde(rename_all = "camelCase")]
 pub struct Account<'a> {
     pub active: bool,
@@ -388,7 +388,7 @@ pub struct Account<'a> {
     pub time: Datetime,
 }
 
-#[derive(serde::Deserialize, Debug, Clone, jacquard_derive::IntoStatic)]
+#[derive(serde::Deserialize, serde::Serialize, Debug, Clone, jacquard_derive::IntoStatic)]
 #[serde(rename_all = "camelCase")]
 pub struct Sync<'a> {
     #[serde(with = "jacquard_common::serde_bytes_helper")]
@@ -484,7 +484,7 @@ impl<'a> jacquard_common::IntoStatic for InfoName<'a> {
     }
 }
 
-#[derive(serde::Deserialize, Debug, Clone, jacquard_derive::IntoStatic)]
+#[derive(serde::Deserialize, serde::Serialize, Debug, Clone, jacquard_derive::IntoStatic)]
 #[serde(rename_all = "camelCase")]
 pub struct Info<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -501,6 +501,18 @@ pub enum SubscribeReposMessage<'i> {
     Identity(Box<Identity<'i>>),
     Account(Box<Account<'i>>),
     Info(Box<Info<'i>>),
+}
+
+impl<'i> SubscribeReposMessage<'i> {
+    pub fn did<'s>(&'s self) -> Option<&'s Did<'i>> {
+        Some(match self {
+            SubscribeReposMessage::Commit(c) => &c.repo,
+            SubscribeReposMessage::Identity(i) => &i.did,
+            SubscribeReposMessage::Account(a) => &a.did,
+            SubscribeReposMessage::Sync(s) => &s.did,
+            _ => return None,
+        })
+    }
 }
 
 use serde::Deserialize;
@@ -522,7 +534,7 @@ where
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, serde::Serialize)]
 struct EventHeader {
     op: i64,
     t: Option<String>,
@@ -564,6 +576,23 @@ pub fn decode_frame<'i>(bytes: &'i [u8]) -> Result<SubscribeReposMessage<'i>, Fi
     };
 
     Ok(msg)
+}
+
+#[cfg(feature = "relay")]
+#[derive(serde::Serialize)]
+struct EncodeHeader<'a> {
+    op: i64,
+    t: &'a str,
+}
+
+#[cfg(feature = "relay")]
+pub fn encode_frame<T: serde::Serialize>(t: &str, body: &T) -> miette::Result<bytes::Bytes> {
+    let mut buf = serde_ipld_dagcbor::to_vec(&EncodeHeader { op: 1, t })
+        .map_err(|e| miette::miette!("encode_frame header: {e}"))?;
+    buf.extend_from_slice(
+        &serde_ipld_dagcbor::to_vec(body).map_err(|e| miette::miette!("encode_frame body: {e}"))?,
+    );
+    Ok(bytes::Bytes::from(buf))
 }
 
 #[cfg(test)]

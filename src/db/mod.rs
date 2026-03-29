@@ -1,6 +1,10 @@
 use crate::config::Compression;
 use crate::db::compaction::DropPrefixFilterFactory;
-use crate::types::{BroadcastEvent, RepoState};
+#[cfg(feature = "events")]
+use crate::types::BroadcastEvent;
+#[cfg(feature = "relay")]
+use crate::types::RelayBroadcast;
+use crate::types::RepoState;
 
 use fjall::config::{BlockSizePolicy, CompressionPolicy, RestartIntervalPolicy};
 use fjall::{
@@ -51,8 +55,16 @@ pub struct Db {
     pub crawler: Keyspace,
     #[cfg(feature = "backlinks")]
     pub backlinks: Keyspace,
+    #[cfg(feature = "events")]
     pub(crate) event_tx: broadcast::Sender<BroadcastEvent>,
+    #[cfg(feature = "events")]
     pub next_event_id: Arc<AtomicU64>,
+    #[cfg(feature = "relay")]
+    pub(crate) relay_events: Keyspace,
+    #[cfg(feature = "relay")]
+    pub(crate) next_relay_seq: Arc<AtomicU64>,
+    #[cfg(feature = "relay")]
+    pub(crate) relay_broadcast_tx: broadcast::Sender<RelayBroadcast>,
     pub counts_map: HashMap<SmolStr, u64>,
 }
 
@@ -357,6 +369,21 @@ impl Db {
                 .data_block_restart_interval_policy(RestartIntervalPolicy::all(2)),
         )?;
 
+        #[cfg(feature = "relay")]
+        let relay_events = open_ks(
+            "relay_events",
+            opts()
+                // only iterated for cursor replay
+                .expect_point_read_hits(true)
+                .max_memtable_size(mb(cfg.db_events_memtable_size_mb))
+                .data_block_size_policy(BlockSizePolicy::new([kb(64), kb(128)]))
+                .data_block_compression_policy(CompressionPolicy::new([
+                    CompressionType::None,
+                    get_compression("events", 3),
+                ]))
+                .data_block_restart_interval_policy(RestartIntervalPolicy::new([64, 128])),
+        )?;
+
         #[cfg(feature = "backlinks")]
         let backlinks = open_ks(
             "backlinks",
@@ -377,6 +404,7 @@ impl Db {
         // when adding new keyspaces, make sure to add them to the /stats endpoint
         // and also update any relevant /debug/* endpoints
 
+        #[cfg(feature = "events")]
         let (event_tx, _) = broadcast::channel(10000);
 
         let this = Self {
@@ -395,26 +423,56 @@ impl Db {
             crawler,
             #[cfg(feature = "backlinks")]
             backlinks,
+            #[cfg(feature = "events")]
             event_tx,
             counts_map: HashMap::new(),
+            #[cfg(feature = "events")]
             next_event_id: Arc::new(AtomicU64::new(0)),
+            #[cfg(feature = "relay")]
+            relay_events,
+            #[cfg(feature = "relay")]
+            next_relay_seq: Arc::new(AtomicU64::new(0)),
+            #[cfg(feature = "relay")]
+            relay_broadcast_tx: {
+                let (tx, _) = broadcast::channel(10000);
+                tx
+            },
         };
 
         migration::run(&this)?;
 
-        let mut last_id = 0;
-        if let Some(guard) = this.events.iter().next_back() {
-            let k = guard.key().into_diagnostic()?;
-            last_id = u64::from_be_bytes(
-                k.as_ref()
-                    .try_into()
-                    .into_diagnostic()
-                    .wrap_err("expected to be id (8 bytes)")?,
-            );
+        #[cfg(feature = "relay")]
+        {
+            let mut last_relay_seq = 0u64;
+            if let Some(guard) = this.relay_events.iter().next_back() {
+                let k = guard.key().into_diagnostic()?;
+                last_relay_seq = u64::from_be_bytes(
+                    k.as_ref()
+                        .try_into()
+                        .into_diagnostic()
+                        .wrap_err("relay_events: invalid key length")?,
+                );
+            }
+            this.next_relay_seq
+                .store(last_relay_seq + 1, std::sync::atomic::Ordering::Relaxed);
         }
-        // relaxed is fine since we are just initializing the db
-        this.next_event_id
-            .store(last_id + 1, std::sync::atomic::Ordering::Relaxed);
+
+        #[cfg(feature = "events")]
+        {
+            let mut last_id = 0;
+            if let Some(guard) = this.events.iter().next_back() {
+                let k = guard.key().into_diagnostic()?;
+                last_id = u64::from_be_bytes(
+                    k.as_ref()
+                        .try_into()
+                        .into_diagnostic()
+                        .wrap_err("expected to be id (8 bytes)")?,
+                );
+            }
+            // relaxed is fine since we are just initializing the db
+            this.next_event_id
+                .store(last_id + 1, std::sync::atomic::Ordering::Relaxed);
+        }
 
         // load counts into memory
         for guard in this.counts.prefix(keys::COUNT_KS_PREFIX) {
@@ -543,6 +601,8 @@ impl Db {
         )?;
         #[cfg(feature = "backlinks")]
         compact(self.backlinks.clone()).await?;
+        #[cfg(feature = "relay")]
+        compact(self.relay_events.clone()).await?;
         Ok(())
     }
 

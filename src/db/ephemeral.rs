@@ -20,7 +20,10 @@ pub fn ephemeral_ttl_tick(db: &Db, ttl: &Duration) -> miette::Result<()> {
     let cutoff_ts = now.saturating_sub(ttl.as_secs());
 
     // write current watermark
+    #[cfg(feature = "events")]
     let current_event_id = db.next_event_id.load(Ordering::SeqCst);
+    #[cfg(not(feature = "events"))]
+    let current_event_id = 0u64;
     db.cursors
         .insert(
             keys::event_watermark_key(now),

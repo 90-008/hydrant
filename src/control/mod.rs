@@ -22,6 +22,7 @@ use miette::{IntoDiagnostic, Result, WrapErr};
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, error, info};
 
+#[cfg(feature = "events")]
 use crate::backfill::BackfillWorker;
 use crate::config::{Config, SignatureVerification};
 use crate::db::{
@@ -29,13 +30,17 @@ use crate::db::{
     load_persisted_firehose_sources,
 };
 use crate::filter::FilterMode;
+#[cfg(feature = "events")]
 use crate::ingest::worker::FirehoseWorker;
 use crate::state::AppState;
 use crate::types::MarshallableEvt;
 
 use crawler::{CrawlerShared, spawn_crawler_producer};
 use firehose::{FirehoseShared, spawn_firehose_ingestor};
+#[cfg(feature = "events")]
 use stream::event_stream_thread;
+#[cfg(feature = "relay")]
+use stream::relay_stream_thread;
 
 /// infromation about a host hydrant is consuming from.
 pub struct Host {
@@ -213,7 +218,8 @@ impl Hydrant {
             // internal buffered channel between ingestors / backfill and the firehose worker
             let (buffer_tx, buffer_rx) = mpsc::unbounded_channel();
 
-            // 5. spawn the backfill worker
+            // 5. spawn the backfill worker (not used in relay mode)
+            #[cfg(feature = "events")]
             tokio::spawn({
                 let state = state.clone();
                 BackfillWorker::new(
@@ -232,23 +238,27 @@ impl Hydrant {
             });
 
             // 6. re-queue any repos that lost their backfill state, then start the retry worker
-            if let Err(e) = tokio::task::spawn_blocking({
-                let state = state.clone();
-                move || crate::backfill::manager::queue_gone_backfills(&state)
-            })
-            .await
-            .into_diagnostic()?
+            #[cfg(feature = "events")]
             {
-                error!(err = %e, "failed to queue gone backfills");
-                db::check_poisoned_report(&e);
+                if let Err(e) = tokio::task::spawn_blocking({
+                    let state = state.clone();
+                    move || crate::backfill::manager::queue_gone_backfills(&state)
+                })
+                .await
+                .into_diagnostic()?
+                {
+                    error!(err = %e, "failed to queue gone backfills");
+                    db::check_poisoned_report(&e);
+                }
+
+                std::thread::spawn({
+                    let state = state.clone();
+                    move || crate::backfill::manager::retry_worker(state)
+                });
             }
 
-            std::thread::spawn({
-                let state = state.clone();
-                move || crate::backfill::manager::retry_worker(state)
-            });
-
-            // 7. ephemeral GC thread
+            // 7. ephemeral GC thread (not used in relay mode)
+            #[cfg(feature = "events")]
             if config.ephemeral {
                 let state = state.clone();
                 std::thread::Builder::new()
@@ -264,7 +274,7 @@ impl Hydrant {
                 move || loop {
                     std::thread::sleep(persist_interval);
 
-                    state.relay_cursors.iter_sync(|relay, cursor| {
+                    state.firehose_cursors.iter_sync(|relay, cursor| {
                         let seq = cursor.load(Ordering::SeqCst);
                         if seq > 0 {
                             if let Err(e) = db::set_firehose_cursor(&state.db, relay, seq) {
@@ -288,6 +298,7 @@ impl Hydrant {
             });
 
             // 9. events/sec stats ticker
+            #[cfg(feature = "events")]
             tokio::spawn({
                 let state = state.clone();
                 let mut last_id = state.db.next_event_id.load(Ordering::Relaxed);
@@ -529,8 +540,22 @@ impl Hydrant {
             let handle = tokio::runtime::Handle::current();
             let firehose_worker = std::thread::spawn({
                 let state = state.clone();
+                let handle = handle.clone();
                 move || {
-                    FirehoseWorker::new(
+                    #[cfg(feature = "relay")]
+                    return crate::ingest::relay_worker::RelayWorker::new(
+                        state,
+                        buffer_rx,
+                        matches!(config.verify_signatures, SignatureVerification::Full),
+                        config.firehose_workers,
+                        crate::ingest::validation::ValidationOptions {
+                            verify_mst: config.verify_mst,
+                            rev_clock_skew_secs: config.rev_clock_skew_secs,
+                        },
+                    )
+                    .run(handle);
+                    #[cfg(feature = "events")]
+                    return FirehoseWorker::new(
                         state,
                         buffer_rx,
                         matches!(config.verify_signatures, SignatureVerification::Full),
@@ -541,7 +566,7 @@ impl Hydrant {
                             rev_clock_skew_secs: config.rev_clock_skew_secs,
                         },
                     )
-                    .run(handle)
+                    .run(handle);
                 }
             });
 
@@ -594,6 +619,7 @@ impl Hydrant {
     ///
     /// multiple concurrent subscribers each receive a full independent copy of the stream.
     /// the stream ends when the `EventStream` is dropped.
+    #[cfg(feature = "events")]
     pub fn subscribe(&self, cursor: Option<u64>) -> EventStream {
         let (tx, rx) = mpsc::channel(500);
         let state = self.state.clone();
@@ -608,6 +634,30 @@ impl Hydrant {
             .expect("failed to spawn stream thread");
 
         EventStream(rx)
+    }
+
+    /// subscribe to the relay's ordered `subscribeRepos` event stream.
+    ///
+    /// returns a [`RelayEventStream`] that yields pre-encoded CBOR binary frames
+    /// ready to forward directly to ATProto clients via WebSocket.
+    ///
+    /// - if `cursor` is `None`, streaming starts from the current head (live tail only).
+    /// - if `cursor` is `Some(seq)`, all persisted events from that seq onward are replayed first.
+    #[cfg(feature = "relay")]
+    pub fn subscribe_repos(&self, cursor: Option<u64>) -> RelayEventStream {
+        let (tx, rx) = mpsc::channel(500);
+        let state = self.state.clone();
+        let runtime = tokio::runtime::Handle::current();
+
+        std::thread::Builder::new()
+            .name("hydrant-relay-stream".into())
+            .spawn(move || {
+                let _g = runtime.enter();
+                relay_stream_thread(state, tx, cursor);
+            })
+            .expect("failed to spawn relay stream thread");
+
+        RelayEventStream(rx)
     }
 
     /// return database counts and on-disk sizes for all keyspaces.
@@ -785,12 +835,30 @@ impl axum::extract::FromRef<Hydrant> for Arc<AppState> {
 /// implements [`futures::Stream`] and can be used with `StreamExt::next`,
 /// `while let Some(evt) = stream.next().await`, `forward`, etc.
 /// the stream terminates when the underlying channel closes (i.e. hydrant shuts down).
+#[cfg(feature = "events")]
 pub struct EventStream(mpsc::Receiver<Event>);
 
+#[cfg(feature = "events")]
 impl Stream for EventStream {
     type Item = Event;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.0.poll_recv(cx)
+    }
+}
+
+/// the relay event stream produced by [`Hydrant::subscribe_repos`].
+#[cfg(feature = "relay")]
+pub struct RelayEventStream(mpsc::Receiver<bytes::Bytes>);
+
+#[cfg(feature = "relay")]
+impl futures::Stream for RelayEventStream {
+    type Item = bytes::Bytes;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
         self.0.poll_recv(cx)
     }
 }

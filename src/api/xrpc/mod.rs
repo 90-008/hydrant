@@ -39,9 +39,12 @@ mod get_repo_status;
 mod list_hosts;
 mod list_records;
 mod list_repos;
+#[cfg(feature = "relay")]
+mod subscribe_repos;
 
 pub fn router() -> Router<Hydrant> {
-    Router::new()
+    #[allow(unused_mut)]
+    let mut r = Router::new()
         .route(GetRecordRequest::PATH, get(get_record::handle))
         .route(ListRecordsRequest::PATH, get(list_records::handle))
         .route(CountRecords::PATH, get(count_records::handle))
@@ -55,7 +58,17 @@ pub fn router() -> Router<Hydrant> {
         .route(GetLatestCommitRequest::PATH, get(get_latest_commit::handle))
         .route(GetRepoRequest::PATH, get(get_repo::handle))
         .route(GetRepoStatusRequest::PATH, get(get_repo_status::handle))
-        .route(ListReposRequest::PATH, get(list_repos::handle))
+        .route(ListReposRequest::PATH, get(list_repos::handle));
+
+    #[cfg(feature = "relay")]
+    {
+        r = r.route(
+            "/xrpc/com.atproto.sync.subscribeRepos",
+            axum::routing::get(subscribe_repos::handle),
+        );
+    }
+
+    r
 }
 
 #[derive(Debug)]

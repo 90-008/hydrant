@@ -13,6 +13,7 @@ mod firehose;
 mod ingestion;
 mod repos;
 mod stats;
+#[cfg(feature = "events")]
 mod stream;
 mod xrpc;
 
@@ -20,8 +21,10 @@ pub async fn serve(hydrant: Hydrant, port: u16) -> miette::Result<()> {
     #[allow(unused_mut)]
     let mut app = Router::new()
         .route("/health", get(|| async { "OK" }))
-        .route("/stats", get(stats::get_stats))
-        .nest("/stream", stream::router())
+        .route("/stats", get(stats::get_stats));
+    #[cfg(feature = "events")]
+    let app = app.nest("/stream", stream::router());
+    let app = app
         .merge(xrpc::router())
         .merge(filter::router())
         .merge(repos::router())
@@ -31,9 +34,7 @@ pub async fn serve(hydrant: Hydrant, port: u16) -> miette::Result<()> {
         .merge(db::router());
 
     #[cfg(feature = "backlinks")]
-    {
-        app = app.merge(crate::backlinks::api::router());
-    }
+    let app = app.merge(crate::backlinks::api::router());
 
     let app = app
         .with_state(hydrant)

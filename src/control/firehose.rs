@@ -48,7 +48,7 @@ pub(super) async fn spawn_firehose_ingestor(
     let start = db::get_firehose_cursor(&state.db, relay_url).await?;
     // insert into relay_cursors if not already present; existing in-memory cursor takes precedence
     let _ = state
-        .relay_cursors
+        .firehose_cursors
         .insert_async(relay_url.clone(), AtomicI64::new(start.unwrap_or(0)))
         .await;
 
@@ -115,7 +115,7 @@ impl FirehoseHandle {
             .await
             .into_diagnostic()??;
 
-        self.state.relay_cursors.peek_with(&relay_url, |_, c| {
+        self.state.firehose_cursors.peek_with(&relay_url, |_, c| {
             c.store(0, Ordering::SeqCst);
         });
         Ok(())
@@ -190,7 +190,7 @@ impl FirehoseHandle {
         }
 
         // remove from relay_cursors (persist thread will stop tracking it)
-        self.state.relay_cursors.remove_async(url).await;
+        self.state.firehose_cursors.remove_async(url).await;
 
         if self.persisted.remove_async(url).await.is_some() {
             let db = self.state.db.clone();

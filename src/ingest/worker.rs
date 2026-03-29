@@ -1,10 +1,11 @@
+use super::*;
 use crate::db::{self, keys};
 use crate::filter::FilterMode;
 use crate::ingest::stream::{Account, Commit, Identity, SubscribeReposMessage, Sync};
 use crate::ingest::validation::{
-    CommitValidationError, SyncValidationError, ValidationOptions, validate_commit, validate_sync,
+    CommitValidationError, SyncValidationError, ValidatedCommit, ValidatedSync, ValidationContext,
+    ValidationOptions,
 };
-use crate::ingest::{BufferRx, IngestMessage};
 use crate::ops;
 use crate::resolver::{NoSigningKeyError, ResolverError};
 use crate::state::AppState;
@@ -14,17 +15,16 @@ use fjall::OwnedWriteBatch;
 
 use jacquard_common::IntoStatic;
 use jacquard_common::cowstr::ToCowStr;
-use jacquard_common::types::crypto::PublicKey;
 use jacquard_common::types::did::Did;
 use jacquard_repo::error::CommitError;
 use miette::{Diagnostic, IntoDiagnostic, Result};
 use rand::Rng;
-use smol_str::ToSmolStr;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::sync::atomic::Ordering::SeqCst;
 use thiserror::Error;
+use tokio::runtime::Handle;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, trace, warn};
 
@@ -50,15 +50,6 @@ impl From<miette::Report> for IngestError {
     fn from(report: miette::Report) -> Self {
         IngestError::Generic(report)
     }
-}
-
-enum HostAuthorityOutcome {
-    /// stored pds matched the source host immediately.
-    Authorized,
-    /// pds migrated: doc now points to this host, but our stored state was stale. trigger backfill.
-    Migration,
-    /// host did not match even after doc resolution. reject the message.
-    WrongHost,
 }
 
 // gate returned by check_repo_state, tells the shard loop what to do with the message
@@ -101,8 +92,7 @@ struct WorkerContext<'a> {
     added_blocks: &'a mut i64,
     records_delta: &'a mut i64,
     broadcast_events: &'a mut Vec<BroadcastEvent>,
-    handle: &'a tokio::runtime::Handle,
-    validation_opts: &'a ValidationOptions,
+    vctx: ValidationContext<'a>,
 }
 
 impl FirehoseWorker {
@@ -127,7 +117,7 @@ impl FirehoseWorker {
     // starts the worker threads and the main dispatch loop
     // the dispatch loop reads from the firehose channel and
     // distributes messages to shards based on the hash of the DID
-    pub fn run(mut self, handle: tokio::runtime::Handle) -> Result<()> {
+    pub fn run(mut self, handle: Handle) -> Result<()> {
         let mut shards = Vec::with_capacity(self.num_shards);
 
         for i in 0..self.num_shards {
@@ -191,7 +181,7 @@ impl FirehoseWorker {
         state: Arc<AppState>,
         verify_signatures: bool,
         ephemeral: bool,
-        handle: tokio::runtime::Handle,
+        handle: Handle,
         validation_opts: Arc<ValidationOptions>,
     ) {
         let _guard = handle.enter();
@@ -212,10 +202,11 @@ impl FirehoseWorker {
                 added_blocks: &mut added_blocks,
                 records_delta: &mut records_delta,
                 broadcast_events: &mut broadcast_events,
-                handle: &handle,
+                vctx: ValidationContext {
+                    opts: &validation_opts,
+                },
                 verify_signatures,
                 ephemeral,
-                validation_opts: &validation_opts,
             };
 
             match msg {
@@ -258,10 +249,12 @@ impl FirehoseWorker {
                         }
                     }
                 }
-                IngestMessage::Firehose { relay, is_pds, msg } => {
-                    let _span = tracing::info_span!("firehose", relay = %relay).entered();
-                    // only enforce host authority when the source is a direct PDS connection
-                    let source_host = is_pds.then(|| relay.host_str()).flatten();
+                IngestMessage::Firehose {
+                    relay: firehose,
+                    is_pds,
+                    msg,
+                } => {
+                    let _span = tracing::info_span!("firehose", relay = %firehose).entered();
                     let (did, seq) = match &msg {
                         SubscribeReposMessage::Commit(c) => (&c.repo, c.seq),
                         SubscribeReposMessage::Identity(i) => (&i.did, i.seq),
@@ -278,8 +271,8 @@ impl FirehoseWorker {
                             }
                             error!(did = %did, err = %e, "error in check_repo_state");
                             state
-                                .relay_cursors
-                                .peek_with(&relay, |_, c| c.store(seq, SeqCst));
+                                .firehose_cursors
+                                .peek_with(&firehose, |_, c| c.store(seq, SeqCst));
                             continue;
                         }
                     };
@@ -299,6 +292,60 @@ impl FirehoseWorker {
                             }
                         }
                         ProcessGate::Ready(mut repo_state) => {
+                            // first validate the pds host
+                            if let Some(host) = firehose.host_str()
+                                && is_pds
+                            {
+                                let authority = match Self::check_host_authority(
+                                    &mut ctx,
+                                    did,
+                                    &mut repo_state,
+                                    host,
+                                ) {
+                                    Ok(a) => a,
+                                    Err(e) => {
+                                        error!(did = %did, err = %e, "failed to check host authority");
+                                        state
+                                            .firehose_cursors
+                                            .peek_with(&firehose, |_, c| c.store(seq, SeqCst));
+                                        continue;
+                                    }
+                                };
+                                match authority {
+                                    AuthorityOutcome::Authorized => {}
+                                    AuthorityOutcome::WasStale => {
+                                        // pds migrated: our data may be stale, backfill from the new host
+                                        warn!(did = %did, source_host = host, "pds migration detected, triggering backfill");
+                                        if let Err(e) =
+                                            Self::trigger_backfill(&mut ctx, did, repo_state)
+                                        {
+                                            error!(did = %did, err = %e, "failed to trigger backfill");
+                                        } else if let SubscribeReposMessage::Commit(commit) = &msg {
+                                            if let Err(e) = ops::persist_to_resync_buffer(
+                                                &state.db, did, commit,
+                                            ) {
+                                                error!(
+                                                    did = %did, err = %e,
+                                                    "failed to persist commit to resync_buffer"
+                                                );
+                                            }
+                                        }
+                                        state
+                                            .firehose_cursors
+                                            .peek_with(&firehose, |_, c| c.store(seq, SeqCst));
+                                        continue;
+                                    }
+                                    // todo: ideally ban pds
+                                    AuthorityOutcome::WrongHost { expected } => {
+                                        warn!(did = %did, got = host, expected = %expected, "commit rejected: wrong host");
+                                        state
+                                            .firehose_cursors
+                                            .peek_with(&firehose, |_, c| c.store(seq, SeqCst));
+                                        continue;
+                                    }
+                                }
+                            }
+
                             let pre_status = repo_state.status.clone();
 
                             // if it was in deactivated/takendown/suspended state, we can mark it
@@ -332,8 +379,10 @@ impl FirehoseWorker {
                                                     "failed to transition inactive repo to synced"
                                                 );
                                                 state
-                                                    .relay_cursors
-                                                    .peek_with(&relay, |_, c| c.store(seq, SeqCst));
+                                                    .firehose_cursors
+                                                    .peek_with(&firehose, |_, c| {
+                                                        c.store(seq, SeqCst)
+                                                    });
                                                 continue;
                                             }
                                         }
@@ -341,14 +390,8 @@ impl FirehoseWorker {
                                 }
                             }
 
-                            match Self::process_message(
-                                &mut ctx,
-                                &msg,
-                                did,
-                                repo_state,
-                                pre_status,
-                                source_host,
-                            ) {
+                            match Self::process_message(&mut ctx, &msg, did, repo_state, pre_status)
+                            {
                                 Ok(RepoProcessResult::Ok(_)) => {}
                                 Ok(RepoProcessResult::Deleted) => {
                                     state.db.update_count("repos", -1);
@@ -386,10 +429,9 @@ impl FirehoseWorker {
                         }
                     }
 
-                    // todo: consider not using seqcst
                     state
-                        .relay_cursors
-                        .peek_with(&relay, |_, c| c.store(seq, SeqCst));
+                        .firehose_cursors
+                        .peek_with(&firehose, |_, c| c.store(seq, SeqCst));
                 }
             }
 
@@ -407,7 +449,7 @@ impl FirehoseWorker {
                 let _ = state.db.event_tx.send(evt);
             }
 
-            state.db.inner.persist(fjall::PersistMode::Buffer).ok();
+            // state.db.inner.persist(fjall::PersistMode::Buffer).ok();
         }
     }
 
@@ -428,16 +470,15 @@ impl FirehoseWorker {
         did: &Did,
         repo_state: RepoState<'s>,
         pre_status: RepoStatus,
-        source_host: Option<&str>,
     ) -> Result<RepoProcessResult<'s, 'c>, IngestError> {
         match msg {
             SubscribeReposMessage::Commit(commit) => {
                 trace!(did = %did, "processing commit");
-                Self::handle_commit(ctx, did, repo_state, commit, source_host)
+                Self::handle_commit(ctx, did, repo_state, commit)
             }
             SubscribeReposMessage::Sync(sync) => {
                 debug!(did = %did, "processing sync");
-                Self::handle_sync(ctx, did, repo_state, sync, source_host)
+                Self::handle_sync(ctx, did, repo_state, sync)
             }
             SubscribeReposMessage::Identity(identity) => {
                 debug!(did = %did, "processing identity");
@@ -459,103 +500,21 @@ impl FirehoseWorker {
         did: &Did,
         mut repo_state: RepoState<'s>,
         commit: &'c Commit<'c>,
-        source_host: Option<&str>,
     ) -> Result<RepoProcessResult<'s, 'c>, IngestError> {
         repo_state.advance_message_time(commit.time.0.timestamp_millis());
 
-        if let Some(host) = source_host {
-            match Self::check_host_authority(ctx, did, &mut repo_state, host)? {
-                HostAuthorityOutcome::Authorized => {}
-                HostAuthorityOutcome::Migration => {
-                    // pds migrated: our data may be stale, backfill from the new host
-                    warn!(did = %did, source_host = host, "pds migration detected, triggering backfill");
-                    let mut batch = ctx.state.db.inner.batch();
-                    let _repo_state = ops::update_repo_status(
-                        &mut batch,
-                        &ctx.state.db,
-                        did,
-                        repo_state,
-                        RepoStatus::Backfilling,
-                    )?;
-                    batch.commit().into_diagnostic()?;
-                    ctx.state
-                        .db
-                        .update_gauge_diff(&GaugeState::Synced, &GaugeState::Pending);
-                    ctx.state.notify_backfill();
-                    return Ok(RepoProcessResult::NeedsBackfill(Some(commit)));
-                }
-                // todo: ideally ban pds
-                HostAuthorityOutcome::WrongHost => {
-                    warn!(did = %did, source_host = host, pds = ?repo_state.pds, "commit rejected: wrong host");
-                    return Ok(RepoProcessResult::Ok(repo_state));
-                }
-            }
-        }
-
-        // validate the commit: stale rev, size limits, future rev, CAR parse, field
-        // consistency, signature, and chain-break detection
-        let signing_key = Self::fetch_key(ctx, did)?;
-        let validated = match validate_commit(
-            commit,
-            Some(&repo_state),
-            signing_key.as_ref(),
-            ctx.validation_opts,
-            ctx.handle,
-        ) {
-            Ok(v) => v,
-            Err(CommitValidationError::StaleRev) => {
-                debug!(
-                    did = %did,
-                    commit_rev = %commit.rev,
-                    "skipping replayed commit"
-                );
-                return Ok(RepoProcessResult::Ok(repo_state));
-            }
-            Err(CommitValidationError::SigFailure { .. }) => {
-                // refresh key and retry once
-                Self::refresh_doc(ctx, &mut repo_state, did)?;
-                let refreshed_key = Self::fetch_key(ctx, did)?;
-                match validate_commit(
-                    commit,
-                    Some(&repo_state),
-                    refreshed_key.as_ref(),
-                    ctx.validation_opts,
-                    ctx.handle,
-                ) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        warn!(did = %did, err = %e, "commit rejected after key refresh");
-                        return Ok(RepoProcessResult::Ok(repo_state));
-                    }
-                }
-            }
-            Err(e) => {
-                warn!(did = %did, err = %e, "commit rejected");
-                return Ok(RepoProcessResult::Ok(repo_state));
-            }
+        let Some(validated) = ctx.validate_commit(did, &mut repo_state, commit)? else {
+            return Ok(RepoProcessResult::Ok(repo_state));
         };
 
-        // chain break: prev_data or since mismatch against last known state → backfill
-        if let Some(cb) = &validated.chain_break {
+        if validated.chain_break.is_broken() {
             warn!(
                 did = %did,
-                since_mismatch = cb.since_mismatch,
-                prev_data_mismatch = cb.prev_data_mismatch,
+                broken = ?validated.chain_break,
                 "chain break detected, triggering backfill"
             );
-            let mut batch = ctx.state.db.inner.batch();
-            let _repo_state = ops::update_repo_status(
-                &mut batch,
-                &ctx.state.db,
-                did,
-                repo_state,
-                RepoStatus::Backfilling,
-            )?;
-            batch.commit().into_diagnostic()?;
-            ctx.state
-                .db
-                .update_gauge_diff(&GaugeState::Synced, &GaugeState::Pending);
-            ctx.state.notify_backfill();
+            Self::trigger_backfill(ctx, did, repo_state)?;
+            // not updating repo state root commit since we are backfilling anyway
             return Ok(RepoProcessResult::NeedsBackfill(Some(commit)));
         }
 
@@ -582,72 +541,29 @@ impl FirehoseWorker {
         did: &Did,
         mut repo_state: RepoState<'s>,
         sync: &'c Sync<'c>,
-        source_host: Option<&str>,
     ) -> Result<RepoProcessResult<'s, 'c>, IngestError> {
         repo_state.advance_message_time(sync.time.0.timestamp_millis());
 
-        if let Some(host) = source_host {
-            match Self::check_host_authority(ctx, did, &mut repo_state, host)? {
-                HostAuthorityOutcome::Authorized | HostAuthorityOutcome::Migration => {
-                    // migration is fine here — sync already triggers a backfill below
-                }
-                // todo: ideally ban pds
-                HostAuthorityOutcome::WrongHost => {
-                    warn!(did = %did, source_host = host, pds = ?repo_state.pds, "sync rejected: wrong host");
-                    return Ok(RepoProcessResult::Ok(repo_state));
-                }
-            }
-        }
-
-        // validate: size limit, CAR parse, field consistency, signature
-        let signing_key = Self::fetch_key(ctx, did)?;
-        let validated = match validate_sync(sync, signing_key.as_ref(), ctx.handle) {
-            Ok(v) => v,
-            Err(SyncValidationError::SigFailure { .. }) => {
-                // refresh key and retry once (same pattern as handle_commit)
-                Self::refresh_doc(ctx, &mut repo_state, did)?;
-                let refreshed_key = Self::fetch_key(ctx, did)?;
-                match validate_sync(sync, refreshed_key.as_ref(), ctx.handle) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        warn!(did = %did, err = %e, "sync rejected after key refresh");
-                        return Ok(RepoProcessResult::Ok(repo_state));
-                    }
-                }
-            }
-            Err(e) => {
-                warn!(did = %did, err = %e, "sync rejected");
-                return Ok(RepoProcessResult::Ok(repo_state));
-            }
+        let Some(validated) = ctx.validate_sync(did, &mut repo_state, sync)? else {
+            return Ok(RepoProcessResult::Ok(repo_state));
         };
 
         // skip noop syncs (data CID unchanged)
         if let Some(current_commit) = &repo_state.root {
-            if current_commit.data == validated.data_cid.to_ipld().expect("valid cid") {
+            if current_commit.data == validated.commit_obj.data {
                 debug!(did = %did, "skipping noop sync");
                 return Ok(RepoProcessResult::Ok(repo_state));
             }
 
-            if validated.rev.as_str() <= current_commit.rev.to_tid().as_str() {
+            if validated.commit_obj.rev.as_str() <= current_commit.rev.to_tid().as_str() {
                 debug!(did = %did, "skipping replayed sync");
                 return Ok(RepoProcessResult::Ok(repo_state));
             }
         }
+        // not updating repo state root commit since we are backfilling anyway
 
         warn!(did = %did, "sync event, triggering backfill");
-        let mut batch = ctx.state.db.inner.batch();
-        repo_state = ops::update_repo_status(
-            &mut batch,
-            &ctx.state.db,
-            did,
-            repo_state,
-            RepoStatus::Backfilling,
-        )?;
-        batch.commit().into_diagnostic()?;
-        ctx.state
-            .db
-            .update_gauge_diff(&GaugeState::Synced, &GaugeState::Pending);
-        ctx.state.notify_backfill();
+        let repo_state = Self::trigger_backfill(ctx, did, repo_state)?;
         Ok(RepoProcessResult::Ok(repo_state))
     }
 
@@ -664,10 +580,11 @@ impl FirehoseWorker {
         }
         repo_state.advance_message_time(event_ms);
 
+        // todo: make this match relay sync behaviour
         let changed = if identity.handle.is_none() {
             // no handle sent is basically "invalidate your caches"
             ctx.state.resolver.invalidate_sync(did);
-            let doc = ctx.handle.block_on(ctx.state.resolver.resolve_doc(did))?;
+            let doc = Handle::current().block_on(ctx.state.resolver.resolve_doc(did))?;
             repo_state.update_from_doc(doc)
         } else {
             let old_handle = repo_state.handle.clone();
@@ -724,7 +641,7 @@ impl FirehoseWorker {
             status: account.status.as_ref().map(|s| s.to_cowstr().into_static()),
         };
 
-        Self::refresh_doc(ctx, &mut repo_state, did)?;
+        ctx.refresh_doc(&mut repo_state, did)?;
 
         if !account.active {
             use crate::ingest::stream::AccountStatus;
@@ -735,31 +652,7 @@ impl FirehoseWorker {
                     return Ok(RepoProcessResult::Deleted);
                 }
                 status => {
-                    let target_status = match status {
-                        Some(status) => match status {
-                            AccountStatus::Deleted => {
-                                unreachable!("deleted account status is handled before")
-                            }
-                            AccountStatus::Takendown => RepoStatus::Takendown,
-                            AccountStatus::Suspended => RepoStatus::Suspended,
-                            AccountStatus::Deactivated => RepoStatus::Deactivated,
-                            AccountStatus::Throttled => RepoStatus::Error("throttled".into()),
-                            AccountStatus::Desynchronized => {
-                                RepoStatus::Error("desynchronized".into())
-                            }
-                            AccountStatus::Other(s) => {
-                                warn!(
-                                    did = %did, status = %s,
-                                    "unknown account status, will put in error state"
-                                );
-                                RepoStatus::Error(s.to_smolstr())
-                            }
-                        },
-                        None => {
-                            warn!(did = %did, "account inactive but no status provided");
-                            RepoStatus::Error("unknown".into())
-                        }
-                    };
+                    let target_status = inactive_account_repo_status(did, status);
 
                     if repo_state.status == target_status {
                         debug!(did = %did, ?target_status, "account status unchanged");
@@ -923,7 +816,7 @@ impl FirehoseWorker {
             let commit: Commit = rmp_serde::from_slice(&value).into_diagnostic()?;
 
             // buffered commits have already been source-checked on arrival; skip host check
-            let res = Self::handle_commit(ctx, did, repo_state, &commit, None);
+            let res = Self::handle_commit(ctx, did, repo_state, &commit);
             let res = match res {
                 Ok(r) => r,
                 Err(e) => {
@@ -952,72 +845,118 @@ impl FirehoseWorker {
         Ok(RepoProcessResult::Ok(repo_state))
     }
 
-    /// check that `source_host` is the authoritative PDS for `did`.
-    ///
-    /// - `Authorized`: stored pds matched immediately (fast path).
-    /// - `Migration`: stored pds was wrong but doc resolved to this host; caller should backfill.
-    /// - `WrongHost`: host did not match even after doc resolution; caller should reject.
+    // transitions repo to Backfilling, commits the status change immediately (separate from
+    // ctx.batch), updates the gauge, and pings the backfill worker. returns the updated state.
+    fn trigger_backfill<'s>(
+        ctx: &mut WorkerContext,
+        did: &Did,
+        repo_state: RepoState<'s>,
+    ) -> Result<RepoState<'s>, IngestError> {
+        let mut batch = ctx.state.db.inner.batch();
+        let repo_state = ops::update_repo_status(
+            &mut batch,
+            &ctx.state.db,
+            did,
+            repo_state,
+            RepoStatus::Backfilling,
+        )?;
+        batch.commit().into_diagnostic()?;
+        ctx.state
+            .db
+            .update_gauge_diff(&GaugeState::Synced, &GaugeState::Pending);
+        ctx.state.notify_backfill();
+        Ok(repo_state)
+    }
+
     fn check_host_authority(
         ctx: &mut WorkerContext,
         did: &Did,
         repo_state: &mut RepoState,
         source_host: &str,
-    ) -> Result<HostAuthorityOutcome, IngestError> {
-        let pds_host = repo_state
-            .pds
-            .as_deref()
-            .and_then(|pds| url::Url::parse(pds).ok())
-            .and_then(|u| u.host_str().map(str::to_owned));
-
-        if pds_host.as_deref() == Some(source_host) {
-            return Ok(HostAuthorityOutcome::Authorized);
+    ) -> Result<AuthorityOutcome, IngestError> {
+        let outcome =
+            super::check_host_authority(&ctx.state.resolver, did, repo_state, source_host)?;
+        if !matches!(outcome, AuthorityOutcome::Authorized) {
+            ctx.batch.insert(
+                &ctx.state.db.repos,
+                keys::repo_key(did),
+                crate::db::ser_repo_state(repo_state)?,
+            );
         }
-
-        // unknown pds or host mismatch — resolve doc to verify or detect a migration
-        Self::refresh_doc(ctx, repo_state, did)?;
-
-        let updated_host = repo_state
-            .pds
-            .as_deref()
-            .and_then(|pds| url::Url::parse(pds).ok())
-            .and_then(|u| u.host_str().map(str::to_owned));
-
-        if updated_host.as_deref() == Some(source_host) {
-            Ok(HostAuthorityOutcome::Migration)
-        } else {
-            Ok(HostAuthorityOutcome::WrongHost)
-        }
+        Ok(outcome)
     }
+}
 
-    // refreshes the handle, pds url and signing key of a did
-    fn refresh_doc(
-        ctx: &mut WorkerContext,
-        repo_state: &mut RepoState,
-        did: &Did,
-    ) -> Result<(), IngestError> {
-        ctx.state.resolver.invalidate_sync(did);
-        let doc = ctx.handle.block_on(ctx.state.resolver.resolve_doc(did))?;
-        repo_state.update_from_doc(doc);
-        repo_state.touch();
-        ctx.batch.insert(
-            &ctx.state.db.repos,
+impl WorkerContext<'_> {
+    fn refresh_doc(&mut self, repo_state: &mut RepoState, did: &Did) -> Result<(), IngestError> {
+        super::refresh_doc(&self.state.resolver, did, repo_state)?;
+        self.batch.insert(
+            &self.state.db.repos,
             keys::repo_key(did),
-            crate::db::ser_repo_state(&repo_state)?,
+            crate::db::ser_repo_state(repo_state)?,
         );
         Ok(())
     }
 
-    fn fetch_key(
-        ctx: &WorkerContext,
+    fn fetch_key(&self, did: &Did) -> Result<Option<PublicKey<'static>>> {
+        super::fetch_key(&self.state.resolver, self.verify_signatures, did)
+    }
+
+    fn validate_commit<'s, 'c>(
+        &mut self,
         did: &Did,
-    ) -> Result<Option<PublicKey<'static>>, IngestError> {
-        if ctx.verify_signatures {
-            let key = ctx
-                .handle
-                .block_on(ctx.state.resolver.resolve_signing_key(did))?;
-            Ok(Some(key))
-        } else {
-            Ok(None)
+        repo_state: &mut RepoState<'s>,
+        commit: &'c Commit<'c>,
+    ) -> Result<Option<ValidatedCommit<'c>>, IngestError> {
+        let key = self.fetch_key(did)?;
+        match self.vctx.validate_commit(commit, repo_state, key.as_ref()) {
+            Ok(v) => return Ok(Some(v)),
+            Err(CommitValidationError::StaleRev) => {
+                debug!(did = %did, commit_rev = %commit.rev, "skipping replayed commit");
+                return Ok(None);
+            }
+            Err(CommitValidationError::SigFailure) => {}
+            Err(e) => {
+                warn!(did = %did, err = %e, "commit rejected");
+                return Ok(None);
+            }
+        }
+
+        self.refresh_doc(repo_state, did)?;
+        let key = self.fetch_key(did)?;
+        match self.vctx.validate_commit(commit, repo_state, key.as_ref()) {
+            Ok(v) => Ok(Some(v)),
+            Err(e) => {
+                warn!(did = %did, err = %e, "commit rejected after key refresh");
+                Ok(None)
+            }
+        }
+    }
+
+    fn validate_sync<'s>(
+        &mut self,
+        did: &Did,
+        repo_state: &mut RepoState<'s>,
+        sync: &Sync<'_>,
+    ) -> Result<Option<ValidatedSync>, IngestError> {
+        let key = self.fetch_key(did)?;
+        match self.vctx.validate_sync(sync, key.as_ref()) {
+            Ok(v) => return Ok(Some(v)),
+            Err(SyncValidationError::SigFailure) => {}
+            Err(e) => {
+                warn!(did = %did, err = %e, "sync rejected");
+                return Ok(None);
+            }
+        }
+
+        self.refresh_doc(repo_state, did)?;
+        let key = self.fetch_key(did)?;
+        match self.vctx.validate_sync(sync, key.as_ref()) {
+            Ok(v) => Ok(Some(v)),
+            Err(e) => {
+                warn!(did = %did, err = %e, "sync rejected after key refresh");
+                Ok(None)
+            }
         }
     }
 }

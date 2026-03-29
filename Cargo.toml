@@ -4,9 +4,11 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
-default = []
+default = ["events"]
 sync_all = []
 backlinks = []
+relay = []
+events = []
 
 [dependencies]
 tokio = { version = "1.0", features = ["full"] }

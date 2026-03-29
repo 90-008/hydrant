@@ -16,9 +16,7 @@ pub struct AppState {
     pub db: Db,
     pub resolver: Resolver,
     pub(crate) filter: FilterHandle,
-    /// per-relay firehose cursors. values use interior mutability so they can be
-    /// updated through the lock-free `peek_with` reads in the ingest worker.
-    pub relay_cursors: scc::HashIndex<Url, AtomicI64>,
+    pub firehose_cursors: scc::HashIndex<Url, AtomicI64>,
     pub backfill_notify: Notify,
     pub crawler_enabled: watch::Sender<bool>,
     pub firehose_enabled: watch::Sender<bool>,
@@ -53,7 +51,7 @@ impl AppState {
             db,
             resolver,
             filter,
-            relay_cursors,
+            firehose_cursors: relay_cursors,
             backfill_notify: Notify::new(),
             crawler_enabled,
             firehose_enabled,

@@ -1,5 +1,4 @@
 use jacquard_common::IntoStatic;
-use jacquard_common::types::cid::Cid;
 use jacquard_common::types::crypto::PublicKey;
 use jacquard_repo::MemoryBlockStore;
 use jacquard_repo::Mst;
@@ -50,10 +49,8 @@ pub enum CommitValidationError {
     #[error("field mismatch in {field}")]
     FieldMismatch { field: &'static str },
     /// signature verification failed.
-    /// `refreshed: false` means the key has not been re-fetched yet;
-    /// the caller should refresh and retry with the same commit.
     #[error("signature verification failed")]
-    SigFailure { refreshed: bool },
+    SigFailure,
     /// a block, op count, or record exceeds the ATProto size limits
     #[error("size limit exceeded: {0}")]
     SizeLimitExceeded(SizeLimitKind),
@@ -80,11 +77,12 @@ pub enum SyncValidationError {
     FieldMismatch { field: &'static str },
     /// signature verification failed
     #[error("signature verification failed")]
-    SigFailure { refreshed: bool },
+    SigFailure,
 }
 
 /// indicates that the commit's chain pointers do not match the last known repo state.
 /// this is not a hard rejection so callers can decide whta they want to do
+#[derive(Default, Debug)]
 pub struct ChainBreak {
     /// msg.since is present and does not match the last known rev
     pub since_mismatch: bool,
@@ -92,23 +90,24 @@ pub struct ChainBreak {
     pub prev_data_mismatch: bool,
 }
 
+impl ChainBreak {
+    pub fn is_broken(&self) -> bool {
+        self.since_mismatch || self.prev_data_mismatch
+    }
+}
+
 /// a successfully validated `#commit` message, carrying pre-parsed data for apply_commit
 pub struct ValidatedCommit<'c> {
     pub commit: &'c Commit<'c>,
     /// result of parse_car_bytes, already done so apply_commit does not re-parse
     pub parsed_blocks: ParsedCar,
-    /// deserialized and signature-verified commit object
     pub commit_obj: AtpCommit<'static>,
-    /// Some if chain pointers are inconsistent with last known state
-    pub chain_break: Option<ChainBreak>,
+    pub chain_break: ChainBreak,
 }
 
 /// a successfully validated `#sync` message
 pub struct ValidatedSync {
-    /// MST root CID from the commit object, used to detect noop syncs
-    pub data_cid: Cid<'static>,
-    /// rev string from the commit object, used to detect stale syncs
-    pub rev: String,
+    pub commit_obj: AtpCommit<'static>,
 }
 
 pub struct ValidationOptions {
@@ -127,6 +126,30 @@ impl Default for ValidationOptions {
     }
 }
 
+/// all methods panic if called outside a tokio runtime context.
+pub struct ValidationContext<'a> {
+    pub opts: &'a ValidationOptions,
+}
+
+impl ValidationContext<'_> {
+    pub fn validate_commit<'c>(
+        &self,
+        msg: &'c Commit<'c>,
+        repo_state: &RepoState,
+        signing_key: Option<&PublicKey>,
+    ) -> Result<ValidatedCommit<'c>, CommitValidationError> {
+        validate_commit(msg, repo_state, signing_key, self.opts)
+    }
+
+    pub fn validate_sync(
+        &self,
+        msg: &Sync<'_>,
+        signing_key: Option<&PublicKey>,
+    ) -> Result<ValidatedSync, SyncValidationError> {
+        validate_sync(msg, signing_key)
+    }
+}
+
 /// validate an incoming `#commit` message.
 ///
 /// on success, returns a `ValidatedCommit` carrying pre-parsed data so that
@@ -135,15 +158,16 @@ impl Default for ValidationOptions {
 /// chain-break (since/prevData mismatch) is NOT an error. callers check
 /// `validated.chain_break.is_some()` and decide how to respond.
 ///
-/// - `repo_state`: `None` for the first-ever commit for this DID.
 /// - `signing_key`: `None` when signature verification is disabled.
+///
+/// panics if called outside a tokio runtime context.
 pub fn validate_commit<'c>(
     msg: &'c Commit<'c>,
-    repo_state: Option<&RepoState>,
+    repo_state: &RepoState,
     signing_key: Option<&PublicKey>,
     opts: &ValidationOptions,
-    handle: &tokio::runtime::Handle,
 ) -> Result<ValidatedCommit<'c>, CommitValidationError> {
+    let handle = tokio::runtime::Handle::current();
     const MAX_BLOCKS_BYTES: usize = 2_097_152; // 2 MiB
     const MAX_OPS: usize = 200;
     const MAX_RECORD_BYTES: usize = 1_048_576; // 1 MiB
@@ -161,11 +185,9 @@ pub fn validate_commit<'c>(
     }
 
     // 2. stale rev, skip if msg.rev <= last known rev (lexicographic order)
-    if let Some(state) = repo_state {
-        if let Some(root) = &state.root {
-            if msg.rev.as_str() <= root.rev.to_tid().as_str() {
-                return Err(CommitValidationError::StaleRev);
-            }
+    if let Some(root) = &repo_state.root {
+        if msg.rev.as_str() <= root.rev.to_tid().as_str() {
+            return Err(CommitValidationError::StaleRev);
         }
     }
 
@@ -203,13 +225,17 @@ pub fn validate_commit<'c>(
     if let Some(key) = signing_key {
         commit_obj
             .verify(key)
-            .map_err(|_| CommitValidationError::SigFailure { refreshed: false })?;
+            .map_err(|_| CommitValidationError::SigFailure)?;
     }
 
     let commit_obj = commit_obj.into_static();
 
     // 8. chain break checks
-    let chain_break = chain_break_check(msg, repo_state);
+    let chain_break = repo_state
+        .root
+        .as_ref()
+        .map(|r| breaks_chain(msg, r))
+        .unwrap_or_default();
 
     // 9–10. per-record size limits and basic CBOR validity
     for op in &msg.ops {
@@ -236,7 +262,8 @@ pub fn validate_commit<'c>(
 
     // 11. MST inversion
     if opts.verify_mst {
-        verify_mst(msg, &parsed, &commit_obj, handle).map_err(CommitValidationError::MstInvalid)?;
+        verify_mst(msg, &parsed, &commit_obj, &handle)
+            .map_err(CommitValidationError::MstInvalid)?;
     }
 
     Ok(ValidatedCommit {
@@ -247,14 +274,12 @@ pub fn validate_commit<'c>(
     })
 }
 
-/// validate an incoming `#sync` message.
-///
-/// replaces `ops::verify_sync_event`, adding field consistency checks.
+/// panics if called outside a tokio runtime context.
 pub fn validate_sync<'c>(
     msg: &'c Sync<'c>,
     signing_key: Option<&PublicKey>,
-    handle: &tokio::runtime::Handle,
 ) -> Result<ValidatedSync, SyncValidationError> {
+    let handle = tokio::runtime::Handle::current();
     const MAX_BLOCKS_BYTES: usize = 2_097_152;
 
     // 1. size limit
@@ -287,20 +312,15 @@ pub fn validate_sync<'c>(
     if let Some(key) = signing_key {
         commit_obj
             .verify(key)
-            .map_err(|_| SyncValidationError::SigFailure { refreshed: false })?;
+            .map_err(|_| SyncValidationError::SigFailure)?;
     }
 
     Ok(ValidatedSync {
-        data_cid: Cid::ipld(commit_obj.data).into_static(),
-        rev: commit_obj.rev.to_string(),
+        commit_obj: commit_obj.into_static(),
     })
 }
 
-/// compare msg chain pointers against known repo state and return a `ChainBreak` if inconsistent.
-fn chain_break_check(msg: &Commit<'_>, repo_state: Option<&RepoState>) -> Option<ChainBreak> {
-    let state = repo_state?;
-    let root = state.root.as_ref()?;
-
+fn breaks_chain(msg: &Commit<'_>, root: &crate::types::Commit) -> ChainBreak {
     // since should equal the rev of the previous commit; only flag when since is present and wrong
     let since_mismatch = msg
         .since
@@ -317,13 +337,9 @@ fn chain_break_check(msg: &Commit<'_>, repo_state: Option<&RepoState>) -> Option
         None => true, // no prev_data but we have a previous state is a chain break
     };
 
-    if since_mismatch || prev_data_mismatch {
-        Some(ChainBreak {
-            since_mismatch,
-            prev_data_mismatch,
-        })
-    } else {
-        None
+    ChainBreak {
+        since_mismatch,
+        prev_data_mismatch,
     }
 }
 

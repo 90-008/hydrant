@@ -209,6 +209,12 @@ pub fn firehose_source_key(url: &str) -> Vec<u8> {
     key
 }
 
+/// key format: {SEQ} (u64 big-endian), mirroring event_key
+#[cfg(feature = "relay")]
+pub fn relay_event_key(seq: u64) -> [u8; 8] {
+    seq.to_be_bytes()
+}
+
 // key format: {collection}|{cid_bytes}
 pub fn block_key(collection: &str, cid: &[u8]) -> Vec<u8> {
     let mut key = Vec::with_capacity(collection.len() + 1 + cid.len());

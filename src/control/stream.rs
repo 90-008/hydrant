@@ -1,21 +1,26 @@
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 
-use jacquard_common::types::cid::{ATP_CID_HASH, IpldCid};
-use jacquard_common::types::nsid::Nsid;
-use jacquard_common::types::string::Rkey;
-use jacquard_common::{CowStr, IntoStatic, RawData};
-use jacquard_repo::DAG_CBOR_CID_CODEC;
-use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 use tracing::error;
 
-use crate::db::{self, keys};
+use crate::db::keys;
 use crate::state::AppState;
-use crate::types::{BroadcastEvent, MarshallableEvt, RecordEvt, StoredData, StoredEvent};
+use std::sync::atomic::Ordering;
 
-use super::Event;
+#[cfg(feature = "events")]
+use {
+    super::Event,
+    crate::db,
+    crate::types::{BroadcastEvent, MarshallableEvt, RecordEvt, StoredData, StoredEvent},
+    jacquard_common::types::cid::{ATP_CID_HASH, IpldCid},
+    jacquard_common::types::nsid::Nsid,
+    jacquard_common::types::string::Rkey,
+    jacquard_common::{CowStr, IntoStatic, RawData},
+    jacquard_repo::DAG_CBOR_CID_CODEC,
+    sha2::{Digest, Sha256},
+};
 
+#[cfg(feature = "events")]
 pub(super) fn event_stream_thread(
     state: Arc<AppState>,
     tx: mpsc::Sender<Event>,
@@ -87,6 +92,71 @@ pub(super) fn event_stream_thread(
     }
 }
 
+#[cfg(feature = "relay")]
+pub(super) fn relay_stream_thread(
+    state: Arc<AppState>,
+    tx: mpsc::Sender<bytes::Bytes>,
+    cursor: Option<u64>,
+) {
+    use crate::types::RelayBroadcast;
+    use std::sync::atomic::Ordering;
+
+    let mut relay_rx = state.db.relay_broadcast_tx.subscribe();
+    let ks = state.db.relay_events.clone();
+    let mut current_seq = match cursor {
+        Some(c) => c.saturating_sub(1),
+        None => state
+            .db
+            .next_relay_seq
+            .load(Ordering::Relaxed)
+            .saturating_sub(1),
+    };
+
+    loop {
+        // catch up from db: send all stored frames from current_seq+1 onward
+        loop {
+            let mut found = false;
+            for item in ks.range(crate::db::keys::relay_event_key(current_seq + 1)..) {
+                let (k, v) = match item.into_inner() {
+                    Ok(kv) => kv,
+                    Err(e) => {
+                        error!(err = %e, "relay stream: failed to read relay_events");
+                        break;
+                    }
+                };
+                let seq = match k.as_ref().try_into().map(u64::from_be_bytes) {
+                    Ok(s) => s,
+                    Err(_) => {
+                        error!("relay stream: failed to parse relay event seq");
+                        continue;
+                    }
+                };
+                current_seq = seq;
+                if tx.blocking_send(bytes::Bytes::copy_from_slice(&v)).is_err() {
+                    return; // subscriber dropped
+                }
+                found = true;
+            }
+            if !found {
+                break;
+            }
+        }
+
+        // wait for live events
+        match relay_rx.blocking_recv() {
+            Ok(RelayBroadcast::Persisted(_)) => {} // re-run catch-up
+            Ok(RelayBroadcast::Ephemeral(frame)) => {
+                if tx.blocking_send(frame).is_err() {
+                    return;
+                }
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {} // re-run catch-up
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+        }
+    }
+}
+
+#[cfg(feature = "events")]
 fn stored_to_event(state: &AppState, id: u64, stored: StoredEvent<'_>) -> Option<Event> {
     let StoredEvent {
         live,
