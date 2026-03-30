@@ -37,16 +37,19 @@ def run-test [] {
     }
 }
 
-def main [--only: list<string> = []] {
+def main [--only: list<string> = [], --skip-creds] {
     print "building hydrant..."
-    # build defaults features
+    # build default features
     cargo build
     # build backlinks
     cargo build --features backlinks
     print ""
 
     # discover all test scripts, excluding infrastructure files
-    let excluded = ["common", "mock_relay", "run_all"]
+    mut excluded = ["common", "mock_relay", "run_all"]
+    if $skip_creds {
+        $excluded = ($excluded | append ["authenticated_stream", "repo_sync_integrity"])
+    }
     let discovered = (
         ls tests/*.nu
         | get name

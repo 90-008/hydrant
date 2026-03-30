@@ -31,12 +31,12 @@ use tracing::{Instrument, debug, error, info, trace, warn};
 
 pub mod manager;
 
-use crate::ingest::{BufferTx, IngestMessage};
+use crate::ingest::indexer::{IndexerMessage, IndexerTx};
 use crate::util::{WatchEnabledExt, url_to_fluent_uri};
 
 pub struct BackfillWorker {
     state: Arc<AppState>,
-    buffer_tx: BufferTx,
+    buffer_tx: IndexerTx,
     http: reqwest::Client,
     semaphore: Arc<Semaphore>,
     verify_signatures: bool,
@@ -48,7 +48,7 @@ pub struct BackfillWorker {
 impl BackfillWorker {
     pub fn new(
         state: Arc<AppState>,
-        buffer_tx: BufferTx,
+        buffer_tx: IndexerTx,
         timeout: Duration,
         concurrency_limit: usize,
         verify_signatures: bool,
@@ -182,7 +182,7 @@ impl BackfillWorker {
 async fn did_task(
     state: &Arc<AppState>,
     http: reqwest::Client,
-    buffer_tx: BufferTx,
+    buffer_tx: IndexerTx,
     did: &Did<'static>,
     pending_key: Slice,
     _permit: tokio::sync::OwnedSemaphorePermit,
@@ -192,30 +192,24 @@ async fn did_task(
     let db = &state.db;
 
     match process_did(&state, &http, &did, verify_signatures, ephemeral).await {
-        Ok(Some(repo_state)) => {
+        Ok(Some(_repo_state)) => {
             let did_key = keys::repo_key(&did);
 
             // determine old gauge state
             // if it was error/suspended etc, we need to know which error kind it was to decrement correctly.
-            // we have to peek at the resync state.
-            let old_gauge = state.db.repo_gauge_state_async(&repo_state, &did_key).await;
-
             let mut batch = db.inner.batch();
-            // remove from pending
-            if old_gauge == GaugeState::Pending {
-                batch.remove(&db.pending, pending_key);
-            }
-            // remove from resync
-            if old_gauge.is_resync() {
-                batch.remove(&db.resync, &did_key);
-            }
+            // unconditionally remove from pending
+            batch.remove(&db.pending, pending_key);
+            // remove from resync, just in case
+            batch.remove(&db.resync, &did_key);
+
             tokio::task::spawn_blocking(move || batch.commit().into_diagnostic())
                 .await
                 .into_diagnostic()??;
 
             state
                 .db
-                .update_gauge_diff_async(&old_gauge, &GaugeState::Synced)
+                .update_gauge_diff_async(&GaugeState::Pending, &GaugeState::Synced)
                 .await;
 
             let state = state.clone();
@@ -229,7 +223,10 @@ async fn did_task(
             .await
             .into_diagnostic()??;
 
-            if let Err(e) = buffer_tx.send(IngestMessage::BackfillFinished(did.clone())) {
+            if let Err(e) = buffer_tx
+                .send(IndexerMessage::BackfillFinished(did.clone()))
+                .await
+            {
                 error!(err = %e, "failed to send BackfillFinished");
             }
             Ok(())
@@ -310,6 +307,7 @@ async fn did_task(
                     {
                         let mut state: RepoState =
                             rmp_serde::from_slice(&state_bytes).into_diagnostic()?;
+                        state.active = true;
                         state.status = RepoStatus::Error(error_string.into());
                         Some(rmp_serde::to_vec(&state).into_diagnostic()?)
                     } else {
@@ -422,22 +420,23 @@ async fn process_did<'i>(
     );
     state.update_from_doc(doc);
 
-    let emit_identity = |status: &RepoStatus| {
+    let emit_identity = |status: &RepoStatus, active: bool| {
+        let status = match status {
+            RepoStatus::Deactivated => "deactivated",
+            RepoStatus::Takendown => "takendown",
+            RepoStatus::Suspended => "suspended",
+            RepoStatus::Deleted => "deleted",
+            RepoStatus::Desynchronized => "desynchronized",
+            RepoStatus::Throttled => "throttled",
+            _ => "",
+        };
         let evt = AccountEvt {
             did: did.clone(),
-            active: !matches!(
-                status,
-                RepoStatus::Deactivated | RepoStatus::Takendown | RepoStatus::Suspended
-            ),
-            status: Some(
-                match status {
-                    RepoStatus::Deactivated => "deactivated",
-                    RepoStatus::Takendown => "takendown",
-                    RepoStatus::Suspended => "suspended",
-                    _ => "active",
-                }
-                .into(),
-            ),
+            active,
+            status: status
+                .is_empty()
+                .then_some(None)
+                .unwrap_or_else(|| Some(status.into())),
         };
         let _ = app_state.db.event_tx.send(ops::make_account_event(db, evt));
     };
@@ -472,7 +471,7 @@ async fn process_did<'i>(
             if let Some(status) = inactive_status {
                 warn!(?status, "repo is inactive, stopping backfill");
 
-                emit_identity(&status);
+                emit_identity(&status, false);
 
                 let resync_state = ResyncState::Gone {
                     status: status.clone(),
@@ -483,6 +482,7 @@ async fn process_did<'i>(
                 app_state
                     .db
                     .update_repo_state_async(did, move |state, (key, batch)| {
+                        state.active = false;
                         state.status = status;
                         batch.insert(&app_state_clone.db.resync, key, resync_bytes);
                         Ok((true, ()))
@@ -498,8 +498,13 @@ async fn process_did<'i>(
         Err(e) => Err(e).into_diagnostic()?,
     };
 
-    // emit identity event so any consumers know
-    emit_identity(&state.status);
+    // emit identity event so any consumers know, but only if something changed
+    if state.active != previous_state.active
+        || state.status != previous_state.status
+        || previous_state.pds.is_none()
+    {
+        emit_identity(&state.status, state.active);
+    }
 
     trace!(
         bytes = car_bytes.body.len(),
@@ -721,7 +726,6 @@ async fn process_did<'i>(
             }
 
             // 6. update data, status is updated in worker shard
-            state.tracked = true;
             state.root = Some(root_commit);
             state.touch();
 
@@ -729,6 +733,21 @@ async fn process_did<'i>(
                 &app_state.db.repos,
                 keys::repo_key(&did),
                 ser_repo_state(&state)?,
+            );
+
+            let metadata_key = keys::repo_metadata_key(&did);
+            let metadata_bytes = app_state
+                .db
+                .repo_metadata
+                .get(&metadata_key)
+                .into_diagnostic()?
+                .ok_or_else(|| miette::miette!("repo metadata not found for {}", did))?;
+            let mut metadata = crate::db::deser_repo_metadata(&metadata_bytes)?;
+            metadata.tracked = true;
+            batch.insert(
+                &app_state.db.repo_metadata,
+                &metadata_key,
+                crate::db::ser_repo_metadata(&metadata)?,
             );
 
             // add the counts
@@ -746,14 +765,23 @@ async fn process_did<'i>(
         .into_diagnostic()??
     };
 
+    let metadata_key = keys::repo_metadata_key(did);
+    let metadata_bytes = db
+        .repo_metadata
+        .get(&metadata_key)
+        .into_diagnostic()?
+        .ok_or_else(|| miette::miette!("repo metadata not found for {}", did))?;
+    let metadata = crate::db::deser_repo_metadata(metadata_bytes.as_ref())?;
+
     let Some((_state, records_cnt_delta, added_blocks, count)) = result else {
-        // signal mode: no signal-matching records found — clean up the optimistically-added repo
+        // signal mode: no signal-matching records found, clean up the optimistically-added repo
         let did_key = keys::repo_key(did);
-        let backfill_pending_key = keys::pending_key(previous_state.index_id);
+        let backfill_pending_key = keys::pending_key(metadata.index_id);
         let app_state = app_state.clone();
         tokio::task::spawn_blocking(move || {
             let mut batch = app_state.db.inner.batch();
             batch.remove(&app_state.db.repos, &did_key);
+            batch.remove(&app_state.db.repo_metadata, &metadata_key);
             batch.remove(&app_state.db.pending, backfill_pending_key);
             batch.commit().into_diagnostic()
         })

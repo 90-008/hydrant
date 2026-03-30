@@ -32,6 +32,9 @@ pub async fn handle(
         RepoStatus::Takendown => Some(GetRepoError::RepoTakendown(None)),
         RepoStatus::Suspended => Some(GetRepoError::RepoSuspended(None)),
         RepoStatus::Deactivated => Some(GetRepoError::RepoDeactivated(None)),
+        RepoStatus::Deleted => Some(GetRepoError::RepoNotFound(Some(CowStr::Borrowed(
+            "deleted",
+        )))),
         _ => None,
     };
     if let Some(err) = xrpc_err {

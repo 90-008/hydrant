@@ -205,7 +205,7 @@ pub async fn handle_debug_iter(
                         "invalid_u64".to_string()
                     }
                 } else if partition == "blocks" {
-                    // key is col|cid_bytes — show as "col|<cid_str>"
+                    // key is col|cid_bytes, show as "col|<cid_str>"
                     if let Some(sep) = k.iter().position(|&b| b == keys::SEP) {
                         let col = String::from_utf8_lossy(&k[..sep]);
                         match cid::Cid::read_bytes(&k[sep + 1..]) {
@@ -303,7 +303,11 @@ pub async fn handle_debug_ephemeral_ttl_tick(
     State(state): State<Arc<AppState>>,
 ) -> Result<StatusCode, StatusCode> {
     tokio::task::spawn_blocking(move || {
-        crate::db::ephemeral::ephemeral_ttl_tick(&state.db, &state.ephemeral_ttl)
+        #[cfg(feature = "indexer")]
+        let res = crate::db::ephemeral::ephemeral_ttl_tick(&state.db, &state.ephemeral_ttl);
+        #[cfg(feature = "relay")]
+        let res = crate::db::ephemeral::relay_events_ttl_tick(&state.db, &state.ephemeral_ttl);
+        res
     })
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
@@ -316,7 +320,7 @@ pub async fn handle_debug_ephemeral_ttl_tick(
 pub struct DebugSeedWatermarkRequest {
     /// unix timestamp (seconds) to write the watermark at
     pub ts: u64,
-    /// event_id the watermark points to — all events before this id will be pruned
+    /// event_id the watermark points to, all events before this id will be pruned
     pub event_id: u64,
 }
 
@@ -328,13 +332,14 @@ pub async fn handle_debug_seed_watermark(
     Query(req): Query<DebugSeedWatermarkRequest>,
 ) -> Result<StatusCode, StatusCode> {
     tokio::task::spawn_blocking(move || {
+        #[cfg(feature = "indexer")]
+        let key = crate::db::keys::event_watermark_key(req.ts);
+        #[cfg(feature = "relay")]
+        let key = crate::db::keys::relay_event_watermark_key(req.ts);
         state
             .db
             .cursors
-            .insert(
-                crate::db::keys::event_watermark_key(req.ts),
-                req.event_id.to_be_bytes(),
-            )
+            .insert(key, req.event_id.to_be_bytes())
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
     })
     .await

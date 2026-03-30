@@ -57,10 +57,9 @@ impl FilterConfig {
     }
 }
 
-fn nsid_matches(pattern: &str, collection: &str) -> bool {
-    if let Some(prefix) = pattern.strip_suffix(".*") {
-        collection == prefix || collection.starts_with(prefix)
-    } else {
-        collection == pattern
-    }
+fn nsid_matches(pattern: &str, col: &str) -> bool {
+    pattern
+        .strip_suffix(".*")
+        .map(|prefix| col == prefix || col.starts_with(prefix))
+        .unwrap_or_else(|| col == pattern)
 }

@@ -57,7 +57,7 @@ def main [] {
     let filter = (http get $"($url)/filter")
     print $"filter state: ($filter | to json)"
     if not ($filter.signals | any { |s| $s == $collection }) {
-        print $"FAILED: ($collection) not in signals — filter not configured"
+        print $"FAILED: ($collection) not in signals, filter not configured"
         try { kill -9 $instance.pid }
         rm -rf $db_path
         exit 1
@@ -99,7 +99,7 @@ def main [] {
             print $"FAILED: ($did) not found in repos API"
             $all_found = false
         } else {
-            print $"ok: ($did) — status: ($repo.status)"
+            print $"ok: ($did), status: ($repo.status)"
         }
     }
 

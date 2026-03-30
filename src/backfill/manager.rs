@@ -1,12 +1,12 @@
 use crate::db::types::TrimmedDid;
-use crate::db::{self, deser_repo_state};
-use crate::ops;
+use crate::db::{self, keys};
 use crate::state::AppState;
-use crate::types::{GaugeState, RepoStatus, ResyncState};
+use crate::types::{GaugeState, ResyncState};
 use miette::{IntoDiagnostic, Result};
+
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 
 pub fn queue_gone_backfills(state: &Arc<AppState>) -> Result<()> {
     debug!("scanning for deactivated/takendown repos to retry...");
@@ -28,20 +28,38 @@ pub fn queue_gone_backfills(state: &Arc<AppState>) -> Result<()> {
             if matches!(resync_state, ResyncState::Gone { .. }) {
                 debug!(did = %did, "queuing retry for gone repo");
 
-                let Some(state_bytes) = state.db.repos.get(&key).into_diagnostic()? else {
-                    warn!(did = %did, "repo state not found");
-                    continue;
+                let metadata_key = keys::repo_metadata_key(&did);
+                let metadata_bytes = match state
+                    .db
+                    .repo_metadata
+                    .get(&metadata_key)
+                    .map(|b| b.ok_or_else(|| miette::miette!("repo metadata not found")))
+                    .into_diagnostic()
+                    .flatten()
+                {
+                    Ok(b) => b,
+                    Err(e) => {
+                        error!(did = %did, err = %e, "failed to get repo metadata");
+                        continue;
+                    }
                 };
+                let mut metadata = crate::db::deser_repo_metadata(&metadata_bytes)?;
 
-                // update repo state back to backfilling
-                let repo_state = deser_repo_state(&state_bytes)?;
-                ops::update_repo_status(
-                    &mut batch,
-                    &state.db,
-                    &did,
-                    repo_state,
-                    RepoStatus::Backfilling,
-                )?;
+                // move from resync back into pending
+                batch.remove(&state.db.resync, key.clone());
+                let old_pending = keys::pending_key(metadata.index_id);
+                batch.remove(&state.db.pending, old_pending);
+                metadata.index_id = rand::random::<u64>();
+                batch.insert(
+                    &state.db.pending,
+                    keys::pending_key(metadata.index_id),
+                    key.clone(),
+                );
+                batch.insert(
+                    &state.db.repo_metadata,
+                    &metadata_key,
+                    crate::db::ser_repo_metadata(&metadata)?,
+                );
 
                 transitions.push((GaugeState::Resync(None), GaugeState::Pending));
             }
@@ -100,36 +118,49 @@ pub fn retry_worker(state: Arc<AppState>) {
                     if next_retry <= now {
                         debug!(did = %did, "retrying backfill");
 
-                        let state_bytes = match state.db.repos.get(&key).into_diagnostic() {
+                        let metadata_key = keys::repo_metadata_key(&did);
+                        let metadata_bytes = match state
+                            .db
+                            .repo_metadata
+                            .get(&metadata_key)
+                            .map(|b| b.ok_or_else(|| miette::miette!("repo metadata not found")))
+                            .into_diagnostic()
+                            .flatten()
+                        {
                             Ok(b) => b,
-                            Err(err) => {
-                                error!(did = %did, err = %err, "failed to get repo state");
+                            Err(e) => {
+                                error!(did = %did, err = %e, "failed to get repo metadata");
                                 continue;
                             }
                         };
-                        let Some(state_bytes) = state_bytes else {
-                            error!(did = %did, "repo state not found");
-                            continue;
+                        let mut metadata = match crate::db::deser_repo_metadata(
+                            metadata_bytes.as_ref(),
+                        ) {
+                            Ok(m) => m,
+                            Err(e) => {
+                                error!(did = %did, err = %e, "failed to deserialize repo metadata");
+                                continue;
+                            }
                         };
 
-                        let repo_state = match deser_repo_state(&state_bytes) {
+                        // move from resync back into pending
+                        batch.remove(&state.db.resync, key.clone());
+                        let old_pending = keys::pending_key(metadata.index_id);
+                        batch.remove(&state.db.pending, old_pending);
+                        metadata.index_id = rand::random::<u64>();
+                        batch.insert(
+                            &state.db.pending,
+                            keys::pending_key(metadata.index_id),
+                            key.clone(),
+                        );
+                        let serialized_metadata = match crate::db::ser_repo_metadata(&metadata) {
                             Ok(s) => s,
                             Err(e) => {
-                                error!(did = %did, err = %e, "failed to deserialize repo state");
+                                error!(did = %did, err = %e, "failed to serialize repo metadata");
                                 continue;
                             }
                         };
-                        let res = ops::update_repo_status(
-                            &mut batch,
-                            &state.db,
-                            &did,
-                            repo_state,
-                            RepoStatus::Backfilling,
-                        );
-                        if let Err(e) = res {
-                            error!(did = %did, err = %e, "failed to update repo status");
-                            continue;
-                        }
+                        batch.insert(&state.db.repo_metadata, &metadata_key, serialized_metadata);
 
                         transitions.push((GaugeState::Resync(Some(kind)), GaugeState::Pending));
                     }

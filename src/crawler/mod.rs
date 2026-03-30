@@ -1,3 +1,5 @@
+#![allow(dead_code, unused_imports)]
+
 use crate::state::AppState;
 use futures::future::join_all;
 use jacquard_common::types::string::Did;
@@ -121,7 +123,7 @@ impl CrawlerStats {
             if delta_processed == 0 && delta_crawled == 0 {
                 if is_throttled {
                     info!("throttled: pending queue full");
-                } else {
+                } else if *self.0.state.crawler_enabled.borrow() {
                     info!("idle: no repos crawled or processed in 60s");
                 }
                 continue;

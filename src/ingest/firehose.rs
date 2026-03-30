@@ -1,4 +1,3 @@
-use crate::db::deser_repo_state;
 use crate::filter::{FilterHandle, FilterMode};
 use crate::ingest::stream::{FirehoseError, FirehoseStream, SubscribeReposMessage, decode_frame};
 use crate::ingest::{BufferTx, IngestMessage};
@@ -147,11 +146,15 @@ impl FirehoseIngestor {
         }
         trace!(did = %did, "forwarding message to ingest buffer");
 
-        if let Err(e) = self.buffer_tx.send(IngestMessage::Firehose {
-            relay: self.relay_host.clone(),
-            is_pds: self.is_pds,
-            msg: msg.into_static(),
-        }) {
+        if let Err(e) = self
+            .buffer_tx
+            .send(IngestMessage::Firehose {
+                url: self.relay_host.clone(),
+                is_pds: self.is_pds,
+                msg: msg.into_static(),
+            })
+            .await
+        {
             error!(err = %e, "failed to send message to buffer processor");
         }
     }
@@ -174,11 +177,16 @@ impl FirehoseIngestor {
             match filter.mode {
                 FilterMode::Full => Ok(true),
                 FilterMode::Filter => {
-                    let repo_key = crate::db::keys::repo_key(&did);
-                    if let Some(bytes) = state.db.repos.get(&repo_key).into_diagnostic()? {
-                        let repo_state = deser_repo_state(&bytes)?;
+                    let metadata_key = crate::db::keys::repo_metadata_key(&did);
+                    if let Some(bytes) = state
+                        .db
+                        .repo_metadata
+                        .get(&metadata_key)
+                        .into_diagnostic()?
+                    {
+                        let metadata = crate::db::deser_repo_metadata(bytes.as_ref())?;
 
-                        if repo_state.tracked {
+                        if metadata.tracked {
                             trace!(did = %did, "tracked repo, processing");
                             return Ok(true);
                         } else {

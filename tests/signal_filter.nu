@@ -15,7 +15,7 @@ def main [] {
     let url = $"http://localhost:($port)"
     let db_path = (mktemp -d -t hydrant_signal_test.XXXXXX)
     
-    let random_str = (random chars -l 6)
+    let random_str = ("a" + (random chars -l 5))
     let collection = $"systems.hydrant.test.($random_str)"
 
     print $"database path: ($db_path)"

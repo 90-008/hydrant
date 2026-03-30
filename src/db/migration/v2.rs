@@ -9,6 +9,7 @@ use crate::db::{
     Db,
     types::{DbTid, DidKey},
 };
+use crate::types::Commit;
 use crate::types::v2::*;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -13,7 +13,7 @@ mod firehose;
 mod ingestion;
 mod repos;
 mod stats;
-#[cfg(feature = "events")]
+#[cfg(feature = "indexer")]
 mod stream;
 mod xrpc;
 
@@ -22,7 +22,7 @@ pub async fn serve(hydrant: Hydrant, port: u16) -> miette::Result<()> {
     let mut app = Router::new()
         .route("/health", get(|| async { "OK" }))
         .route("/stats", get(stats::get_stats));
-    #[cfg(feature = "events")]
+    #[cfg(feature = "indexer")]
     let app = app.nest("/stream", stream::router());
     let app = app
         .merge(xrpc::router())

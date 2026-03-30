@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use tracing::error;
 
 use miette::{IntoDiagnostic, Result};
 
@@ -284,7 +285,11 @@ impl FilterPatch {
             db_filter::load(&filter_ks)
         })
         .await
-        .into_diagnostic()??;
+        .into_diagnostic()?
+        .map_err(|e| {
+            error!(err = %e, "failed to apply filter patch");
+            e
+        })?;
 
         let exclude_list = {
             let filter_ks = self.state.db.filter.clone();

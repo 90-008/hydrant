@@ -1,6 +1,6 @@
 use crate::db::{keys, ser_repo_state};
 use crate::state::AppState;
-use crate::types::RepoState;
+use crate::types::{RepoMetadata, RepoState};
 use miette::{IntoDiagnostic, Result};
 use rand::Rng;
 use rand::rngs::SmallRng;
@@ -142,25 +142,33 @@ impl CrawlerWorker {
             BLOCKING_TASK_TIMEOUT,
             tokio::task::spawn_blocking(move || -> Result<Vec<InFlightGuard>> {
                 let mut rng: SmallRng = rand::make_rng();
-                let mut write_batch = db.inner.batch();
+                let mut batch = db.inner.batch();
                 let mut surviving = Vec::new();
                 for guard in guards {
                     let did_key = keys::repo_key(&*guard);
+                    let metadata_key = keys::repo_metadata_key(&*guard);
                     if db.repos.contains_key(&did_key).into_diagnostic()? {
                         continue;
                     }
-                    let state = RepoState::untracked(rng.next_u64());
-                    write_batch.insert(&db.repos, &did_key, ser_repo_state(&state)?);
-                    write_batch.insert(&db.pending, keys::pending_key(state.index_id), &did_key);
+                    let state = RepoState::backfilling();
+                    let metadata = RepoMetadata::backfilling(rng.next_u64());
+                    batch.insert(&db.repos, &did_key, ser_repo_state(&state)?);
+                    batch.insert(
+                        &db.repo_metadata,
+                        &metadata_key,
+                        crate::db::ser_repo_metadata(&metadata)?,
+                    );
+                    batch.insert(&db.pending, keys::pending_key(metadata.index_id), &did_key);
                     // clear any stale retry entry, this DID is confirmed and being enqueued
-                    write_batch.remove(&db.crawler, keys::crawler_retry_key(&*guard));
+                    batch.remove(&db.crawler, keys::crawler_retry_key(&*guard));
                     trace!(did = %*guard, "enqueuing repo");
                     surviving.push(guard);
                 }
                 if let Some(cursor) = cursor_update {
-                    write_batch.insert(&db.cursors, cursor.key, cursor.value);
+                    batch.insert(&db.cursors, cursor.key, cursor.value);
                 }
-                write_batch.commit().into_diagnostic()?;
+                // todo: repo state overwrites here are acceptable?
+                batch.commit().into_diagnostic()?;
                 Ok(surviving)
             }),
         )

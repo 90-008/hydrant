@@ -10,7 +10,11 @@ pub use v1::{firehose_cursor_key, firehose_cursor_key_from_url};
 /// separator used for composite keys
 pub const SEP: u8 = b'|';
 
+#[cfg(feature = "indexer")]
 pub const EVENT_WATERMARK_PREFIX: &[u8] = b"ewm|";
+
+#[cfg(feature = "relay")]
+pub const RELAY_EVENT_WATERMARK_PREFIX: &[u8] = b"rwm|";
 
 /// THIS SHOULD ALWAYS BE STABLE. DO NOT CHANGE
 pub const VERSIONING_KEY: &[u8] = b"db_version";
@@ -22,13 +26,31 @@ pub fn repo_key<'a>(did: &'a Did) -> Vec<u8> {
     vec
 }
 
+pub const REPO_METADATA_PREFIX: &[u8] = b"rm|";
+
+pub fn repo_metadata_key<'a>(did: &'a Did) -> Vec<u8> {
+    let mut vec = Vec::with_capacity(REPO_METADATA_PREFIX.len() + 32);
+    vec.extend_from_slice(REPO_METADATA_PREFIX);
+    TrimmedDid::from(did).write_to_vec(&mut vec);
+    vec
+}
+
 pub fn pending_key(id: u64) -> [u8; 8] {
     id.to_be_bytes()
 }
 
+#[cfg(feature = "indexer")]
 pub fn event_watermark_key(timestamp_secs: u64) -> Vec<u8> {
     let mut key = Vec::with_capacity(EVENT_WATERMARK_PREFIX.len() + 8);
     key.extend_from_slice(EVENT_WATERMARK_PREFIX);
+    key.extend_from_slice(&timestamp_secs.to_be_bytes());
+    key
+}
+
+#[cfg(feature = "relay")]
+pub fn relay_event_watermark_key(timestamp_secs: u64) -> Vec<u8> {
+    let mut key = Vec::with_capacity(RELAY_EVENT_WATERMARK_PREFIX.len() + 8);
+    key.extend_from_slice(RELAY_EVENT_WATERMARK_PREFIX);
     key.extend_from_slice(&timestamp_secs.to_be_bytes());
     key
 }
@@ -209,8 +231,8 @@ pub fn firehose_source_key(url: &str) -> Vec<u8> {
     key
 }
 
-/// key format: {SEQ} (u64 big-endian), mirroring event_key
 #[cfg(feature = "relay")]
+/// key format: {SEQ} (u64 big-endian), mirroring event_key
 pub fn relay_event_key(seq: u64) -> [u8; 8] {
     seq.to_be_bytes()
 }

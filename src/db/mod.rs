@@ -1,10 +1,10 @@
 use crate::config::Compression;
 use crate::db::compaction::DropPrefixFilterFactory;
-#[cfg(feature = "events")]
+#[cfg(feature = "indexer")]
 use crate::types::BroadcastEvent;
 #[cfg(feature = "relay")]
 use crate::types::RelayBroadcast;
-use crate::types::RepoState;
+use crate::types::{RepoMetadata, RepoState};
 
 use fjall::config::{BlockSizePolicy, CompressionPolicy, RestartIntervalPolicy};
 use fjall::{
@@ -49,15 +49,16 @@ pub struct Db {
     pub pending: Keyspace,
     pub resync: Keyspace,
     pub resync_buffer: Keyspace,
+    pub repo_metadata: Keyspace,
     pub events: Keyspace,
     pub counts: Keyspace,
     pub filter: Keyspace,
     pub crawler: Keyspace,
     #[cfg(feature = "backlinks")]
     pub backlinks: Keyspace,
-    #[cfg(feature = "events")]
+    #[cfg(feature = "indexer")]
     pub(crate) event_tx: broadcast::Sender<BroadcastEvent>,
-    #[cfg(feature = "events")]
+    #[cfg(feature = "indexer")]
     pub next_event_id: Arc<AtomicU64>,
     #[cfg(feature = "relay")]
     pub(crate) relay_events: Keyspace,
@@ -297,6 +298,16 @@ impl Db {
                 .data_block_compression_policy(CompressionPolicy::disabled())
                 .data_block_restart_interval_policy(RestartIntervalPolicy::all(16)),
         )?;
+        let repo_metadata = open_ks(
+            "repo_metadata",
+            opts()
+                // point reads for tracking check
+                .expect_point_read_hits(true)
+                .max_memtable_size(mb(8))
+                .data_block_size_policy(BlockSizePolicy::all(kb(4)))
+                .data_block_compression_policy(CompressionPolicy::disabled())
+                .data_block_restart_interval_policy(RestartIntervalPolicy::all(4)),
+        )?;
         let events = open_ks(
             "events",
             opts()
@@ -404,8 +415,11 @@ impl Db {
         // when adding new keyspaces, make sure to add them to the /stats endpoint
         // and also update any relevant /debug/* endpoints
 
-        #[cfg(feature = "events")]
+        #[cfg(feature = "indexer")]
         let (event_tx, _) = broadcast::channel(10000);
+
+        #[cfg(feature = "relay")]
+        let (relay_broadcast_tx, _) = broadcast::channel(10000);
 
         let this = Self {
             inner: db,
@@ -417,26 +431,24 @@ impl Db {
             pending,
             resync,
             resync_buffer,
+            repo_metadata,
             events,
             counts,
             filter,
             crawler,
             #[cfg(feature = "backlinks")]
             backlinks,
-            #[cfg(feature = "events")]
+            #[cfg(feature = "indexer")]
             event_tx,
             counts_map: HashMap::new(),
-            #[cfg(feature = "events")]
+            #[cfg(feature = "indexer")]
             next_event_id: Arc::new(AtomicU64::new(0)),
             #[cfg(feature = "relay")]
             relay_events,
             #[cfg(feature = "relay")]
             next_relay_seq: Arc::new(AtomicU64::new(0)),
             #[cfg(feature = "relay")]
-            relay_broadcast_tx: {
-                let (tx, _) = broadcast::channel(10000);
-                tx
-            },
+            relay_broadcast_tx,
         };
 
         migration::run(&this)?;
@@ -457,7 +469,7 @@ impl Db {
                 .store(last_relay_seq + 1, std::sync::atomic::Ordering::Relaxed);
         }
 
-        #[cfg(feature = "events")]
+        #[cfg(feature = "indexer")]
         {
             let mut last_id = 0;
             if let Some(guard) = this.events.iter().next_back() {
@@ -572,9 +584,9 @@ impl Db {
     }
 
     pub fn persist(&self) -> Result<()> {
-        #[cfg(not(feature = "sync_all"))]
+        #[cfg(not(feature = "__persist_sync_all"))]
         const MODE: PersistMode = PersistMode::Buffer;
-        #[cfg(feature = "sync_all")]
+        #[cfg(feature = "__persist_sync_all")]
         const MODE: PersistMode = PersistMode::SyncAll;
         self.inner.persist(MODE).into_diagnostic()?;
         Ok(())
@@ -594,15 +606,16 @@ impl Db {
             compact(self.pending.clone()),
             compact(self.resync.clone()),
             compact(self.resync_buffer.clone()),
+            compact(self.repo_metadata.clone()),
             compact(self.events.clone()),
             compact(self.counts.clone()),
             compact(self.filter.clone()),
             compact(self.crawler.clone()),
         )?;
-        #[cfg(feature = "backlinks")]
-        compact(self.backlinks.clone()).await?;
         #[cfg(feature = "relay")]
         compact(self.relay_events.clone()).await?;
+        #[cfg(feature = "backlinks")]
+        compact(self.backlinks.clone()).await?;
         Ok(())
     }
 
@@ -762,11 +775,13 @@ impl Db {
     ) -> crate::types::GaugeState {
         match repo_state.status {
             crate::types::RepoStatus::Synced => crate::types::GaugeState::Synced,
-            crate::types::RepoStatus::Backfilling => crate::types::GaugeState::Pending,
             crate::types::RepoStatus::Error(_)
             | crate::types::RepoStatus::Deactivated
             | crate::types::RepoStatus::Takendown
-            | crate::types::RepoStatus::Suspended => {
+            | crate::types::RepoStatus::Suspended
+            | crate::types::RepoStatus::Deleted
+            | crate::types::RepoStatus::Desynchronized
+            | crate::types::RepoStatus::Throttled => {
                 if let Some(resync_bytes) = resync_bytes {
                     if let Ok(crate::types::ResyncState::Error { kind, .. }) =
                         rmp_serde::from_slice::<crate::types::ResyncState>(resync_bytes)
@@ -780,24 +795,6 @@ impl Db {
                 }
             }
         }
-    }
-
-    pub(crate) async fn repo_gauge_state_async(
-        &self,
-        repo_state: &RepoState<'_>,
-        did_key: &[u8],
-    ) -> crate::types::GaugeState {
-        let repo_state = repo_state.clone().into_static();
-        let did_key = did_key.to_vec();
-
-        let db_resync = self.resync.clone();
-
-        tokio::task::spawn_blocking(move || {
-            let resync_bytes_opt = db_resync.get(&did_key).ok().flatten();
-            Self::repo_gauge_state(&repo_state, resync_bytes_opt.as_deref())
-        })
-        .await
-        .unwrap_or(crate::types::GaugeState::Resync(None))
     }
 }
 
@@ -823,6 +820,14 @@ pub async fn get_firehose_cursor(db: &Db, relay: &Url) -> Result<Option<i64>> {
             ))
         })
         .transpose()
+}
+
+pub fn ser_repo_metadata(state: &RepoMetadata) -> Result<Vec<u8>> {
+    rmp_serde::to_vec(&state).into_diagnostic()
+}
+
+pub fn deser_repo_metadata(bytes: &[u8]) -> Result<RepoMetadata> {
+    rmp_serde::from_slice(bytes).into_diagnostic()
 }
 
 pub fn ser_repo_state(state: &RepoState) -> Result<Vec<u8>> {

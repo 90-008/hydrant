@@ -6,13 +6,12 @@ use jacquard_common::CowStr;
 use jacquard_common::Data;
 use jacquard_common::types::did::Did;
 use miette::{Context, IntoDiagnostic, Result};
-use rand::{Rng, rng};
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use tracing::debug;
 
 use crate::db::types::{DbAction, DbRkey, DbTid, TrimmedDid};
-use crate::db::{self, Db, keys, ser_repo_state};
+use crate::db::{self, Db, keys};
 use crate::filter::FilterConfig;
 use crate::ingest::stream::Commit;
 use crate::ingest::validation::ValidatedCommit;
@@ -32,11 +31,6 @@ pub fn persist_to_resync_buffer(db: &Db, did: &Did, commit: &Commit) -> Result<(
         "buffered commit to resync_buffer"
     );
     Ok(())
-}
-
-pub fn has_buffered_commits(db: &Db, did: &Did) -> bool {
-    let prefix = keys::resync_buffer_prefix(did);
-    db.resync_buffer.prefix(&prefix).next().is_some()
 }
 
 // emitting identity is ephemeral
@@ -69,24 +63,24 @@ pub fn delete_repo(
     batch: &mut OwnedWriteBatch,
     db: &Db,
     did: &Did,
-    repo_state: &RepoState,
+    _repo_state: &RepoState,
 ) -> Result<()> {
     debug!(did = %did, "deleting repo");
 
     let repo_key = keys::repo_key(did);
-    let pending_key = keys::pending_key(repo_state.index_id);
+    let metadata_key = keys::repo_metadata_key(did);
 
-    // 1. delete from repos, pending, resync
-    batch.remove(&db.repos, &repo_key);
-    match repo_state.status {
-        RepoStatus::Synced => {}
-        RepoStatus::Backfilling => {
-            batch.remove(&db.pending, &pending_key);
-        }
-        _ => {
-            batch.remove(&db.resync, &repo_key);
-        }
+    let metadata_bytes = db.repo_metadata.get(&metadata_key).into_diagnostic()?;
+    if let Some(metadata_bytes) = metadata_bytes {
+        let metadata = db::deser_repo_metadata(&metadata_bytes)?;
+        batch.remove(&db.pending, keys::pending_key(metadata.index_id));
     }
+
+    // 1. delete from resync, and metadata
+    // we don't delete from repos, relay uses it as a tombstone
+    // todo: we should still delete it after some time
+    batch.remove(&db.resync, &repo_key);
+    batch.remove(&db.repo_metadata, &metadata_key);
 
     // 2. delete from resync buffer
     let resync_prefix = keys::resync_buffer_prefix(did);
@@ -123,7 +117,7 @@ pub fn delete_repo(
     Ok(())
 }
 
-pub fn update_repo_status<'batch, 's>(
+pub fn transition_repo<'batch, 's>(
     batch: &'batch mut OwnedWriteBatch,
     db: &Db,
     did: &Did,
@@ -133,62 +127,72 @@ pub fn update_repo_status<'batch, 's>(
     debug!(did = %did, status = ?new_status, "updating repo status");
 
     let repo_key = keys::repo_key(did);
-    let pending_key = keys::pending_key(repo_state.index_id);
+    let metadata_key = keys::repo_metadata_key(did);
 
-    // manage queues
-    match &new_status {
-        RepoStatus::Synced => {
-            batch.remove(&db.pending, &pending_key);
-            // we dont have to remove from resync here because it has to transition resync -> pending first
-        }
-        RepoStatus::Backfilling => {
-            // if we are coming from an error state, remove from resync
-            if !matches!(repo_state.status, RepoStatus::Synced) {
+    let metadata_bytes = db.repo_metadata.get(&metadata_key).into_diagnostic()?;
+    if let Some(metadata_bytes) = metadata_bytes {
+        let metadata = db::deser_repo_metadata(&metadata_bytes)?;
+        let pending_key = keys::pending_key(metadata.index_id);
+
+        // manage queues
+        match &new_status {
+            RepoStatus::Synced => {
+                batch.remove(&db.pending, &pending_key);
+                // we dont have to remove from resync here because it has to transition resync -> pending first
+            }
+            RepoStatus::Error(msg) => {
+                tracing::warn!("transitioning to error: {msg}");
+                batch.remove(&db.pending, &pending_key);
+                // TODO: we need to make errors have kind instead of "message" in repo status
+                // and then pass it to resync error kind
+                let resync_state = crate::types::ResyncState::Error {
+                    kind: crate::types::ResyncErrorKind::Generic,
+                    retry_count: 0,
+                    next_retry: chrono::Utc::now().timestamp(),
+                };
+                batch.insert(
+                    &db.resync,
+                    &repo_key,
+                    rmp_serde::to_vec(&resync_state).into_diagnostic()?,
+                );
+            }
+            RepoStatus::Deactivated | RepoStatus::Takendown | RepoStatus::Suspended => {
+                // this shouldnt be needed since a repo wont be in a pending state when it gets to any of these states
+                // batch.remove(&db.pending, &pending_key);
+                let resync_state = ResyncState::Gone {
+                    status: new_status.clone(),
+                };
+                batch.insert(
+                    &db.resync,
+                    &repo_key,
+                    rmp_serde::to_vec(&resync_state).into_diagnostic()?,
+                );
+            }
+            RepoStatus::Deleted => {
+                // terminal state: remove from queues, no resync entry needed
+                batch.remove(&db.pending, &pending_key);
                 batch.remove(&db.resync, &repo_key);
             }
-            // remove the old entry
-            batch.remove(&db.pending, &pending_key);
-            // add as new entry
-            repo_state.index_id = rng().next_u64();
-            batch.insert(
-                &db.pending,
-                keys::pending_key(repo_state.index_id),
-                &repo_key,
-            );
-        }
-        RepoStatus::Error(_msg) => {
-            batch.remove(&db.pending, &pending_key);
-            // TODO: we need to make errors have kind instead of "message" in repo status
-            // and then pass it to resync error kind
-            let resync_state = crate::types::ResyncState::Error {
-                kind: crate::types::ResyncErrorKind::Generic,
-                retry_count: 0,
-                next_retry: chrono::Utc::now().timestamp(),
-            };
-            batch.insert(
-                &db.resync,
-                &repo_key,
-                rmp_serde::to_vec(&resync_state).into_diagnostic()?,
-            );
-        }
-        RepoStatus::Deactivated | RepoStatus::Takendown | RepoStatus::Suspended => {
-            // this shouldnt be needed since a repo wont be in a pending state when it gets to any of these states
-            // batch.remove(&db.pending, &pending_key);
-            let resync_state = ResyncState::Gone {
-                status: new_status.clone(),
-            };
-            batch.insert(
-                &db.resync,
-                &repo_key,
-                rmp_serde::to_vec(&resync_state).into_diagnostic()?,
-            );
+            RepoStatus::Desynchronized | RepoStatus::Throttled => {
+                // like an error: remove from pending and schedule a resync attempt
+                batch.remove(&db.pending, &pending_key);
+                let resync_state = crate::types::ResyncState::Error {
+                    kind: crate::types::ResyncErrorKind::Generic,
+                    retry_count: 0,
+                    next_retry: chrono::Utc::now().timestamp(),
+                };
+                batch.insert(
+                    &db.resync,
+                    &repo_key,
+                    rmp_serde::to_vec(&resync_state).into_diagnostic()?,
+                );
+            }
         }
     }
 
+    repo_state.active = matches!(new_status, RepoStatus::Synced | RepoStatus::Error(_));
     repo_state.status = new_status;
     repo_state.touch();
-
-    batch.insert(&db.repos, &repo_key, ser_repo_state(&repo_state)?);
 
     Ok(repo_state)
 }
@@ -214,8 +218,6 @@ pub fn apply_commit<'s>(
 
     repo_state.root = Some(validated.commit_obj.into());
     repo_state.touch();
-
-    batch.insert(&db.repos, keys::repo_key(did), ser_repo_state(&repo_state)?);
 
     // 2. iterate ops and update records index
     let mut records_delta = 0;

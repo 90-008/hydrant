@@ -27,6 +27,11 @@ use jacquard_common::{
 use serde::{Deserialize, Serialize};
 use smol_str::ToSmolStr;
 use std::fmt::Display;
+#[cfg(feature = "relay")]
+use {
+    jacquard_api::com_atproto::sync::subscribe_repos::SubscribeReposEndpoint,
+    jacquard_common::xrpc::SubscriptionEndpoint,
+};
 
 mod com_atproto_describe_repo;
 mod count_records;
@@ -43,8 +48,7 @@ mod list_repos;
 mod subscribe_repos;
 
 pub fn router() -> Router<Hydrant> {
-    #[allow(unused_mut)]
-    let mut r = Router::new()
+    let r = Router::new()
         .route(GetRecordRequest::PATH, get(get_record::handle))
         .route(ListRecordsRequest::PATH, get(list_records::handle))
         .route(CountRecords::PATH, get(count_records::handle))
@@ -61,12 +65,10 @@ pub fn router() -> Router<Hydrant> {
         .route(ListReposRequest::PATH, get(list_repos::handle));
 
     #[cfg(feature = "relay")]
-    {
-        r = r.route(
-            "/xrpc/com.atproto.sync.subscribeRepos",
-            axum::routing::get(subscribe_repos::handle),
-        );
-    }
+    let r = r.route(
+        SubscribeReposEndpoint::PATH,
+        axum::routing::get(subscribe_repos::handle),
+    );
 
     r
 }

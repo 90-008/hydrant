@@ -12,6 +12,7 @@ use jacquard_common::{
     },
 };
 use miette::Diagnostic;
+use serde::{Deserialize, Serialize};
 use smol_str::format_smolstr;
 use thiserror::Error;
 use tokio::net::TcpStream;
@@ -388,7 +389,7 @@ pub struct Account<'a> {
     pub time: Datetime,
 }
 
-#[derive(serde::Deserialize, serde::Serialize, Debug, Clone, jacquard_derive::IntoStatic)]
+#[derive(Deserialize, Serialize, Debug, Clone, jacquard_derive::IntoStatic)]
 #[serde(rename_all = "camelCase")]
 pub struct Sync<'a> {
     #[serde(with = "jacquard_common::serde_bytes_helper")]
@@ -515,9 +516,6 @@ impl<'i> SubscribeReposMessage<'i> {
     }
 }
 
-use serde::Deserialize;
-use serde_ipld_dagcbor::de::Deserializer;
-
 // some relays send `""` for `since` when there is no previous revision instead of null
 fn deserialize_tid_or_empty<'de, D>(deserializer: D) -> Result<Option<Tid>, D::Error>
 where
@@ -530,11 +528,11 @@ where
             tracing::warn!("received since with empty string instead of null");
             Ok(None)
         }
-        Some(s) => s.parse::<Tid>().map(Some).map_err(serde::de::Error::custom),
+        Some(s) => s.parse().map(Some).map_err(serde::de::Error::custom),
     }
 }
 
-#[derive(Debug, Deserialize, serde::Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct EventHeader {
     op: i64,
     t: Option<String>,
@@ -547,7 +545,7 @@ struct ErrorFrame {
 }
 
 pub fn decode_frame<'i>(bytes: &'i [u8]) -> Result<SubscribeReposMessage<'i>, FirehoseError> {
-    let mut de = Deserializer::from_slice(bytes);
+    let mut de = serde_ipld_dagcbor::de::Deserializer::from_slice(bytes);
     let header = EventHeader::deserialize(&mut de)?;
 
     match header.op {
@@ -579,18 +577,18 @@ pub fn decode_frame<'i>(bytes: &'i [u8]) -> Result<SubscribeReposMessage<'i>, Fi
 }
 
 #[cfg(feature = "relay")]
-#[derive(serde::Serialize)]
+#[derive(Serialize)]
 struct EncodeHeader<'a> {
     op: i64,
     t: &'a str,
 }
 
 #[cfg(feature = "relay")]
-pub fn encode_frame<T: serde::Serialize>(t: &str, body: &T) -> miette::Result<bytes::Bytes> {
+pub fn encode_frame<T: serde::Serialize>(t: &str, msg: &T) -> miette::Result<bytes::Bytes> {
     let mut buf = serde_ipld_dagcbor::to_vec(&EncodeHeader { op: 1, t })
         .map_err(|e| miette::miette!("encode_frame header: {e}"))?;
     buf.extend_from_slice(
-        &serde_ipld_dagcbor::to_vec(body).map_err(|e| miette::miette!("encode_frame body: {e}"))?,
+        &serde_ipld_dagcbor::to_vec(msg).map_err(|e| miette::miette!("encode_frame body: {e}"))?,
     );
     Ok(bytes::Bytes::from(buf))
 }

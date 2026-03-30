@@ -106,7 +106,7 @@ def run-auth-test [did: string, password: string, pds_url: string, relays: strin
                     $e | select id type | insert value $value
                 })
                 print $"captured ($events | length) events"
-                $display_events | table -e | print
+                $display_events | to text | print
 
                 # filter live events for the relevant entities
                 let relevant_events = ($events | where { |it|

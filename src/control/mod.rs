@@ -1,3 +1,5 @@
+#![allow(unused_imports)]
+
 pub(crate) mod crawler;
 pub(crate) mod filter;
 pub(crate) mod firehose;
@@ -22,7 +24,7 @@ use miette::{IntoDiagnostic, Result, WrapErr};
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, error, info};
 
-#[cfg(feature = "events")]
+#[cfg(feature = "indexer")]
 use crate::backfill::BackfillWorker;
 use crate::config::{Config, SignatureVerification};
 use crate::db::{
@@ -30,14 +32,14 @@ use crate::db::{
     load_persisted_firehose_sources,
 };
 use crate::filter::FilterMode;
-#[cfg(feature = "events")]
-use crate::ingest::worker::FirehoseWorker;
+#[cfg(feature = "indexer")]
+use crate::ingest::indexer::FirehoseWorker;
 use crate::state::AppState;
 use crate::types::MarshallableEvt;
 
 use crawler::{CrawlerShared, spawn_crawler_producer};
 use firehose::{FirehoseShared, spawn_firehose_ingestor};
-#[cfg(feature = "events")]
+#[cfg(feature = "indexer")]
 use stream::event_stream_thread;
 #[cfg(feature = "relay")]
 use stream::relay_stream_thread;
@@ -215,16 +217,21 @@ impl Hydrant {
         }
 
         let fut = async move {
-            // internal buffered channel between ingestors / backfill and the firehose worker
-            let (buffer_tx, buffer_rx) = mpsc::unbounded_channel();
+            // raw firehose events from pds/relay to RelayWorker
+            let (buffer_tx, buffer_rx) = mpsc::channel::<crate::ingest::IngestMessage>(500);
+
+            // validated IndexerMessages from RelayWorker/backfill to FirehoseWorker
+            #[cfg(feature = "indexer")]
+            let (indexer_tx, indexer_rx) =
+                mpsc::channel::<crate::ingest::indexer::IndexerMessage>(500);
 
             // 5. spawn the backfill worker (not used in relay mode)
-            #[cfg(feature = "events")]
+            #[cfg(feature = "indexer")]
             tokio::spawn({
                 let state = state.clone();
                 BackfillWorker::new(
                     state.clone(),
-                    buffer_tx.clone(),
+                    indexer_tx.clone(),
                     config.repo_fetch_timeout,
                     config.backfill_concurrency_limit,
                     matches!(
@@ -238,7 +245,7 @@ impl Hydrant {
             });
 
             // 6. re-queue any repos that lost their backfill state, then start the retry worker
-            #[cfg(feature = "events")]
+            #[cfg(feature = "indexer")]
             {
                 if let Err(e) = tokio::task::spawn_blocking({
                     let state = state.clone();
@@ -258,12 +265,22 @@ impl Hydrant {
             }
 
             // 7. ephemeral GC thread (not used in relay mode)
-            #[cfg(feature = "events")]
+            #[cfg(feature = "indexer")]
             if config.ephemeral {
                 let state = state.clone();
                 std::thread::Builder::new()
                     .name("ephemeral-gc".into())
                     .spawn(move || crate::db::ephemeral::ephemeral_ttl_worker(state))
+                    .into_diagnostic()?;
+            }
+
+            // relay events TTL: relay_events keyspace grows unbounded without pruning
+            #[cfg(feature = "relay")]
+            {
+                let state = state.clone();
+                std::thread::Builder::new()
+                    .name("relay-events-gc".into())
+                    .spawn(move || crate::db::ephemeral::relay_events_ttl_worker(state))
                     .into_diagnostic()?;
             }
 
@@ -298,17 +315,23 @@ impl Hydrant {
             });
 
             // 9. events/sec stats ticker
-            #[cfg(feature = "events")]
             tokio::spawn({
                 let state = state.clone();
-                let mut last_id = state.db.next_event_id.load(Ordering::Relaxed);
+                let get_id = |state: &AppState| {
+                    #[cfg(feature = "indexer")]
+                    let id = state.db.next_event_id.load(Ordering::Relaxed);
+                    #[cfg(feature = "relay")]
+                    let id = state.db.next_relay_seq.load(Ordering::Relaxed);
+                    id
+                };
+                let mut last_id = get_id(&state);
                 let mut last_time = std::time::Instant::now();
                 let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
                 async move {
                     loop {
                         interval.tick().await;
 
-                        let current_id = state.db.next_event_id.load(Ordering::Relaxed);
+                        let current_id = get_id(&state);
                         let current_time = std::time::Instant::now();
                         let delta = current_id.saturating_sub(last_id);
 
@@ -410,7 +433,8 @@ impl Hydrant {
                     .await;
             }
 
-            // 11. spawn crawler infrastructure (always, to support dynamic source management)
+            // 11. spawn crawler infrastructure
+            #[cfg(feature = "indexer")]
             {
                 use crate::crawler::throttle::Throttler;
                 use crate::crawler::{
@@ -536,16 +560,21 @@ impl Hydrant {
                 }
             }
 
-            // 12. spawn the firehose worker on a blocking thread (fatal task)
-            let handle = tokio::runtime::Handle::current();
-            let firehose_worker = std::thread::spawn({
+            // 12. spawn the relay worker
+            let relay_worker = std::thread::spawn({
                 let state = state.clone();
-                let handle = handle.clone();
+                let handle = tokio::runtime::Handle::current();
+                let config = config.clone();
+
+                #[cfg(feature = "indexer")]
+                let hook = indexer_tx.clone();
+
                 move || {
-                    #[cfg(feature = "relay")]
-                    return crate::ingest::relay_worker::RelayWorker::new(
+                    crate::ingest::relay::RelayWorker::new(
                         state,
                         buffer_rx,
+                        #[cfg(feature = "indexer")]
+                        hook,
                         matches!(config.verify_signatures, SignatureVerification::Full),
                         config.firehose_workers,
                         crate::ingest::validation::ValidationOptions {
@@ -553,30 +582,48 @@ impl Hydrant {
                             rev_clock_skew_secs: config.rev_clock_skew_secs,
                         },
                     )
-                    .run(handle);
-                    #[cfg(feature = "events")]
-                    return FirehoseWorker::new(
-                        state,
-                        buffer_rx,
-                        matches!(config.verify_signatures, SignatureVerification::Full),
-                        config.ephemeral,
-                        config.firehose_workers,
-                        crate::ingest::validation::ValidationOptions {
-                            verify_mst: config.verify_mst,
-                            rev_clock_skew_secs: config.rev_clock_skew_secs,
-                        },
-                    )
-                    .run(handle);
+                    .run(handle)
                 }
             });
 
+            let tx = Arc::clone(&fatal_tx);
+            tokio::spawn(
+                tokio::task::spawn_blocking(move || {
+                    relay_worker
+                        .join()
+                        .map_err(|e| miette::miette!("relay worker died: {e:?}"))
+                })
+                .map(move |r| {
+                    let result = r.into_diagnostic().flatten().flatten();
+                    let _ = tx.send(Some(result.map_err(|e| e.to_string())));
+                }),
+            );
+
+            // 13. spawn the firehose worker (if enabled)
+            #[cfg(feature = "indexer")]
+            let firehose_worker = std::thread::spawn({
+                let state = state.clone();
+                let handle = tokio::runtime::Handle::current();
+                let config = config.clone();
+                move || {
+                    FirehoseWorker::new(
+                        state,
+                        indexer_rx,
+                        config.ephemeral,
+                        config.firehose_workers,
+                    )
+                    .run(handle)
+                }
+            });
+
+            #[cfg(feature = "indexer")]
             {
                 let tx = Arc::clone(&fatal_tx);
                 tokio::spawn(
                     tokio::task::spawn_blocking(move || {
                         firehose_worker
                             .join()
-                            .map_err(|e| miette::miette!("buffer processor died: {e:?}"))
+                            .map_err(|e| miette::miette!("firehose worker died: {e:?}"))
                     })
                     .map(move |r| {
                         let result = r.into_diagnostic().flatten().flatten();
@@ -619,7 +666,7 @@ impl Hydrant {
     ///
     /// multiple concurrent subscribers each receive a full independent copy of the stream.
     /// the stream ends when the `EventStream` is dropped.
-    #[cfg(feature = "events")]
+    #[cfg(feature = "indexer")]
     pub fn subscribe(&self, cursor: Option<u64>) -> EventStream {
         let (tx, rx) = mpsc::channel(500);
         let state = self.state.clone();
@@ -835,10 +882,10 @@ impl axum::extract::FromRef<Hydrant> for Arc<AppState> {
 /// implements [`futures::Stream`] and can be used with `StreamExt::next`,
 /// `while let Some(evt) = stream.next().await`, `forward`, etc.
 /// the stream terminates when the underlying channel closes (i.e. hydrant shuts down).
-#[cfg(feature = "events")]
+#[cfg(feature = "indexer")]
 pub struct EventStream(mpsc::Receiver<Event>);
 
-#[cfg(feature = "events")]
+#[cfg(feature = "indexer")]
 impl Stream for EventStream {
     type Item = Event;
 

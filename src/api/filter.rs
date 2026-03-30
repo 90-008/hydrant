@@ -16,6 +16,7 @@ pub fn router() -> Router<Hydrant> {
         .route("/filter", patch(handle_patch_filter))
 }
 
+use tracing::error;
 pub async fn handle_get_filter(
     State(hydrant): State<Hydrant>,
 ) -> Result<Json<FilterSnapshot>, (StatusCode, String)> {
@@ -46,6 +47,9 @@ pub async fn handle_patch_filter(
     p.excludes = body.excludes;
     p.apply()
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+        .map_err(|e| {
+            error!(err = %e, "failed to patch filter");
+            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        })
         .map(Json)
 }

@@ -1,5 +1,6 @@
 use std::fmt::{Debug, Display};
 
+use bytes::Bytes;
 use jacquard_common::types::cid::IpldCid;
 use jacquard_common::types::nsid::Nsid;
 use jacquard_common::types::string::{Did, Rkey};
@@ -16,7 +17,6 @@ use crate::resolver::MiniDoc;
 pub(crate) mod v2 {
     use super::*;
 
-    // todo: add desynchronized and throttled fields
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
     pub enum RepoStatus {
         Backfilling,
@@ -40,21 +40,11 @@ pub(crate) mod v2 {
     #[derive(Debug, Clone, Serialize, Deserialize)]
     #[serde(bound(deserialize = "'i: 'de"))]
     pub(crate) struct RepoState<'i> {
-        // todo: add active field
         pub status: RepoStatus,
         pub root: Option<Commit>,
-        // todo: is this actually valid? the spec says this is informal and intermadiate
-        // services may change it. we should probably document it. if we cant use this
-        // then how do we dedup account / identity ops?
-        /// ms since epoch of the last firehose message we processed for this repo.
-        /// used to deduplicate identity / account events that can arrive from multiple relays at
-        /// different wall-clock times but represent the same underlying PDS event.
         pub last_message_time: Option<i64>,
-        /// this is when we *ingested* any last updates
-        pub last_updated_at: i64, // unix timestamp
-        /// whether we are ingesting events for this repo
+        pub last_updated_at: i64,
         pub tracked: bool,
-        /// index id in pending keyspace
         pub index_id: u64,
         #[serde(borrow)]
         pub signing_key: Option<DidKey<'i>>,
@@ -64,20 +54,76 @@ pub(crate) mod v2 {
         pub handle: Option<Handle<'i>>,
     }
 }
-pub(crate) use v2::*;
 
-impl Display for RepoStatus {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            RepoStatus::Backfilling => write!(f, "backfilling"),
-            RepoStatus::Synced => write!(f, "synced"),
-            RepoStatus::Error(e) => write!(f, "error({e})"),
-            RepoStatus::Deactivated => write!(f, "deactivated"),
-            RepoStatus::Takendown => write!(f, "takendown"),
-            RepoStatus::Suspended => write!(f, "suspended"),
-        }
+pub(crate) mod v4 {
+    use super::*;
+    pub(crate) use v2::Commit;
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub enum RepoStatus {
+        /// repo is synced to latest commit from what we know of
+        Synced,
+        /// some unclassified fatal error
+        Error(SmolStr),
+        /// user has temporarily paused their overall account. content should
+        /// not be displayed or redistributed, but does not need to be deleted
+        /// from infrastructure. implied time-limited. also the initial state
+        /// for an account after migrating to another pds instance.
+        Deactivated,
+        /// host or service has takendown the account. implied permanent or
+        /// long-term, though may be reverted.
+        Takendown,
+        /// host or service has temporarily paused the account. implied
+        /// time-limited.
+        Suspended,
+        /// user or host has deleted the account, and content should be removed
+        /// from the network. implied permanent or long-term, though may be
+        /// reverted (deleted accounts may reactivate on the same or another
+        /// host).
+        ///
+        /// account is deleted; kept as a tombstone so stale commits arriving from the upstream
+        /// backfill window are not forwarded. active=false per spec.
+        Deleted,
+        /// host detected a repo sync problem. active may be true or false per spec;
+        /// the `active` field on `RepoState` is authoritative.
+        Desynchronized,
+        /// resource rate-limit exceeded. active may be true or false per spec;
+        /// the `active` field on `RepoState` is authoritative.
+        Throttled,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(bound(deserialize = "'i: 'de"))]
+    pub(crate) struct RepoState<'i> {
+        /// whether the upstream considers this account active.
+        /// services should use the `active` flag to control overall account visibility
+        pub active: bool,
+        pub status: RepoStatus,
+        pub root: Option<Commit>,
+        /// ms since epoch of the last firehose message we processed for this repo.
+        /// used to deduplicate identity / account events that can arrive from multiple relays at
+        /// different wall-clock times but represent the same underlying PDS event.
+        pub last_message_time: Option<i64>,
+        /// this is when we *ingested* any last updates
+        pub last_updated_at: i64, // unix timestamp
+        #[serde(borrow)]
+        pub signing_key: Option<DidKey<'i>>,
+        #[serde(borrow)]
+        pub pds: Option<CowStr<'i>>,
+        #[serde(borrow)]
+        pub handle: Option<Handle<'i>>,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub(crate) struct RepoMetadata {
+        /// whether we are ingesting events for this repo
+        pub tracked: bool,
+        /// index id in pending keyspace (if backfilling)
+        pub index_id: u64,
     }
 }
+
+pub(crate) use v4::*;
 
 impl<'c> From<AtpCommit<'c>> for Commit {
     fn from(value: AtpCommit<'c>) -> Self {
@@ -93,7 +139,7 @@ impl<'c> From<AtpCommit<'c>> for Commit {
 
 impl Commit {
     pub(crate) fn into_atp_commit<'i>(self, did: Did<'i>) -> Option<AtpCommit<'i>> {
-        // from a migration
+        // version < 0 is a sentinel used in v2 migration for repos with no commit data
         if self.version < 0 {
             return None;
         }
@@ -108,26 +154,41 @@ impl Commit {
     }
 }
 
-impl<'i> RepoState<'i> {
+impl Display for RepoStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RepoStatus::Synced => write!(f, "synced"),
+            RepoStatus::Error(e) => write!(f, "error({e})"),
+            RepoStatus::Deactivated => write!(f, "deactivated"),
+            RepoStatus::Takendown => write!(f, "takendown"),
+            RepoStatus::Suspended => write!(f, "suspended"),
+            RepoStatus::Deleted => write!(f, "deleted"),
+            RepoStatus::Desynchronized => write!(f, "desynchronized"),
+            RepoStatus::Throttled => write!(f, "throttled"),
+        }
+    }
+}
+
+impl RepoMetadata {
     pub fn backfilling(index_id: u64) -> Self {
         Self {
-            status: RepoStatus::Backfilling,
-            root: None,
-            last_updated_at: chrono::Utc::now().timestamp(),
             index_id,
             tracked: true,
+        }
+    }
+}
+
+impl<'i> RepoState<'i> {
+    pub fn backfilling() -> Self {
+        Self {
+            active: true,
+            status: RepoStatus::Desynchronized,
+            root: None,
+            last_updated_at: chrono::Utc::now().timestamp(),
             handle: None,
             pds: None,
             signing_key: None,
             last_message_time: None,
-        }
-    }
-
-    /// backfilling, but not tracked yet
-    pub fn untracked(index_id: u64) -> Self {
-        Self {
-            tracked: false,
-            ..Self::backfilling(index_id)
         }
     }
 
@@ -158,11 +219,10 @@ impl<'i> IntoStatic for RepoState<'i> {
 
     fn into_static(self) -> Self::Output {
         RepoState {
+            active: self.active,
             status: self.status,
             root: self.root,
             last_updated_at: self.last_updated_at,
-            index_id: self.index_id,
-            tracked: self.tracked,
             handle: self.handle.map(IntoStatic::into_static),
             pds: self.pds.map(IntoStatic::into_static),
             signing_key: self.signing_key.map(IntoStatic::into_static),
@@ -244,7 +304,7 @@ pub struct MarshallableEvt<'i> {
     pub account: Option<AccountEvt<'i>>,
 }
 
-#[cfg(feature = "events")]
+#[cfg(feature = "indexer")]
 #[derive(Clone, Debug)]
 pub(crate) enum BroadcastEvent {
     #[allow(dead_code)]
@@ -284,8 +344,6 @@ pub struct AccountEvt<'i> {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<CowStr<'i>>,
 }
-
-use bytes::Bytes;
 
 #[derive(Serialize, Deserialize, Clone)]
 pub(crate) enum StoredData {

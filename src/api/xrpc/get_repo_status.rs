@@ -29,13 +29,16 @@ pub async fn handle(
         });
     };
 
-    let (active, status) = repo_status_to_api(state.status);
+    let status = repo_status_to_api(state.status);
 
     // rev is only meaningful when the repo is active and has been synced at least once
-    let rev = active.then(|| state.root.map(|c| c.rev.to_tid())).flatten();
+    let rev = state
+        .active
+        .then(|| state.root.map(|c| c.rev.to_tid()))
+        .flatten();
 
     Ok(Json(GetRepoStatusOutput {
-        active,
+        active: state.active,
         did: req.did,
         rev,
         status: status.map(|s| match s {
@@ -51,18 +54,16 @@ pub async fn handle(
     }))
 }
 
-pub(super) fn repo_status_to_api(status: RepoStatus) -> (bool, Option<ApiRepoStatus<'static>>) {
+pub(super) fn repo_status_to_api(status: RepoStatus) -> Option<ApiRepoStatus<'static>> {
     match status {
-        RepoStatus::Synced => (true, None),
-        RepoStatus::Deactivated => (false, Some(ApiRepoStatus::Deactivated)),
-        RepoStatus::Takendown => (false, Some(ApiRepoStatus::Takendown)),
-        RepoStatus::Suspended => (false, Some(ApiRepoStatus::Suspended)),
-        // we lost sync with this repo! report desynchronized
-        // technicalllyyyy backfilling can mean the repo is active
-        // because we are syncing it from the pds, but like also it is currently
-        // desync'ed so...
-        RepoStatus::Backfilling | RepoStatus::Error(_) => {
-            (false, Some(ApiRepoStatus::Desynchronized))
-        }
+        RepoStatus::Synced => None,
+        RepoStatus::Deactivated => Some(ApiRepoStatus::Deactivated),
+        RepoStatus::Takendown => Some(ApiRepoStatus::Takendown),
+        RepoStatus::Suspended => Some(ApiRepoStatus::Suspended),
+        RepoStatus::Deleted => Some(ApiRepoStatus::Deleted),
+        // per spec, desynchronized and throttled have active=may-be-true
+        RepoStatus::Desynchronized => Some(ApiRepoStatus::Desynchronized),
+        RepoStatus::Throttled => Some(ApiRepoStatus::Throttled),
+        RepoStatus::Error(_) => Some(ApiRepoStatus::Desynchronized),
     }
 }

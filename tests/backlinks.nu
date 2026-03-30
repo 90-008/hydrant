@@ -157,7 +157,7 @@ def check-source-filter [url: string, likes: list] {
 # verify that reverse=true actually inverts the order using a subject with 2+ backlinks.
 # returns an error string on failure, or empty string on success.
 def check-reverse-ordering [url: string, subject: string, expected_count: int] {
-    print $"checking reverse ordering — subject has ($expected_count) backlinks..."
+    print $"checking reverse ordering... subject has ($expected_count) backlinks..."
     print $"  subject: ($subject)"
 
     let fwd = (http get $"($url)/xrpc/blue.microcosm.links.getBacklinks?subject=($subject | url encode)&limit=50")

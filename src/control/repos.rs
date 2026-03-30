@@ -17,9 +17,9 @@ use smol_str::ToSmolStr;
 use url::Url;
 
 use crate::db::types::{DbRkey, DidKey, TrimmedDid};
-use crate::db::{self, Db, keys, ser_repo_state};
+use crate::db::{self, Db, keys};
 use crate::state::AppState;
-use crate::types::{GaugeState, RepoState, RepoStatus};
+use crate::types::{GaugeState, RepoMetadata, RepoState, RepoStatus};
 use crate::util::invalid_handle;
 
 /// information about a tracked or known repository. returned by [`ReposControl`] methods.
@@ -77,7 +77,8 @@ impl ReposControl {
     pub(crate) fn iter_states(
         &self,
         cursor: Option<&Did<'_>>,
-    ) -> impl Iterator<Item = Result<(Did<'static>, RepoState<'static>)>> {
+    ) -> impl Iterator<Item = Result<(Did<'static>, RepoState<'static>, crate::types::RepoMetadata)>>
+    {
         let start_bound = if let Some(cursor) = cursor {
             let did_key = keys::repo_key(cursor);
             std::ops::Bound::Excluded(did_key)
@@ -85,22 +86,30 @@ impl ReposControl {
             std::ops::Bound::Unbounded
         };
 
+        let db = self.0.db.clone();
         self.0
             .db
             .repos
             .range((start_bound, std::ops::Bound::Unbounded))
-            .map(|g| {
+            .map(move |g| {
                 let (k, v) = g.into_inner().into_diagnostic()?;
                 let repo_state = crate::db::deser_repo_state(&v)?.into_static();
                 let did = TrimmedDid::try_from(k.as_ref())?.to_did();
-                Ok((did, repo_state))
+                let metadata_key = keys::repo_metadata_key(&did);
+                let metadata = db
+                    .repo_metadata
+                    .get(&metadata_key)
+                    .into_diagnostic()?
+                    .ok_or_else(|| miette::miette!("repo metadata not found for {}", did))?;
+                let metadata = crate::db::deser_repo_metadata(metadata.as_ref())?;
+                Ok((did, repo_state, metadata))
             })
     }
 
     /// iterates through all repositories, returning their state.
     pub fn iter(&self, cursor: Option<&Did<'_>>) -> impl Iterator<Item = Result<RepoInfo>> {
         self.iter_states(cursor)
-            .map(|r| r.map(|(did, s)| repo_state_to_info(did, s)))
+            .map(|r| r.map(|(did, s, m)| repo_state_to_info(did, s, m.tracked)))
     }
 
     #[allow(dead_code)]
@@ -113,6 +122,7 @@ impl ReposControl {
         };
 
         let repos = self.0.db.repos.clone();
+        let db = self.0.db.clone();
         self.0
             .db
             .pending
@@ -131,9 +141,19 @@ impl ReposControl {
                     tracing::warn!(id, did = ?did_key, "stale pending???");
                     return Ok(None);
                 };
-                let repo_state = crate::db::deser_repo_state(&bytes)?;
+                let repo_state = crate::db::deser_repo_state(bytes.as_ref())?;
                 let did = TrimmedDid::try_from(did_key.as_ref())?.to_did();
-                Ok(Some((id, repo_state_to_info(did, repo_state))))
+                let metadata_key = keys::repo_metadata_key(&did);
+                let metadata = db
+                    .repo_metadata
+                    .get(&metadata_key)
+                    .into_diagnostic()?
+                    .ok_or_else(|| miette::miette!("repo metadata not found for {}", did))?;
+                let metadata = crate::db::deser_repo_metadata(metadata.as_ref())?;
+                Ok(Some((
+                    id,
+                    repo_state_to_info(did, repo_state.into_static(), metadata.tracked),
+                )))
             })
             .map(|b| b.transpose())
             .flatten()
@@ -149,6 +169,7 @@ impl ReposControl {
         };
 
         let repos = self.0.db.repos.clone();
+        let db = self.0.db.clone();
         self.0
             .db
             .resync
@@ -160,9 +181,20 @@ impl ReposControl {
                     tracing::warn!(did = ?did_key, "stale resync???");
                     return Ok(None);
                 };
-                let repo_state = crate::db::deser_repo_state(&bytes)?;
+                let repo_state = crate::db::deser_repo_state(bytes.as_ref())?;
                 let did = TrimmedDid::try_from(did_key.as_ref())?.to_did();
-                Ok(Some(repo_state_to_info(did, repo_state)))
+                let metadata_key = keys::repo_metadata_key(&did);
+                let metadata = db
+                    .repo_metadata
+                    .get(&metadata_key)
+                    .into_diagnostic()?
+                    .ok_or_else(|| miette::miette!("repo metadata not found for {}", did))?;
+                let metadata = crate::db::deser_repo_metadata(metadata.as_ref())?;
+                Ok(Some(repo_state_to_info(
+                    did,
+                    repo_state.into_static(),
+                    metadata.tracked,
+                )))
             })
             .map(|b| b.transpose())
             .flatten()
@@ -199,28 +231,46 @@ impl ReposControl {
         transitions: &mut Vec<(GaugeState, GaugeState)>,
     ) -> Result<bool> {
         let did_key = keys::repo_key(did);
+        let metadata_key = keys::repo_metadata_key(did);
+
         let repo_bytes = db.repos.get(&did_key).into_diagnostic()?;
         let existing = repo_bytes
             .as_deref()
             .map(db::deser_repo_state)
             .transpose()?;
 
-        if let Some(mut repo_state) = existing
-            && repo_state.status != RepoStatus::Backfilling
-        {
-            let resync = db.resync.get(&did_key).into_diagnostic()?;
-            let old = db::Db::repo_gauge_state(&repo_state, resync.as_deref());
-            repo_state.tracked = true;
-            repo_state.status = RepoStatus::Backfilling;
-            batch.insert(&db.repos, &did_key, ser_repo_state(&repo_state)?);
-            batch.insert(
-                &db.pending,
-                keys::pending_key(repo_state.index_id),
-                &did_key,
-            );
-            batch.remove(&db.resync, &did_key);
-            transitions.push((old, GaugeState::Pending));
-            return Ok(true);
+        if let Some(repo_state) = existing {
+            let metadata_bytes = db
+                .repo_metadata
+                .get(&metadata_key)
+                .into_diagnostic()?
+                .ok_or_else(|| miette::miette!("repo metadata not found for {}", did))?;
+            let mut metadata = crate::db::deser_repo_metadata(&metadata_bytes)?;
+
+            // skip if already in pending queue
+            let is_pending = db
+                .pending
+                .get(keys::pending_key(metadata.index_id))
+                .into_diagnostic()?
+                .is_some();
+            if !is_pending {
+                let resync = db.resync.get(&did_key).into_diagnostic()?;
+                let old = db::Db::repo_gauge_state(&repo_state, resync.as_deref());
+                metadata.tracked = true;
+                // insert into pending with new index_id
+                let old_pending = keys::pending_key(metadata.index_id);
+                batch.remove(&db.pending, &old_pending);
+                metadata.index_id = rand::Rng::next_u64(&mut rand::rng());
+                batch.insert(&db.pending, keys::pending_key(metadata.index_id), &did_key);
+                batch.remove(&db.resync, &did_key);
+                batch.insert(
+                    &db.repo_metadata,
+                    &metadata_key,
+                    crate::db::ser_repo_metadata(&metadata)?,
+                );
+                transitions.push((old, GaugeState::Pending));
+                return Ok(true);
+            }
         }
 
         Ok(false)
@@ -291,26 +341,27 @@ impl ReposControl {
 
             for did in dids {
                 let did_key = keys::repo_key(&did);
-                let repo_bytes = db.repos.get(&did_key).into_diagnostic()?;
-                let existing = repo_bytes
-                    .as_deref()
-                    .map(db::deser_repo_state)
+                let metadata_key = keys::repo_metadata_key(&did);
+
+                let metadata_bytes = db.repo_metadata.get(&metadata_key).into_diagnostic()?;
+                let existing_metadata = metadata_bytes
+                    .map(|b| crate::db::deser_repo_metadata(&b))
                     .transpose()?;
 
-                if let Some(repo_state) = existing {
-                    // the double read here is an ok tradeoff, the block will be in read-cache anyway
-                    if !repo_state.tracked && Self::_resync(db, &did, &mut batch, &mut transitions)?
-                    {
+                if let Some(metadata) = existing_metadata {
+                    if !metadata.tracked && Self::_resync(db, &did, &mut batch, &mut transitions)? {
                         queued.push(did);
                     }
                 } else {
-                    let repo_state = RepoState::backfilling(rng.next_u64());
-                    batch.insert(&db.repos, &did_key, ser_repo_state(&repo_state)?);
+                    let repo_state = RepoState::backfilling();
+                    let metadata = RepoMetadata::backfilling(rng.next_u64());
+                    batch.insert(&db.repos, &did_key, crate::db::ser_repo_state(&repo_state)?);
                     batch.insert(
-                        &db.pending,
-                        keys::pending_key(repo_state.index_id),
-                        &did_key,
+                        &db.repo_metadata,
+                        &metadata_key,
+                        crate::db::ser_repo_metadata(&metadata)?,
                     );
+                    batch.insert(&db.pending, keys::pending_key(metadata.index_id), &did_key);
                     added += 1;
                     queued.push(did);
                     transitions.push((GaugeState::Synced, GaugeState::Pending));
@@ -351,6 +402,8 @@ impl ReposControl {
 
             for did in dids {
                 let did_key = keys::repo_key(&did);
+                let metadata_key = keys::repo_metadata_key(&did);
+
                 let repo_bytes = db.repos.get(&did_key).into_diagnostic()?;
                 let existing = repo_bytes
                     .as_deref()
@@ -358,18 +411,28 @@ impl ReposControl {
                     .transpose()?;
 
                 if let Some(repo_state) = existing {
-                    if repo_state.tracked {
-                        let resync = db.resync.get(&did_key).into_diagnostic()?;
-                        let old = db::Db::repo_gauge_state(&repo_state, resync.as_deref());
-                        let mut repo_state = repo_state.into_static();
-                        repo_state.tracked = false;
-                        batch.insert(&db.repos, &did_key, ser_repo_state(&repo_state)?);
-                        batch.remove(&db.pending, keys::pending_key(repo_state.index_id));
-                        batch.remove(&db.resync, &did_key);
-                        if old != GaugeState::Synced {
-                            gauge_decrements.push(old);
+                    let metadata_bytes = db.repo_metadata.get(&metadata_key).into_diagnostic()?;
+                    let existing_metadata = metadata_bytes
+                        .map(|b| crate::db::deser_repo_metadata(&b))
+                        .transpose()?;
+
+                    if let Some(mut metadata) = existing_metadata {
+                        if metadata.tracked {
+                            let resync = db.resync.get(&did_key).into_diagnostic()?;
+                            let old = db::Db::repo_gauge_state(&repo_state, resync.as_deref());
+                            metadata.tracked = false;
+                            batch.insert(
+                                &db.repo_metadata,
+                                &metadata_key,
+                                crate::db::ser_repo_metadata(&metadata)?,
+                            );
+                            batch.remove(&db.pending, keys::pending_key(metadata.index_id));
+                            batch.remove(&db.resync, &did_key);
+                            if old != GaugeState::Synced {
+                                gauge_decrements.push(old);
+                            }
+                            untracked.push(did);
                         }
-                        untracked.push(did);
                     }
                 }
             }
@@ -390,7 +453,7 @@ impl ReposControl {
     }
 }
 
-pub(crate) fn repo_state_to_info(did: Did<'static>, s: RepoState<'_>) -> RepoInfo {
+pub(crate) fn repo_state_to_info(did: Did<'static>, s: RepoState<'_>, tracked: bool) -> RepoInfo {
     let (rev, data) = s
         .root
         .map(|c| (Some(c.rev.to_tid()), Some(c.data)))
@@ -398,7 +461,7 @@ pub(crate) fn repo_state_to_info(did: Did<'static>, s: RepoState<'_>) -> RepoInf
     RepoInfo {
         did,
         status: s.status,
-        tracked: s.tracked,
+        tracked,
         rev,
         data,
         handle: s.handle.map(|h| h.into_static()),
@@ -479,7 +542,29 @@ impl<'i> RepoHandle<'i> {
     /// returns `None` if hydrant has never seen this repository.
     pub async fn info(&self) -> Result<Option<RepoInfo>> {
         let did = self.did.clone().into_static();
-        Ok(self.state().await?.map(|s| repo_state_to_info(did, s)))
+        let did_key = keys::repo_key(&did);
+        let metadata_key = keys::repo_metadata_key(&did);
+        let app_state = self.state.clone();
+
+        tokio::task::spawn_blocking(move || {
+            let state_bytes = app_state.db.repos.get(&did_key).into_diagnostic()?;
+            let Some(state_bytes) = state_bytes else {
+                return Ok(None);
+            };
+            let repo_state = crate::db::deser_repo_state(&state_bytes)?;
+
+            let metadata_bytes = app_state
+                .db
+                .repo_metadata
+                .get(&metadata_key)
+                .into_diagnostic()?
+                .ok_or_else(|| miette::miette!("repo metadata not found for {}", did))?;
+            let metadata = crate::db::deser_repo_metadata(&metadata_bytes)?;
+
+            Ok(Some(repo_state_to_info(did, repo_state, metadata.tracked)))
+        })
+        .await
+        .into_diagnostic()?
     }
 
     /// returns the collections of this repository and the number of records it has in each.
@@ -518,7 +603,32 @@ impl<'i> RepoHandle<'i> {
             return Err(MiniDocError::RepoNotFound);
         };
 
-        if info.status == RepoStatus::Backfilling {
+        // check if repo is still backfilling (in pending)
+        let metadata_key = keys::repo_metadata_key(&self.did);
+        let app_state = self.state.clone();
+
+        let is_pending = tokio::task::spawn_blocking(move || {
+            let metadata_bytes = app_state
+                .db
+                .repo_metadata
+                .get(&metadata_key)
+                .into_diagnostic()?;
+            let Some(metadata_bytes) = metadata_bytes else {
+                return Ok::<_, miette::Report>(false);
+            };
+            let metadata = crate::db::deser_repo_metadata(metadata_bytes.as_ref())?;
+            Ok(app_state
+                .db
+                .pending
+                .get(crate::db::keys::pending_key(metadata.index_id))
+                .into_diagnostic()?
+                .is_some())
+        })
+        .await
+        .map_err(|e| MiniDocError::Other(miette::miette!(e)))?
+        .map_err(MiniDocError::Other)?;
+
+        if is_pending {
             return Err(MiniDocError::NotSynced);
         }
 
