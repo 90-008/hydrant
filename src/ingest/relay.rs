@@ -606,11 +606,9 @@ impl WorkerContext<'_> {
             miette::bail!("can't get pds host???");
         };
 
-        if expected.as_str() == source_host {
-            Ok(AuthorityOutcome::WasStale)
-        } else {
-            Ok(AuthorityOutcome::WrongHost { expected })
-        }
+        Ok((expected.as_str() == source_host)
+            .then_some(AuthorityOutcome::WasStale)
+            .unwrap_or(AuthorityOutcome::WrongHost { expected }))
     }
 
     fn refresh_doc(&mut self, did: &Did, repo_state: &mut RepoState) -> Result<()> {
@@ -645,7 +643,7 @@ impl WorkerContext<'_> {
             }
             Err(CommitValidationError::SigFailure) => {}
             Err(e) => {
-                warn!(err = %e, "commit rejected");
+                debug!(err = %e, "commit rejected");
                 return Ok(None);
             }
         }
@@ -655,7 +653,7 @@ impl WorkerContext<'_> {
         match self.vctx.validate_commit(commit, repo_state, key.as_ref()) {
             Ok(v) => Ok(Some(v)),
             Err(e) => {
-                warn!(err = %e, "commit rejected after key refresh");
+                debug!(err = %e, "commit rejected after key refresh");
                 Ok(None)
             }
         }
@@ -672,7 +670,7 @@ impl WorkerContext<'_> {
             Ok(v) => return Ok(Some(v)),
             Err(SyncValidationError::SigFailure) => {}
             Err(e) => {
-                warn!(err = %e, "sync rejected");
+                debug!(err = %e, "sync rejected");
                 return Ok(None);
             }
         }
@@ -682,7 +680,7 @@ impl WorkerContext<'_> {
         match self.vctx.validate_sync(sync, key.as_ref()) {
             Ok(v) => Ok(Some(v)),
             Err(e) => {
-                warn!(err = %e, "sync rejected after key refresh");
+                debug!(err = %e, "sync rejected after key refresh");
                 Ok(None)
             }
         }
