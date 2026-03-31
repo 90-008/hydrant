@@ -211,6 +211,21 @@ impl Db {
                 // did plc are random so the interval wont rlly matter
                 .data_block_restart_interval_policy(RestartIntervalPolicy::new([2, 4])),
         )?;
+        let repo_metadata = open_ks(
+            "repo_metadata",
+            opts()
+                .expect_point_read_hits(true)
+                .max_memtable_size(mb(cfg.db_repos_memtable_size_mb / 2))
+                // its did -> random u64 id + bool, not much to compress, very small
+                .data_block_size_policy(BlockSizePolicy::new([kb(2), kb(4), kb(8)]))
+                .data_block_compression_policy(CompressionPolicy::new([
+                    CompressionType::None,
+                    CompressionType::None,
+                    get_compression("repos", 3),
+                ]))
+                // did plc are random so the interval wont rlly matter
+                .data_block_restart_interval_policy(RestartIntervalPolicy::new([2, 4])),
+        )?;
         let pending = open_ks(
             "pending",
             opts()
@@ -298,16 +313,6 @@ impl Db {
                 .data_block_compression_policy(CompressionPolicy::disabled())
                 .data_block_restart_interval_policy(RestartIntervalPolicy::all(16)),
         )?;
-        let repo_metadata = open_ks(
-            "repo_metadata",
-            opts()
-                // point reads for tracking check
-                .expect_point_read_hits(true)
-                .max_memtable_size(mb(8))
-                .data_block_size_policy(BlockSizePolicy::all(kb(4)))
-                .data_block_compression_policy(CompressionPolicy::disabled())
-                .data_block_restart_interval_policy(RestartIntervalPolicy::all(4)),
-        )?;
         let events = open_ks(
             "events",
             opts()
@@ -387,10 +392,12 @@ impl Db {
                 // only iterated for cursor replay
                 .expect_point_read_hits(true)
                 .max_memtable_size(mb(cfg.db_events_memtable_size_mb))
-                .data_block_size_policy(BlockSizePolicy::new([kb(64), kb(128)]))
+                .data_block_size_policy(BlockSizePolicy::new([kb(64), kb(128), kb(256)]))
                 .data_block_compression_policy(CompressionPolicy::new([
                     CompressionType::None,
                     get_compression("events", 3),
+                    get_compression("events", 3),
+                    get_compression("events", 5),
                 ]))
                 .data_block_restart_interval_policy(RestartIntervalPolicy::new([64, 128])),
         )?;

@@ -488,7 +488,7 @@ impl Config {
             db_worker_threads: 8,
             db_max_journaling_size_mb: 1024,
             db_blocks_memtable_size_mb: BASE_MEMTABLE_MB,
-            db_repos_memtable_size_mb: BASE_MEMTABLE_MB / 2,
+            db_repos_memtable_size_mb: BASE_MEMTABLE_MB / 4,
             db_events_memtable_size_mb: BASE_MEMTABLE_MB,
             db_records_memtable_size_mb: BASE_MEMTABLE_MB / 3 * 2,
             ..Self::default()
