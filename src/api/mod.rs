@@ -11,6 +11,7 @@ mod debug;
 mod filter;
 mod firehose;
 mod ingestion;
+mod pds;
 mod repos;
 mod stats;
 #[cfg(feature = "indexer")]
@@ -27,6 +28,7 @@ pub async fn serve(hydrant: Hydrant, port: u16) -> miette::Result<()> {
     let app = app
         .merge(xrpc::router())
         .merge(filter::router())
+        .merge(pds::router())
         .merge(repos::router())
         .merge(ingestion::router())
         .merge(crawler::router())

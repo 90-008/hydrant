@@ -1,11 +1,64 @@
 use miette::Result;
 use serde::{Deserialize, Serialize};
 use smol_str::ToSmolStr;
+use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::Duration;
 use url::Url;
+
+/// rate limit parameters for a named tier of PDS connections.
+///
+/// the per-second limit is `max(per_second_base, accounts * per_second_account_mul)`,
+/// giving a floor at `per_second_base` that scales up with the PDS's active account count.
+#[derive(Debug, Clone, Copy)]
+pub struct RateTier {
+    /// floor for the per-second limit, regardless of account count.
+    pub per_second_base: u64,
+    /// per-second events allowed per active account on this PDS.
+    pub per_second_account_mul: f64,
+    /// per-hour limit.
+    pub per_hour: u64,
+    /// per-day limit.
+    pub per_day: u64,
+}
+
+impl RateTier {
+    /// built-in "trusted" tier: high limits for well-behaved PDS operators.
+    pub fn trusted() -> Self {
+        Self {
+            per_second_base: 5000,
+            per_second_account_mul: 10.0,
+            per_hour: 5000 * 3600,
+            per_day: 5000 * 86400,
+        }
+    }
+
+    /// built-in "default" tier: conservative limits for unknown PDS operators.
+    pub fn default_tier() -> Self {
+        Self {
+            per_second_base: 50,
+            per_second_account_mul: 0.5,
+            per_hour: 1000 * 3600,
+            per_day: 1000 * 86400,
+        }
+    }
+
+    /// parse `base/mul/hourly/daily` format used by `HYDRANT_RATE_TIERS`.
+    fn parse(s: &str) -> Option<Self> {
+        let parts: Vec<&str> = s.split('/').collect();
+        if parts.len() != 4 {
+            return None;
+        }
+        Some(Self {
+            per_second_base: parts[0].parse().ok()?,
+            per_second_account_mul: parts[1].parse().ok()?,
+            per_hour: parts[2].parse().ok()?,
+            per_day: parts[3].parse().ok()?,
+        })
+    }
+}
 
 /// this is for internal use only, please don't use this macro.
 #[doc(hidden)]
@@ -309,6 +362,17 @@ pub struct Config {
     /// set via `HYDRANT_ENABLE_BACKLINKS=true`.
     pub enable_backlinks: bool,
 
+    /// list of trusted PDS/relay hosts to pre-assign to the "trusted" rate tier at startup.
+    /// set via `HYDRANT_TRUSTED_HOSTS` as a comma-separated list of hostnames.
+    /// hosts not present in this list use the "default" tier unless assigned via the API.
+    pub trusted_hosts: Vec<String>,
+    /// named rate tier definitions for PDS rate limiting.
+    ///
+    /// built-in tiers ("default" and "trusted") are always present and may be overridden.
+    /// set via `HYDRANT_RATE_TIERS` as a comma-separated list of `name:base/mul/hourly/daily` entries,
+    /// e.g. `trusted:5000/10.0/18000000/432000000,custom:100/1.0/7200000/172800000`.
+    pub rate_tiers: HashMap<String, RateTier>,
+
     /// db internals, tune only if you know what you're doing.
     ///
     /// size of the fjall block cache in MB. set via `HYDRANT_CACHE_SIZE`.
@@ -388,6 +452,13 @@ impl Default for Config {
             filter_collections: None,
             filter_excludes: None,
             enable_backlinks: false,
+            trusted_hosts: vec![],
+            rate_tiers: {
+                let mut m = HashMap::new();
+                m.insert("default".to_string(), RateTier::default_tier());
+                m.insert("trusted".to_string(), RateTier::trusted());
+                m
+            },
             cache_size: 256,
             data_compression: Compression::Lz4,
             journal_compression: Compression::Lz4,
@@ -549,6 +620,35 @@ impl Config {
 
         let enable_backlinks: bool = cfg!("ENABLE_BACKLINKS", defaults.enable_backlinks);
 
+        // start with built-in tiers, then layer in any env-defined overrides.
+        // format: HYDRANT_RATE_TIERS=name:base/mul/hourly/daily,...
+        let mut rate_tiers = defaults.rate_tiers.clone();
+        if let Ok(s) = std::env::var("HYDRANT_RATE_TIERS") {
+            for entry in s.split(',') {
+                let entry = entry.trim();
+                if let Some((name, spec)) = entry.split_once(':') {
+                    match RateTier::parse(spec) {
+                        Some(tier) => {
+                            rate_tiers.insert(name.trim().to_string(), tier);
+                        }
+                        None => tracing::warn!(
+                            "ignoring invalid rate tier '{name}': expected base/mul/hourly/daily format"
+                        ),
+                    }
+                }
+            }
+        }
+
+        let trusted_hosts = std::env::var("HYDRANT_TRUSTED_HOSTS")
+            .ok()
+            .map(|s| {
+                s.split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
+            .unwrap_or_else(|| defaults.trusted_hosts.clone());
+
         let default_mode = CrawlerMode::default_for(full_network);
         let crawler_sources = match std::env::var("HYDRANT_CRAWLER_URLS") {
             Ok(s) => s
@@ -593,6 +693,8 @@ impl Config {
             filter_collections,
             filter_excludes,
             enable_backlinks,
+            trusted_hosts,
+            rate_tiers,
             cache_size,
             data_compression,
             journal_compression,

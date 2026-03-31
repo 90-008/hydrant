@@ -1,14 +1,23 @@
+use crate::config::RateTier;
+use parking_lot::Mutex;
 use scc::HashMap;
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{Notify, Semaphore, SemaphorePermit};
 use url::Url;
 
 /// max concurrent in-flight requests per PDS before we start queuing
 /// ref pds allows 10 requests per second... so 10 should be fine
 const PER_PDS_CONCURRENCY: usize = 10;
+
+// per second, hour and day
+const DURATIONS: [Duration; 3] = [
+    Duration::from_secs(1),
+    Duration::from_secs(3600),
+    Duration::from_secs(86400),
+];
 
 #[derive(Clone)]
 pub struct Throttler {
@@ -54,6 +63,7 @@ struct State {
     /// let tasks exit naturally, deferring to the background retry loop.
     failure_notify: Notify,
     semaphore: Semaphore,
+    rate_limiter: RateLimiter,
 }
 
 impl State {
@@ -64,6 +74,7 @@ impl State {
             consecutive_timeouts: AtomicUsize::new(0),
             failure_notify: Notify::new(),
             semaphore: Semaphore::new(PER_PDS_CONCURRENCY),
+            rate_limiter: RateLimiter::new(),
         }
     }
 }
@@ -92,9 +103,6 @@ impl ThrottleHandle {
     /// called on a 429 response. `retry_after_secs` comes from the `Retry-After`
     /// header if present; falls back to 60s. uses `fetch_max` so concurrent callers
     /// don't race each other back to a shorter window.
-    ///
-    /// deliberately does NOT notify waiters — 429s are soft and tasks should exit
-    /// naturally via the `Retry` result rather than being cancelled.
     pub fn record_ratelimit(&self, retry_after_secs: Option<u64>) {
         let secs = retry_after_secs.unwrap_or(60) as i64;
         let until = chrono::Utc::now().timestamp() + secs;
@@ -155,7 +163,6 @@ impl ThrottleHandle {
     }
 
     /// resolves when this PDS gets a hard failure notification.
-    /// used by `or_throttle` and the semaphore acquire select to cancel in-flight work.
     pub async fn wait_for_failure(&self) {
         loop {
             let notified = self.state.failure_notify.notified();
@@ -163,6 +170,108 @@ impl ThrottleHandle {
                 return;
             }
             notified.await;
+        }
+    }
+
+    /// waits until the rate tier's limits allow more events for this PDS.
+    /// sleeps precisely until the most restrictive window opens rather than polling.
+    pub async fn wait_for_allow(&self, num_accounts: u64, tier: &RateTier) {
+        let limits = limits_for(num_accounts, tier);
+        while let Some(wait) = self.state.rate_limiter.try_acquire(limits) {
+            tokio::time::sleep(wait).await;
+        }
+    }
+}
+
+fn limits_for(num_accounts: u64, tier: &RateTier) -> [u64; 3] {
+    let per_sec = tier
+        .per_second_base
+        .max((num_accounts as f64 * tier.per_second_account_mul) as u64);
+    [per_sec, tier.per_hour, tier.per_day]
+}
+
+struct WindowState {
+    count: u64,
+    prev_count: u64,
+    window_start: Instant,
+}
+
+impl WindowState {
+    fn new() -> Self {
+        Self {
+            count: 0,
+            prev_count: 0,
+            window_start: Instant::now(),
+        }
+    }
+
+    fn rotate(&mut self, dur: Duration) {
+        let elapsed = self.window_start.elapsed();
+        if elapsed >= dur {
+            let n = (elapsed.as_nanos() / dur.as_nanos()).max(1) as u32;
+            self.prev_count = if n == 1 { self.count } else { 0 };
+            self.count = 0;
+            self.window_start += dur * n;
+        }
+    }
+
+    /// returns how long to sleep before this window would allow one more event.
+    /// Duration::ZERO means allow now.
+    fn wait_needed(&self, dur: Duration, limit: u64) -> Duration {
+        let elapsed = self.window_start.elapsed();
+        let remaining = dur.saturating_sub(elapsed);
+        let weight = remaining.as_secs_f64() / dur.as_secs_f64();
+        let effective = self.count as f64 + self.prev_count as f64 * weight;
+
+        if effective < limit as f64 {
+            return Duration::ZERO;
+        }
+
+        if self.prev_count == 0 || self.count as f64 >= limit as f64 {
+            // must wait for a full window rotation
+            remaining + Duration::from_millis(1)
+        } else {
+            let secs = remaining.as_secs_f64()
+                - dur.as_secs_f64() * (limit as f64 - self.count as f64) / self.prev_count as f64;
+            Duration::from_secs_f64(secs.max(0.0)) + Duration::from_micros(500)
+        }
+    }
+}
+
+struct RateLimiter {
+    // parking_lot::Mutex — uncontended path never touches the kernel
+    windows: Mutex<[WindowState; 3]>,
+}
+
+impl RateLimiter {
+    fn new() -> Self {
+        Self {
+            windows: Mutex::new([WindowState::new(), WindowState::new(), WindowState::new()]),
+        }
+    }
+
+    /// returns None if the slot was acquired, or Some(sleep_for) if limited.
+    fn try_acquire(&self, limits: [u64; 3]) -> Option<Duration> {
+        let mut windows = self.windows.lock();
+
+        windows
+            .iter_mut()
+            .zip(DURATIONS)
+            .for_each(|(w, d)| w.rotate(d));
+
+        let max_wait = windows
+            .iter()
+            .zip(DURATIONS)
+            .zip(limits)
+            .map(|((w, dur), limit)| w.wait_needed(dur, limit))
+            .max()
+            .unwrap_or(Duration::ZERO);
+
+        if max_wait.is_zero() {
+            windows.iter_mut().for_each(|w| w.count += 1);
+            None
+        } else {
+            Some(max_wait)
         }
     }
 }

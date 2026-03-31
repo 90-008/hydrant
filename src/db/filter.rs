@@ -1,11 +1,10 @@
 use fjall::{Keyspace, OwnedWriteBatch};
-use jacquard_common::IntoStatic;
-use jacquard_common::types::nsid::Nsid;
 use jacquard_common::types::string::Did;
 use miette::{IntoDiagnostic, Result};
 
 use crate::db::types::TrimmedDid;
-use crate::filter::{FilterConfig, FilterMode, SetUpdate};
+use crate::filter::{FilterConfig, FilterMode};
+use crate::patch::SetUpdate;
 
 pub const MODE_KEY: &[u8] = b"m";
 pub const SIGNAL_PREFIX: u8 = b's';
@@ -113,14 +112,14 @@ pub fn load(ks: &Keyspace) -> Result<FilterConfig> {
     for guard in ks.prefix(signal_prefix) {
         let (k, _) = guard.into_inner().into_diagnostic()?;
         let val = std::str::from_utf8(&k[signal_prefix.len()..]).into_diagnostic()?;
-        config.signals.push(Nsid::new(val)?.into_static());
+        config.signals.push(val.into());
     }
 
     let col_prefix = [COLLECTION_PREFIX, SEP];
     for guard in ks.prefix(col_prefix) {
         let (k, _) = guard.into_inner().into_diagnostic()?;
         let val = std::str::from_utf8(&k[col_prefix.len()..]).into_diagnostic()?;
-        config.collections.push(Nsid::new(val)?.into_static());
+        config.collections.push(val.into());
     }
 
     Ok(config)
@@ -144,6 +143,8 @@ pub fn read_set(ks: &Keyspace, prefix: u8) -> Result<Vec<String>> {
 
 #[cfg(test)]
 mod tests {
+    use smol_str::SmolStr;
+
     use super::*;
 
     #[test]
@@ -198,14 +199,8 @@ mod tests {
 
         let config = load(&ks)?;
         assert_eq!(config.mode, FilterMode::Filter);
-        assert_eq!(
-            config.signals,
-            vec![Nsid::new("a.b.c").unwrap().into_static()]
-        );
-        assert_eq!(
-            config.collections,
-            vec![Nsid::new("d.e.f").unwrap().into_static()]
-        );
+        assert_eq!(config.signals, vec![SmolStr::new("a.b.c")]);
+        assert_eq!(config.collections, vec![SmolStr::new("d.e.f")]);
 
         let excludes = read_set(&ks, EXCLUDE_PREFIX)?;
         assert_eq!(excludes, vec!["did:plc:yk4q3id7id6p5z3bypvshc64"]);

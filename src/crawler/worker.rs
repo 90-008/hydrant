@@ -137,35 +137,44 @@ impl CrawlerWorker {
 
         // filter already-known repos, build and commit the write batch, then return
         // the surviving guards so they are dropped on the async side after commit.
-        let db = self.state.db.clone();
+        let app_state = self.state.clone();
         let surviving = tokio::time::timeout(
             BLOCKING_TASK_TIMEOUT,
             tokio::task::spawn_blocking(move || -> Result<Vec<InFlightGuard>> {
                 let mut rng: SmallRng = rand::make_rng();
-                let mut batch = db.inner.batch();
+                let mut batch = app_state.db.inner.batch();
                 let mut surviving = Vec::new();
                 for guard in guards {
                     let did_key = keys::repo_key(&*guard);
                     let metadata_key = keys::repo_metadata_key(&*guard);
-                    if db.repos.contains_key(&did_key).into_diagnostic()? {
+                    if app_state
+                        .db
+                        .repos
+                        .contains_key(&did_key)
+                        .into_diagnostic()?
+                    {
                         continue;
                     }
                     let state = RepoState::backfilling();
                     let metadata = RepoMetadata::backfilling(rng.next_u64());
-                    batch.insert(&db.repos, &did_key, ser_repo_state(&state)?);
+                    batch.insert(&app_state.db.repos, &did_key, ser_repo_state(&state)?);
                     batch.insert(
-                        &db.repo_metadata,
+                        &app_state.db.repo_metadata,
                         &metadata_key,
                         crate::db::ser_repo_metadata(&metadata)?,
                     );
-                    batch.insert(&db.pending, keys::pending_key(metadata.index_id), &did_key);
+                    batch.insert(
+                        &app_state.db.pending,
+                        keys::pending_key(metadata.index_id),
+                        &did_key,
+                    );
                     // clear any stale retry entry, this DID is confirmed and being enqueued
-                    batch.remove(&db.crawler, keys::crawler_retry_key(&*guard));
+                    batch.remove(&app_state.db.crawler, keys::crawler_retry_key(&*guard));
                     trace!(did = %*guard, "enqueuing repo");
                     surviving.push(guard);
                 }
                 if let Some(cursor) = cursor_update {
-                    batch.insert(&db.cursors, cursor.key, cursor.value);
+                    batch.insert(&app_state.db.cursors, cursor.key, cursor.value);
                 }
                 // todo: repo state overwrites here are acceptable?
                 batch.commit().into_diagnostic()?;
@@ -202,12 +211,12 @@ impl CrawlerWorker {
     }
 
     async fn commit_cursor(&self, cursor: CursorUpdate) -> Result<()> {
-        let db = self.state.db.clone();
+        let state = self.state.clone();
         tokio::time::timeout(
             BLOCKING_TASK_TIMEOUT,
             tokio::task::spawn_blocking(move || {
-                let mut batch = db.inner.batch();
-                batch.insert(&db.cursors, cursor.key, cursor.value);
+                let mut batch = state.db.inner.batch();
+                batch.insert(&state.db.cursors, cursor.key, cursor.value);
                 batch.commit().into_diagnostic()
             }),
         )

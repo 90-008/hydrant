@@ -274,7 +274,7 @@ impl RelayWorker {
             }
             SubscribeReposMessage::Account(account) => {
                 debug!("processing account");
-                Self::handle_account(ctx, &mut repo_state, &msg.firehose, *account)
+                Self::handle_account(ctx, &mut repo_state, &msg.firehose, *account, msg.is_pds)
             }
             _ => Ok(()),
         }
@@ -472,8 +472,9 @@ impl RelayWorker {
     fn handle_account(
         ctx: &mut WorkerContext,
         repo_state: &mut RepoState,
-        #[allow(unused_variables)] firehose: &Url,
+        firehose: &Url,
         #[allow(unused_mut)] mut account: Account<'static>,
+        is_pds: bool,
     ) -> Result<()> {
         let event_ms = account.time.0.timestamp_millis();
         if repo_state.last_message_time.is_some_and(|t| event_ms <= t) {
@@ -483,8 +484,10 @@ impl RelayWorker {
 
         repo_state.advance_message_time(event_ms);
 
+        // always capture was_active for count tracking, not just in indexer mode
+        let was_active = repo_state.active;
         #[cfg(feature = "indexer")]
-        let (was_active, was_status) = (repo_state.active, repo_state.status.clone());
+        let was_status = repo_state.status.clone();
 
         repo_state.active = account.active;
         if !account.active {
@@ -510,6 +513,18 @@ impl RelayWorker {
                 Some(AccountStatus::Throttled) => RepoStatus::Throttled,
                 _ => RepoStatus::Synced,
             };
+        }
+
+        // update per-PDS active account count on transitions
+        if is_pds {
+            if let Some(host) = firehose.host_str() {
+                let count_key = keys::pds_account_count_key(host);
+                if !was_active && repo_state.active {
+                    ctx.state.db.update_count(&count_key, 1);
+                } else if was_active && !repo_state.active {
+                    ctx.state.db.update_count(&count_key, -1);
+                }
+            }
         }
 
         let repo_key = keys::repo_key(&account.did);
@@ -558,14 +573,20 @@ impl WorkerContext<'_> {
         repo_state: &mut RepoState,
         source_host: &str,
     ) -> Result<AuthorityOutcome> {
-        let expected = pds_host(repo_state.pds.as_deref());
+        let pds_host = |pds: &str| {
+            Url::parse(pds)
+                .ok()
+                .and_then(|u| u.host_str().map(SmolStr::new))
+        };
+
+        let expected = repo_state.pds.as_deref().and_then(pds_host);
         if expected.as_deref() == Some(source_host) {
             return Ok(AuthorityOutcome::Authorized);
         }
 
         // try again once
         self.refresh_doc(did, repo_state)?;
-        let Some(expected) = pds_host(repo_state.pds.as_deref()) else {
+        let Some(expected) = repo_state.pds.as_deref().and_then(pds_host) else {
             miette::bail!("can't get pds host???");
         };
 
@@ -837,6 +858,13 @@ impl WorkerContext<'_> {
 
         db.update_count("repos", 1);
 
+        // track initial active state for per-PDS rate limiting
+        if msg.is_pds && repo_state.active {
+            if let Some(host) = msg.firehose.host_str() {
+                db.update_count(&keys::pds_account_count_key(host), 1);
+            }
+        }
+
         Ok(Some(repo_state))
     }
 
@@ -860,13 +888,4 @@ enum AuthorityOutcome {
     WasStale,
     /// host did not match even after doc resolution.
     WrongHost { expected: SmolStr },
-}
-
-fn pds_host(pds: Option<&str>) -> Option<SmolStr> {
-    // todo: add faster host parsing since we only need that
-    pds.and_then(|pds| Url::parse(pds).ok()).map(|u| {
-        u.host_str()
-            .map(SmolStr::new)
-            .expect("that there is host in pds url")
-    })
 }

@@ -3,12 +3,14 @@
 pub(crate) mod crawler;
 pub(crate) mod filter;
 pub(crate) mod firehose;
+pub(crate) mod pds;
 pub(crate) mod repos;
 pub(crate) mod stream;
 
 pub use crawler::{CrawlerHandle, CrawlerSourceInfo};
 pub use filter::{FilterControl, FilterPatch, FilterSnapshot};
 pub use firehose::{FirehoseHandle, FirehoseSourceInfo};
+pub use pds::{PdsControl, PdsTierAssignment, PdsTierDefinition};
 pub use repos::{ListedRecord, Record, RecordList, RepoHandle, RepoInfo, ReposControl};
 use smol_str::{SmolStr, ToSmolStr};
 
@@ -87,6 +89,7 @@ pub struct Hydrant {
     pub firehose: FirehoseHandle,
     pub backfill: BackfillHandle,
     pub filter: FilterControl,
+    pub pds: PdsControl,
     pub repos: ReposControl,
     pub db: DbControl,
     #[cfg(feature = "backlinks")]
@@ -121,15 +124,15 @@ impl Hydrant {
             let signals = config
                 .filter_signals
                 .clone()
-                .map(crate::filter::SetUpdate::Set);
+                .map(crate::patch::SetUpdate::Set);
             let collections = config
                 .filter_collections
                 .clone()
-                .map(crate::filter::SetUpdate::Set);
+                .map(crate::patch::SetUpdate::Set);
             let excludes = config
                 .filter_excludes
                 .clone()
-                .map(crate::filter::SetUpdate::Set);
+                .map(crate::patch::SetUpdate::Set);
 
             tokio::task::spawn_blocking(move || {
                 let mut batch = inner.batch();
@@ -174,14 +177,10 @@ impl Hydrant {
                 tasks: Arc::new(scc::HashMap::new()),
                 persisted: Arc::new(scc::HashSet::new()),
             },
-            firehose: FirehoseHandle {
-                state: state.clone(),
-                shared: Arc::new(std::sync::OnceLock::new()),
-                tasks: Arc::new(scc::HashMap::new()),
-                persisted: Arc::new(scc::HashSet::new()),
-            },
+            firehose: FirehoseHandle::new(state.clone()),
             backfill: BackfillHandle(state.clone()),
             filter: FilterControl(state.clone()),
+            pds: pds::PdsControl(state.clone()),
             repos: ReposControl(state.clone()),
             db: DbControl(state.clone()),
             #[cfg(feature = "backlinks")]
@@ -436,10 +435,10 @@ impl Hydrant {
             // 11. spawn crawler infrastructure
             #[cfg(feature = "indexer")]
             {
-                use crate::crawler::throttle::Throttler;
                 use crate::crawler::{
                     CrawlerStats, CrawlerWorker, InFlight, RetryProducer, SignalChecker,
                 };
+                use crate::util::throttle::Throttler;
 
                 let http = reqwest::Client::builder()
                     .user_agent(concat!(
@@ -450,7 +449,7 @@ impl Hydrant {
                     .gzip(true)
                     .build()
                     .expect("that reqwest will build");
-                let pds_throttler = Throttler::new();
+                let pds_throttler = state.throttler.clone();
                 let in_flight = InFlight::new();
                 let stats = CrawlerStats::new(
                     state.clone(),
@@ -714,7 +713,7 @@ impl Hydrant {
     ///
     /// sizes are in bytes, reported per keyspace.
     pub async fn stats(&self) -> Result<StatsResponse> {
-        let db = self.state.db.clone();
+        let state = self.state.clone();
 
         let mut counts: BTreeMap<&'static str, u64> = futures::future::join_all(
             [
@@ -729,29 +728,29 @@ impl Hydrant {
             ]
             .into_iter()
             .map(|name| {
-                let db = db.clone();
-                async move { (name, db.get_count(name).await) }
+                let state = state.clone();
+                async move { (name, state.db.get_count(name).await) }
             }),
         )
         .await
         .into_iter()
         .collect();
 
-        counts.insert("events", db.events.approximate_len() as u64);
+        counts.insert("events", state.db.events.approximate_len() as u64);
 
         let sizes = tokio::task::spawn_blocking(move || {
             let mut s = BTreeMap::new();
-            s.insert("repos", db.repos.disk_space());
-            s.insert("records", db.records.disk_space());
-            s.insert("blocks", db.blocks.disk_space());
-            s.insert("cursors", db.cursors.disk_space());
-            s.insert("pending", db.pending.disk_space());
-            s.insert("resync", db.resync.disk_space());
-            s.insert("resync_buffer", db.resync_buffer.disk_space());
-            s.insert("events", db.events.disk_space());
-            s.insert("counts", db.counts.disk_space());
-            s.insert("filter", db.filter.disk_space());
-            s.insert("crawler", db.crawler.disk_space());
+            s.insert("repos", state.db.repos.disk_space());
+            s.insert("records", state.db.records.disk_space());
+            s.insert("blocks", state.db.blocks.disk_space());
+            s.insert("cursors", state.db.cursors.disk_space());
+            s.insert("pending", state.db.pending.disk_space());
+            s.insert("resync", state.db.resync.disk_space());
+            s.insert("resync_buffer", state.db.resync_buffer.disk_space());
+            s.insert("events", state.db.events.disk_space());
+            s.insert("counts", state.db.counts.disk_space());
+            s.insert("filter", state.db.filter.disk_space());
+            s.insert("crawler", state.db.crawler.disk_space());
             s
         })
         .await
@@ -788,12 +787,12 @@ impl Hydrant {
     ///
     /// returns the seq we are on for this host.
     pub async fn get_host_status(&self, hostname: &str) -> Result<Option<Host>> {
-        let db = self.state.db.clone();
+        let state = self.state.clone();
         let hostname = hostname.to_smolstr();
 
         tokio::task::spawn_blocking(move || {
             let key = keys::firehose_cursor_key(&hostname);
-            let Some(seq) = db.cursors.get(&key).into_diagnostic()? else {
+            let Some(seq) = state.db.cursors.get(&key).into_diagnostic()? else {
                 return Ok(None);
             };
             let seq = i64::from_be_bytes(
@@ -820,7 +819,7 @@ impl Hydrant {
         cursor: Option<&str>,
         limit: usize,
     ) -> Result<(Vec<Host>, Option<SmolStr>)> {
-        let db = self.state.db.clone();
+        let state = self.state.clone();
         let cursor = cursor.map(str::to_string);
 
         tokio::task::spawn_blocking(move || {
@@ -836,7 +835,8 @@ impl Hydrant {
 
             // fetch one extra item to detect whether there is a next page
             let mut hosts: Vec<Host> = Vec::with_capacity(limit + 1);
-            for item in db
+            for item in state
+                .db
                 .cursors
                 .range((start_bound, std::ops::Bound::Excluded(prefix_end)))
                 .take(limit + 1)
@@ -972,9 +972,9 @@ impl DbControl {
         state
             .with_ingestion_paused(async || {
                 let train = |name: &'static str| {
-                    let db = state.db.clone();
-                    tokio::task::spawn_blocking(move || db.train_dict(name))
-                        .map(|res| res.into_diagnostic().flatten())
+                    let state = state.clone();
+                    tokio::task::spawn_blocking(move || state.db.train_dict(name))
+                        .map(|res: Result<_, _>| res.into_diagnostic().flatten())
                 };
                 tokio::try_join!(train("repos"), train("blocks"), train("events")).map(|_| ())
             })

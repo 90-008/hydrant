@@ -1,21 +1,11 @@
-use jacquard_common::types::nsid::Nsid;
 use serde::{Deserialize, Serialize};
+use smol_str::SmolStr;
 use std::sync::Arc;
 
 pub(crate) type FilterHandle = Arc<arc_swap::ArcSwap<FilterConfig>>;
 
 pub(crate) fn new_handle(config: FilterConfig) -> FilterHandle {
     Arc::new(arc_swap::ArcSwap::new(Arc::new(config)))
-}
-
-/// apply a bool patch or set replacement for a single set update.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(untagged)]
-pub(crate) enum SetUpdate {
-    /// replace the entire set with this list
-    Set(Vec<String>),
-    /// patch: true = add, false = remove
-    Patch(std::collections::HashMap<String, bool>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -28,8 +18,8 @@ pub enum FilterMode {
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct FilterConfig {
     pub mode: FilterMode,
-    pub signals: Vec<Nsid<'static>>,
-    pub collections: Vec<Nsid<'static>>,
+    pub signals: Vec<SmolStr>,
+    pub collections: Vec<SmolStr>,
 }
 
 impl FilterConfig {

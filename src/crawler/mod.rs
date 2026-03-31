@@ -14,10 +14,9 @@ use url::Url;
 
 mod by_collection;
 mod list_repos;
-pub mod throttle;
 mod worker;
 
-use throttle::Throttler;
+use crate::util::throttle::Throttler;
 
 pub(crate) use by_collection::ByCollectionProducer;
 pub(crate) use list_repos::{ListReposProducer, RetryProducer, SignalChecker};

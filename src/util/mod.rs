@@ -10,6 +10,8 @@ use url::Url;
 
 use crate::{db::types::DidKey, types::RepoStatus};
 
+pub mod throttle;
+
 /// outcome of [`RetryWithBackoff::retry`] when the operation does not succeed.
 pub enum RetryOutcome<E> {
     /// ratelimited after exhausting all retries

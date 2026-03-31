@@ -1,7 +1,7 @@
-use crate::crawler::throttle::{OrFailure, ThrottleHandle, Throttler};
 use crate::db::keys::crawler_cursor_key;
 use crate::db::{Db, keys};
 use crate::state::AppState;
+use crate::util::throttle::{OrFailure, ThrottleHandle, Throttler};
 use crate::util::{
     ErrorForStatus, RetryOutcome, RetryWithBackoff, WatchEnabledExt, parse_retry_after,
 };
@@ -653,7 +653,7 @@ impl RetryProducer {
     }
 
     async fn process_queue(&self) -> Result<Option<Duration>> {
-        let db = self.checker.state.db.clone();
+        let state = self.checker.state.clone();
 
         struct ScanResult {
             ready: Vec<Did<'static>>,
@@ -675,7 +675,7 @@ impl RetryProducer {
             let mut next_wake: Option<Duration> = None;
             let mut had_more = false;
 
-            for guard in db.crawler.prefix(keys::CRAWLER_RETRY_PREFIX) {
+            for guard in state.db.crawler.prefix(keys::CRAWLER_RETRY_PREFIX) {
                 let (key, val) = guard.into_inner().into_diagnostic()?;
                 let state: RetryState = rmp_serde::from_slice(&val).into_diagnostic()?;
                 let did = keys::crawler_retry_parse_key(&key)?.to_did();

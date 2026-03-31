@@ -18,6 +18,7 @@ pub(crate) mod db;
 pub(crate) mod ingest;
 #[cfg(feature = "indexer")]
 pub(crate) mod ops;
+pub(crate) mod patch;
 pub(crate) mod resolver;
 pub(crate) mod state;
 pub(crate) mod util;

@@ -1491,6 +1491,7 @@ dependencies = [
  "miette",
  "mimalloc",
  "multibase",
+ "parking_lot",
  "rand 0.10.0",
  "reqwest",
  "rmp-serde",

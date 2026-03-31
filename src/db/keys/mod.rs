@@ -231,6 +231,10 @@ pub fn firehose_source_key(url: &str) -> Vec<u8> {
     key
 }
 
+pub fn pds_account_count_key(host: &str) -> String {
+    format!("p|{host}")
+}
+
 #[cfg(feature = "relay")]
 /// key format: {SEQ} (u64 big-endian), mirroring event_key
 pub fn relay_event_key(seq: u64) -> [u8; 8] {

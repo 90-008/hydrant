@@ -3,6 +3,7 @@ use crate::ingest::stream::{FirehoseError, FirehoseStream, SubscribeReposMessage
 use crate::ingest::{BufferTx, IngestMessage};
 use crate::state::AppState;
 use crate::util::WatchEnabledExt;
+use crate::util::throttle::ThrottleHandle;
 use jacquard_common::IntoStatic;
 use jacquard_common::types::did::Did;
 use miette::{IntoDiagnostic, Result};
@@ -21,10 +22,11 @@ pub struct FirehoseIngestor {
     filter: FilterHandle,
     enabled: watch::Receiver<bool>,
     _verify_signatures: bool,
+    throttle: ThrottleHandle,
 }
 
 impl FirehoseIngestor {
-    pub fn new(
+    pub async fn new(
         state: Arc<AppState>,
         buffer_tx: BufferTx,
         relay_host: Url,
@@ -33,6 +35,7 @@ impl FirehoseIngestor {
         enabled: watch::Receiver<bool>,
         verify_signatures: bool,
     ) -> Self {
+        let throttle = state.throttler.get_handle(&relay_host).await;
         Self {
             state,
             buffer_tx,
@@ -41,11 +44,16 @@ impl FirehoseIngestor {
             filter,
             enabled,
             _verify_signatures: verify_signatures,
+            throttle,
         }
     }
 
     #[tracing::instrument(skip(self), fields(relay = %self.relay_host))]
     pub async fn run(mut self) -> Result<()> {
+        // extract host as owned String to avoid borrow conflicts with &self inside the loop
+        let host = self.relay_host.host_str().unwrap_or("").to_string();
+        let count_key = crate::db::keys::pds_account_count_key(&host);
+
         loop {
             self.enabled.wait_enabled("firehose").await;
 
@@ -87,7 +95,14 @@ impl FirehoseIngestor {
                             }
                         };
                         match decode_frame(&bytes) {
-                            Ok(msg) => self.handle_message(msg).await,
+                            Ok(msg) => {
+                                if self.is_pds {
+                                    let accounts = self.state.db.get_count(&count_key).await;
+                                    let tier = self.state.pds_tier_for(&host);
+                                    self.throttle.wait_for_allow(accounts, &tier).await;
+                                }
+                                self.handle_message(msg).await
+                            },
                             Err(e) => {
                                 match e {
                                     // dont disconnect on unknown op or type

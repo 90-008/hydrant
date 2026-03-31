@@ -1,5 +1,6 @@
 use crate::control::{FilterPatch, Hydrant};
-use crate::filter::{FilterMode, SetUpdate};
+use crate::filter::FilterMode;
+use crate::patch::SetUpdate;
 use axum::{
     Json, Router,
     extract::State,

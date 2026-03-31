@@ -29,6 +29,7 @@ pub mod ephemeral;
 pub mod filter;
 pub mod keys;
 pub mod migration;
+pub mod pds_tiers;
 pub mod types;
 
 use tokio::sync::broadcast;
@@ -38,7 +39,6 @@ fn default_opts() -> KeyspaceCreateOptions {
     KeyspaceCreateOptions::default()
 }
 
-#[derive(Clone)]
 pub struct Db {
     pub inner: Arc<Database>,
     pub path: std::path::PathBuf,

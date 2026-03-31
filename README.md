@@ -2,7 +2,7 @@
 
 -> [hydrant](#hydrant)</br>
 -> [vs tap](#vs-tap) | [stream](#stream-behavior) | [multi-relay](#multiple-relay-support) | [crawler sources](#crawler-sources)</br>
--> [configuration](#configuration)</br>
+-> [configuration](#configuration) | [build features](#build-features)</br>
 -> [rest api](#rest-api) | [filter](#filter-management) | [ingestion](#ingestion-control) | [crawler](#crawler-management) | [firehose](#firehose-management) | [repos](#repository-management)</br>
 -> [xrpc api](#data-access-xrpc) | [backlinks](#bluemicrocosmlinks) | [identity](#bluemicrocosmidentity) | [atproto](#comatproto) | [custom](#systemsgazehydrant)
 
@@ -141,6 +141,18 @@ directory, it will also be loaded automatically.
 | `ENABLE_CRAWLER` | `true` if full network or crawler sources are configured, `false` otherwise | whether to actively query the network for unknown repositories. |
 | `CRAWLER_MAX_PENDING_REPOS` | `2000` | max pending repos for crawler. |
 | `CRAWLER_RESUME_PENDING_REPOS` | `1000` | resume threshold for crawler pending repos. |
+
+## build features
+
+<small>[<- back to toc](#table-of-contents)</small>
+
+`hydrant` has several optional compile-time features:
+
+| feature | default | description |
+| :--- | :--- | :--- |
+| `indexer` | yes | enables the indexing logic. |
+| `relay` | no | enables relay functionality. |
+| `backlinks` | no | enables the backlinks indexer and XRPC endpoints (`blue.microcosm.links.*`). |
 
 ## REST api
 
@@ -329,6 +341,8 @@ the following are implemented currently:
 - `com.atproto.sync.getRepoStatus`
 - `com.atproto.sync.listRepos`
 - `com.atproto.sync.getLatestCommit`
+- `com.atproto.sync.requestCrawl` (adds the host to firehose sources in relay mode)
+- `com.atproto.sync.subscribeRepos` (WebSocket firehose stream, requires `relay` feature)
 
 ### systems.gaze.hydrant.*
 
@@ -397,11 +411,3 @@ return the number of records that link to a given subject.
 | `source` | no | filter by source collection (same format as `getBacklinks`). |
 
 returns `{ count }`.
-
-### blue.microcosm.identity.*
-
-<small>[<- back to toc](#table-of-contents)</small>
-
-#### blue.microcosm.identity.resolveMiniDoc
-
-see [here](https://slingshot.microcosm.blue/#tag/slingshot-specific-queries/GET/xrpc/blue.microcosm.identity.resolveMiniDoc) for this XRPC's documentation.

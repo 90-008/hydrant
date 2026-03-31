@@ -4,7 +4,8 @@ use tracing::error;
 use miette::{IntoDiagnostic, Result};
 
 use crate::db::filter as db_filter;
-use crate::filter::{FilterMode, SetUpdate};
+use crate::filter::FilterMode;
+use crate::patch::SetUpdate;
 use crate::state::AppState;
 
 /// a point-in-time snapshot of the filter configuration. returned by all [`FilterControl`] methods.
@@ -273,6 +274,7 @@ impl FilterPatch {
         let filter_ks = self.state.db.filter.clone();
         let inner = self.state.db.inner.clone();
         let filter_handle = self.state.filter.clone();
+        let state = self.state.clone();
         let mode = self.mode;
         let signals = self.signals;
         let collections = self.collections;
@@ -282,6 +284,7 @@ impl FilterPatch {
             let mut batch = inner.batch();
             db_filter::apply_patch(&mut batch, &filter_ks, mode, signals, collections, excludes)?;
             batch.commit().into_diagnostic()?;
+            state.db.persist()?;
             db_filter::load(&filter_ks)
         })
         .await

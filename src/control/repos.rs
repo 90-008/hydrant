@@ -86,7 +86,7 @@ impl ReposControl {
             std::ops::Bound::Unbounded
         };
 
-        let db = self.0.db.clone();
+        let state = self.0.clone();
         self.0
             .db
             .repos
@@ -96,7 +96,8 @@ impl ReposControl {
                 let repo_state = crate::db::deser_repo_state(&v)?.into_static();
                 let did = TrimmedDid::try_from(k.as_ref())?.to_did();
                 let metadata_key = keys::repo_metadata_key(&did);
-                let metadata = db
+                let metadata = state
+                    .db
                     .repo_metadata
                     .get(&metadata_key)
                     .into_diagnostic()?
@@ -122,7 +123,7 @@ impl ReposControl {
         };
 
         let repos = self.0.db.repos.clone();
-        let db = self.0.db.clone();
+        let state = self.0.clone();
         self.0
             .db
             .pending
@@ -144,7 +145,8 @@ impl ReposControl {
                 let repo_state = crate::db::deser_repo_state(bytes.as_ref())?;
                 let did = TrimmedDid::try_from(did_key.as_ref())?.to_did();
                 let metadata_key = keys::repo_metadata_key(&did);
-                let metadata = db
+                let metadata = state
+                    .db
                     .repo_metadata
                     .get(&metadata_key)
                     .into_diagnostic()?
@@ -169,7 +171,7 @@ impl ReposControl {
         };
 
         let repos = self.0.db.repos.clone();
-        let db = self.0.db.clone();
+        let state = self.0.clone();
         self.0
             .db
             .resync
@@ -184,7 +186,8 @@ impl ReposControl {
                 let repo_state = crate::db::deser_repo_state(bytes.as_ref())?;
                 let did = TrimmedDid::try_from(did_key.as_ref())?.to_did();
                 let metadata_key = keys::repo_metadata_key(&did);
-                let metadata = db
+                let metadata = state
+                    .db
                     .repo_metadata
                     .get(&metadata_key)
                     .into_diagnostic()?
@@ -304,6 +307,7 @@ impl ReposControl {
             }
 
             batch.commit().into_diagnostic()?;
+            state.db.persist()?;
             Ok::<_, miette::Report>((queued, transitions))
         })
         .await
@@ -369,6 +373,7 @@ impl ReposControl {
             }
 
             batch.commit().into_diagnostic()?;
+            state.db.persist()?;
             Ok::<_, miette::Report>((added, queued, transitions))
         })
         .await
@@ -438,6 +443,7 @@ impl ReposControl {
             }
 
             batch.commit().into_diagnostic()?;
+            state.db.persist()?;
             Ok::<_, miette::Report>((untracked, gauge_decrements))
         })
         .await

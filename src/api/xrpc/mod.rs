@@ -1,18 +1,10 @@
-use crate::api::xrpc::count_records::CountRecords;
-use crate::api::xrpc::describe_repo::DescribeRepo;
 use crate::control::Hydrant;
 use axum::extract::FromRequest;
 use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::{Json, Router, extract::State, http::StatusCode};
-use jacquard_api::com_atproto::repo::{
-    describe_repo::DescribeRepoRequest as AtprotoDescribeRepoRequest,
-    get_record::{GetRecordError, GetRecordOutput, GetRecordRequest},
-    list_records::{ListRecordsOutput, ListRecordsRequest, Record as RepoRecord},
-};
 use jacquard_api::com_atproto::sync::get_host_status::GetHostStatusRequest;
 use jacquard_api::com_atproto::sync::get_latest_commit::GetLatestCommitRequest;
-use jacquard_api::com_atproto::sync::get_repo::GetRepoRequest;
 use jacquard_api::com_atproto::sync::get_repo_status::GetRepoStatusRequest;
 use jacquard_api::com_atproto::sync::list_hosts::ListHostsRequest;
 use jacquard_api::com_atproto::sync::list_repos::ListReposRequest;
@@ -27,48 +19,79 @@ use jacquard_common::{
 use serde::{Deserialize, Serialize};
 use smol_str::ToSmolStr;
 use std::fmt::Display;
+use std::result::Result;
+#[cfg(feature = "indexer")]
+use {
+    crate::api::xrpc::count_records::CountRecords,
+    crate::api::xrpc::describe_repo::DescribeRepo,
+    jacquard_api::com_atproto::repo::{
+        describe_repo::DescribeRepoRequest as AtprotoDescribeRepoRequest,
+        get_record::{GetRecordError, GetRecordOutput, GetRecordRequest},
+        list_records::{ListRecordsOutput, ListRecordsRequest, Record as RepoRecord},
+    },
+    jacquard_api::com_atproto::sync::get_repo::GetRepoRequest,
+};
 #[cfg(feature = "relay")]
 use {
+    jacquard_api::com_atproto::sync::request_crawl::RequestCrawlRequest,
     jacquard_api::com_atproto::sync::subscribe_repos::SubscribeReposEndpoint,
     jacquard_common::xrpc::SubscriptionEndpoint,
 };
 
-mod com_atproto_describe_repo;
-mod count_records;
-mod describe_repo;
 mod get_host_status;
 mod get_latest_commit;
-mod get_record;
-mod get_repo;
 mod get_repo_status;
 mod list_hosts;
-mod list_records;
 mod list_repos;
+
+#[cfg(feature = "indexer")]
+mod com_atproto_describe_repo;
+#[cfg(feature = "indexer")]
+mod count_records;
+#[cfg(feature = "indexer")]
+mod describe_repo;
+#[cfg(feature = "indexer")]
+mod get_record;
+#[cfg(feature = "indexer")]
+mod get_repo;
+#[cfg(feature = "indexer")]
+mod list_records;
+
+#[cfg(feature = "relay")]
+mod request_crawl;
 #[cfg(feature = "relay")]
 mod subscribe_repos;
 
 pub fn router() -> Router<Hydrant> {
     let r = Router::new()
+        .route(GetHostStatusRequest::PATH, get(get_host_status::handle))
+        .route(ListHostsRequest::PATH, get(list_hosts::handle))
+        .route(GetLatestCommitRequest::PATH, get(get_latest_commit::handle))
+        .route(GetRepoStatusRequest::PATH, get(get_repo_status::handle))
+        .route(ListReposRequest::PATH, get(list_repos::handle));
+
+    #[cfg(feature = "indexer")]
+    let r = r
         .route(GetRecordRequest::PATH, get(get_record::handle))
         .route(ListRecordsRequest::PATH, get(list_records::handle))
         .route(CountRecords::PATH, get(count_records::handle))
+        .route(GetRepoRequest::PATH, get(get_repo::handle))
         .route(DescribeRepo::PATH, get(describe_repo::handle))
         .route(
             AtprotoDescribeRepoRequest::PATH,
             get(com_atproto_describe_repo::handle),
-        )
-        .route(GetHostStatusRequest::PATH, get(get_host_status::handle))
-        .route(ListHostsRequest::PATH, get(list_hosts::handle))
-        .route(GetLatestCommitRequest::PATH, get(get_latest_commit::handle))
-        .route(GetRepoRequest::PATH, get(get_repo::handle))
-        .route(GetRepoStatusRequest::PATH, get(get_repo_status::handle))
-        .route(ListReposRequest::PATH, get(list_repos::handle));
+        );
 
     #[cfg(feature = "relay")]
-    let r = r.route(
-        SubscribeReposEndpoint::PATH,
-        axum::routing::get(subscribe_repos::handle),
-    );
+    let r = r
+        .route(
+            SubscribeReposEndpoint::PATH,
+            axum::routing::get(subscribe_repos::handle),
+        )
+        .route(
+            RequestCrawlRequest::PATH,
+            axum::routing::get(subscribe_repos::handle),
+        );
 
     r
 }
