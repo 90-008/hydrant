@@ -152,9 +152,9 @@ directory, it will also be loaded automatically.
 
 | feature | default | description |
 | :--- | :--- | :--- |
-| `indexer` | yes | enables the indexing logic. |
-| `relay` | no | enables relay functionality. |
-| `backlinks` | no | enables the backlinks indexer and XRPC endpoints (`blue.microcosm.links.*`). |
+| `indexer` | yes | makes hydrant act as an indexer. incompatible with the relay feature. |
+| `relay` | no | makes hydrant act as a relay. incompatible with the indexer feature. |
+| `backlinks` | no | enables the backlinks indexer and XRPC endpoints (`blue.microcosm.links.*`). requires indexer feature. |
 
 ## REST api
 
