@@ -5,6 +5,7 @@ pub(crate) mod filter;
 pub(crate) mod firehose;
 pub(crate) mod pds;
 pub(crate) mod repos;
+mod seed;
 pub(crate) mod stream;
 
 pub use crawler::{CrawlerHandle, CrawlerSourceInfo};
@@ -430,6 +431,16 @@ impl Hydrant {
                     .tasks
                     .insert_async(source.url.clone(), handle)
                     .await;
+            }
+
+            // 10c. seed firehose PDS sources from listHosts on configured seed URLs
+            if !config.seed_hosts.is_empty() {
+                let seed_urls = config.seed_hosts.clone();
+                let firehose = firehose.clone();
+                let state = state.clone();
+                tokio::spawn(async move {
+                    seed::seed_from_list_hosts(&seed_urls, &firehose, &state).await;
+                });
             }
 
             // 11. spawn crawler infrastructure

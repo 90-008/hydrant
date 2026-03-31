@@ -220,6 +220,14 @@ pub fn crawler_source_key(url: &str) -> Vec<u8> {
     key
 }
 
+pub const SEED_CURSOR_PREFIX: &[u8] = b"seed_cursor|";
+
+pub fn seed_cursor_key(url: &str) -> Vec<u8> {
+    let mut key = SEED_CURSOR_PREFIX.to_vec();
+    key.extend_from_slice(url.as_bytes());
+    key
+}
+
 pub const FIREHOSE_CURSOR_PREFIX: &[u8] = b"firehose_cursor|";
 
 pub const FIREHOSE_SOURCE_PREFIX: &[u8] = b"firehose|";

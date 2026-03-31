@@ -362,6 +362,14 @@ pub struct Config {
     /// set via `HYDRANT_ENABLE_BACKLINKS=true`.
     pub enable_backlinks: bool,
 
+    /// base URL(s) of relay or aggregator services to seed firehose PDS sources from at startup.
+    ///
+    /// hydrant calls `com.atproto.sync.listHosts` on each URL and adds the returned PDSes
+    /// as firehose sources (with `is_pds = true`). account counts from the response are
+    /// applied to newly-seen hosts to initialise rate-limiting immediately.
+    ///
+    /// set via `HYDRANT_SEED_HOSTS` as a comma-separated list of base URLs.
+    pub seed_hosts: Vec<Url>,
     /// list of trusted PDS/relay hosts to pre-assign to the "trusted" rate tier at startup.
     /// set via `HYDRANT_TRUSTED_HOSTS` as a comma-separated list of hostnames.
     /// hosts not present in this list use the "default" tier unless assigned via the API.
@@ -424,16 +432,26 @@ impl Default for Config {
         const BASE_MEMTABLE_MB: u64 = 32;
         Self {
             database_path: PathBuf::from("./hydrant.db"),
-            full_network: false,
             ephemeral: false,
             #[cfg(feature = "indexer")]
             ephemeral_ttl: Duration::from_secs(3600), // 1 hour
             #[cfg(feature = "relay")]
             ephemeral_ttl: Duration::from_secs(3600 * 24 * 3), // 3 days
+            #[cfg(not(feature = "relay"))]
+            full_network: false,
+            #[cfg(feature = "relay")]
+            full_network: true,
+            #[cfg(not(feature = "relay"))]
             relays: vec![FirehoseSource {
                 url: Url::parse("wss://relay.fire.hose.cam/").unwrap(),
                 is_pds: false,
             }],
+            #[cfg(feature = "relay")]
+            relays: vec![],
+            #[cfg(not(feature = "relay"))]
+            seed_hosts: vec![],
+            #[cfg(feature = "relay")]
+            seed_hosts: vec![Url::parse("https://bsky.network").unwrap()],
             plc_urls: vec![Url::parse("https://plc.wtf").unwrap()],
             enable_firehose: true,
             firehose_workers: 8,
@@ -503,7 +521,12 @@ impl Config {
         load_dotenv();
 
         // full_network is read first since it determines which defaults to use.
-        let full_network: bool = cfg!("FULL_NETWORK", false);
+        // relay mode defaults to true so that the network is indexed by default.
+        #[cfg(feature = "relay")]
+        let default_full_network = true;
+        #[cfg(not(feature = "relay"))]
+        let default_full_network = false;
+        let full_network: bool = cfg!("FULL_NETWORK", default_full_network);
         let defaults = full_network
             .then(Self::full_network)
             .unwrap_or_else(Self::default);
@@ -642,6 +665,24 @@ impl Config {
             }
         }
 
+        let seed_hosts: Vec<Url> = std::env::var("HYDRANT_SEED_HOSTS")
+            .ok()
+            .map(|s| {
+                s.split(',')
+                    .filter_map(|u| {
+                        let u = u.trim();
+                        if u.is_empty() {
+                            return None;
+                        }
+                        Url::parse(u).ok().or_else(|| {
+                            tracing::warn!("invalid seed host URL: {u}");
+                            None
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_else(|| defaults.seed_hosts.clone());
+
         let trusted_hosts = std::env::var("HYDRANT_TRUSTED_HOSTS")
             .ok()
             .map(|s| {
@@ -676,6 +717,7 @@ impl Config {
             database_path,
             full_network,
             ephemeral,
+            seed_hosts,
             ephemeral_ttl,
             relays: relay_hosts,
             plc_urls,
@@ -809,6 +851,19 @@ impl fmt::Display for Config {
         }
         if self.enable_backlinks {
             config_line!(f, "backlinks", "enabled")?;
+        }
+        if !self.seed_hosts.is_empty() {
+            config_line!(
+                f,
+                "seed hosts",
+                format_args!(
+                    "{:?}",
+                    self.seed_hosts
+                        .iter()
+                        .map(|u| u.as_str())
+                        .collect::<Vec<_>>()
+                )
+            )?;
         }
         Ok(())
     }

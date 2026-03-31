@@ -1,7 +1,7 @@
 #### table-of-contents
 
 -> [hydrant](#hydrant)</br>
--> [vs tap](#vs-tap) | [stream](#stream-behavior) | [multi-relay](#multiple-relay-support) | [crawler sources](#crawler-sources)</br>
+-> [vs tap](#vs-tap) | [stream](#stream-behavior) | [multi-relay](#multiple-relay-support) | [seeding](#firehose-seeding) | [crawler sources](#crawler-sources)</br>
 -> [configuration](#configuration) | [build features](#build-features)</br>
 -> [rest api](#rest-api) | [filter](#filter-management) | [ingestion](#ingestion-control) | [crawler](#crawler-management) | [firehose](#firehose-management) | [pds](#pds-management) | [repos](#repository-management)</br>
 -> [xrpc api](#data-access-xrpc) | [backlinks](#bluemicrocosmlinks) | [identity](#bluemicrocosmidentity) | [atproto](#comatproto) | [custom](#systemsgazehydrant)
@@ -78,6 +78,34 @@ host authority. relays (`is_pds: false`, the default) are exempt from this check
 since they forward commits from many PDSes by design. this means you will trust
 the relay on this though.
 
+#### firehose seeding
+
+<small>[<- back to toc](#table-of-contents)</small>
+
+in relay mode, `RELAY_HOSTS` defaults to empty. set `SEED_HOSTS` to one or more
+relay base URLs and hydrant will call `com.atproto.sync.listHosts` on each at
+startup, adding every returned PDS as a firehose source:
+
+```
+HYDRANT_SEED_HOSTS=https://bsky.network
+```
+
+seeding runs as a background task so the main firehose loop is not blocked. seed
+URLs are fetched concurrently (up to four at a time) and the full `listHosts`
+pagination is consumed for each. if a request fails partway through, the hosts
+collected so far are still added and the failure is logged.
+
+each discovered host is added as a persistent PDS firehose source (`is_pds: true`), 
+equivalent to calling `POST /firehose/sources`.
+
+banned hosts (`status: "banned"`) are skipped. all other statuses are included
+since the firehose ingestor retries on disconnect and transiently-unavailable
+hosts will reconnect on their own.
+
+seeding runs from latest cursor on restart so new PDS' added to the upstream relay
+since the last start are picked up automatically (if they haven't through firehose).
+sources that are already running are detected and skipped, so re-seeding is idempotent.
+
 ### crawler sources
 
 <small>[<- back to toc](#table-of-contents)</small>
@@ -117,13 +145,14 @@ directory, it will also be loaded automatically.
 | :--- | :--- | :--- |
 | `DATABASE_PATH` | `./hydrant.db` | path to the database folder. |
 | `RUST_LOG` | `info` | log filter directives (e.g., `debug`, `hydrant=trace`). [`tracing` env-filter syntax](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html). |
-| `RELAY_HOST` | `wss://relay.fire.hose.cam/` | URL of the relay (firehose only). |
-| `RELAY_HOSTS` | | comma-separated list of firehose sources (firehose only). if unset, falls back to `RELAY_HOST`. prefix a URL with `pds::` to mark it as a direct PDS connection (e.g. `pds::wss://pds.example.com`). bare URLs are treated as relays. |
+| `RELAY_HOST` | `wss://relay.fire.hose.cam/` (indexer), empty (relay) | URL of a firehose source. |
+| `RELAY_HOSTS` | | comma-separated list of firehose sources. if unset, falls back to `RELAY_HOST`. prefix a URL with `pds::` to mark it as a direct PDS connection (e.g. `pds::wss://pds.example.com`). bare URLs are treated as relays. defaults to empty in relay mode, PDS' are expected to be seeded via `SEED_HOSTS` or the firehose management API. |
+| `SEED_HOSTS` | `https://bsky.network` (relay) | comma-separated list of base URLs to call `com.atproto.sync.listHosts` on at startup. hydrant adds every non-banned host as a PDS firehose source. see [firehose seeding](#firehose-seeding). |
 | `CRAWLER_URLS` | relay hosts in full-network mode, `https://lightrail.microcosm.blue` in filter mode | comma-separated list of `[mode::]url` crawler sources. mode is `relay` or `by_collection`; bare URLs use the default mode. set to empty string to disable crawling. |
 | `PLC_URL` | `https://plc.wtf`, `https://plc.directory` if full network | base URL(s) of the PLC directory (comma-separated for multiple). |
 | `EPHEMERAL` | `false` | if enabled, no records are stored. events are deleted after a certain duration (`EPHEMERAL_TTL`). |
 | `EPHEMERAL_TTL` | `60min`, `3d` in relay mode | decides after how long events should be deleted. |
-| `FULL_NETWORK` | `false` | if `true`, discovers and indexes all repositories in the network. |
+| `FULL_NETWORK` | `false` (indexer), `true` (relay) | if `true`, discovers and indexes all repositories in the network. |
 | `FILTER_SIGNALS` | | comma-separated list of NSID patterns to use for the filter (e.g. `app.bsky.feed.post,app.bsky.graph.*`). |
 | `FILTER_COLLECTIONS` | | comma-separated list of NSID patterns to use for the collections filter. |
 | `FILTER_EXCLUDES` | | comma-separated list of DIDs to exclude from indexing. |
