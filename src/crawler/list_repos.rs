@@ -3,7 +3,8 @@ use crate::db::{Db, keys};
 use crate::state::AppState;
 use crate::util::throttle::{OrFailure, ThrottleHandle, Throttler};
 use crate::util::{
-    ErrorForStatus, RetryOutcome, RetryWithBackoff, WatchEnabledExt, parse_retry_after,
+    ErrorForStatus, RetryOutcome, RetryWithBackoff, WatchEnabledExt, is_tls_cert_error,
+    parse_retry_after,
 };
 use chrono::{DateTime, TimeDelta, Utc};
 use fjall::OwnedWriteBatch;
@@ -28,9 +29,10 @@ use url::Url;
 use super::worker::{CrawlerBatch, CursorUpdate};
 use super::{CrawlerStats, InFlight, InFlightGuard, base_url};
 
-pub(super) const MAX_RETRY_ATTEMPTS: u32 = 5;
 const MAX_RETRY_BATCH: usize = 1000;
 const BLOCKING_TASK_TIMEOUT: Duration = Duration::from_secs(30);
+
+pub(super) const MAX_RETRY_ATTEMPTS: u32 = 5;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub(super) struct RetryState {
@@ -74,18 +76,6 @@ impl RetryState {
     }
 }
 
-pub(super) enum CrawlCheckResult {
-    Signal,
-    NoSignal,
-    Retry(RetryState),
-}
-
-impl From<RetryState> for CrawlCheckResult {
-    fn from(value: RetryState) -> Self {
-        Self::Retry(value)
-    }
-}
-
 trait ToRetryState {
     fn to_retry_state(&self) -> RetryState;
 }
@@ -99,6 +89,18 @@ impl ToRetryState for ThrottleHandle {
             attempts: 0,
             status: None,
         }
+    }
+}
+
+pub(super) enum CrawlCheckResult {
+    Signal,
+    NoSignal,
+    Retry(RetryState),
+}
+
+impl From<RetryState> for CrawlCheckResult {
+    fn from(value: RetryState) -> Self {
+        Self::Retry(value)
     }
 }
 
@@ -129,19 +131,6 @@ fn is_throttle_worthy(e: &reqwest::Error) -> bool {
                 | crate::util::SITE_FROZEN
         )
     })
-}
-
-fn is_tls_cert_error(io_err: &std::io::Error) -> bool {
-    let Some(inner) = io_err.get_ref() else {
-        return false;
-    };
-    if let Some(rustls_err) = inner.downcast_ref::<rustls::Error>() {
-        return matches!(rustls_err, rustls::Error::InvalidCertificate(_));
-    }
-    if let Some(nested_io) = inner.downcast_ref::<std::io::Error>() {
-        return is_tls_cert_error(nested_io);
-    }
-    false
 }
 
 /// shared describeRepo signal-checking logic used by both relay and retry producers.

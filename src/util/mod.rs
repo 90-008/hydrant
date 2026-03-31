@@ -12,6 +12,41 @@ use crate::{db::types::DidKey, types::RepoStatus};
 
 pub mod throttle;
 
+#[allow(dead_code)]
+/// checks if the error contains a hyper / std io timeout error
+pub fn is_timeout(err: &dyn std::error::Error) -> bool {
+    let mut source = err.source();
+
+    while let Some(err) = source {
+        if let Some(hyper_err) = err.downcast_ref::<hyper::Error>() {
+            if hyper_err.is_timeout() {
+                return true;
+            }
+        }
+        if let Some(io) = err.downcast_ref::<std::io::Error>() {
+            if io.kind() == std::io::ErrorKind::TimedOut {
+                return true;
+            }
+        }
+        source = err.source();
+    }
+
+    false
+}
+
+pub fn is_tls_cert_error(io_err: &std::io::Error) -> bool {
+    let Some(inner) = io_err.get_ref() else {
+        return false;
+    };
+    if let Some(rustls_err) = inner.downcast_ref::<rustls::Error>() {
+        return matches!(rustls_err, rustls::Error::InvalidCertificate(_));
+    }
+    if let Some(nested_io) = inner.downcast_ref::<std::io::Error>() {
+        return is_tls_cert_error(nested_io);
+    }
+    false
+}
+
 /// outcome of [`RetryWithBackoff::retry`] when the operation does not succeed.
 pub enum RetryOutcome<E> {
     /// ratelimited after exhausting all retries

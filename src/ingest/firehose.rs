@@ -2,17 +2,64 @@ use crate::filter::{FilterHandle, FilterMode};
 use crate::ingest::stream::{FirehoseError, FirehoseStream, SubscribeReposMessage, decode_frame};
 use crate::ingest::{BufferTx, IngestMessage};
 use crate::state::AppState;
-use crate::util::WatchEnabledExt;
 use crate::util::throttle::ThrottleHandle;
+use crate::util::{WatchEnabledExt, is_timeout, is_tls_cert_error};
+use hyper::StatusCode;
 use jacquard_common::IntoStatic;
 use jacquard_common::types::did::Did;
 use miette::{IntoDiagnostic, Result};
+use std::borrow::Cow;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tokio::sync::watch;
+use tokio_tungstenite::tungstenite::{Error as WsError, error::TlsError as WsTlsError};
 use tracing::{Span, debug, error, info, trace, warn};
 use url::Url;
+
+fn is_throttle_worthy(e: &WsError) -> bool {
+    use std::error::Error;
+
+    if is_timeout(e) {
+        return true;
+    }
+
+    if let WsError::Tls(e) = e {
+        match e {
+            WsTlsError::Rustls(e) => {
+                return matches!(e.as_ref(), rustls::Error::InvalidCertificate(_));
+            }
+            WsTlsError::InvalidDnsName => {}
+            _ => {}
+        }
+    } else {
+        let mut src = e.source();
+        while let Some(s) = src {
+            if let Some(io_err) = s.downcast_ref::<std::io::Error>() {
+                if is_tls_cert_error(io_err) {
+                    return true;
+                }
+            }
+            src = s.source();
+        }
+    }
+
+    if let WsError::Http(resp) = e {
+        return matches!(
+            resp.status(),
+            StatusCode::BAD_GATEWAY
+                | StatusCode::SERVICE_UNAVAILABLE
+                | StatusCode::GATEWAY_TIMEOUT
+                | crate::util::CONNECTION_TIMEOUT
+                | crate::util::SITE_FROZEN
+        );
+    }
+
+    matches!(
+        e,
+        WsError::AttackAttempt | WsError::Io(_) | WsError::Protocol(_)
+    )
+}
 
 pub struct FirehoseIngestor {
     state: Arc<AppState>,
@@ -54,11 +101,15 @@ impl FirehoseIngestor {
         let host = self.relay_host.host_str().unwrap_or("").to_string();
         let count_key = crate::db::keys::pds_account_count_key(&host);
 
-        let mut backoff = Duration::from_secs(5);
-        const MAX_BACKOFF: Duration = Duration::from_secs(60 * 15); // 15 mins
+        // this is not for connection throttling (thats handled by ThrottleHandle)
+        // its for stream errors (cbor decode etc)
+        let mut backoff = Duration::from_secs(0);
+        const MAX_BACKOFF: Duration = Duration::from_secs(60 * 60); // 1 ohur
 
         loop {
             self.enabled.wait_enabled("firehose").await;
+
+            tokio::time::sleep(backoff).await;
 
             let start_cursor = self
                 .state
@@ -79,26 +130,40 @@ impl FirehoseIngestor {
             {
                 Ok(s) => s,
                 Err(e) => {
-                    error!(err = %e, backoff_secs = backoff.as_secs(), "failed to connect to firehose, retrying");
-                    tokio::time::sleep(backoff).await;
-                    backoff = (backoff * 2).min(MAX_BACKOFF);
+                    // todo: figure out how to pass timeout to tungesteite i guess
+                    // if let FirehoseError::WebSocket(err) = &e
+                    //     && is_timeout(&err)
+                    // {
+                    //     if !self.throttle.record_timeout() {
+                    //         continue;
+                    //     }
+                    // }
+                    let timeout = if let FirehoseError::WebSocket(e) = &e
+                        && is_throttle_worthy(e)
+                    {
+                        self.throttle.record_failure();
+                        let until = self.throttle.throttled_until();
+                        Duration::from_secs((until - chrono::Utc::now().timestamp()) as u64)
+                    } else {
+                        Duration::from_secs(10)
+                    };
+                    let fmt = humantime::format_duration(timeout);
+                    error!(err = %e, in = %fmt, "failed to connect to firehose, retrying later");
+                    tokio::time::sleep(timeout).await;
                     continue;
                 }
             };
 
+            self.throttle.record_success();
             info!("firehose connected");
-            backoff = Duration::from_secs(5);
 
-            let disconnected_by_error = loop {
+            let res = loop {
                 tokio::select! {
                     msg = stream.next() => {
-                        let Some(bytes_res) = msg else { break true; };
+                        let Some(bytes_res) = msg else { break Err(FirehoseError::EmptyFrame); };
                         let bytes = match bytes_res {
                             Ok(b) => b,
-                            Err(e) => {
-                                error!(err = %e, "firehose stream error");
-                                break true;
-                            }
+                            Err(e) => break Err(e),
                         };
                         match decode_frame(&bytes) {
                             Ok(msg) => {
@@ -110,7 +175,7 @@ impl FirehoseIngestor {
                                         _ = self.enabled.changed() => {
                                             if !*self.enabled.borrow() {
                                                 info!("firehose disabled, disconnecting");
-                                                break false;
+                                                break Ok(());
                                             }
                                         }
                                     }
@@ -129,30 +194,35 @@ impl FirehoseIngestor {
                                         continue;
                                     },
                                     // everything else is a hard error
-                                    FirehoseError::RelayError { error, message } => {
-                                        let message = message.unwrap_or_else(|| "<no message>".to_owned());
-                                        error!(err = %error, "relay sent error: {message}");
-                                    },
-                                    e => error!(err = %e, "firehose stream error"),
+                                    e => break Err(e),
                                 }
-                                break true;
                             }
                         }
+                        backoff = Duration::from_secs(0);
                     }
                     _ = self.enabled.changed() => {
                         if !*self.enabled.borrow() {
                             info!("firehose disabled, disconnecting");
-                            break false;
+                            break Ok(());
                         }
                     }
                 }
             };
 
-            if disconnected_by_error {
-                error!(
-                    backoff_secs = backoff.as_secs(),
-                    "firehose disconnected, reconnecting"
-                );
+            if let Err(e) = res {
+                if let FirehoseError::RelayError { error, message } = e {
+                    let message = message.map_or(Cow::Borrowed("<no message>"), Cow::Owned);
+                    error!(err = %error, "relay sent error: {message}");
+                } else if backoff.as_secs() < 60 {
+                    // stop logging errors after a minute of retries
+                    // as to not spam logs, unlikely for error to change atp
+                    error!(err = %e, "firehose stream error");
+                }
+                if backoff.is_zero() {
+                    backoff = Duration::from_secs(5);
+                }
+                let fmt = humantime::format_duration(backoff);
+                error!(in = %fmt, "firehose disconnected, reconnecting");
                 tokio::time::sleep(backoff).await;
                 backoff = (backoff * 2).min(MAX_BACKOFF);
             }

@@ -114,7 +114,7 @@ impl ThrottleHandle {
     /// called on hard failures (timeout, TLS error, bad gateway, etc).
     /// returns throttle duration in minutes if this is a *new* throttle,
     /// and notifies all in-flight tasks to cancel immediately.
-    pub fn record_failure(&self) -> Option<i64> {
+    pub fn record_failure(&self) -> Option<u64> {
         if self.is_throttled() {
             return None;
         }
@@ -126,10 +126,10 @@ impl ThrottleHandle {
             + 1;
 
         // 30 min, 60 min, 120 min, ... capped at ~512 hours
-        let base_minutes = 30i64;
+        let base_minutes = 30u64;
         let exponent = (failures as u32).saturating_sub(1);
-        let minutes = base_minutes * 2i64.pow(exponent.min(10));
-        let until = chrono::Utc::now().timestamp() + minutes * 60;
+        let minutes = base_minutes * 2u64.pow(exponent.min(10));
+        let until = chrono::Utc::now().timestamp() + (minutes * 60) as i64;
 
         self.state.throttled_until.store(until, Ordering::Release);
         self.state.failure_notify.notify_waiters();
@@ -143,6 +143,7 @@ impl ThrottleHandle {
         Duration::from_secs(3 * 2u64.pow(n.min(2) as u32))
     }
 
+    /// returns whether the timeout attempts are exhausted
     pub fn record_timeout(&self) -> bool {
         let timeouts = self
             .state

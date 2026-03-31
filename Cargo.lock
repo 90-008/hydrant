@@ -1481,6 +1481,7 @@ dependencies = [
  "glob",
  "hex",
  "humantime",
+ "hyper",
  "iroh-car",
  "jacquard-api",
  "jacquard-common",

@@ -726,13 +726,15 @@ impl Hydrant {
     pub async fn stats(&self) -> Result<StatsResponse> {
         let state = self.state.clone();
 
+        // todo: update stats, only return necessary info on relay vs indexer modes
+        // (and ephemeral indexer)
         let mut counts: BTreeMap<&'static str, u64> = futures::future::join_all(
             [
                 "repos",
                 "pending",
-                "resync",
                 "records",
                 "blocks",
+                "resync",
                 "error_ratelimited",
                 "error_transport",
                 "error_generic",
