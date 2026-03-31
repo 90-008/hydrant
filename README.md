@@ -3,7 +3,7 @@
 -> [hydrant](#hydrant)</br>
 -> [vs tap](#vs-tap) | [stream](#stream-behavior) | [multi-relay](#multiple-relay-support) | [crawler sources](#crawler-sources)</br>
 -> [configuration](#configuration) | [build features](#build-features)</br>
--> [rest api](#rest-api) | [filter](#filter-management) | [ingestion](#ingestion-control) | [crawler](#crawler-management) | [firehose](#firehose-management) | [repos](#repository-management)</br>
+-> [rest api](#rest-api) | [filter](#filter-management) | [ingestion](#ingestion-control) | [crawler](#crawler-management) | [firehose](#firehose-management) | [pds](#pds-management) | [repos](#repository-management)</br>
 -> [xrpc api](#data-access-xrpc) | [backlinks](#bluemicrocosmlinks) | [identity](#bluemicrocosmidentity) | [atproto](#comatproto) | [custom](#systemsgazehydrant)
 
 # hydrant
@@ -141,6 +141,8 @@ directory, it will also be loaded automatically.
 | `ENABLE_CRAWLER` | `true` if full network or crawler sources are configured, `false` otherwise | whether to actively query the network for unknown repositories. |
 | `CRAWLER_MAX_PENDING_REPOS` | `2000` | max pending repos for crawler. |
 | `CRAWLER_RESUME_PENDING_REPOS` | `1000` | resume threshold for crawler pending repos. |
+| `TRUSTED_HOSTS` | | comma-separated list of PDS hostnames to pre-assign to the `trusted` rate tier at startup. hosts not listed here use the `default` tier unless assigned via the API. |
+| `RATE_TIERS` | | comma-separated list of named rate tier definitions in `name:base/mul/hourly/daily` format (e.g. `trusted:5000/10.0/18000000/432000000`). built-in tiers (`default`, `trusted`) are always present and can be overridden. |
 
 ## build features
 
@@ -284,6 +286,47 @@ each set field accepts one of two forms:
   - returns `200 OK` if the relay was found and removed, `404 Not Found` otherwise.
 - `DELETE /firehose/cursors`: reset the stored cursor for a given firehose relay URL. body: `{ "key": "..." }`
   where key is a URL. causes the next firehose connection to restart from the beginning.
+
+### PDS management
+
+<small>[<- back to toc](#table-of-contents)</small>
+
+hydrant rate-limits firehose events per PDS. each PDS is assigned to a named
+rate tier that controls how aggressively hydrant limits events from it. two
+built-in tiers are always present: `default` (conservative limits for unknown
+operators) and `trusted` (higher limits for well-behaved operators). additional
+tiers can be defined via `RATE_TIERS`.
+
+the per-second limit scales with the number of active accounts on the PDS:
+`max(per_second_base, accounts × per_second_account_mul)`.
+
+- `GET /pds/tiers`: list all current tier assignments alongside the available
+  tier definitions.
+  - returns `{ "assignments": [{ "host": string, "tier": string }], "rate_tiers": { <name>: { "per_second_base": int, "per_second_account_mul": float, "per_hour": int, "per_day": int } } }`.
+  - `assignments` only contains PDSes with an explicit assignment; any PDS not
+    listed uses the `default` tier.
+- `PUT /pds/tiers`: assign a PDS to a named rate tier.
+  - body: `{ "host": string, "tier": string }`.
+  - `host` is the PDS hostname (e.g. `pds.example.com`).
+  - `tier` must be one of the configured tier names. returns `400` if unknown.
+  - assignments are persisted to the database and survive restarts.
+  - re-assigning the same host updates the tier in place without creating a duplicate.
+- `DELETE /pds/tiers`: remove an explicit tier assignment for a PDS, reverting
+  it to the `default` tier.
+  - body: `{ "host": string }`.
+  - returns `200` even if no assignment existed.
+- `GET /pds/rate-tiers`: list the available rate tier definitions.
+  - returns a map of tier name to `{ "per_second_base", "per_second_account_mul", "per_hour", "per_day" }`.
+
+hosts listed in `TRUSTED_HOSTS` are seeded as `trusted` at startup, but only
+when no database assignment already exists for that host — DB entries always win.
+the seed is not written to the database, so it is re-applied on every restart.
+consequences: if you remove a host from `TRUSTED_HOSTS` and it has no DB entry,
+it will revert to `default` on the next restart. if you explicitly assign a host
+via the API (which writes to the DB), that assignment persists regardless of
+`TRUSTED_HOSTS`. if you delete a host's DB assignment via the API while it is
+still listed in `TRUSTED_HOSTS`, it will be re-seeded as `trusted` on the next
+restart.
 
 ### repository management
 
