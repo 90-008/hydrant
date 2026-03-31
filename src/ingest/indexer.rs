@@ -2,12 +2,12 @@ use super::*;
 use crate::db::{self, keys, ser_repo_metadata};
 use crate::ingest::stream::{Account, Commit, Identity};
 use crate::ingest::validation;
-use crate::ops;
 use crate::resolver::{NoSigningKeyError, ResolverError};
 use crate::state::AppState;
 use crate::types::{
     AccountEvt, BroadcastEvent, GaugeState, IdentityEvt, RepoMetadata, RepoState, RepoStatus,
 };
+use crate::{ops, util};
 
 use fjall::OwnedWriteBatch;
 
@@ -16,8 +16,6 @@ use jacquard_common::cowstr::ToCowStr;
 use jacquard_common::types::did::Did;
 use jacquard_repo::error::CommitError;
 use miette::{Diagnostic, IntoDiagnostic, Result};
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::sync::atomic::Ordering::SeqCst;
 use thiserror::Error;
@@ -178,11 +176,7 @@ impl FirehoseWorker {
                 IndexerMessage::BackfillFinished(did) => did,
             };
 
-            let mut hasher = DefaultHasher::new();
-            did.hash(&mut hasher);
-            let hash = hasher.finish();
-            let shard_idx = (hash as usize) % self.num_shards;
-
+            let shard_idx = (util::hash(did) as usize) % self.num_shards;
             if let Err(e) = shards[shard_idx].send(msg) {
                 error!(shard = shard_idx, err = %e, "failed to send message to shard, shard panicked?");
                 break;

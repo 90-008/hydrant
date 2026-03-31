@@ -1,5 +1,4 @@
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
+use std::collections::HashMap;
 use std::sync::Arc;
 #[cfg(feature = "relay")]
 use std::sync::atomic::Ordering;
@@ -33,6 +32,7 @@ use crate::state::AppState;
 #[cfg(feature = "relay")]
 use crate::types::RelayBroadcast;
 use crate::types::{RepoState, RepoStatus};
+use crate::util;
 use smol_str::{SmolStr, ToSmolStr};
 
 struct WorkerContext<'a> {
@@ -47,6 +47,7 @@ struct WorkerContext<'a> {
     #[cfg(feature = "indexer")]
     hook: crate::ingest::indexer::IndexerTx,
     http: reqwest::Client,
+    error_counts: HashMap<u64, u32, nohash_hasher::BuildNoHashHasher<u64>>,
 }
 
 struct WorkerMessage {
@@ -151,10 +152,7 @@ impl RelayWorker {
                     SubscribeReposMessage::Sync(s) => &s.did,
                     _ => continue,
                 };
-                let mut hasher = DefaultHasher::new();
-                did.hash(&mut hasher);
-                let idx = (hasher.finish() as usize) % self.num_shards;
-                idx
+                (util::hash(did) as usize) % self.num_shards
             };
 
             if let Err(e) = shards[shard_idx].send(WorkerMessage {
@@ -199,6 +197,7 @@ impl RelayWorker {
             #[cfg(feature = "indexer")]
             hook,
             http,
+            error_counts: Default::default(),
         };
 
         while let Some(msg) = rx.blocking_recv() {
@@ -254,9 +253,12 @@ impl RelayWorker {
         {
             let outcome = ctx.check_host_authority(did, &mut repo_state, host)?;
             if let AuthorityOutcome::WrongHost { expected } = outcome {
-                warn!(got = host, expected = %expected, "message rejected: wrong host");
+                if !ctx.inc_error(host) {
+                    warn!(got = host, expected = %expected, "message rejected: wrong host");
+                }
                 return Ok(());
             }
+            ctx.reset_error(host);
         }
 
         match msg.msg {
@@ -567,6 +569,20 @@ impl RelayWorker {
 }
 
 impl WorkerContext<'_> {
+    /// increments host error counter, returns if host is suppressed or not
+    fn inc_error(&mut self, host: &str) -> bool {
+        let error_count = self.error_counts.entry(util::hash(&host)).or_default();
+        let is_suppressed = *error_count > 50;
+        *error_count += 1;
+        is_suppressed
+    }
+
+    fn reset_error(&mut self, host: &str) {
+        if let Some(count) = self.error_counts.get_mut(&util::hash(&host)) {
+            *count = 0;
+        }
+    }
+
     fn check_host_authority(
         &mut self,
         did: &Did,

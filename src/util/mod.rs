@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{hash::Hash, time::Duration};
 
 use jacquard_common::{deps::fluent_uri, types::string::Handle};
 use rand::RngExt;
@@ -216,4 +216,12 @@ pub fn url_to_fluent_uri(url: &Url) -> fluent_uri::Uri<String> {
 
 pub(crate) fn invalid_handle() -> Handle<'static> {
     unsafe { Handle::unchecked("handle.invalid") }
+}
+
+/// returns hash of value using ahash
+pub fn hash<T: Hash>(val: &T) -> u64 {
+    use std::hash::Hasher;
+    let mut hasher = ahash::AHasher::default();
+    val.hash(&mut hasher);
+    hasher.finish()
 }
