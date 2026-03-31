@@ -122,7 +122,7 @@ directory, it will also be loaded automatically.
 | `CRAWLER_URLS` | relay hosts in full-network mode, `https://lightrail.microcosm.blue` in filter mode | comma-separated list of `[mode::]url` crawler sources. mode is `relay` or `by_collection`; bare URLs use the default mode. set to empty string to disable crawling. |
 | `PLC_URL` | `https://plc.wtf`, `https://plc.directory` if full network | base URL(s) of the PLC directory (comma-separated for multiple). |
 | `EPHEMERAL` | `false` | if enabled, no records are stored. events are deleted after a certain duration (`EPHEMERAL_TTL`). |
-| `EPHEMERAL_TTL` | `60min` | decides after how long events should be deleted. |
+| `EPHEMERAL_TTL` | `60min`, `3d` in relay mode | decides after how long events should be deleted. |
 | `FULL_NETWORK` | `false` | if `true`, discovers and indexes all repositories in the network. |
 | `FILTER_SIGNALS` | | comma-separated list of NSID patterns to use for the filter (e.g. `app.bsky.feed.post,app.bsky.graph.*`). |
 | `FILTER_COLLECTIONS` | | comma-separated list of NSID patterns to use for the collections filter. |

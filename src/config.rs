@@ -426,7 +426,10 @@ impl Default for Config {
             database_path: PathBuf::from("./hydrant.db"),
             full_network: false,
             ephemeral: false,
-            ephemeral_ttl: Duration::from_secs(3600),
+            #[cfg(feature = "indexer")]
+            ephemeral_ttl: Duration::from_secs(3600), // 1 hour
+            #[cfg(feature = "relay")]
+            ephemeral_ttl: Duration::from_secs(3600 * 24 * 3), // 3 days
             relays: vec![FirehoseSource {
                 url: Url::parse("wss://relay.fire.hose.cam/").unwrap(),
                 is_pds: false,
@@ -460,7 +463,7 @@ impl Default for Config {
                 m
             },
             cache_size: 256,
-            data_compression: Compression::Lz4,
+            data_compression: Compression::Zstd,
             journal_compression: Compression::Lz4,
             db_worker_threads: 4,
             db_max_journaling_size_mb: 400,
