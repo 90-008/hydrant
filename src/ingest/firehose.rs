@@ -54,6 +54,9 @@ impl FirehoseIngestor {
         let host = self.relay_host.host_str().unwrap_or("").to_string();
         let count_key = crate::db::keys::pds_account_count_key(&host);
 
+        let mut backoff = Duration::from_secs(5);
+        const MAX_BACKOFF: Duration = Duration::from_secs(60 * 15); // 15 mins
+
         loop {
             self.enabled.wait_enabled("firehose").await;
 
@@ -71,17 +74,20 @@ impl FirehoseIngestor {
                 None => info!("no cursor found, live tailing"),
             }
 
-            let mut stream =
-                match FirehoseStream::connect(self.relay_host.clone(), start_cursor).await {
-                    Ok(s) => s,
-                    Err(e) => {
-                        error!(err = %e, "failed to connect to firehose, retrying in 5s");
-                        tokio::time::sleep(Duration::from_secs(5)).await;
-                        continue;
-                    }
-                };
+            let mut stream = match FirehoseStream::connect(self.relay_host.clone(), start_cursor)
+                .await
+            {
+                Ok(s) => s,
+                Err(e) => {
+                    error!(err = %e, backoff_secs = backoff.as_secs(), "failed to connect to firehose, retrying");
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(MAX_BACKOFF);
+                    continue;
+                }
+            };
 
             info!("firehose connected");
+            backoff = Duration::from_secs(5);
 
             let disconnected_by_error = loop {
                 tokio::select! {
@@ -99,7 +105,15 @@ impl FirehoseIngestor {
                                 if self.is_pds {
                                     let accounts = self.state.db.get_count(&count_key).await;
                                     let tier = self.state.pds_tier_for(&host);
-                                    self.throttle.wait_for_allow(accounts, &tier).await;
+                                    tokio::select! {
+                                        _ = self.throttle.wait_for_allow(accounts, &tier) => {}
+                                        _ = self.enabled.changed() => {
+                                            if !*self.enabled.borrow() {
+                                                info!("firehose disabled, disconnecting");
+                                                break false;
+                                            }
+                                        }
+                                    }
                                 }
                                 self.handle_message(msg).await
                             },
@@ -135,8 +149,12 @@ impl FirehoseIngestor {
             };
 
             if disconnected_by_error {
-                error!("firehose disconnected, reconnecting in 5s...");
-                tokio::time::sleep(Duration::from_secs(5)).await;
+                error!(
+                    backoff_secs = backoff.as_secs(),
+                    "firehose disconnected, reconnecting"
+                );
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(MAX_BACKOFF);
             }
         }
     }
