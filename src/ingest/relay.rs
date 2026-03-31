@@ -303,8 +303,8 @@ impl RelayWorker {
         } = validated;
 
         if chain_break.is_broken() {
-            // chain breaks are not grounds for blocking in relay mode
-            warn!(broken = ?chain_break, "relay: chain break, forwarding anyway");
+            // chain breaks are not grounds for blocking when acting as a relay
+            debug!(broken = ?chain_break, "chain break, forwarding anyway");
         }
 
         let repo_key = keys::repo_key(&commit.repo);
