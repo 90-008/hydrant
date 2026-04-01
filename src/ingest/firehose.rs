@@ -4,7 +4,6 @@ use crate::ingest::{BufferTx, IngestMessage};
 use crate::state::AppState;
 use crate::util::throttle::ThrottleHandle;
 use crate::util::{WatchEnabledExt, is_timeout, is_tls_cert_error};
-use hyper::StatusCode;
 use jacquard_common::IntoStatic;
 use jacquard_common::types::did::Did;
 use miette::{IntoDiagnostic, Result};
@@ -13,7 +12,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tokio::sync::watch;
-use tokio_tungstenite::tungstenite::{Error as WsError, error::TlsError as WsTlsError};
+use tokio_websockets::Error as WsError;
 use tracing::{Span, debug, error, info, trace, warn};
 use url::Url;
 
@@ -24,40 +23,43 @@ fn is_throttle_worthy(e: &WsError) -> bool {
         return true;
     }
 
-    if let WsError::Tls(e) = e {
-        match e {
-            WsTlsError::Rustls(e) => {
-                return matches!(e.as_ref(), rustls::Error::InvalidCertificate(_));
+    match e {
+        WsError::Rustls(e) => {
+            if matches!(e, rustls::Error::InvalidCertificate(_)) {
+                return true;
             }
-            WsTlsError::InvalidDnsName => {}
-            _ => {}
         }
-    } else {
-        let mut src = e.source();
-        while let Some(s) = src {
-            if let Some(io_err) = s.downcast_ref::<std::io::Error>() {
-                if is_tls_cert_error(io_err) {
-                    return true;
-                }
+        WsError::Io(io_err) => {
+            if is_tls_cert_error(io_err) {
+                return true;
             }
-            src = s.source();
         }
+        WsError::Upgrade(tokio_websockets::upgrade::Error::DidNotSwitchProtocols(status)) => {
+            return matches!(
+                *status,
+                502 // BAD_GATEWAY
+                    | 503 // SERVICE_UNAVAILABLE
+                    | 504 // GATEWAY_TIMEOUT
+                    | 522 // CONNECTION_TIMEOUT
+                    | 530 // SITE_FROZEN
+            );
+        }
+        _ => {}
     }
 
-    if let WsError::Http(resp) = e {
-        return matches!(
-            resp.status(),
-            StatusCode::BAD_GATEWAY
-                | StatusCode::SERVICE_UNAVAILABLE
-                | StatusCode::GATEWAY_TIMEOUT
-                | crate::util::CONNECTION_TIMEOUT
-                | crate::util::SITE_FROZEN
-        );
+    let mut src = e.source();
+    while let Some(s) = src {
+        if let Some(io_err) = s.downcast_ref::<std::io::Error>() {
+            if is_tls_cert_error(io_err) {
+                return true;
+            }
+        }
+        src = s.source();
     }
 
     matches!(
         e,
-        WsError::AttackAttempt | WsError::Io(_) | WsError::Protocol(_)
+        WsError::Io(_) | WsError::Protocol(_) | WsError::PayloadTooLong { .. }
     )
 }
 
@@ -97,8 +99,7 @@ impl FirehoseIngestor {
 
     #[tracing::instrument(skip(self), fields(relay = %self.relay_host))]
     pub async fn run(mut self) -> Result<()> {
-        // extract host as owned String to avoid borrow conflicts with &self inside the loop
-        let host = self.relay_host.host_str().unwrap_or("").to_string();
+        let host = self.relay_host.host_str().unwrap_or("");
         let count_key = crate::db::keys::pds_account_count_key(&host);
 
         // this is not for connection throttling (thats handled by ThrottleHandle)

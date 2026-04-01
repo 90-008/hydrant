@@ -4,7 +4,7 @@
 -> [vs tap](#vs-tap) | [stream](#stream-behavior) | [multi-relay](#multiple-relay-support) | [seeding](#firehose-seeding) | [crawler sources](#crawler-sources)</br>
 -> [configuration](#configuration) | [build features](#build-features)</br>
 -> [rest api](#rest-api) | [filter](#filter-management) | [ingestion](#ingestion-control) | [crawler](#crawler-management) | [firehose](#firehose-management) | [pds](#pds-management) | [repos](#repository-management)</br>
--> [xrpc api](#data-access-xrpc) | [backlinks](#bluemicrocosmlinks) | [identity](#bluemicrocosmidentity) | [atproto](#comatproto) | [custom](#systemsgazehydrant)
+-> [xrpc api](#data-access-xrpc) | [atproto](#comatproto) | [backlinks](#bluemicrocosmlinks) | [identity](#bluemicrocosmidentity) | [custom](#systemsgazehydrant)
 
 # hydrant
 

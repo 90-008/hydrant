@@ -1,10 +1,8 @@
 use axum::{
-    extract::{
-        Query, State,
-        ws::{Message, WebSocket, WebSocketUpgrade},
-    },
+    extract::{Query, State},
     response::IntoResponse,
 };
+use axum_tws::{Message, WebSocket, WebSocketUpgrade};
 use futures::StreamExt;
 use serde::Deserialize;
 
@@ -27,7 +25,7 @@ async fn handle_socket(mut socket: WebSocket, hydrant: Hydrant, query: Subscribe
     let mut stream = hydrant.subscribe_repos(query.cursor);
 
     while let Some(frame) = stream.next().await {
-        if socket.send(Message::Binary(frame)).await.is_err() {
+        if socket.send(Message::binary(frame)).await.is_err() {
             break;
         }
     }

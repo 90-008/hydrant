@@ -2,12 +2,10 @@ use crate::control::Hydrant;
 use axum::Router;
 use axum::routing::get;
 use axum::{
-    extract::{
-        Query, State,
-        ws::{Message, WebSocket, WebSocketUpgrade},
-    },
+    extract::{Query, State},
     response::IntoResponse,
 };
+use axum_tws::{Message, WebSocket, WebSocketUpgrade};
 use futures::StreamExt;
 use serde::Deserialize;
 use tracing::error;
@@ -35,7 +33,7 @@ async fn handle_socket(mut socket: WebSocket, hydrant: Hydrant, query: StreamQue
     while let Some(evt) = stream.next().await {
         match serde_json::to_string(&evt) {
             Ok(json) => {
-                if socket.send(Message::Text(json.into())).await.is_err() {
+                if socket.send(Message::text(json)).await.is_err() {
                     break;
                 }
             }

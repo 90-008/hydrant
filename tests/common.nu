@@ -56,7 +56,7 @@ export def load-env-file [] {
 }
 
 export def resolve-pds [did: string] {
-    let doc = (http get $"https://plc.gaze.systems/($did)" | from json)
+    let doc = (http get $"https://plc.wtf/($did)" | from json)
     ($doc.service | where type == "AtprotoPersonalDataServer" | first).serviceEndpoint
 }
 
@@ -123,7 +123,7 @@ export def start-hydrant [binary: string, db_path: string, port: int] {
         HYDRANT_API_PORT: ($port | into string),
         HYDRANT_ENABLE_DEBUG: "true",
         HYDRANT_DEBUG_PORT: (resolve-test-debug-port ($port + 1) | into string),
-        HYDRANT_PLC_URL: "https://plc.gaze.systems",
+        HYDRANT_PLC_URL: "https://plc.wtf",
         RUST_LOG: "debug,hyper=error,tokio=error,h2=error,tower=error,rustls=error"
     } | merge $hydrant_vars
 

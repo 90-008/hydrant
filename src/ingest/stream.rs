@@ -1,6 +1,6 @@
 use std::convert::Infallible;
-use std::option::Option;
 
+use axum::http::Uri;
 use bytes::Bytes;
 use futures::StreamExt;
 use jacquard_common::error::DecodeError;
@@ -15,15 +15,14 @@ use miette::Diagnostic;
 use serde::{Deserialize, Serialize};
 use smol_str::format_smolstr;
 use thiserror::Error;
-use tokio::net::TcpStream;
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
+use tokio_websockets::{ClientBuilder, WebSocketStream};
 use tracing::trace;
 use url::Url;
 
 #[derive(Debug, Error, Diagnostic)]
 pub enum FirehoseError {
     #[error("websocket error: {0}")]
-    WebSocket(#[from] tokio_tungstenite::tungstenite::Error),
+    WebSocket(#[from] tokio_websockets::Error),
     #[error("unknown scheme: {0}")]
     UnknownScheme(String),
     #[error("decode error: {0}")]
@@ -52,7 +51,7 @@ impl From<serde_ipld_dagcbor::DecodeError<Infallible>> for FirehoseError {
 }
 
 pub struct FirehoseStream {
-    ws: WebSocketStream<MaybeTlsStream<TcpStream>>,
+    ws: WebSocketStream<tokio_websockets::MaybeTlsStream<tokio::net::TcpStream>>,
 }
 
 impl FirehoseStream {
@@ -67,7 +66,12 @@ impl FirehoseStream {
         let cursor = cursor.map(|c| format_smolstr!("cursor={c}"));
         relay.set_query(cursor.as_deref());
 
-        let (ws, _) = connect_async(relay.as_str()).await?;
+        let uri: Uri = relay
+            .as_str()
+            .parse()
+            .map_err(|e| FirehoseError::Cbor(format!("invalid uri: {e}")))?;
+
+        let (ws, _) = ClientBuilder::from_uri(uri).connect().await?;
         Ok(Self { ws })
     }
 
@@ -76,13 +80,14 @@ impl FirehoseStream {
         loop {
             match self.ws.next().await? {
                 Err(e) => return Some(Err(e.into())),
-                Ok(Message::Binary(bytes)) => {
+                Ok(msg) if msg.is_binary() => {
+                    let bytes: Bytes = msg.into_payload().into();
                     if bytes.is_empty() {
                         return Some(Err(FirehoseError::EmptyFrame));
                     }
                     return Some(Ok(bytes));
                 }
-                Ok(Message::Close(_)) => return None,
+                Ok(msg) if msg.is_close() => return None,
                 Ok(x) => {
                     trace!(msg = ?x, "relay sent unexpected message");
                     continue;
