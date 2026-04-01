@@ -1,27 +1,36 @@
 use std::str::FromStr;
 
 use crate::control::{Hydrant, RepoInfo};
+#[cfg(feature = "indexer")]
+use axum::routing::{delete, post, put};
 use axum::{
     Json, Router,
     body::Body,
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
-    routing::{delete, get, post, put},
+    routing::get,
 };
 use jacquard_common::types::did::Did;
 use miette::IntoDiagnostic;
 use serde::Deserialize;
 
 pub fn router() -> Router<Hydrant> {
-    Router::new()
+    #[allow(unused_mut)]
+    let r = Router::new()
         .route("/repos", get(handle_get_repos))
+        .route("/repos/{did}", get(handle_get_repo));
+
+    #[cfg(feature = "indexer")]
+    let r = r
         .route("/repos/resync", post(handle_post_resync))
-        .route("/repos/{did}", get(handle_get_repo))
         .route("/repos", put(handle_put_repos))
-        .route("/repos", delete(handle_delete_repos))
+        .route("/repos", delete(handle_delete_repos));
+
+    r
 }
 
+#[cfg(feature = "indexer")]
 #[derive(Deserialize, Debug)]
 pub struct RepoRequest {
     pub did: String,
@@ -90,6 +99,7 @@ pub async fn handle_get_repo(
         .ok_or_else(|| (StatusCode::NOT_FOUND, "repository not found".to_string()))
 }
 
+#[cfg(feature = "indexer")]
 pub async fn handle_put_repos(
     State(hydrant): State<Hydrant>,
     headers: HeaderMap,
@@ -111,6 +121,7 @@ pub async fn handle_put_repos(
     Ok(did_list_response(queued, &headers))
 }
 
+#[cfg(feature = "indexer")]
 pub async fn handle_delete_repos(
     State(hydrant): State<Hydrant>,
     headers: HeaderMap,
@@ -132,6 +143,7 @@ pub async fn handle_delete_repos(
     Ok(did_list_response(untracked, &headers))
 }
 
+#[cfg(feature = "indexer")]
 pub async fn handle_post_resync(
     State(hydrant): State<Hydrant>,
     headers: HeaderMap,
@@ -159,6 +171,7 @@ fn prefers_json(headers: &HeaderMap) -> bool {
     contains_json(header::ACCEPT) || contains_json(header::CONTENT_TYPE)
 }
 
+#[cfg(feature = "indexer")]
 fn did_list_response(dids: Vec<Did<'static>>, headers: &HeaderMap) -> Response {
     if prefers_json(headers) {
         let body: Vec<String> = dids.into_iter().map(|d| d.to_string()).collect();
@@ -173,6 +186,7 @@ fn did_list_response(dids: Vec<Did<'static>>, headers: &HeaderMap) -> Response {
     }
 }
 
+#[cfg(feature = "indexer")]
 async fn parse_body(
     body: Body,
     headers: &HeaderMap,

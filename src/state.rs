@@ -6,7 +6,9 @@ use std::time::Duration;
 use arc_swap::ArcSwap;
 use miette::Result;
 use smol_str::SmolStr;
-use tokio::sync::{Notify, watch};
+#[cfg(feature = "indexer")]
+use tokio::sync::Notify;
+use tokio::sync::watch;
 use url::Url;
 
 use crate::{
@@ -27,9 +29,12 @@ pub struct AppState {
     pub(crate) pds_tiers: PdsTierHandle,
     pub(crate) rate_tiers: HashMap<String, RateTier>,
     pub firehose_cursors: scc::HashIndex<Url, AtomicI64>,
+    #[cfg(feature = "indexer")]
     pub backfill_notify: Notify,
+    #[cfg(feature = "indexer")]
     pub crawler_enabled: watch::Sender<bool>,
     pub firehose_enabled: watch::Sender<bool>,
+    #[cfg(feature = "indexer")]
     pub backfill_enabled: watch::Sender<bool>,
     pub ephemeral_ttl: Duration,
     pub throttler: Throttler,
@@ -41,6 +46,7 @@ impl AppState {
         let resolver = Resolver::new(config.plc_urls.clone(), config.identity_cache_size);
         let filter_config = crate::db::filter::load(&db.filter)?;
 
+        #[cfg(feature = "indexer")]
         let crawler_default = match config.enable_crawler {
             Some(b) => b,
             // default: enabled if full-network mode, or if crawler sources are configured
@@ -69,8 +75,10 @@ impl AppState {
 
         let relay_cursors = scc::HashIndex::new();
 
+        #[cfg(feature = "indexer")]
         let (crawler_enabled, _) = watch::channel(crawler_default);
         let (firehose_enabled, _) = watch::channel(config.enable_firehose);
+        #[cfg(feature = "indexer")]
         let (backfill_enabled, _) = watch::channel(true);
 
         Ok(Self {
@@ -80,15 +88,19 @@ impl AppState {
             pds_tiers,
             rate_tiers: config.rate_tiers.clone(),
             firehose_cursors: relay_cursors,
+            #[cfg(feature = "indexer")]
             backfill_notify: Notify::new(),
+            #[cfg(feature = "indexer")]
             crawler_enabled,
             firehose_enabled,
+            #[cfg(feature = "indexer")]
             backfill_enabled,
             ephemeral_ttl: config.ephemeral_ttl.clone(),
             throttler: Throttler::new(),
         })
     }
 
+    #[cfg(feature = "indexer")]
     pub fn notify_backfill(&self) {
         self.backfill_notify.notify_one();
     }
@@ -115,16 +127,26 @@ impl AppState {
         F: FnOnce() -> Fut,
         Fut: Future<Output = T>,
     {
+        #[cfg(feature = "indexer")]
         let crawler_was = *self.crawler_enabled.borrow();
         let firehose_was = *self.firehose_enabled.borrow();
+        #[cfg(feature = "indexer")]
         let backfill_was = *self.backfill_enabled.borrow();
+
+        #[cfg(feature = "indexer")]
         self.crawler_enabled.send_replace(false);
         self.firehose_enabled.send_replace(false);
+        #[cfg(feature = "indexer")]
         self.backfill_enabled.send_replace(false);
+
         let result = f().await;
+
+        #[cfg(feature = "indexer")]
         self.crawler_enabled.send_replace(crawler_was);
         self.firehose_enabled.send_replace(firehose_was);
+        #[cfg(feature = "indexer")]
         self.backfill_enabled.send_replace(backfill_was);
+
         result
     }
 }

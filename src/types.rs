@@ -169,14 +169,60 @@ impl Display for RepoStatus {
     }
 }
 
-impl RepoMetadata {
-    pub fn backfilling(index_id: u64) -> Self {
-        Self {
-            index_id,
-            tracked: true,
+impl RepoMetadata {}
+
+#[cfg(feature = "indexer")]
+mod indexer {
+    use super::*;
+
+    impl RepoMetadata {
+        pub fn backfilling(index_id: u64) -> Self {
+            Self {
+                index_id,
+                tracked: true,
+            }
+        }
+    }
+
+    impl ResyncState {
+        pub fn next_backoff(retry_count: u32) -> i64 {
+            // exponential backoff: 1m, 2m, 4m, 8m... up to 1h
+            let base = 60;
+            let cap = 3600;
+            let mult = 2u64.pow(retry_count.min(10)) as i64;
+            let delay = (base * mult).min(cap);
+
+            // add +/- 10% jitter
+            let jitter = (rand::random::<f64>() * 0.2 - 0.1) * delay as f64;
+            let delay = (delay as f64 + jitter) as i64;
+
+            chrono::Utc::now().timestamp() + delay
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    pub(crate) enum BroadcastEvent {
+        #[allow(dead_code)]
+        Persisted(u64),
+        Ephemeral(Box<MarshallableEvt<'static>>),
+    }
+
+    #[derive(Debug, PartialEq, Eq, Clone, Copy)]
+    pub(crate) enum GaugeState {
+        Synced,
+        Pending,
+        Resync(Option<ResyncErrorKind>),
+    }
+
+    impl GaugeState {
+        pub fn is_resync(&self) -> bool {
+            matches!(self, GaugeState::Resync(_))
         }
     }
 }
+
+#[cfg(feature = "indexer")]
+pub(crate) use indexer::*;
 
 impl<'i> RepoState<'i> {
     pub fn backfilling() -> Self {
@@ -250,22 +296,6 @@ pub(crate) enum ResyncState {
     },
 }
 
-impl ResyncState {
-    pub fn next_backoff(retry_count: u32) -> i64 {
-        // exponential backoff: 1m, 2m, 4m, 8m... up to 1h
-        let base = 60;
-        let cap = 3600;
-        let mult = 2u64.pow(retry_count.min(10)) as i64;
-        let delay = (base * mult).min(cap);
-
-        // add +/- 10% jitter
-        let jitter = (rand::random::<f64>() * 0.2 - 0.1) * delay as f64;
-        let delay = (delay as f64 + jitter) as i64;
-
-        chrono::Utc::now().timestamp() + delay
-    }
-}
-
 #[derive(Debug, Serialize, Clone)]
 pub enum EventType {
     Record,
@@ -302,14 +332,6 @@ pub struct MarshallableEvt<'i> {
     #[serde(borrow)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub account: Option<AccountEvt<'i>>,
-}
-
-#[cfg(feature = "indexer")]
-#[derive(Clone, Debug)]
-pub(crate) enum BroadcastEvent {
-    #[allow(dead_code)]
-    Persisted(u64),
-    Ephemeral(Box<MarshallableEvt<'static>>),
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -390,19 +412,6 @@ pub(crate) struct StoredEvent<'i> {
     #[serde(default)]
     #[serde(skip_serializing_if = "StoredData::is_nothing")]
     pub data: StoredData,
-}
-
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
-pub(crate) enum GaugeState {
-    Synced,
-    Pending,
-    Resync(Option<ResyncErrorKind>),
-}
-
-impl GaugeState {
-    pub fn is_resync(&self) -> bool {
-        matches!(self, GaugeState::Resync(_))
-    }
 }
 
 #[cfg(feature = "relay")]

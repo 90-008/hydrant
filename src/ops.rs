@@ -72,7 +72,7 @@ pub fn delete_repo(
 
     let metadata_bytes = db.repo_metadata.get(&metadata_key).into_diagnostic()?;
     if let Some(metadata_bytes) = metadata_bytes {
-        let metadata = db::deser_repo_metadata(&metadata_bytes)?;
+        let metadata = db::deser_repo_meta(&metadata_bytes)?;
         batch.remove(&db.pending, keys::pending_key(metadata.index_id));
     }
 
@@ -131,7 +131,7 @@ pub fn transition_repo<'batch, 's>(
 
     let metadata_bytes = db.repo_metadata.get(&metadata_key).into_diagnostic()?;
     if let Some(metadata_bytes) = metadata_bytes {
-        let metadata = db::deser_repo_metadata(&metadata_bytes)?;
+        let metadata = db::deser_repo_meta(&metadata_bytes)?;
         let pending_key = keys::pending_key(metadata.index_id);
 
         // manage queues

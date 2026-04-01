@@ -8,7 +8,7 @@ use serde::Deserialize;
 use url::Url;
 
 use crate::config::{CrawlerMode, CrawlerSource};
-use crate::control::{CrawlerSourceInfo, Hydrant};
+use crate::control::{Hydrant, crawler::CrawlerSourceInfo};
 
 pub fn router() -> Router<Hydrant> {
     Router::new()

@@ -5,6 +5,7 @@ use std::{net::SocketAddr, sync::Arc};
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
+#[cfg(feature = "indexer")]
 mod crawler;
 mod db;
 mod debug;
@@ -25,15 +26,20 @@ pub async fn serve(hydrant: Hydrant, port: u16) -> miette::Result<()> {
         .route("/stats", get(stats::get_stats));
     #[cfg(feature = "indexer")]
     let app = app.nest("/stream", stream::router());
-    let app = app
+    #[allow(unused_mut)]
+    let mut app = app
         .merge(xrpc::router())
         .merge(filter::router())
         .merge(pds::router())
         .merge(repos::router())
         .merge(ingestion::router())
-        .merge(crawler::router())
         .merge(firehose::router())
         .merge(db::router());
+
+    #[cfg(feature = "indexer")]
+    {
+        app = app.merge(crawler::router());
+    }
 
     #[cfg(feature = "backlinks")]
     let app = app.merge(crate::backlinks::api::router());

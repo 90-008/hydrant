@@ -1,5 +1,5 @@
 use super::*;
-use crate::db::{self, keys, ser_repo_metadata};
+use crate::db::{self, keys, ser_repo_meta};
 use crate::ingest::stream::{Account, Commit, Identity};
 use crate::ingest::validation;
 use crate::resolver::{NoSigningKeyError, ResolverError};
@@ -434,7 +434,7 @@ impl FirehoseWorker {
         let metadata_key = keys::repo_metadata_key(did);
         let metadata_bytes = db.repo_metadata.get(&metadata_key).into_diagnostic()?;
         let is_backfilling = if let Some(metadata_bytes) = metadata_bytes {
-            let metadata = crate::db::deser_repo_metadata(metadata_bytes.as_ref())?;
+            let metadata = crate::db::deser_repo_meta(metadata_bytes.as_ref())?;
             db.pending
                 .get(keys::pending_key(metadata.index_id))
                 .into_diagnostic()?
@@ -616,7 +616,7 @@ impl FirehoseWorker {
             .repo_metadata
             .get(&meta_key)
             .into_diagnostic()?
-            .map(|b| crate::db::deser_repo_metadata(&b))
+            .map(|b| crate::db::deser_repo_meta(&b))
             .transpose()?;
         let had_metadata = existing_metadata.is_some();
         let mut metadata = existing_metadata.unwrap_or_else(|| RepoMetadata {
@@ -634,7 +634,7 @@ impl FirehoseWorker {
 
         metadata.index_id = rand::random::<u64>();
         batch.insert(&db.pending, keys::pending_key(metadata.index_id), &repo_key);
-        batch.insert(&db.repo_metadata, &meta_key, ser_repo_metadata(&metadata)?);
+        batch.insert(&db.repo_metadata, &meta_key, ser_repo_meta(&metadata)?);
         batch.commit().into_diagnostic()?;
 
         if !was_pending {

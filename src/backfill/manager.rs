@@ -43,7 +43,7 @@ pub fn queue_gone_backfills(state: &Arc<AppState>) -> Result<()> {
                         continue;
                     }
                 };
-                let mut metadata = crate::db::deser_repo_metadata(&metadata_bytes)?;
+                let mut metadata = crate::db::deser_repo_meta(&metadata_bytes)?;
 
                 // move from resync back into pending
                 batch.remove(&state.db.resync, key.clone());
@@ -58,7 +58,7 @@ pub fn queue_gone_backfills(state: &Arc<AppState>) -> Result<()> {
                 batch.insert(
                     &state.db.repo_metadata,
                     &metadata_key,
-                    crate::db::ser_repo_metadata(&metadata)?,
+                    crate::db::ser_repo_meta(&metadata)?,
                 );
 
                 transitions.push((GaugeState::Resync(None), GaugeState::Pending));
@@ -133,9 +133,8 @@ pub fn retry_worker(state: Arc<AppState>) {
                                 continue;
                             }
                         };
-                        let mut metadata = match crate::db::deser_repo_metadata(
-                            metadata_bytes.as_ref(),
-                        ) {
+                        let mut metadata = match crate::db::deser_repo_meta(metadata_bytes.as_ref())
+                        {
                             Ok(m) => m,
                             Err(e) => {
                                 error!(did = %did, err = %e, "failed to deserialize repo metadata");
@@ -153,7 +152,7 @@ pub fn retry_worker(state: Arc<AppState>) {
                             keys::pending_key(metadata.index_id),
                             key.clone(),
                         );
-                        let serialized_metadata = match crate::db::ser_repo_metadata(&metadata) {
+                        let serialized_metadata = match crate::db::ser_repo_meta(&metadata) {
                             Ok(s) => s,
                             Err(e) => {
                                 error!(did = %did, err = %e, "failed to serialize repo metadata");

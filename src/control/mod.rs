@@ -1,5 +1,6 @@
 #![allow(unused_imports)]
 
+#[cfg(feature = "indexer")]
 pub(crate) mod crawler;
 pub(crate) mod filter;
 pub(crate) mod firehose;
@@ -8,7 +9,16 @@ pub(crate) mod repos;
 mod seed;
 pub(crate) mod stream;
 
-pub use crawler::{CrawlerHandle, CrawlerSourceInfo};
+#[cfg(feature = "indexer")]
+mod indexer;
+#[cfg(feature = "indexer")]
+pub use indexer::*;
+
+#[cfg(feature = "relay")]
+mod relay;
+#[cfg(feature = "relay")]
+pub use relay::*;
+
 pub use filter::{FilterControl, FilterPatch, FilterSnapshot};
 pub use firehose::{FirehoseHandle, FirehoseSourceInfo};
 pub use pds::{PdsControl, PdsTierAssignment, PdsTierDefinition};
@@ -30,17 +40,15 @@ use tracing::{debug, error, info};
 #[cfg(feature = "indexer")]
 use crate::backfill::BackfillWorker;
 use crate::config::{Config, SignatureVerification};
-use crate::db::{
-    self, filter as db_filter, keys, load_persisted_crawler_sources,
-    load_persisted_firehose_sources,
-};
+#[cfg(feature = "indexer")]
+use crate::db::load_persisted_crawler_sources;
+use crate::db::{self, filter as db_filter, keys, load_persisted_firehose_sources};
 use crate::filter::FilterMode;
 #[cfg(feature = "indexer")]
 use crate::ingest::indexer::FirehoseWorker;
 use crate::state::AppState;
 use crate::types::MarshallableEvt;
 
-use crawler::{CrawlerShared, spawn_crawler_producer};
 use firehose::{FirehoseShared, spawn_firehose_ingestor};
 #[cfg(feature = "indexer")]
 use stream::event_stream_thread;
@@ -86,8 +94,10 @@ pub type Event = MarshallableEvt<'static>;
 /// ```
 #[derive(Clone)]
 pub struct Hydrant {
-    pub crawler: CrawlerHandle,
+    #[cfg(feature = "indexer")]
+    pub crawler: crawler::CrawlerHandle,
     pub firehose: FirehoseHandle,
+    #[cfg(feature = "indexer")]
     pub backfill: BackfillHandle,
     pub filter: FilterControl,
     pub pds: PdsControl,
@@ -160,26 +170,32 @@ impl Hydrant {
             state.filter.store(Arc::new(new_filter));
         }
 
-        // 4. set crawler enabled state from config, evaluated against the post-patch filter
-        let post_patch_crawler = match config.enable_crawler {
-            Some(b) => b,
-            None => {
-                state.filter.load().mode == FilterMode::Full || !config.crawler_sources.is_empty()
-            }
-        };
-        state.crawler_enabled.send_replace(post_patch_crawler);
+        #[cfg(feature = "indexer")]
+        {
+            // 4. set crawler enabled state from config, evaluated against the post-patch filter
+            let post_patch_crawler = match config.enable_crawler {
+                Some(b) => b,
+                None => {
+                    state.filter.load().mode == FilterMode::Full
+                        || !config.crawler_sources.is_empty()
+                }
+            };
+            state.crawler_enabled.send_replace(post_patch_crawler);
+        }
 
         let state = Arc::new(state);
 
         Ok(Self {
-            crawler: CrawlerHandle {
+            #[cfg(feature = "indexer")]
+            crawler: crawler::CrawlerHandle {
                 state: state.clone(),
                 shared: Arc::new(std::sync::OnceLock::new()),
                 tasks: Arc::new(scc::HashMap::new()),
                 persisted: Arc::new(scc::HashSet::new()),
             },
             firehose: FirehoseHandle::new(state.clone()),
-            backfill: BackfillHandle(state.clone()),
+            #[cfg(feature = "indexer")]
+            backfill: BackfillHandle::new(state.clone()),
             filter: FilterControl(state.clone()),
             pds: pds::PdsControl(state.clone()),
             repos: ReposControl(state.clone()),
@@ -209,6 +225,7 @@ impl Hydrant {
     pub fn run(&self) -> Result<impl Future<Output = Result<()>>> {
         let state = self.state.clone();
         let config = self.config.clone();
+        #[cfg(feature = "indexer")]
         let crawler = self.crawler.clone();
         let firehose = self.firehose.clone();
 
@@ -356,13 +373,6 @@ impl Hydrant {
 
             let (fatal_tx_inner, mut fatal_rx) = watch::channel(None);
             let fatal_tx = Arc::new(fatal_tx_inner);
-
-            info!(
-                crawler_enabled = *state.crawler_enabled.borrow(),
-                firehose_enabled = *state.firehose_enabled.borrow(),
-                filter_mode = ?state.filter.load().mode,
-                "starting ingestion"
-            );
 
             // 10. set shared and spawn firehose ingestors
             firehose
@@ -516,7 +526,7 @@ impl Hydrant {
                 // set shared objects so CrawlerHandle methods can use them
                 crawler
                     .shared
-                    .set(CrawlerShared {
+                    .set(crawler::CrawlerShared {
                         http,
                         checker,
                         in_flight,
@@ -530,7 +540,7 @@ impl Hydrant {
                 // spawn initial sources from config
                 for source in config.crawler_sources.iter() {
                     let enabled_rx = state.crawler_enabled.subscribe();
-                    let handle = spawn_crawler_producer(
+                    let handle = crawler::spawn_crawler_producer(
                         source,
                         &shared.http,
                         &state,
@@ -556,7 +566,7 @@ impl Hydrant {
                         continue;
                     }
                     let enabled_rx = state.crawler_enabled.subscribe();
-                    let handle = spawn_crawler_producer(
+                    let handle = crawler::spawn_crawler_producer(
                         source,
                         &shared.http,
                         &state,
@@ -662,61 +672,6 @@ impl Hydrant {
         Ok(fut)
     }
 
-    /// subscribe to the ordered event stream.
-    ///
-    /// returns an [`EventStream`] that implements [`futures::Stream`].
-    ///
-    /// - if `cursor` is `None`, streaming starts from the current head (live tail only).
-    /// - if `cursor` is `Some(id)`, all persisted `record` events from that ID onward are
-    ///   replayed first, then the stream will switch to live tailing.
-    ///
-    /// `identity` and `account` events are ephemeral and are never replayed from a cursor,
-    /// only live ones are delivered. use [`ReposControl::info`] to fetch current state for
-    /// a specific repository.
-    ///
-    /// multiple concurrent subscribers each receive a full independent copy of the stream.
-    /// the stream ends when the `EventStream` is dropped.
-    #[cfg(feature = "indexer")]
-    pub fn subscribe(&self, cursor: Option<u64>) -> EventStream {
-        let (tx, rx) = mpsc::channel(500);
-        let state = self.state.clone();
-        let runtime = tokio::runtime::Handle::current();
-
-        std::thread::Builder::new()
-            .name("hydrant-stream".into())
-            .spawn(move || {
-                let _g = runtime.enter();
-                event_stream_thread(state, tx, cursor);
-            })
-            .expect("failed to spawn stream thread");
-
-        EventStream(rx)
-    }
-
-    /// subscribe to the relay's ordered `subscribeRepos` event stream.
-    ///
-    /// returns a [`RelayEventStream`] that yields pre-encoded CBOR binary frames
-    /// ready to forward directly to ATProto clients via WebSocket.
-    ///
-    /// - if `cursor` is `None`, streaming starts from the current head (live tail only).
-    /// - if `cursor` is `Some(seq)`, all persisted events from that seq onward are replayed first.
-    #[cfg(feature = "relay")]
-    pub fn subscribe_repos(&self, cursor: Option<u64>) -> RelayEventStream {
-        let (tx, rx) = mpsc::channel(500);
-        let state = self.state.clone();
-        let runtime = tokio::runtime::Handle::current();
-
-        std::thread::Builder::new()
-            .name("hydrant-relay-stream".into())
-            .spawn(move || {
-                let _g = runtime.enter();
-                relay_stream_thread(state, tx, cursor);
-            })
-            .expect("failed to spawn relay stream thread");
-
-        RelayEventStream(rx)
-    }
-
     /// return database counts and on-disk sizes for all keyspaces.
     ///
     /// counts include: `repos`, `pending`, `resync`, `records`, `blocks`, `events`,
@@ -726,44 +681,64 @@ impl Hydrant {
     pub async fn stats(&self) -> Result<StatsResponse> {
         let state = self.state.clone();
 
-        // todo: update stats, only return necessary info on relay vs indexer modes
-        // (and ephemeral indexer)
-        let mut counts: BTreeMap<&'static str, u64> = futures::future::join_all(
-            [
-                "repos",
-                "pending",
-                "records",
-                "blocks",
-                "resync",
-                "error_ratelimited",
-                "error_transport",
-                "error_generic",
-            ]
-            .into_iter()
-            .map(|name| {
+        #[allow(unused_mut)]
+        let mut count_keys = vec![
+            "repos",
+            "error_ratelimited",
+            "error_transport",
+            "error_generic",
+        ];
+
+        #[cfg(feature = "indexer")]
+        {
+            count_keys.push("pending");
+            count_keys.push("records");
+            count_keys.push("blocks");
+            count_keys.push("resync");
+        }
+
+        let mut counts: BTreeMap<&'static str, u64> =
+            futures::future::join_all(count_keys.into_iter().map(|name| {
                 let state = state.clone();
                 async move { (name, state.db.get_count(name).await) }
-            }),
-        )
-        .await
-        .into_iter()
-        .collect();
+            }))
+            .await
+            .into_iter()
+            .collect();
 
+        #[cfg(feature = "indexer")]
         counts.insert("events", state.db.events.approximate_len() as u64);
+
+        #[cfg(feature = "relay")]
+        counts.insert(
+            "relay_events",
+            state.db.relay_events.approximate_len() as u64,
+        );
 
         let sizes = tokio::task::spawn_blocking(move || {
             let mut s = BTreeMap::new();
             s.insert("repos", state.db.repos.disk_space());
-            s.insert("records", state.db.records.disk_space());
-            s.insert("blocks", state.db.blocks.disk_space());
             s.insert("cursors", state.db.cursors.disk_space());
-            s.insert("pending", state.db.pending.disk_space());
-            s.insert("resync", state.db.resync.disk_space());
-            s.insert("resync_buffer", state.db.resync_buffer.disk_space());
-            s.insert("events", state.db.events.disk_space());
             s.insert("counts", state.db.counts.disk_space());
             s.insert("filter", state.db.filter.disk_space());
             s.insert("crawler", state.db.crawler.disk_space());
+
+            #[cfg(feature = "indexer")]
+            {
+                s.insert("records", state.db.records.disk_space());
+                s.insert("blocks", state.db.blocks.disk_space());
+                s.insert("pending", state.db.pending.disk_space());
+                s.insert("resync", state.db.resync.disk_space());
+                s.insert("resync_buffer", state.db.resync_buffer.disk_space());
+                s.insert("events", state.db.events.disk_space());
+            }
+
+            #[cfg(feature = "relay")]
+            s.insert("relay_events", state.db.relay_events.disk_space());
+
+            #[cfg(feature = "backlinks")]
+            s.insert("backlinks", state.db.backlinks.disk_space());
+
             s
         })
         .await
@@ -890,39 +865,6 @@ impl axum::extract::FromRef<Hydrant> for Arc<AppState> {
     }
 }
 
-/// a stream of [`Event`]s. returned by [`Hydrant::subscribe`].
-///
-/// implements [`futures::Stream`] and can be used with `StreamExt::next`,
-/// `while let Some(evt) = stream.next().await`, `forward`, etc.
-/// the stream terminates when the underlying channel closes (i.e. hydrant shuts down).
-#[cfg(feature = "indexer")]
-pub struct EventStream(mpsc::Receiver<Event>);
-
-#[cfg(feature = "indexer")]
-impl Stream for EventStream {
-    type Item = Event;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        self.0.poll_recv(cx)
-    }
-}
-
-/// the relay event stream produced by [`Hydrant::subscribe_repos`].
-#[cfg(feature = "relay")]
-pub struct RelayEventStream(mpsc::Receiver<bytes::Bytes>);
-
-#[cfg(feature = "relay")]
-impl futures::Stream for RelayEventStream {
-    type Item = bytes::Bytes;
-
-    fn poll_next(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Self::Item>> {
-        self.0.poll_recv(cx)
-    }
-}
-
 /// database statistics returned by [`Hydrant::stats`].
 #[derive(serde::Serialize)]
 pub struct StatsResponse {
@@ -930,29 +872,6 @@ pub struct StatsResponse {
     pub counts: BTreeMap<&'static str, u64>,
     /// on-disk size in bytes per keyspace
     pub sizes: BTreeMap<&'static str, u64>,
-}
-
-/// runtime control over the backfill worker component.
-///
-/// the backfill worker fetches full repo CAR files from each repo's PDS for any
-/// repository in the pending queue, parses the MST, and inserts all matching records
-/// into the database. concurrency is bounded by `HYDRANT_BACKFILL_CONCURRENCY_LIMIT`.
-#[derive(Clone)]
-pub struct BackfillHandle(Arc<AppState>);
-
-impl BackfillHandle {
-    /// enable the backfill worker, no-op if already enabled.
-    pub fn enable(&self) {
-        self.0.backfill_enabled.send_replace(true);
-    }
-    /// disable the backfill worker, in-flight repos complete before pausing.
-    pub fn disable(&self) {
-        self.0.backfill_enabled.send_replace(false);
-    }
-    /// returns the current enabled state of the backfill worker.
-    pub fn is_enabled(&self) -> bool {
-        *self.0.backfill_enabled.borrow()
-    }
 }
 
 /// control over database maintenance operations.

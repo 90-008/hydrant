@@ -10,8 +10,6 @@ use fjall::config::{BlockSizePolicy, CompressionPolicy, RestartIntervalPolicy};
 use fjall::{
     CompressionType, Database, Keyspace, KeyspaceCreateOptions, OwnedWriteBatch, PersistMode, Slice,
 };
-use jacquard_common::IntoStatic;
-use jacquard_common::types::string::Did;
 use lsm_tree::compaction::Factory;
 use miette::{Context, IntoDiagnostic, Result};
 use scc::HashMap;
@@ -43,17 +41,23 @@ pub struct Db {
     pub inner: Arc<Database>,
     pub path: std::path::PathBuf,
     pub repos: Keyspace,
-    pub records: Keyspace,
-    pub blocks: Keyspace,
-    pub cursors: Keyspace,
-    pub pending: Keyspace,
-    pub resync: Keyspace,
-    pub resync_buffer: Keyspace,
     pub repo_metadata: Keyspace,
-    pub events: Keyspace,
+    pub cursors: Keyspace,
     pub counts: Keyspace,
     pub filter: Keyspace,
     pub crawler: Keyspace,
+    #[cfg(feature = "indexer")]
+    pub records: Keyspace,
+    #[cfg(feature = "indexer")]
+    pub blocks: Keyspace,
+    #[cfg(feature = "indexer")]
+    pub pending: Keyspace,
+    #[cfg(feature = "indexer")]
+    pub resync: Keyspace,
+    #[cfg(feature = "indexer")]
+    pub resync_buffer: Keyspace,
+    #[cfg(feature = "indexer")]
+    pub events: Keyspace,
     #[cfg(feature = "backlinks")]
     pub backlinks: Keyspace,
     #[cfg(feature = "indexer")]
@@ -69,6 +73,7 @@ pub struct Db {
     pub counts_map: HashMap<SmolStr, u64>,
 }
 
+#[cfg(feature = "indexer")]
 macro_rules! update_gauge_diff_impl {
     ($self:ident, $old:ident, $new:ident, $update_method:ident $(, $await:tt)?) => {{
         use crate::types::GaugeState;
@@ -226,6 +231,7 @@ impl Db {
                 // did plc are random so the interval wont rlly matter
                 .data_block_restart_interval_policy(RestartIntervalPolicy::new([2, 4])),
         )?;
+        #[cfg(feature = "indexer")]
         let pending = open_ks(
             "pending",
             opts()
@@ -239,6 +245,7 @@ impl Db {
                 // ids are sequential and share prefix so we can use large interval to save space
                 .data_block_restart_interval_policy(RestartIntervalPolicy::all(64)),
         )?;
+        #[cfg(feature = "indexer")]
         let resync = open_ks(
             "resync",
             opts()
@@ -253,6 +260,7 @@ impl Db {
                 .data_block_restart_interval_policy(RestartIntervalPolicy::all(4)),
         )?;
         // this is used in non-ephemeral mode
+        #[cfg(feature = "indexer")]
         let blocks = open_ks(
             "blocks",
             opts()
@@ -276,6 +284,7 @@ impl Db {
                 ]))
                 .data_block_restart_interval_policy(RestartIntervalPolicy::new([8, 16, 32])),
         )?;
+        #[cfg(feature = "indexer")]
         let records = open_ks(
             "records",
             opts()
@@ -302,6 +311,7 @@ impl Db {
                 .data_block_compression_policy(CompressionPolicy::disabled())
                 .data_block_restart_interval_policy(RestartIntervalPolicy::all(1)),
         )?;
+        #[cfg(feature = "indexer")]
         let resync_buffer = open_ks(
             "resync_buffer",
             opts()
@@ -313,6 +323,7 @@ impl Db {
                 .data_block_compression_policy(CompressionPolicy::disabled())
                 .data_block_restart_interval_policy(RestartIntervalPolicy::all(16)),
         )?;
+        #[cfg(feature = "indexer")]
         let events = open_ks(
             "events",
             opts()
@@ -432,13 +443,19 @@ impl Db {
             inner: db,
             path: cfg.database_path.clone(),
             repos,
+            repo_metadata,
+            #[cfg(feature = "indexer")]
             records,
+            #[cfg(feature = "indexer")]
             blocks,
             cursors,
+            #[cfg(feature = "indexer")]
             pending,
+            #[cfg(feature = "indexer")]
             resync,
+            #[cfg(feature = "indexer")]
             resync_buffer,
-            repo_metadata,
+            #[cfg(feature = "indexer")]
             events,
             counts,
             filter,
@@ -510,7 +527,9 @@ impl Db {
 
     pub fn train_dict(&self, ks_name: &str) -> Result<()> {
         let ks = match ks_name {
+            #[cfg(feature = "indexer")]
             "blocks" => &self.blocks,
+            #[cfg(feature = "indexer")]
             "events" => &self.events,
             "repos" => &self.repos,
             #[cfg(feature = "backlinks")]
@@ -527,27 +546,33 @@ impl Db {
         };
 
         let samples: Vec<Vec<u8>> = if ks_name == "blocks" {
-            // sample up to 200 data blocks per collection, discovered lazily in the predicate
-            let per_collection_limit = 200usize;
-            let collection_counts: RefCell<std::collections::HashMap<Vec<u8>, usize>> =
-                RefCell::new(std::collections::HashMap::new());
+            #[cfg(not(feature = "indexer"))]
+            miette::bail!("indexer feature required for blocks keyspace training");
 
-            let new = ks
-                .sample_data_blocks(5000, |first, _last| {
-                    let Some(sep_idx) = first.iter().position(|&b| b == keys::SEP) else {
-                        return false;
-                    };
-                    let mut counts = collection_counts.borrow_mut();
-                    let count = counts.entry(first[..sep_idx].to_vec()).or_insert(0);
-                    if *count >= per_collection_limit {
-                        return false;
-                    }
-                    *count += 1;
-                    true
-                })
-                .into_diagnostic()?;
+            #[cfg(feature = "indexer")]
+            {
+                // sample up to 200 data blocks per collection, discovered lazily in the predicate
+                let per_collection_limit = 200usize;
+                let collection_counts: RefCell<std::collections::HashMap<Vec<u8>, usize>> =
+                    RefCell::new(std::collections::HashMap::new());
 
-            new.into_iter().map(|s| s.to_vec()).collect()
+                let new = ks
+                    .sample_data_blocks(5000, |first, _last| {
+                        let Some(sep_idx) = first.iter().position(|&b| b == keys::SEP) else {
+                            return false;
+                        };
+                        let mut counts = collection_counts.borrow_mut();
+                        let count = counts.entry(first[..sep_idx].to_vec()).or_insert(0);
+                        if *count >= per_collection_limit {
+                            return false;
+                        }
+                        *count += 1;
+                        true
+                    })
+                    .into_diagnostic()?;
+
+                new.into_iter().map(|s| s.to_vec()).collect()
+            }
         } else {
             let mut seen_keys = HashSet::new();
             let captured_keys = RefCell::new(Vec::new());
@@ -605,24 +630,34 @@ impl Db {
                 .await
                 .into_diagnostic()?
         };
-        tokio::try_join!(
+
+        let mut tasks = vec![
             compact(self.repos.clone()),
-            compact(self.records.clone()),
-            compact(self.blocks.clone()),
             compact(self.cursors.clone()),
-            compact(self.pending.clone()),
-            compact(self.resync.clone()),
-            compact(self.resync_buffer.clone()),
             compact(self.repo_metadata.clone()),
-            compact(self.events.clone()),
             compact(self.counts.clone()),
             compact(self.filter.clone()),
             compact(self.crawler.clone()),
-        )?;
+        ];
+
+        #[cfg(feature = "indexer")]
+        {
+            tasks.push(compact(self.records.clone()));
+            tasks.push(compact(self.blocks.clone()));
+            tasks.push(compact(self.pending.clone()));
+            tasks.push(compact(self.resync.clone()));
+            tasks.push(compact(self.resync_buffer.clone()));
+            tasks.push(compact(self.events.clone()));
+        }
+
         #[cfg(feature = "relay")]
-        compact(self.relay_events.clone()).await?;
+        tasks.push(compact(self.relay_events.clone()));
+
         #[cfg(feature = "backlinks")]
-        compact(self.backlinks.clone()).await?;
+        tasks.push(compact(self.backlinks.clone()));
+
+        futures::future::try_join_all(tasks).await?;
+
         Ok(())
     }
 
@@ -654,6 +689,7 @@ impl Db {
             .into_diagnostic()?
     }
 
+    #[allow(dead_code)]
     pub async fn contains_key(ks: Keyspace, key: impl Into<Slice>) -> Result<bool> {
         let key = key.into();
         tokio::task::spawn_blocking(move || ks.contains_key(key).into_diagnostic())
@@ -711,98 +747,18 @@ impl Db {
             .await
             .unwrap_or(0)
     }
+}
 
-    pub(crate) fn update_gauge_diff(
-        &self,
-        old: &crate::types::GaugeState,
-        new: &crate::types::GaugeState,
-    ) {
-        update_gauge_diff_impl!(self, old, new, update_count);
-    }
+#[cfg(feature = "indexer")]
+mod indexer;
 
-    pub(crate) async fn update_gauge_diff_async(
-        &self,
-        old: &crate::types::GaugeState,
-        new: &crate::types::GaugeState,
-    ) {
-        update_gauge_diff_impl!(self, old, new, update_count_async, await);
-    }
+#[cfg(feature = "indexer")]
+pub use indexer::*;
 
-    pub(crate) fn update_repo_state<F, T>(
-        batch: &mut OwnedWriteBatch,
-        repos: &Keyspace,
-        did: &Did<'_>,
-        f: F,
-    ) -> Result<Option<(RepoState<'static>, T)>>
-    where
-        F: FnOnce(&mut RepoState, (&[u8], &mut fjall::OwnedWriteBatch)) -> Result<(bool, T)>,
-    {
-        let key = keys::repo_key(did);
-        if let Some(bytes) = repos.get(&key).into_diagnostic()? {
-            let mut state: RepoState = deser_repo_state(bytes.as_ref())?.into_static();
-            let (changed, result) = f(&mut state, (key.as_slice(), batch))?;
-            if changed {
-                batch.insert(repos, key, ser_repo_state(&state)?);
-            }
-            Ok(Some((state, result)))
-        } else {
-            Ok(None)
-        }
-    }
-
-    pub(crate) async fn update_repo_state_async<F, T>(
-        &self,
-        did: &Did<'_>,
-        f: F,
-    ) -> Result<Option<(RepoState<'static>, T)>>
-    where
-        F: FnOnce(&mut RepoState, (&[u8], &mut fjall::OwnedWriteBatch)) -> Result<(bool, T)>
-            + Send
-            + 'static,
-        T: Send + 'static,
-    {
-        let mut batch = self.inner.batch();
-        let repos = self.repos.clone();
-        let did = did.clone().into_static();
-
-        tokio::task::spawn_blocking(move || {
-            let Some((state, t)) = Self::update_repo_state(&mut batch, &repos, &did, f)? else {
-                return Ok(None);
-            };
-            batch.commit().into_diagnostic()?;
-            Ok(Some((state, t)))
-        })
-        .await
-        .into_diagnostic()?
-    }
-
-    pub(crate) fn repo_gauge_state(
-        repo_state: &RepoState,
-        resync_bytes: Option<&[u8]>,
-    ) -> crate::types::GaugeState {
-        match repo_state.status {
-            crate::types::RepoStatus::Synced => crate::types::GaugeState::Synced,
-            crate::types::RepoStatus::Error(_)
-            | crate::types::RepoStatus::Deactivated
-            | crate::types::RepoStatus::Takendown
-            | crate::types::RepoStatus::Suspended
-            | crate::types::RepoStatus::Deleted
-            | crate::types::RepoStatus::Desynchronized
-            | crate::types::RepoStatus::Throttled => {
-                if let Some(resync_bytes) = resync_bytes {
-                    if let Ok(crate::types::ResyncState::Error { kind, .. }) =
-                        rmp_serde::from_slice::<crate::types::ResyncState>(resync_bytes)
-                    {
-                        crate::types::GaugeState::Resync(Some(kind))
-                    } else {
-                        crate::types::GaugeState::Resync(None)
-                    }
-                } else {
-                    crate::types::GaugeState::Resync(None)
-                }
-            }
-        }
-    }
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+pub(crate) struct FirehoseSourceMeta {
+    #[serde(default)]
+    pub(crate) is_pds: bool,
 }
 
 pub fn set_firehose_cursor(db: &Db, relay: &Url, cursor: i64) -> Result<()> {
@@ -818,7 +774,7 @@ pub async fn get_firehose_cursor(db: &Db, relay: &Url) -> Result<Option<i64>> {
     let key = keys::firehose_cursor_key_from_url(relay);
     Db::get(db.cursors.clone(), key)
         .await?
-        .map(|v| {
+        .map(|v: Slice| {
             Ok(i64::from_be_bytes(
                 v.as_ref()
                     .try_into()
@@ -829,11 +785,11 @@ pub async fn get_firehose_cursor(db: &Db, relay: &Url) -> Result<Option<i64>> {
         .transpose()
 }
 
-pub fn ser_repo_metadata(state: &RepoMetadata) -> Result<Vec<u8>> {
+pub fn ser_repo_meta(state: &RepoMetadata) -> Result<Vec<u8>> {
     rmp_serde::to_vec(&state).into_diagnostic()
 }
 
-pub fn deser_repo_metadata(bytes: &[u8]) -> Result<RepoMetadata> {
+pub fn deser_repo_meta(bytes: &[u8]) -> Result<RepoMetadata> {
     rmp_serde::from_slice(bytes).into_diagnostic()
 }
 
@@ -873,72 +829,6 @@ pub fn persist_counts(db: &Db) -> Result<()> {
     batch.commit().into_diagnostic()
 }
 
-pub fn set_record_count(
-    batch: &mut OwnedWriteBatch,
-    db: &Db,
-    did: &Did<'_>,
-    collection: &str,
-    count: u64,
-) {
-    let key = keys::count_collection_key(did, collection);
-    batch.insert(&db.counts, key, count.to_be_bytes());
-}
-
-pub fn update_record_count(
-    batch: &mut OwnedWriteBatch,
-    db: &Db,
-    did: &Did<'_>,
-    collection: &str,
-    delta: i64,
-) -> Result<()> {
-    let key = keys::count_collection_key(did, collection);
-    let count = db
-        .counts
-        .get(&key)
-        .into_diagnostic()?
-        .map(|v| -> Result<_> {
-            Ok(u64::from_be_bytes(
-                v.as_ref()
-                    .try_into()
-                    .into_diagnostic()
-                    .wrap_err("expected to be count (8 bytes)")?,
-            ))
-        })
-        .transpose()?
-        .unwrap_or(0);
-    let new_count = if delta >= 0 {
-        count.saturating_add(delta as u64)
-    } else {
-        count.saturating_sub(delta.unsigned_abs())
-    };
-    batch.insert(&db.counts, key, new_count.to_be_bytes());
-    Ok(())
-}
-
-pub fn get_record_count(db: &Db, did: &Did<'_>, collection: &str) -> Result<u64> {
-    let key = keys::count_collection_key(did, collection);
-    let count = db
-        .counts
-        .get(&key)
-        .into_diagnostic()?
-        .map(|v| -> Result<_> {
-            Ok(u64::from_be_bytes(
-                v.as_ref()
-                    .try_into()
-                    .into_diagnostic()
-                    .wrap_err("expected to be count (8 bytes)")?,
-            ))
-        })
-        .transpose()?;
-    Ok(count.unwrap_or(0))
-}
-
-#[derive(serde::Serialize, serde::Deserialize, Default)]
-pub(crate) struct FirehoseSourceMeta {
-    #[serde(default)]
-    pub(crate) is_pds: bool,
-}
-
 pub fn load_persisted_firehose_sources(
     db: &crate::db::Db,
 ) -> Result<Vec<crate::config::FirehoseSource>> {
@@ -956,23 +846,6 @@ pub fn load_persisted_firehose_sources(
             url,
             is_pds: meta.is_pds,
         });
-    }
-    Ok(sources)
-}
-
-pub fn load_persisted_crawler_sources(
-    db: &crate::db::Db,
-) -> Result<Vec<crate::config::CrawlerSource>> {
-    use crate::db::keys::CRAWLER_SOURCE_PREFIX;
-
-    let mut sources = Vec::new();
-    for entry in db.crawler.prefix(CRAWLER_SOURCE_PREFIX) {
-        let (key, val) = entry.into_inner().into_diagnostic()?;
-        let url_bytes = &key[CRAWLER_SOURCE_PREFIX.len()..];
-        let url_str = std::str::from_utf8(url_bytes).into_diagnostic()?;
-        let url = Url::parse(url_str).into_diagnostic()?;
-        let mode: crate::config::CrawlerMode = rmp_serde::from_slice(&val).into_diagnostic()?;
-        sources.push(crate::config::CrawlerSource { url, mode });
     }
     Ok(sources)
 }

@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use std::{hash::Hash, time::Duration};
 
 use jacquard_common::{deps::fluent_uri, types::string::Handle};

@@ -59,7 +59,7 @@ async fn seed_one(
         let ks = state.db.cursors.clone();
         let key = cursor_key.clone();
         match db::Db::get(ks, key).await {
-            Ok(Some(b)) => rmp_serde::from_slice::<String>(&b).ok(),
+            Ok(Some(b)) => rmp_serde::from_slice::<String>(b.as_ref()).ok(),
             Ok(None) => None,
             Err(e) => {
                 warn!(err = %e, "failed to load seed cursor, starting from scratch");

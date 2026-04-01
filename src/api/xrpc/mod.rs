@@ -2,20 +2,22 @@ use crate::control::Hydrant;
 use axum::extract::FromRequest;
 use axum::response::IntoResponse;
 use axum::routing::get;
+#[cfg(feature = "relay")]
+use axum::routing::post;
 use axum::{Json, Router, extract::State, http::StatusCode};
 use jacquard_api::com_atproto::sync::get_host_status::GetHostStatusRequest;
 use jacquard_api::com_atproto::sync::get_latest_commit::GetLatestCommitRequest;
 use jacquard_api::com_atproto::sync::get_repo_status::GetRepoStatusRequest;
 use jacquard_api::com_atproto::sync::list_hosts::ListHostsRequest;
 use jacquard_api::com_atproto::sync::list_repos::ListReposRequest;
+#[cfg(feature = "indexer")]
 use jacquard_common::types::ident::AtIdentifier;
+#[cfg(feature = "indexer")]
+use jacquard_common::types::string::AtUri;
 use jacquard_common::xrpc::XrpcResp;
+use jacquard_common::xrpc::{GenericXrpcError, XrpcError};
 use jacquard_common::xrpc::{XrpcEndpoint, XrpcMethod};
 use jacquard_common::{IntoStatic, xrpc::XrpcRequest};
-use jacquard_common::{
-    types::string::AtUri,
-    xrpc::{GenericXrpcError, XrpcError},
-};
 use serde::{Deserialize, Serialize};
 use smol_str::ToSmolStr;
 use std::fmt::Display;
@@ -84,14 +86,8 @@ pub fn router() -> Router<Hydrant> {
 
     #[cfg(feature = "relay")]
     let r = r
-        .route(
-            SubscribeReposEndpoint::PATH,
-            axum::routing::get(subscribe_repos::handle),
-        )
-        .route(
-            RequestCrawlRequest::PATH,
-            axum::routing::get(subscribe_repos::handle),
-        );
+        .route(SubscribeReposEndpoint::PATH, get(subscribe_repos::handle))
+        .route(RequestCrawlRequest::PATH, post(request_crawl::handle));
 
     r
 }
@@ -177,6 +173,7 @@ fn bad_request<E: std::error::Error + IntoStatic>(
     }
 }
 
+#[cfg(feature = "indexer")]
 fn upstream_error<E: std::error::Error + IntoStatic>(
     nsid: &'static str,
     message: impl Display,

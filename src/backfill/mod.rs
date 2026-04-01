@@ -742,12 +742,12 @@ async fn process_did<'i>(
                 .get(&metadata_key)
                 .into_diagnostic()?
                 .ok_or_else(|| miette::miette!("repo metadata not found for {}", did))?;
-            let mut metadata = crate::db::deser_repo_metadata(&metadata_bytes)?;
+            let mut metadata = crate::db::deser_repo_meta(&metadata_bytes)?;
             metadata.tracked = true;
             batch.insert(
                 &app_state.db.repo_metadata,
                 &metadata_key,
-                crate::db::ser_repo_metadata(&metadata)?,
+                crate::db::ser_repo_meta(&metadata)?,
             );
 
             // add the counts
@@ -771,7 +771,7 @@ async fn process_did<'i>(
         .get(&metadata_key)
         .into_diagnostic()?
         .ok_or_else(|| miette::miette!("repo metadata not found for {}", did))?;
-    let metadata = crate::db::deser_repo_metadata(metadata_bytes.as_ref())?;
+    let metadata = crate::db::deser_repo_meta(metadata_bytes.as_ref())?;
 
     let Some((_state, records_cnt_delta, added_blocks, count)) = result else {
         // signal mode: no signal-matching records found, clean up the optimistically-added repo

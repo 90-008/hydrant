@@ -288,7 +288,7 @@ impl FirehoseIngestor {
                         .get(&metadata_key)
                         .into_diagnostic()?
                     {
-                        let metadata = crate::db::deser_repo_metadata(bytes.as_ref())?;
+                        let metadata = crate::db::deser_repo_meta(bytes.as_ref())?;
 
                         if metadata.tracked {
                             trace!(did = %did, "tracked repo, processing");

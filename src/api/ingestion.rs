@@ -15,25 +15,31 @@ pub fn router() -> Router<Hydrant> {
 
 #[derive(Serialize)]
 pub struct IngestionStatus {
+    #[cfg(feature = "indexer")]
     pub crawler: bool,
     pub firehose: bool,
+    #[cfg(feature = "indexer")]
     pub backfill: bool,
 }
 
 pub async fn get_ingestion(State(hydrant): State<Hydrant>) -> Json<IngestionStatus> {
     Json(IngestionStatus {
+        #[cfg(feature = "indexer")]
         crawler: hydrant.crawler.is_enabled(),
         firehose: hydrant.firehose.is_enabled(),
+        #[cfg(feature = "indexer")]
         backfill: hydrant.backfill.is_enabled(),
     })
 }
 
 #[derive(Deserialize)]
 pub struct IngestionPatch {
+    #[cfg(feature = "indexer")]
     #[serde(default)]
     pub crawler: Option<bool>,
     #[serde(default)]
     pub firehose: Option<bool>,
+    #[cfg(feature = "indexer")]
     #[serde(default)]
     pub backfill: Option<bool>,
 }
@@ -42,6 +48,7 @@ pub async fn patch_ingestion(
     State(hydrant): State<Hydrant>,
     Json(body): Json<IngestionPatch>,
 ) -> StatusCode {
+    #[cfg(feature = "indexer")]
     if let Some(crawler) = body.crawler {
         if crawler {
             hydrant.crawler.enable();
@@ -56,6 +63,7 @@ pub async fn patch_ingestion(
             hydrant.firehose.disable();
         }
     }
+    #[cfg(feature = "indexer")]
     if let Some(backfill) = body.backfill {
         if backfill {
             hydrant.backfill.enable();

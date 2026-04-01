@@ -304,6 +304,9 @@ impl RelayWorker {
             ..
         } = validated;
 
+        #[cfg(not(feature = "indexer"))]
+        let _ = parsed_blocks;
+
         if chain_break.is_broken() {
             // chain breaks are not grounds for blocking when acting as a relay
             debug!(broken = ?chain_break, "chain break, forwarding anyway");
@@ -782,7 +785,7 @@ impl WorkerContext<'_> {
             .repo_metadata
             .get(&metadata_key)
             .into_diagnostic()?
-            .map(|bytes| db::deser_repo_metadata(&bytes))
+            .map(|bytes| db::deser_repo_meta(&bytes))
             .transpose()?;
 
         if metadata.map_or(false, |m| !m.tracked) {

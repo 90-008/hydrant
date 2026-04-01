@@ -30,26 +30,33 @@ impl FilterConfig {
             collections: Vec::new(),
         }
     }
-
-    pub fn matches_collection(&self, collection: &str) -> bool {
-        if self.collections.is_empty() {
-            return true;
-        }
-        self.collections.iter().any(|p| nsid_matches(p, collection))
-    }
-
-    pub fn matches_signal(&self, collection: &str) -> bool {
-        self.signals.iter().any(|p| nsid_matches(p, collection))
-    }
-
-    pub fn check_signals(&self) -> bool {
-        self.mode == FilterMode::Filter && !self.signals.is_empty()
-    }
 }
 
-fn nsid_matches(pattern: &str, col: &str) -> bool {
-    pattern
-        .strip_suffix(".*")
-        .map(|prefix| col == prefix || col.starts_with(prefix))
-        .unwrap_or_else(|| col == pattern)
+#[cfg(feature = "indexer")]
+mod indexer {
+    use super::*;
+
+    impl FilterConfig {
+        pub fn matches_collection(&self, collection: &str) -> bool {
+            if self.collections.is_empty() {
+                return true;
+            }
+            self.collections.iter().any(|p| nsid_matches(p, collection))
+        }
+
+        pub fn matches_signal(&self, collection: &str) -> bool {
+            self.signals.iter().any(|p| nsid_matches(p, collection))
+        }
+
+        pub fn check_signals(&self) -> bool {
+            self.mode == FilterMode::Filter && !self.signals.is_empty()
+        }
+    }
+
+    fn nsid_matches(pattern: &str, col: &str) -> bool {
+        pattern
+            .strip_suffix(".*")
+            .map(|prefix| col == prefix || col.starts_with(prefix))
+            .unwrap_or_else(|| col == pattern)
+    }
 }

@@ -161,8 +161,9 @@ impl CrawlerWorker {
                     batch.insert(
                         &app_state.db.repo_metadata,
                         &metadata_key,
-                        crate::db::ser_repo_metadata(&metadata)?,
+                        crate::db::ser_repo_meta(&metadata)?,
                     );
+                    #[cfg(feature = "indexer")]
                     batch.insert(
                         &app_state.db.pending,
                         keys::pending_key(metadata.index_id),
@@ -204,6 +205,7 @@ impl CrawlerWorker {
                 .db
                 .update_count_async("pending", count as i64)
                 .await;
+            #[cfg(feature = "indexer")]
             self.state.notify_backfill();
         }
 

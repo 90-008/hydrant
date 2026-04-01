@@ -8,26 +8,28 @@ use axum::{
     http::StatusCode,
 };
 use jacquard_common::types::cid::Cid;
+#[cfg(feature = "indexer")]
 use jacquard_common::types::ident::AtIdentifier;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::str::FromStr;
 use std::sync::Arc;
 
+#[cfg(feature = "indexer")]
 #[derive(Deserialize)]
 pub struct DebugCountRequest {
     pub did: String,
     pub collection: String,
 }
 
+#[cfg(feature = "indexer")]
 #[derive(Serialize)]
 pub struct DebugCountResponse {
     pub count: usize,
 }
 
 pub fn router() -> axum::Router<Arc<AppState>> {
-    axum::Router::new()
-        .route("/debug/count", get(handle_debug_count))
+    let r = axum::Router::new()
         .route("/debug/get", get(handle_debug_get))
         .route("/debug/iter", get(handle_debug_iter))
         .route("/debug/compact", post(handle_debug_compact))
@@ -35,9 +37,15 @@ pub fn router() -> axum::Router<Arc<AppState>> {
             "/debug/ephemeral_ttl_tick",
             post(handle_debug_ephemeral_ttl_tick),
         )
-        .route("/debug/seed_watermark", post(handle_debug_seed_watermark))
+        .route("/debug/seed_watermark", post(handle_debug_seed_watermark));
+
+    #[cfg(feature = "indexer")]
+    let r = r.route("/debug/count", get(handle_debug_count));
+
+    r
 }
 
+#[cfg(feature = "indexer")]
 pub async fn handle_debug_count(
     State(state): State<Arc<AppState>>,
     Query(req): Query<DebugCountRequest>,
@@ -263,12 +271,17 @@ pub async fn handle_debug_iter(
 fn get_keyspace_by_name(db: &crate::db::Db, name: &str) -> Result<fjall::Keyspace, StatusCode> {
     match name {
         "repos" => Ok(db.repos.clone()),
-        "blocks" => Ok(db.blocks.clone()),
-        "cursors" => Ok(db.cursors.clone()),
-        "pending" => Ok(db.pending.clone()),
-        "resync" => Ok(db.resync.clone()),
-        "events" => Ok(db.events.clone()),
         "counts" => Ok(db.counts.clone()),
+        "cursors" => Ok(db.cursors.clone()),
+        #[cfg(feature = "indexer")]
+        "blocks" => Ok(db.blocks.clone()),
+        #[cfg(feature = "indexer")]
+        "pending" => Ok(db.pending.clone()),
+        #[cfg(feature = "indexer")]
+        "resync" => Ok(db.resync.clone()),
+        #[cfg(feature = "indexer")]
+        "events" => Ok(db.events.clone()),
+        #[cfg(feature = "indexer")]
         "records" => Ok(db.records.clone()),
         _ => Err(StatusCode::BAD_REQUEST),
     }

@@ -13,6 +13,7 @@ pub(crate) mod api;
 pub(crate) mod backfill;
 #[cfg(feature = "backlinks")]
 pub(crate) mod backlinks;
+#[cfg(feature = "indexer")]
 pub(crate) mod crawler;
 pub(crate) mod db;
 pub(crate) mod ingest;
