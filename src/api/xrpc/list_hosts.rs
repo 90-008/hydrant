@@ -25,7 +25,7 @@ pub async fn handle(
                 hostname: CowStr::Owned(h.name),
                 seq: Some(h.seq),
                 status: None,
-                account_count: None,
+                account_count: Some(h.account_count as i64),
                 extra_data: None,
             })
             .collect(),

@@ -20,7 +20,7 @@ pub async fn handle(
     };
 
     Ok(Json(GetHostStatusOutput {
-        account_count: None,
+        account_count: Some(host.account_count as i64),
         hostname: CowStr::Owned(host.name),
         seq: Some(host.seq),
         status: None,

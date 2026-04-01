@@ -57,8 +57,12 @@ use stream::relay_stream_thread;
 
 /// infromation about a host hydrant is consuming from.
 pub struct Host {
+    /// hostname of the host.
     pub name: SmolStr,
+    /// latest seq hydrant has processed from this host.
     pub seq: i64,
+    /// the amount of accounts hydrant has seen from this host.
+    pub account_count: u64,
 }
 
 /// an event emitted by the hydrant event stream.
@@ -789,10 +793,14 @@ impl Hydrant {
                     .into_diagnostic()
                     .wrap_err("cursor value is not 8 bytes")?,
             );
+            let account_count = state
+                .db
+                .get_count_sync(&keys::pds_account_count_key(&hostname));
 
             Ok(Some(Host {
                 name: hostname.into(),
                 seq,
+                account_count,
             }))
         })
         .await
@@ -839,9 +847,13 @@ impl Hydrant {
                         .into_diagnostic()
                         .wrap_err("cursor value is not 8 bytes")?,
                 );
+                let account_count = state
+                    .db
+                    .get_count_sync(&keys::pds_account_count_key(hostname));
                 hosts.push(Host {
                     name: hostname.into(),
                     seq,
+                    account_count,
                 });
             }
 

@@ -747,6 +747,10 @@ impl Db {
             .await
             .unwrap_or(0)
     }
+
+    pub fn get_count_sync(&self, key: &str) -> u64 {
+        self.counts_map.read_sync(key, |_, v| *v).unwrap_or(0)
+    }
 }
 
 #[cfg(feature = "indexer")]
