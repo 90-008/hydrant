@@ -42,6 +42,7 @@ fn is_throttle_worthy(e: &WsError) -> bool {
                     | 504 // GATEWAY_TIMEOUT
                     | 522 // CONNECTION_TIMEOUT
                     | 530 // SITE_FROZEN
+                    | 404 // NOT FOUND
             );
         }
         _ => {}
