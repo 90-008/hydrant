@@ -44,6 +44,8 @@ pub enum FirehoseError {
     Cbor(String),
     #[error("stream closed: {code}: {reason}")]
     StreamClosed { code: u16, reason: String },
+    #[error("tcp layer dropped")]
+    TcpDropped,
 }
 
 impl From<serde_ipld_dagcbor::DecodeError<Infallible>> for FirehoseError {
@@ -86,12 +88,7 @@ impl FirehoseStream {
                 .next()
                 .await
                 .map(|m| m.map_err(Into::into))
-                .unwrap_or_else(|| {
-                    Err(FirehoseError::StreamClosed {
-                        code: 0,
-                        reason: "closed".to_owned(),
-                    })
-                })?;
+                .unwrap_or(Err(FirehoseError::TcpDropped))?;
             match res {
                 msg if msg.is_binary() => {
                     let bytes: Bytes = msg.into_payload().into();

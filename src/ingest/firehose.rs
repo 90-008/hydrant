@@ -10,6 +10,8 @@ use crate::util::{
 use jacquard_common::IntoStatic;
 use jacquard_common::types::did::Did;
 use miette::{IntoDiagnostic, Result};
+use rand::RngExt;
+use rand::rngs::SmallRng;
 use std::borrow::Cow;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -47,6 +49,15 @@ fn is_throttle_worthy(e: &WsError) -> bool {
 
     false
 }
+
+trait AddJitter: rand::Rng {
+    fn add_jitter(&mut self, timeout: Duration) -> Duration {
+        let timeout_secs = timeout.as_secs_f32();
+        let amt = timeout_secs * self.random_range(-0.12..0.12);
+        Duration::from_secs_f32(timeout_secs + amt)
+    }
+}
+impl<R: rand::Rng> AddJitter for R {}
 
 pub struct FirehoseIngestor {
     state: Arc<AppState>,
@@ -92,14 +103,13 @@ impl FirehoseIngestor {
         let mut backoff = Duration::from_secs(0);
         const MAX_BACKOFF: Duration = Duration::from_secs(60 * 60); // 1 hour
 
+        let mut rng: SmallRng = rand::make_rng();
+
         loop {
             if self.state.pds_meta.load().is_banned(host) {
                 break Ok(());
             }
             self.enabled.wait_enabled("firehose").await;
-
-            // sleep stream backoff out if we have any
-            tokio::time::sleep(backoff).await;
 
             // get cursor
             let start_cursor = self
@@ -137,6 +147,7 @@ impl FirehoseIngestor {
                     } else {
                         Duration::from_secs(10)
                     };
+                    let timeout = rng.add_jitter(timeout);
                     let fmt = humantime::format_duration(timeout);
                     error!(err = %e, in = %fmt, "failed to connect to firehose, retrying later");
                     tokio::time::sleep(timeout).await;
@@ -206,6 +217,13 @@ impl FirehoseIngestor {
             };
 
             if let Err(e) = res {
+                // todo: investigate why this happens on test server further
+                // also idk if this is even a good idea to do but whatever
+                if let FirehoseError::TcpDropped = e {
+                    debug!(err = %e, "tcp connection dropped!!!");
+                    tokio::time::sleep(rng.add_jitter(Duration::from_secs(10))).await;
+                    continue;
+                }
                 if let FirehoseError::RelayError { error, message } = e {
                     let message = message.map_or(Cow::Borrowed("<no message>"), Cow::Owned);
                     error!(err = %error, "relay sent error: {message}");
@@ -217,9 +235,10 @@ impl FirehoseIngestor {
                 if backoff.is_zero() {
                     backoff = Duration::from_secs(5);
                 }
-                let fmt = humantime::format_duration(backoff);
-                error!(in = %fmt, "firehose disconnected, reconnecting");
-                tokio::time::sleep(backoff).await;
+                let timeout = rng.add_jitter(backoff);
+                let fmt = humantime::format_duration(timeout);
+                error!(in = %fmt, "firehose disconnected, reconnecting later");
+                tokio::time::sleep(timeout).await;
                 backoff = (backoff * 2).min(MAX_BACKOFF);
             }
         }
