@@ -101,11 +101,12 @@ impl FirehoseIngestor {
             if self.state.pds_meta.load().is_banned(host) {
                 break Ok(());
             }
-
             self.enabled.wait_enabled("firehose").await;
 
+            // sleep stream backoff out if we have any
             tokio::time::sleep(backoff).await;
 
+            // get cursor
             let start_cursor = self
                 .state
                 .firehose_cursors
@@ -114,7 +115,6 @@ impl FirehoseIngestor {
                     (val > 0).then_some(val)
                 })
                 .flatten();
-
             match start_cursor {
                 Some(c) => info!(cursor = %c, "resuming from cursor"),
                 None => info!("no cursor found, live tailing"),
@@ -155,8 +155,7 @@ impl FirehoseIngestor {
             let res = loop {
                 tokio::select! {
                     msg = stream.next() => {
-                        let Some(bytes_res) = msg else { break Err(FirehoseError::EmptyFrame); };
-                        let bytes = match bytes_res {
+                        let bytes = match msg {
                             Ok(b) => b,
                             Err(e) => break Err(e),
                         };

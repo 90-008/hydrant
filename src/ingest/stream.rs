@@ -2,7 +2,7 @@ use std::convert::Infallible;
 
 use axum::http::Uri;
 use bytes::Bytes;
-use futures::StreamExt;
+use futures::{SinkExt, StreamExt};
 use jacquard_common::error::DecodeError;
 use jacquard_common::{
     CowStr,
@@ -15,7 +15,7 @@ use miette::Diagnostic;
 use serde::{Deserialize, Serialize};
 use smol_str::format_smolstr;
 use thiserror::Error;
-use tokio_websockets::{ClientBuilder, WebSocketStream};
+use tokio_websockets::{ClientBuilder, Message as WsMsg, WebSocketStream};
 use tracing::trace;
 use url::Url;
 
@@ -42,6 +42,8 @@ pub enum FirehoseError {
     UnknownType(String),
     #[error("cbor decode error: {0}")]
     Cbor(String),
+    #[error("stream closed")]
+    StreamClosed,
 }
 
 impl From<serde_ipld_dagcbor::DecodeError<Infallible>> for FirehoseError {
@@ -76,19 +78,27 @@ impl FirehoseStream {
     }
 
     /// gets the next message bytes from the firehose
-    pub async fn next(&mut self) -> Option<Result<Bytes, FirehoseError>> {
+    /// none means the stream is closed
+    pub async fn next(&mut self) -> Result<Bytes, FirehoseError> {
         loop {
-            match self.ws.next().await? {
-                Err(e) => return Some(Err(e.into())),
-                Ok(msg) if msg.is_binary() => {
+            let res = self
+                .ws
+                .next()
+                .await
+                .map(|m| m.map_err(Into::into))
+                .unwrap_or_else(|| Err(FirehoseError::StreamClosed))?;
+            match res {
+                msg if msg.is_binary() => {
                     let bytes: Bytes = msg.into_payload().into();
                     if bytes.is_empty() {
-                        return Some(Err(FirehoseError::EmptyFrame));
+                        return Err(FirehoseError::EmptyFrame);
                     }
-                    return Some(Ok(bytes));
+                    return Ok(bytes);
                 }
-                Ok(msg) if msg.is_close() => return None,
-                Ok(x) => {
+                msg if msg.is_ping() => self.ws.send(WsMsg::pong(msg.into_payload())).await?,
+                // if ws closed treat it as an error, since why would a host close the stream??
+                msg if msg.is_close() => return Err(FirehoseError::StreamClosed),
+                x => {
                     trace!(msg = ?x, "relay sent unexpected message");
                     continue;
                 }
