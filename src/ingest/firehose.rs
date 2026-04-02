@@ -4,7 +4,7 @@ use crate::ingest::{BufferTx, IngestMessage};
 use crate::state::AppState;
 use crate::util::throttle::ThrottleHandle;
 use crate::util::{
-    WatchEnabledExt, is_io_error_their_fault, is_status_their_fault, is_timeout, is_tls_cert_error,
+    WatchEnabledExt, is_io_error_their_fault, is_timeout, is_tls_cert_error,
     is_tls_error_their_fault,
 };
 use jacquard_common::IntoStatic;
@@ -16,7 +16,6 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tokio::sync::watch;
 use tokio_websockets::Error as WsError;
-use tokio_websockets::upgrade::Error as WsUpgradeError;
 use tracing::{Span, debug, error, info, trace, warn};
 use url::Url;
 
@@ -31,14 +30,8 @@ fn is_throttle_worthy(e: &WsError) -> bool {
         WsError::Rustls(e) if is_tls_error_their_fault(e) => return true,
         WsError::Io(e) if is_io_error_their_fault(e) || is_tls_cert_error(e) => return true,
         WsError::CannotResolveHost => return true,
-        WsError::Upgrade(WsUpgradeError::DidNotSwitchProtocols(status))
-            if (*status >= 400 && *status < 500) // its not my fault :)
-                || (*status >= 200 && *status < 300)
-                || is_status_their_fault(*status) =>
-        {
-            return true;
-        }
-        WsError::Protocol(_) | WsError::PayloadTooLong { .. } => return true,
+        // we treat every upgrade error as error because uh too bad so sad, im not doing anything wrong
+        WsError::Protocol(_) | WsError::PayloadTooLong { .. } | WsError::Upgrade(_) => return true,
         _ => {}
     }
 
