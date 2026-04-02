@@ -24,16 +24,9 @@ fn is_throttle_worthy(e: &WsError) -> bool {
     }
 
     match e {
-        WsError::Rustls(e) => {
-            if matches!(e, rustls::Error::InvalidCertificate(_)) {
-                return true;
-            }
-        }
-        WsError::Io(io_err) => {
-            if is_tls_cert_error(io_err) {
-                return true;
-            }
-        }
+        WsError::Rustls(e) if matches!(e, rustls::Error::InvalidCertificate(_)) => return true,
+        WsError::Io(io_err) if is_tls_cert_error(io_err) => return true,
+        WsError::CannotResolveHost => return true,
         WsError::Upgrade(tokio_websockets::upgrade::Error::DidNotSwitchProtocols(status)) => {
             return matches!(
                 *status,
@@ -45,6 +38,7 @@ fn is_throttle_worthy(e: &WsError) -> bool {
                     | 404 // NOT FOUND
             );
         }
+        WsError::Protocol(_) | WsError::PayloadTooLong { .. } => return true,
         _ => {}
     }
 
@@ -58,10 +52,7 @@ fn is_throttle_worthy(e: &WsError) -> bool {
         src = s.source();
     }
 
-    matches!(
-        e,
-        WsError::Io(_) | WsError::Protocol(_) | WsError::PayloadTooLong { .. }
-    )
+    false
 }
 
 pub struct FirehoseIngestor {
