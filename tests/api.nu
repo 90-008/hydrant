@@ -256,8 +256,8 @@ def test-pds-tiers [url: string, pid: int] {
     # initial state: no assignments, built-in rate tiers present
     print "  GET /pds/tiers (expect empty assignments, built-in rate_tiers)..."
     let initial = (http get $"($url)/pds/tiers")
-    if ($initial.assignments | length) != 0 {
-        fail $"expected empty assignments, got ($initial.assignments | length)" $pid
+    if ($initial.assignments | columns | length) != 0 {
+        fail $"expected empty assignments, got ($initial.assignments | columns | length)" $pid
     }
     if not ("default" in $initial.rate_tiers) {
         fail "expected 'default' tier in rate_tiers" $pid
@@ -291,17 +291,16 @@ def test-pds-tiers [url: string, pid: int] {
         tier: "trusted"
     } | assert-status 200 "PUT /pds/tiers" $pid
     let after_assign = (http get $"($url)/pds/tiers")
-    if ($after_assign.assignments | length) != 1 {
-        fail $"expected 1 assignment, got ($after_assign.assignments | length)" $pid
+    if ($after_assign.assignments | columns | length) != 1 {
+        fail $"expected 1 assignment, got ($after_assign.assignments | columns | length)" $pid
     }
-    let a = ($after_assign.assignments | first)
-    if $a.host != "pds.example.com" {
-        fail $"expected host=pds.example.com, got ($a.host)" $pid
+    if not ("pds.example.com" in $after_assign.assignments) {
+        fail $"expected host=pds.example.com to be assigned" $pid
     }
-    if $a.tier != "trusted" {
-        fail $"expected tier=trusted, got ($a.tier)" $pid
+    if ($after_assign.assignments | get "pds.example.com") != "trusted" {
+        fail $"expected tier=trusted" $pid
     }
-    print $"  ok: assignment created host=($a.host), tier=($a.tier)"
+    print $"  ok: assignment created host=pds.example.com, tier=trusted"
 
     # re-assigning the same host to a different tier updates without creating a duplicate
     print "  PUT /pds/tiers (re-assign to default)..."
@@ -310,11 +309,11 @@ def test-pds-tiers [url: string, pid: int] {
         tier: "default"
     } | assert-status 200 "PUT /pds/tiers re-assign" $pid
     let after_reassign = (http get $"($url)/pds/tiers")
-    if ($after_reassign.assignments | length) != 1 {
-        fail $"expected 1 assignment after re-assign, got ($after_reassign.assignments | length)" $pid
+    if ($after_reassign.assignments | columns | length) != 1 {
+        fail $"expected 1 assignment after re-assign, got ($after_reassign.assignments | columns | length)" $pid
     }
-    if ($after_reassign.assignments | first).tier != "default" {
-        fail $"expected tier=default after re-assign, got (($after_reassign.assignments | first).tier)" $pid
+    if ($after_reassign.assignments | get "pds.example.com") != "default" {
+        fail $"expected tier=default after re-assign" $pid
     }
     print "  ok: re-assign updates tier without creating a duplicate"
 
@@ -325,10 +324,10 @@ def test-pds-tiers [url: string, pid: int] {
         tier: "nonexistent"
     } | assert-status 400 "PUT /pds/tiers unknown tier" $pid
     let after_bad = (http get $"($url)/pds/tiers")
-    if ($after_bad.assignments | length) != 1 {
+    if ($after_bad.assignments | columns | length) != 1 {
         fail "expected assignment count unchanged after rejected request" $pid
     }
-    if ($after_bad.assignments | first).tier != "default" {
+    if ($after_bad.assignments | get "pds.example.com") != "default" {
         fail "expected tier unchanged after rejected request" $pid
     }
     print "  ok: unknown tier name rejected with 400, existing assignment unchanged"
@@ -340,8 +339,8 @@ def test-pds-tiers [url: string, pid: int] {
         tier: "trusted"
     } | assert-status 200 "PUT /pds/tiers second host" $pid
     let after_second = (http get $"($url)/pds/tiers")
-    if ($after_second.assignments | length) != 2 {
-        fail $"expected 2 assignments, got ($after_second.assignments | length)" $pid
+    if ($after_second.assignments | columns | length) != 2 {
+        fail $"expected 2 assignments, got ($after_second.assignments | columns | length)" $pid
     }
     print "  ok: two distinct hosts listed independently"
 
@@ -351,10 +350,10 @@ def test-pds-tiers [url: string, pid: int] {
         host: "pds.example.com"
     } | assert-status 200 "DELETE /pds/tiers" $pid
     let after_del = (http get $"($url)/pds/tiers")
-    if ($after_del.assignments | length) != 1 {
-        fail $"expected 1 assignment after delete, got ($after_del.assignments | length)" $pid
+    if ($after_del.assignments | columns | length) != 1 {
+        fail $"expected 1 assignment after delete, got ($after_del.assignments | columns | length)" $pid
     }
-    if ($after_del.assignments | first).host != "other.example.com" {
+    if not ("other.example.com" in $after_del.assignments) {
         fail "expected only other.example.com to remain after delete" $pid
     }
     print "  ok: correct host removed, other assignment intact"
@@ -370,7 +369,7 @@ def test-pds-tiers [url: string, pid: int] {
         host: "pds.example.com"
     } | assert-status 200 "DELETE /pds/tiers non-existent" $pid
     let after_idempotent = (http get $"($url)/pds/tiers")
-    if ($after_idempotent.assignments | length) != 0 {
+    if ($after_idempotent.assignments | columns | length) != 0 {
         fail "expected empty assignments after cleanup" $pid
     }
     print "  ok: delete of non-existent host is idempotent"
@@ -398,7 +397,7 @@ def test-pds-tier-persistence [binary: string, db_path: string, port: int] {
     }
 
     let before = (http get $"($url)/pds/tiers")
-    if ($before.assignments | length) != 1 {
+    if ($before.assignments | columns | length) != 1 {
         fail "assignment was not created" $instance.pid
     }
 
@@ -415,15 +414,14 @@ def test-pds-tier-persistence [binary: string, db_path: string, port: int] {
 
     print "  checking assignment survived restart..."
     let after = (http get $"($url)/pds/tiers")
-    if ($after.assignments | length) != 1 {
-        fail $"expected 1 assignment after restart, got ($after.assignments | length)" $instance2.pid
+    if ($after.assignments | columns | length) != 1 {
+        fail $"expected 1 assignment after restart, got ($after.assignments | columns | length)" $instance2.pid
     }
-    let a = ($after.assignments | first)
-    if $a.host != "persist.example.com" {
-        fail $"expected host=persist.example.com after restart, got ($a.host)" $instance2.pid
+    if not ("persist.example.com" in $after.assignments) {
+        fail $"expected host=persist.example.com after restart" $instance2.pid
     }
-    if $a.tier != "trusted" {
-        fail $"expected tier=trusted after restart, got ($a.tier)" $instance2.pid
+    if ($after.assignments | get "persist.example.com") != "trusted" {
+        fail $"expected tier=trusted after restart" $instance2.pid
     }
     print "  ok: tier assignment persisted across restart"
 
@@ -455,12 +453,11 @@ def test-pds-trusted-hosts [binary: string, db_path: string, port: int] {
     let assignments = $tiers.assignments
 
     for host in [$host_a, $host_b] {
-        let match = ($assignments | where host == $host)
-        if ($match | length) != 1 {
-            fail $"expected assignment for ($host) from HYDRANT_TRUSTED_HOSTS, got ($assignments)" $instance.pid
+        if not ($host in $assignments) {
+            fail $"expected assignment for ($host) from HYDRANT_TRUSTED_HOSTS" $instance.pid
         }
-        if ($match | first).tier != "trusted" {
-            fail $"expected tier=trusted for ($host), got (($match | first).tier)" $instance.pid
+        if ($assignments | get $host) != "trusted" {
+            fail $"expected tier=trusted for ($host)" $instance.pid
         }
     }
     print $"  ok: ($host_a) and ($host_b) pre-assigned to trusted tier"
@@ -512,17 +509,102 @@ def test-pds-custom-rate-tier [binary: string, db_path: string, port: int] {
         tier: "custom"
     } | assert-status 200 "PUT /pds/tiers custom tier" $instance.pid
     let after = (http get $"($url)/pds/tiers")
-    let match = ($after.assignments | where host == "custom.example.com")
-    if ($match | length) != 1 {
+    if not ("custom.example.com" in $after.assignments) {
         fail "expected assignment for custom.example.com" $instance.pid
     }
-    if ($match | first).tier != "custom" {
-        fail $"expected tier=custom, got (($match | first).tier)" $instance.pid
+    if ($after.assignments | get "custom.example.com") != "custom" {
+        fail $"expected tier=custom" $instance.pid
     }
     print "  ok: host assigned to custom tier successfully"
 
     kill $instance.pid
     print "custom rate tier test passed!"
+}
+
+def test-pds-banned [url: string, pid: int] {
+    print "=== test: pds ban management ==="
+
+    print "  GET /pds/banned (expect empty)..."
+    let initial = (http get $"($url)/pds/banned")
+    if ($initial | length) != 0 {
+        fail $"expected empty banned list, got ($initial | length)" $pid
+    }
+    print "  ok: starts empty"
+
+    print "  PUT /pds/banned (ban host)..."
+    http put -f -e -t application/json $"($url)/pds/banned" {
+        host: "bad.example.com"
+    } | assert-status 200 "PUT /pds/banned" $pid
+
+    let after_ban = (http get $"($url)/pds/banned")
+    if ($after_ban | length) != 1 {
+        fail $"expected 1 banned host, got ($after_ban | length)" $pid
+    }
+    if ($after_ban | first) != "bad.example.com" {
+        fail $"expected bad.example.com, got ($after_ban | first)" $pid
+    }
+    print "  ok: host banned"
+
+    print "  DELETE /pds/banned (unban host)..."
+    http delete -f -e -t application/json $"($url)/pds/banned" --data {
+        host: "bad.example.com"
+    } | assert-status 200 "DELETE /pds/banned" $pid
+
+    let after_unban = (http get $"($url)/pds/banned")
+    if ($after_unban | length) != 0 {
+        fail "expected empty banned list after unban" $pid
+    }
+    print "  ok: host unbanned"
+
+    print "pds ban management tests passed!"
+}
+
+# verify that banned hosts are written to the database and survive a restart.
+def test-pds-banned-persistence [binary: string, db_path: string, port: int] {
+    print "=== test: pds banned assignments persist across restart ==="
+
+    let url = $"http://localhost:($port)"
+
+    let instance = (with-env { HYDRANT_CRAWLER_URLS: "", HYDRANT_RELAY_HOSTS: "" } {
+        start-hydrant $binary $db_path $port
+    })
+    if not (wait-for-api $url) {
+        fail "hydrant did not start"
+    }
+
+    print "  banning host..."
+    http put -t application/json $"($url)/pds/banned" {
+        host: "persist-ban.example.com"
+    }
+
+    let before = (http get $"($url)/pds/banned")
+    if ($before | length) != 1 {
+        fail "host was not banned" $instance.pid
+    }
+
+    print "  restarting hydrant..."
+    kill $instance.pid
+    sleep 2sec
+
+    let instance2 = (with-env { HYDRANT_CRAWLER_URLS: "", HYDRANT_RELAY_HOSTS: "" } {
+        start-hydrant $binary $db_path $port
+    })
+    if not (wait-for-api $url) {
+        fail "hydrant did not restart" $instance2.pid
+    }
+
+    print "  checking ban survived restart..."
+    let after = (http get $"($url)/pds/banned")
+    if ($after | length) != 1 {
+        fail $"expected 1 banned host after restart, got ($after | length)" $instance2.pid
+    }
+    if ($after | first) != "persist-ban.example.com" {
+        fail $"expected persist-ban.example.com after restart, got ($after | first)" $instance2.pid
+    }
+    print "  ok: banned host persisted across restart"
+
+    kill $instance2.pid
+    print "pds ban persistence test passed!"
 }
 
 def main [] {
@@ -544,6 +626,7 @@ def main [] {
     test-crawler-sources $url $instance.pid
     test-firehose-sources $url $instance.pid
     test-pds-tiers $url $instance.pid
+    test-pds-banned $url $instance.pid
 
     kill $instance.pid
     sleep 2sec
@@ -575,6 +658,12 @@ def main [] {
     let db_pds_custom = (mktemp -d -t hydrant_api.XXXXXX)
     print $"db: ($db_pds_custom)"
     test-pds-custom-rate-tier $binary $db_pds_custom $port
+
+    sleep 1sec
+
+    let db_pds_banned = (mktemp -d -t hydrant_api.XXXXXX)
+    print $"db: ($db_pds_banned)"
+    test-pds-banned-persistence $binary $db_pds_banned $port
 
     print ""
     print "all api tests passed!"

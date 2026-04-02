@@ -46,10 +46,11 @@ use crate::db::{self, filter as db_filter, keys, load_persisted_firehose_sources
 use crate::filter::FilterMode;
 #[cfg(feature = "indexer")]
 use crate::ingest::indexer::FirehoseWorker;
+use crate::pds_meta::{PdsMeta, PdsMetaHandle};
 use crate::state::AppState;
 use crate::types::MarshallableEvt;
 
-use firehose::{FirehoseShared, spawn_firehose_ingestor};
+use firehose::FirehoseShared;
 #[cfg(feature = "indexer")]
 use stream::event_stream_thread;
 #[cfg(feature = "relay")]
@@ -63,6 +64,8 @@ pub struct Host {
     pub seq: i64,
     /// the amount of accounts hydrant has seen from this host.
     pub account_count: u64,
+    /// whether this host is banned or not.
+    pub is_banned: bool,
 }
 
 /// an event emitted by the hydrant event stream.
@@ -190,6 +193,11 @@ impl Hydrant {
         let state = Arc::new(state);
 
         Ok(Self {
+            firehose: FirehoseHandle::new(state.clone()),
+            filter: FilterControl(state.clone()),
+            pds: pds::PdsControl(state.clone()),
+            repos: ReposControl(state.clone()),
+            db: DbControl(state.clone()),
             #[cfg(feature = "indexer")]
             crawler: crawler::CrawlerHandle {
                 state: state.clone(),
@@ -197,13 +205,8 @@ impl Hydrant {
                 tasks: Arc::new(scc::HashMap::new()),
                 persisted: Arc::new(scc::HashSet::new()),
             },
-            firehose: FirehoseHandle::new(state.clone()),
             #[cfg(feature = "indexer")]
             backfill: BackfillHandle::new(state.clone()),
-            filter: FilterControl(state.clone()),
-            pds: pds::PdsControl(state.clone()),
-            repos: ReposControl(state.clone()),
-            db: DbControl(state.clone()),
             #[cfg(feature = "backlinks")]
             backlinks: crate::backlinks::BacklinksControl(state.clone()),
             state,
@@ -404,19 +407,9 @@ impl Hydrant {
                     "starting firehose ingestor(s)"
                 );
                 for source in &relay_hosts {
-                    let enabled_rx = state.firehose_enabled.subscribe();
-                    let handle = spawn_firehose_ingestor(
-                        &source.url,
-                        source.is_pds,
-                        &state,
-                        fire_shared,
-                        enabled_rx,
-                    )
-                    .await?;
-                    let _ = firehose
-                        .tasks
-                        .insert_async(source.url.clone(), handle)
-                        .await;
+                    firehose
+                        .spawn_firehose_ingestor(source, fire_shared)
+                        .await?;
                 }
             }
 
@@ -432,19 +425,9 @@ impl Hydrant {
                 if firehose.tasks.contains_async(&source.url).await {
                     continue;
                 }
-                let enabled_rx = state.firehose_enabled.subscribe();
-                let handle = spawn_firehose_ingestor(
-                    &source.url,
-                    source.is_pds,
-                    &state,
-                    fire_shared,
-                    enabled_rx,
-                )
-                .await?;
-                let _ = firehose
-                    .tasks
-                    .insert_async(source.url.clone(), handle)
-                    .await;
+                firehose
+                    .spawn_firehose_ingestor(source, fire_shared)
+                    .await?;
             }
 
             // 10c. seed firehose PDS sources from listHosts on configured seed URLs
@@ -796,11 +779,13 @@ impl Hydrant {
             let account_count = state
                 .db
                 .get_count_sync(&keys::pds_account_count_key(&hostname));
+            let is_banned = state.pds_meta.load().is_banned(&hostname);
 
             Ok(Some(Host {
                 name: hostname.into(),
                 seq,
                 account_count,
+                is_banned,
             }))
         })
         .await
@@ -850,10 +835,12 @@ impl Hydrant {
                 let account_count = state
                     .db
                     .get_count_sync(&keys::pds_account_count_key(hostname));
+                let is_banned = state.pds_meta.load().is_banned(&hostname);
                 hosts.push(Host {
                     name: hostname.into(),
                     seq,
                     account_count,
+                    is_banned,
                 });
             }
 

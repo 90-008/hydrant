@@ -5,6 +5,7 @@ use tokio::sync::watch;
 use tracing::{error, info};
 use url::Url;
 
+use crate::config::FirehoseSource;
 use crate::db::{self, keys};
 use crate::ingest::{BufferTx, firehose::FirehoseIngestor};
 use crate::state::AppState;
@@ -35,46 +36,6 @@ pub struct FirehoseSourceInfo {
     pub is_pds: bool,
 }
 
-pub(super) async fn spawn_firehose_ingestor(
-    relay_url: &Url,
-    is_pds: bool,
-    state: &Arc<AppState>,
-    shared: &FirehoseShared,
-    enabled: watch::Receiver<bool>,
-) -> Result<FirehoseIngestorHandle> {
-    use std::sync::atomic::AtomicI64;
-
-    let start = db::get_firehose_cursor(&state.db, relay_url).await?;
-    // insert into relay_cursors if not already present; existing in-memory cursor takes precedence
-    let _ = state
-        .firehose_cursors
-        .insert_async(relay_url.clone(), AtomicI64::new(start.unwrap_or(0)))
-        .await;
-
-    info!(relay = %relay_url, is_pds, cursor = ?start, "starting firehose ingestor");
-
-    let ingestor = FirehoseIngestor::new(
-        state.clone(),
-        shared.buffer_tx.clone(),
-        relay_url.clone(),
-        is_pds,
-        state.filter.clone(),
-        enabled,
-        shared.verify_signatures,
-    )
-    .await;
-
-    let relay_for_log = relay_url.clone();
-    let abort = tokio::spawn(async move {
-        if let Err(e) = ingestor.run().await {
-            error!(relay = %relay_for_log, err = %e, "firehose ingestor exited with error");
-        }
-    })
-    .abort_handle();
-
-    Ok(FirehoseIngestorHandle { abort, is_pds })
-}
-
 /// runtime control over the firehose ingestor component.
 #[derive(Clone)]
 pub struct FirehoseHandle {
@@ -95,6 +56,59 @@ impl FirehoseHandle {
             tasks: Arc::new(scc::HashMap::new()),
             persisted: Arc::new(scc::HashSet::new()),
         }
+    }
+
+    pub(super) async fn spawn_firehose_ingestor(
+        &self,
+        source: &FirehoseSource,
+        shared: &FirehoseShared,
+    ) -> Result<()> {
+        use std::sync::atomic::AtomicI64;
+        let state = &self.state;
+
+        let start = db::get_firehose_cursor(&state.db, &source.url).await?;
+        // insert into relay_cursors if not already present; existing in-memory cursor takes precedence
+        let _ = state
+            .firehose_cursors
+            .insert_async(source.url.clone(), AtomicI64::new(start.unwrap_or(0)))
+            .await;
+
+        info!(relay = %source.url, source.is_pds, cursor = ?start, "starting firehose ingestor");
+
+        let enabled = state.firehose_enabled.subscribe();
+        let ingestor = FirehoseIngestor::new(
+            state.clone(),
+            shared.buffer_tx.clone(),
+            source.url.clone(),
+            source.is_pds,
+            state.filter.clone(),
+            enabled,
+            shared.verify_signatures,
+        )
+        .await;
+
+        let abort = tokio::spawn({
+            let relay_url = source.url.clone();
+            let tasks = self.tasks.clone();
+            async move {
+                if let Err(e) = ingestor.run().await {
+                    error!(relay = %relay_url, err = %e, "firehose ingestor exited with error");
+                } else {
+                    // remove from tasks since we shutdown
+                    tasks.remove_async(&relay_url).await;
+                    info!(relay = %relay_url, "firehose shut down!");
+                }
+            }
+        })
+        .abort_handle();
+
+        let handle = FirehoseIngestorHandle {
+            abort,
+            is_pds: source.is_pds,
+        };
+        self.tasks.upsert_async(source.url.clone(), handle).await;
+
+        Ok(())
     }
 
     /// enable firehose ingestion, no-op if already enabled.
@@ -156,9 +170,8 @@ impl FirehoseHandle {
 
         let _ = self.persisted.insert_async(url.clone()).await;
 
-        let enabled_rx = self.state.firehose_enabled.subscribe();
-        let handle = spawn_firehose_ingestor(&url, is_pds, &self.state, shared, enabled_rx).await?;
-        self.tasks.upsert_async(url, handle).await;
+        self.spawn_firehose_ingestor(&FirehoseSource { url, is_pds }, shared)
+            .await?;
 
         Ok(())
     }

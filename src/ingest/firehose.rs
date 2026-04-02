@@ -105,9 +105,13 @@ impl FirehoseIngestor {
         // this is not for connection throttling (thats handled by ThrottleHandle)
         // its for stream errors (cbor decode etc)
         let mut backoff = Duration::from_secs(0);
-        const MAX_BACKOFF: Duration = Duration::from_secs(60 * 60); // 1 ohur
+        const MAX_BACKOFF: Duration = Duration::from_secs(60 * 60); // 1 hour
 
         loop {
+            if self.state.pds_meta.load().is_banned(host) {
+                break Ok(());
+            }
+
             self.enabled.wait_enabled("firehose").await;
 
             tokio::time::sleep(backoff).await;
@@ -169,8 +173,15 @@ impl FirehoseIngestor {
                         match decode_frame(&bytes) {
                             Ok(msg) => {
                                 if self.is_pds {
+                                    let tier = {
+                                        let meta = self.state.pds_meta.load();
+                                        let banned = meta.is_banned(host);
+                                        if banned {
+                                            break Ok(());
+                                        }
+                                        meta.tier_for(host, &self.state.rate_tiers)
+                                    };
                                     let accounts = self.state.db.get_count(&count_key).await;
-                                    let tier = self.state.pds_tier_for(&host);
                                     tokio::select! {
                                         _ = self.throttle.wait_for_allow(accounts, &tier) => {}
                                         _ = self.enabled.changed() => {

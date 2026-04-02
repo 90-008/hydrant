@@ -8,7 +8,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::control::{Hydrant, PdsTierAssignment, PdsTierDefinition};
+use crate::control::{Hydrant, PdsTierDefinition};
 
 pub fn router() -> Router<Hydrant> {
     Router::new()
@@ -16,20 +16,27 @@ pub fn router() -> Router<Hydrant> {
         .route("/pds/tiers", put(set_tier))
         .route("/pds/tiers", delete(remove_tier))
         .route("/pds/rate-tiers", get(list_rate_tiers))
+        .route("/pds/banned", get(list_banned))
+        .route("/pds/banned", put(ban))
+        .route("/pds/banned", delete(unban))
 }
 
 /// combined response: tier assignments + available tier definitions.
 #[derive(Serialize)]
 pub struct TiersResponse {
-    pub assignments: Vec<PdsTierAssignment>,
+    pub assignments: HashMap<String, String>,
     pub rate_tiers: HashMap<String, PdsTierDefinition>,
 }
 
 pub async fn list_tiers(State(hydrant): State<Hydrant>) -> Json<TiersResponse> {
     Json(TiersResponse {
-        assignments: hydrant.pds.list_assignments().await,
+        assignments: hydrant.pds.list_tiers().await,
         rate_tiers: hydrant.pds.list_rate_tiers(),
     })
+}
+
+pub async fn list_banned(State(hydrant): State<Hydrant>) -> Json<Vec<String>> {
+    Json(hydrant.pds.list_banned().await)
 }
 
 pub async fn list_rate_tiers(
@@ -68,6 +75,35 @@ pub async fn remove_tier(
     hydrant
         .pds
         .remove_tier(body.host)
+        .await
+        .map(|_| StatusCode::OK)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+}
+
+#[derive(Deserialize)]
+pub struct BanBody {
+    pub host: String,
+}
+
+pub async fn ban(
+    State(hydrant): State<Hydrant>,
+    Json(body): Json<BanBody>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    hydrant
+        .pds
+        .ban(body.host)
+        .await
+        .map(|_| StatusCode::OK)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+}
+
+pub async fn unban(
+    State(hydrant): State<Hydrant>,
+    Json(body): Json<BanBody>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    hydrant
+        .pds
+        .unban(body.host)
         .await
         .map(|_| StatusCode::OK)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))

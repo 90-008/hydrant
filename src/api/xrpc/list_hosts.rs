@@ -1,5 +1,6 @@
-use jacquard_api::com_atproto::sync::list_hosts::{
-    Host, ListHostsOutput, ListHostsRequest, ListHostsResponse,
+use jacquard_api::com_atproto::sync::{
+    HostStatus,
+    list_hosts::{Host, ListHostsOutput, ListHostsRequest, ListHostsResponse},
 };
 use jacquard_common::CowStr;
 
@@ -24,7 +25,7 @@ pub async fn handle(
             .map(|h| Host {
                 hostname: CowStr::Owned(h.name),
                 seq: Some(h.seq),
-                status: None,
+                status: h.is_banned.then_some(HostStatus::Banned),
                 account_count: Some(h.account_count as i64),
                 extra_data: None,
             })

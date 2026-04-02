@@ -1,5 +1,8 @@
-use jacquard_api::com_atproto::sync::get_host_status::{
-    GetHostStatusError, GetHostStatusOutput, GetHostStatusRequest, GetHostStatusResponse,
+use jacquard_api::com_atproto::sync::{
+    HostStatus,
+    get_host_status::{
+        GetHostStatusError, GetHostStatusOutput, GetHostStatusRequest, GetHostStatusResponse,
+    },
 };
 use jacquard_common::CowStr;
 
@@ -23,7 +26,7 @@ pub async fn handle(
         account_count: Some(host.account_count as i64),
         hostname: CowStr::Owned(host.name),
         seq: Some(host.seq),
-        status: None,
+        status: host.is_banned.then_some(HostStatus::Banned),
         extra_data: None,
     }))
 }

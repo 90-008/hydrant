@@ -1,6 +1,8 @@
 pub mod config;
+/// hydrant main api, includes the Hydrant type for programmatic control.
 pub mod control;
-pub mod filter;
+pub(crate) mod filter;
+pub(crate) mod pds_meta;
 pub mod types;
 
 #[cfg(all(feature = "relay", feature = "indexer"))]
@@ -23,3 +25,5 @@ pub(crate) mod patch;
 pub(crate) mod resolver;
 pub(crate) mod state;
 pub(crate) mod util;
+
+pub use filter::FilterMode;

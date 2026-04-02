@@ -27,7 +27,7 @@ pub mod ephemeral;
 pub mod filter;
 pub mod keys;
 pub mod migration;
-pub mod pds_tiers;
+pub mod pds_meta;
 pub mod types;
 
 use tokio::sync::broadcast;
@@ -389,7 +389,7 @@ impl Db {
             opts()
                 // only iterators are used here
                 .expect_point_read_hits(true)
-                .max_memtable_size(mb(16))
+                .max_memtable_size(mb(8))
                 // did -> failed state, not very compressable
                 .data_block_size_policy(BlockSizePolicy::all(kb(2)))
                 .data_block_compression_policy(CompressionPolicy::disabled())

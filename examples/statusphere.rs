@@ -20,9 +20,9 @@ use std::time::Duration;
 
 use chrono::DateTime;
 use futures::StreamExt;
+use hydrant::FilterMode;
 use hydrant::config::Config;
 use hydrant::control::{EventStream, Hydrant, ReposControl};
-use hydrant::filter::FilterMode;
 use jacquard_common::types::did::Did;
 use jacquard_common::types::tid::Tid;
 use scc::HashMap;
