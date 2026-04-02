@@ -157,6 +157,7 @@ impl FirehoseIngestor {
 
             self.throttle.record_success();
             info!("firehose connected");
+            let connected_at = tokio::time::Instant::now();
 
             let res = loop {
                 tokio::select! {
@@ -189,23 +190,23 @@ impl FirehoseIngestor {
                                 }
                                 self.handle_message(msg).await
                             },
-                            Err(e) => {
-                                match e {
-                                    // dont disconnect on unknown op or type
-                                    FirehoseError::UnknownOp(op) => {
-                                        warn!(op = %op, "unknown frame op");
-                                        continue;
-                                    },
-                                    FirehoseError::UnknownType(t) => {
-                                        warn!(ty = %t, "unknown frame type");
-                                        continue;
-                                    },
-                                    // everything else is a hard error
-                                    e => break Err(e),
-                                }
-                            }
+                            Err(e) => match e {
+                                // dont disconnect on unknown op or type
+                                FirehoseError::UnknownOp(op) => {
+                                    warn!(op = %op, "unknown frame op");
+                                    continue;
+                                },
+                                FirehoseError::UnknownType(t) => {
+                                    warn!(ty = %t, "unknown frame type");
+                                    continue;
+                                },
+                                // everything else is a hard error
+                                e => break Err(e),
+                            },
                         }
-                        backoff = Duration::from_secs(0);
+                        if connected_at.elapsed() > Duration::from_secs(60) {
+                            backoff = Duration::from_secs(0);
+                        }
                     }
                     _ = self.enabled.changed() => {
                         if !*self.enabled.borrow() {
@@ -217,11 +218,11 @@ impl FirehoseIngestor {
             };
 
             if let Err(e) = res {
-                // todo: investigate why this happens on test server further
-                // also idk if this is even a good idea to do but whatever
-                if let FirehoseError::TcpDropped = e {
-                    debug!(err = %e, "tcp connection dropped!!!");
-                    tokio::time::sleep(rng.add_jitter(Duration::from_secs(10))).await;
+                if let FirehoseError::StreamClosed { code, reason } = &e
+                    && *code == 1001
+                {
+                    debug!(reason = %reason, "host gone away");
+                    tokio::time::sleep(Duration::from_secs(1)).await;
                     continue;
                 }
                 if let FirehoseError::RelayError { error, message } = e {
