@@ -135,9 +135,9 @@ impl FirehoseIngestor {
                     //         continue;
                     //     }
                     // }
-                    let timeout = if let FirehoseError::WebSocket(e) = &e
-                        && is_throttle_worthy(e)
-                    {
+                    let do_throttle = matches!(&e, FirehoseError::WebSocket(e) if is_throttle_worthy(e))
+                        || matches!(&e, FirehoseError::EmptyFrame);
+                    let timeout = if do_throttle {
                         self.throttle.record_failure();
                         let until = self.throttle.throttled_until();
                         Duration::from_secs((until - chrono::Utc::now().timestamp()) as u64)
