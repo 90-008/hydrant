@@ -14,6 +14,15 @@ pub async fn handle(
     let url_str = format!("wss://{}/", req.hostname);
     let url = Url::parse(&url_str).map_err(|e| bad_request(nsid, e))?;
 
+    if hydrant.pds.is_banned(&req.hostname) {
+        return Err(XrpcErrorResponse {
+            status: StatusCode::BAD_REQUEST,
+            error: jacquard_common::xrpc::XrpcError::Xrpc(RequestCrawlError::HostBanned(Some(
+                "host is banned".into(),
+            ))),
+        });
+    }
+
     hydrant
         .firehose
         .add_source(url, true)
