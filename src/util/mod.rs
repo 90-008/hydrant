@@ -41,7 +41,7 @@ pub fn is_tls_cert_error(io_err: &std::io::Error) -> bool {
         return false;
     };
     if let Some(rustls_err) = inner.downcast_ref::<rustls::Error>() {
-        return is_tls_error_our_fault(rustls_err);
+        return is_tls_error_their_fault(rustls_err);
     }
     if let Some(nested_io) = inner.downcast_ref::<std::io::Error>() {
         return is_tls_cert_error(nested_io);
@@ -49,7 +49,7 @@ pub fn is_tls_cert_error(io_err: &std::io::Error) -> bool {
     false
 }
 
-pub fn is_tls_error_our_fault(e: &rustls::Error) -> bool {
+pub fn is_tls_error_their_fault(e: &rustls::Error) -> bool {
     use rustls::Error::*;
     matches!(
         *e,
@@ -69,6 +69,19 @@ pub fn is_tls_error_our_fault(e: &rustls::Error) -> bool {
             | PeerSentOversizedRecord
             | NoApplicationProtocol
     )
+}
+
+pub fn is_status_their_fault(status: u16) -> bool {
+    return matches!(
+        status,
+        502 // BAD_GATEWAY
+        | 503 // SERVICE_UNAVAILABLE
+        | 504 // GATEWAY_TIMEOUT
+        | 522 // CONNECTION_TIMEOUT
+        | 525 // SSL_HANDSHAKE_FAILURE
+        | 530 // SITE_FROZEN
+        | 404 // NOT FOUND: we know its not our fault because we use known xrpcs..
+    );
 }
 
 /// outcome of [`RetryWithBackoff::retry`] when the operation does not succeed.
@@ -186,6 +199,12 @@ pub const CONNECTION_TIMEOUT: StatusCode = unsafe {
 };
 pub const SITE_FROZEN: StatusCode = unsafe {
     match StatusCode::from_u16(530) {
+        Ok(s) => s,
+        _ => std::hint::unreachable_unchecked(),
+    }
+};
+pub const SSL_HANDSHAKE_FAILURE: StatusCode = unsafe {
+    match StatusCode::from_u16(525) {
         Ok(s) => s,
         _ => std::hint::unreachable_unchecked(),
     }

@@ -3,7 +3,9 @@ use crate::ingest::stream::{FirehoseError, FirehoseStream, SubscribeReposMessage
 use crate::ingest::{BufferTx, IngestMessage};
 use crate::state::AppState;
 use crate::util::throttle::ThrottleHandle;
-use crate::util::{WatchEnabledExt, is_timeout, is_tls_cert_error, is_tls_error_our_fault};
+use crate::util::{
+    WatchEnabledExt, is_status_their_fault, is_timeout, is_tls_cert_error, is_tls_error_their_fault,
+};
 use jacquard_common::IntoStatic;
 use jacquard_common::types::did::Did;
 use miette::{IntoDiagnostic, Result};
@@ -13,6 +15,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tokio::sync::watch;
 use tokio_websockets::Error as WsError;
+use tokio_websockets::upgrade::Error as WsUpgradeError;
 use tracing::{Span, debug, error, info, trace, warn};
 use url::Url;
 
@@ -24,19 +27,13 @@ fn is_throttle_worthy(e: &WsError) -> bool {
     }
 
     match e {
-        WsError::Rustls(e) if is_tls_error_our_fault(e) => return true,
+        WsError::Rustls(e) if is_tls_error_their_fault(e) => return true,
         WsError::Io(io_err) if is_tls_cert_error(io_err) => return true,
         WsError::CannotResolveHost => return true,
-        WsError::Upgrade(tokio_websockets::upgrade::Error::DidNotSwitchProtocols(status)) => {
-            return matches!(
-                *status,
-                502 // BAD_GATEWAY
-                    | 503 // SERVICE_UNAVAILABLE
-                    | 504 // GATEWAY_TIMEOUT
-                    | 522 // CONNECTION_TIMEOUT
-                    | 530 // SITE_FROZEN
-                    | 404 // NOT FOUND
-            );
+        WsError::Upgrade(WsUpgradeError::DidNotSwitchProtocols(status))
+            if is_status_their_fault(*status) =>
+        {
+            return true;
         }
         WsError::Protocol(_) | WsError::PayloadTooLong { .. } => return true,
         _ => {}

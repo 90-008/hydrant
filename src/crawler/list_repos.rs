@@ -3,8 +3,8 @@ use crate::db::{Db, keys};
 use crate::state::AppState;
 use crate::util::throttle::{OrFailure, ThrottleHandle, Throttler};
 use crate::util::{
-    ErrorForStatus, RetryOutcome, RetryWithBackoff, WatchEnabledExt, is_tls_cert_error,
-    parse_retry_after,
+    ErrorForStatus, RetryOutcome, RetryWithBackoff, WatchEnabledExt, is_status_their_fault,
+    is_tls_cert_error, parse_retry_after,
 };
 use chrono::{DateTime, TimeDelta, Utc};
 use fjall::OwnedWriteBatch;
@@ -121,16 +121,8 @@ fn is_throttle_worthy(e: &reqwest::Error) -> bool {
         src = s.source();
     }
 
-    e.status().map_or(false, |s| {
-        matches!(
-            s,
-            StatusCode::BAD_GATEWAY
-                | StatusCode::SERVICE_UNAVAILABLE
-                | StatusCode::GATEWAY_TIMEOUT
-                | crate::util::CONNECTION_TIMEOUT
-                | crate::util::SITE_FROZEN
-        )
-    })
+    e.status()
+        .map_or(false, |s| is_status_their_fault(s.as_u16()))
 }
 
 /// shared describeRepo signal-checking logic used by both relay and retry producers.
