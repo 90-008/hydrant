@@ -41,12 +41,34 @@ pub fn is_tls_cert_error(io_err: &std::io::Error) -> bool {
         return false;
     };
     if let Some(rustls_err) = inner.downcast_ref::<rustls::Error>() {
-        return matches!(rustls_err, rustls::Error::InvalidCertificate(_));
+        return is_tls_error_our_fault(rustls_err);
     }
     if let Some(nested_io) = inner.downcast_ref::<std::io::Error>() {
         return is_tls_cert_error(nested_io);
     }
     false
+}
+
+pub fn is_tls_error_our_fault(e: &rustls::Error) -> bool {
+    use rustls::Error::*;
+    matches!(
+        *e,
+        InvalidCertificate(_)
+            | PeerMisbehaved(_)
+            | InconsistentKeys(_)
+            | InappropriateMessage { .. }
+            | InappropriateHandshakeMessage { .. }
+            | InvalidMessage(_)
+            | NoCertificatesPresented
+            | UnsupportedNameType
+            | DecryptError
+            | PeerIncompatible(_)
+            | AlertReceived(_)
+            | InvalidCertRevocationList(_)
+            | InvalidEncryptedClientHello(_)
+            | PeerSentOversizedRecord
+            | NoApplicationProtocol
+    )
 }
 
 /// outcome of [`RetryWithBackoff::retry`] when the operation does not succeed.

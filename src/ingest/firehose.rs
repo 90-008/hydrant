@@ -3,7 +3,7 @@ use crate::ingest::stream::{FirehoseError, FirehoseStream, SubscribeReposMessage
 use crate::ingest::{BufferTx, IngestMessage};
 use crate::state::AppState;
 use crate::util::throttle::ThrottleHandle;
-use crate::util::{WatchEnabledExt, is_timeout, is_tls_cert_error};
+use crate::util::{WatchEnabledExt, is_timeout, is_tls_cert_error, is_tls_error_our_fault};
 use jacquard_common::IntoStatic;
 use jacquard_common::types::did::Did;
 use miette::{IntoDiagnostic, Result};
@@ -24,7 +24,7 @@ fn is_throttle_worthy(e: &WsError) -> bool {
     }
 
     match e {
-        WsError::Rustls(e) if matches!(e, rustls::Error::InvalidCertificate(_)) => return true,
+        WsError::Rustls(e) if is_tls_error_our_fault(e) => return true,
         WsError::Io(io_err) if is_tls_cert_error(io_err) => return true,
         WsError::CannotResolveHost => return true,
         WsError::Upgrade(tokio_websockets::upgrade::Error::DidNotSwitchProtocols(status)) => {
