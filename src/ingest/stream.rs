@@ -1,4 +1,5 @@
 use std::convert::Infallible;
+use std::time::Duration;
 
 use axum::http::Uri;
 use bytes::Bytes;
@@ -56,6 +57,7 @@ impl From<serde_ipld_dagcbor::DecodeError<Infallible>> for FirehoseError {
 
 pub struct FirehoseStream {
     ws: WebSocketStream<tokio_websockets::MaybeTlsStream<tokio::net::TcpStream>>,
+    ping_timer: tokio::time::Interval,
 }
 
 impl FirehoseStream {
@@ -76,19 +78,28 @@ impl FirehoseStream {
             .map_err(|e| FirehoseError::Cbor(format!("invalid uri: {e}")))?;
 
         let (ws, _) = ClientBuilder::from_uri(uri).connect().await?;
-        Ok(Self { ws })
+
+        let mut ping_timer = tokio::time::interval(Duration::from_secs(45));
+        ping_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        ping_timer.tick().await; // consume the first tick
+
+        Ok(Self { ws, ping_timer })
     }
 
     /// gets the next message bytes from the firehose
     /// none means the stream is closed
     pub async fn next(&mut self) -> Result<Bytes, FirehoseError> {
         loop {
-            let res = self
-                .ws
-                .next()
-                .await
-                .map(|m| m.map_err(Into::into))
-                .unwrap_or(Err(FirehoseError::TcpDropped))?;
+            let res = tokio::select! {
+                _ = self.ping_timer.tick() => {
+                    self.ping().await?;
+                    continue;
+                }
+                res = self.ws.next() => {
+                    res.map(|m| m.map_err(Into::into))
+                        .unwrap_or(Err(FirehoseError::TcpDropped))?
+                }
+            };
             match res {
                 msg if msg.is_binary() => {
                     let bytes: Bytes = msg.into_payload().into();
@@ -107,12 +118,20 @@ impl FirehoseStream {
                     );
                     return Err(FirehoseError::StreamClosed { code, reason });
                 }
+                msg if msg.is_pong() => continue,
                 x => {
-                    trace!(msg = ?x, "relay sent unexpected message");
+                    trace!(msg = ?x, "host sent unexpected message");
                     continue;
                 }
             }
         }
+    }
+
+    async fn ping(&mut self) -> Result<(), FirehoseError> {
+        self.ws
+            .send(WsMsg::ping(Bytes::new()))
+            .await
+            .map_err(Into::into)
     }
 }
 

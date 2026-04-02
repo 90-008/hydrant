@@ -67,7 +67,6 @@ pub fn is_io_error_their_fault(e: &std::io::Error) -> bool {
 }
 
 pub fn is_tls_error_their_fault(e: &rustls::Error) -> bool {
-    use rustls::AlertDescription;
     use rustls::Error::*;
 
     matches!(
