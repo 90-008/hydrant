@@ -70,20 +70,6 @@ pub fn is_tls_error_their_fault(e: &rustls::Error) -> bool {
     use rustls::AlertDescription;
     use rustls::Error::*;
 
-    if let AlertReceived(alert) = e {
-        return !matches!(
-            alert,
-            // these mean we did something wrong
-            AlertDescription::BadCertificate
-                | AlertDescription::CertificateUnknown
-                | AlertDescription::CertificateRequired
-                | AlertDescription::UnknownCA
-                | AlertDescription::AccessDenied
-                | AlertDescription::InsufficientSecurity
-                | AlertDescription::UnknownPSKIdentity
-        );
-    }
-
     matches!(
         *e,
         InvalidCertificate(_)
@@ -95,6 +81,7 @@ pub fn is_tls_error_their_fault(e: &rustls::Error) -> bool {
             | NoCertificatesPresented
             | UnsupportedNameType
             | DecryptError
+            | AlertReceived(_)
             | PeerIncompatible(_)
             | InvalidCertRevocationList(_)
             | InvalidEncryptedClientHello(_)

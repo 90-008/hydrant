@@ -42,8 +42,8 @@ pub enum FirehoseError {
     UnknownType(String),
     #[error("cbor decode error: {0}")]
     Cbor(String),
-    #[error("stream closed")]
-    StreamClosed,
+    #[error("stream closed: {code}: {reason}")]
+    StreamClosed { code: u16, reason: String },
 }
 
 impl From<serde_ipld_dagcbor::DecodeError<Infallible>> for FirehoseError {
@@ -86,7 +86,12 @@ impl FirehoseStream {
                 .next()
                 .await
                 .map(|m| m.map_err(Into::into))
-                .unwrap_or_else(|| Err(FirehoseError::StreamClosed))?;
+                .unwrap_or_else(|| {
+                    Err(FirehoseError::StreamClosed {
+                        code: 0,
+                        reason: "closed".to_owned(),
+                    })
+                })?;
             match res {
                 msg if msg.is_binary() => {
                     let bytes: Bytes = msg.into_payload().into();
@@ -97,7 +102,14 @@ impl FirehoseStream {
                 }
                 msg if msg.is_ping() => self.ws.send(WsMsg::pong(msg.into_payload())).await?,
                 // if ws closed treat it as an error, since why would a host close the stream??
-                msg if msg.is_close() => return Err(FirehoseError::StreamClosed),
+                // TODO: treat hosts that return these as offline ??????
+                msg if msg.is_close() => {
+                    let (code, reason) = msg.as_close().map_or_else(
+                        || (0, "no reason".to_string()),
+                        |(code, reason)| (code.into(), reason.to_owned()),
+                    );
+                    return Err(FirehoseError::StreamClosed { code, reason });
+                }
                 x => {
                     trace!(msg = ?x, "relay sent unexpected message");
                     continue;
