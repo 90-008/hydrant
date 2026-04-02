@@ -3,8 +3,8 @@ use crate::db::{Db, keys};
 use crate::state::AppState;
 use crate::util::throttle::{OrFailure, ThrottleHandle, Throttler};
 use crate::util::{
-    ErrorForStatus, RetryOutcome, RetryWithBackoff, WatchEnabledExt, is_status_their_fault,
-    is_tls_cert_error, parse_retry_after,
+    ErrorForStatus, RetryOutcome, RetryWithBackoff, WatchEnabledExt, is_io_error_their_fault,
+    is_status_their_fault, is_tls_cert_error, parse_retry_after,
 };
 use chrono::{DateTime, TimeDelta, Utc};
 use fjall::OwnedWriteBatch;
@@ -113,8 +113,8 @@ fn is_throttle_worthy(e: &reqwest::Error) -> bool {
 
     let mut src = e.source();
     while let Some(s) = src {
-        if let Some(io_err) = s.downcast_ref::<std::io::Error>() {
-            if is_tls_cert_error(io_err) {
+        if let Some(e) = s.downcast_ref::<std::io::Error>() {
+            if is_io_error_their_fault(&e) || is_tls_cert_error(e) {
                 return true;
             }
         }

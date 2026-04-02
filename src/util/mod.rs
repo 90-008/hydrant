@@ -49,6 +49,22 @@ pub fn is_tls_cert_error(io_err: &std::io::Error) -> bool {
     false
 }
 
+pub fn is_io_error_their_fault(e: &std::io::Error) -> bool {
+    use std::io::ErrorKind::*;
+    matches!(
+        e.kind(),
+        // some of these maybe our fault, but lets assume we have working networking
+        // if its our fault chances are most of the other hosts will also fail, which will be in the logs
+        // we log the error anyway so it should be easy to tell if something is going bad
+        ConnectionRefused
+            | HostUnreachable
+            | NetworkUnreachable
+            | ConnectionReset
+            | ConnectionAborted
+            | TimedOut
+    )
+}
+
 pub fn is_tls_error_their_fault(e: &rustls::Error) -> bool {
     use rustls::Error::*;
     matches!(

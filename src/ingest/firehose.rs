@@ -4,7 +4,8 @@ use crate::ingest::{BufferTx, IngestMessage};
 use crate::state::AppState;
 use crate::util::throttle::ThrottleHandle;
 use crate::util::{
-    WatchEnabledExt, is_status_their_fault, is_timeout, is_tls_cert_error, is_tls_error_their_fault,
+    WatchEnabledExt, is_io_error_their_fault, is_status_their_fault, is_timeout, is_tls_cert_error,
+    is_tls_error_their_fault,
 };
 use jacquard_common::IntoStatic;
 use jacquard_common::types::did::Did;
@@ -28,7 +29,7 @@ fn is_throttle_worthy(e: &WsError) -> bool {
 
     match e {
         WsError::Rustls(e) if is_tls_error_their_fault(e) => return true,
-        WsError::Io(io_err) if is_tls_cert_error(io_err) => return true,
+        WsError::Io(e) if is_io_error_their_fault(e) || is_tls_cert_error(e) => return true,
         WsError::CannotResolveHost => return true,
         WsError::Upgrade(WsUpgradeError::DidNotSwitchProtocols(status))
             if is_status_their_fault(*status) =>
