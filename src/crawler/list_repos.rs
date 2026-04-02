@@ -121,8 +121,11 @@ fn is_throttle_worthy(e: &reqwest::Error) -> bool {
         src = s.source();
     }
 
-    e.status()
-        .map_or(false, |s| is_status_their_fault(s.as_u16()))
+    e.status().map_or(false, |s| {
+        // lets not consider internal server errors for throttling
+        // a server might be having a hard time on one request, but not on the rest
+        s.as_u16() != 500 && is_status_their_fault(s.as_u16())
+    })
 }
 
 /// shared describeRepo signal-checking logic used by both relay and retry producers.

@@ -32,7 +32,7 @@ fn is_throttle_worthy(e: &WsError) -> bool {
         WsError::Io(e) if is_io_error_their_fault(e) || is_tls_cert_error(e) => return true,
         WsError::CannotResolveHost => return true,
         WsError::Upgrade(WsUpgradeError::DidNotSwitchProtocols(status))
-            if is_status_their_fault(*status) =>
+            if (*status >= 200 && *status < 300) || is_status_their_fault(*status) =>
         {
             return true;
         }

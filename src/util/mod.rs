@@ -87,17 +87,18 @@ pub fn is_tls_error_their_fault(e: &rustls::Error) -> bool {
     )
 }
 
+// use this for public (unauth) xrpc errors
 pub fn is_status_their_fault(status: u16) -> bool {
-    return matches!(
-        status,
-        502 // BAD_GATEWAY
-        | 503 // SERVICE_UNAVAILABLE
-        | 504 // GATEWAY_TIMEOUT
-        | 522 // CONNECTION_TIMEOUT
-        | 525 // SSL_HANDSHAKE_FAILURE
-        | 530 // SITE_FROZEN
-        | 404 // NOT FOUND: we know its not our fault because we use known xrpcs..
-    );
+    return (status >= 100 && status < 200) // informational, why are we here?
+        || (status >= 500 && status < 600) // server error :>
+        || (status >= 300 && status < 400) // any 3xx error doesnt make sense in the context of a pds / relay
+        || matches!(
+            status,
+            404 // NOT FOUND: we know its not our fault because we use known xrpcs..
+            | 436 // some stupid ass error code idk, some domain park uses this i think???
+            | 403 // FORBIDDEN: sob
+            | 401 // UNAUTHORIZED: sob
+        );
 }
 
 /// outcome of [`RetryWithBackoff::retry`] when the operation does not succeed.
