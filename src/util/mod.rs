@@ -62,11 +62,28 @@ pub fn is_io_error_their_fault(e: &std::io::Error) -> bool {
             | ConnectionReset
             | ConnectionAborted
             | TimedOut
+            | UnexpectedEof
     )
 }
 
 pub fn is_tls_error_their_fault(e: &rustls::Error) -> bool {
+    use rustls::AlertDescription;
     use rustls::Error::*;
+
+    if let AlertReceived(alert) = e {
+        return !matches!(
+            alert,
+            // these mean we did something wrong
+            AlertDescription::BadCertificate
+                | AlertDescription::CertificateUnknown
+                | AlertDescription::CertificateRequired
+                | AlertDescription::UnknownCA
+                | AlertDescription::AccessDenied
+                | AlertDescription::InsufficientSecurity
+                | AlertDescription::UnknownPSKIdentity
+        );
+    }
+
     matches!(
         *e,
         InvalidCertificate(_)
@@ -79,11 +96,10 @@ pub fn is_tls_error_their_fault(e: &rustls::Error) -> bool {
             | UnsupportedNameType
             | DecryptError
             | PeerIncompatible(_)
-            | AlertReceived(_)
             | InvalidCertRevocationList(_)
             | InvalidEncryptedClientHello(_)
             | PeerSentOversizedRecord
-            | NoApplicationProtocol
+            | NoApplicationProtocol // this is not exhaustive, so remember to look at rustls::Error on version changes
     )
 }
 
@@ -98,6 +114,7 @@ pub fn is_status_their_fault(status: u16) -> bool {
             | 436 // some stupid ass error code idk, some domain park uses this i think???
             | 403 // FORBIDDEN: sob
             | 401 // UNAUTHORIZED: sob
+            | 410 // GONE: sob
         );
 }
 
