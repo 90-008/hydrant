@@ -17,7 +17,7 @@ you can see
 [random.wisp.place](https://tangled.org/did:plc:dfl62fgb7wtjj3fcbb72naae/random.wisp.place)
 (standalone binary using http API) or the [statusphere
 example](./examples/statusphere.rs) (hydrant-as-library) for examples on how to
-use hydrant (for rust docs look at https://hydrant.gaze.systems/ for now).
+use hydrant (for rust docs look at https://hydrant.klbr.net/ for now).
 
 **WARNING: *the db format is only partially stable.*** we provide migrations in hydrant
 itself, so nothing should go wrong! you should still probably keep backups just in case!
