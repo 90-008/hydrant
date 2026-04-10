@@ -2,7 +2,7 @@
 
 -> [hydrant](#hydrant)</br>
 -> [vs tap](#vs-tap) | [stream](#stream-behavior) | [multi-relay](#multiple-relay-support) | [seeding](#firehose-seeding) | [crawler sources](#crawler-sources)</br>
--> [configuration](#configuration) | [build features](#build-features)</br>
+-> [building](#building-and-running) | [proxying](#reverse-proxying) | [configuration](#configuration) | [build features](#build-features)</br>
 -> [rest api](#rest-api) | [filter](#filter-management) | [ingestion](#ingestion-control) | [crawler](#crawler-management) | [firehose](#firehose-management) | [pds](#pds-management) | [repos](#repository-management)</br>
 -> [xrpc api](#data-access-xrpc) | [atproto](#comatproto) | [backlinks](#bluemicrocosmlinks) | [identity](#bluemicrocosmidentity) | [custom](#systemsgazehydrant)
 
@@ -132,6 +132,73 @@ sources can also be added and removed at runtime via the `/crawler/sources` API
 database and survive restarts. `CRAWLER_URLS` sources are startup-only: they are
 not written to the database and will always reappear after a restart regardless of
 runtime changes (unless you change the config of course).
+
+## building and running
+
+<small>[<- back to toc](#table-of-contents)</small>
+
+hydrant is written in rust and requires the rust toolchain (including `cargo`), `make`, `cmake`
+for some dependencies. you will also need the clang toolchain and the [wild linker](https://github.com/wild-linker/wild).
+
+### from source
+
+to build a production binary:
+
+```bash
+cargo build --release
+```
+
+the binary will be located at `target/release/hydrant`.
+
+#### build features
+
+see [build features](#build-features) for optional features (like `relay` or `backlinks`). to build with a specific feature:
+
+```bash
+cargo build --release --features backlinks
+```
+
+### running
+
+you can run hydrant by executing the binary. make sure to provide the necessary
+environment variables (see [configuration](#configuration)).
+
+```bash
+export HYDRANT_DATABASE_PATH=./hydrant.db
+./target/release/hydrant
+```
+
+### reverse proxying
+
+<small>[<- back to toc](#table-of-contents)</small>
+
+it is **highly recommended** to run hydrant behind a reverse proxy (like nginx or
+caddy) if you intend to expose the XRPC or event stream APIs to the public. hydrant's
+API includes several management endpoints that do not require or support authentication.
+**you MUST NOT expose these management endpoints to the public internet.**
+
+#### public endpoints (safe to proxy)
+
+you should only expose the following paths:
+
+- `GET /xrpc/*`: XRPC endpoints.
+- `GET /stream`: hydrant's ordered event stream.
+- `GET /stats`: general database statistics.
+- `GET /health`: simple health check.
+
+#### management endpoints (keep private)
+
+the following endpoints allow modifying the indexer state and should be kept internal:
+
+- `/repos`: explicit repository tracking/resyncing/untracking.
+- `/filter`: management of NSID filter patterns.
+- `/ingestion`: manual control over component lifecycle (crawler, firehose, etc.).
+- `/crawler/sources`: management of crawler relays.
+- `/firehose/sources`: management of firehose relays.
+- `/pds/tiers`: rate-limit tier assignments.
+- `/db/train` / `/db/compact`: database maintenance tasks.
+- `*/cursors`: cursor management.
+- `/debug/*`: introspection and testing endpoints (only when enabled).
 
 ## configuration
 
