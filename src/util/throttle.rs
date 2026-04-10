@@ -112,35 +112,41 @@ impl ThrottleHandle {
     }
 
     /// called on hard failures (timeout, TLS error, bad gateway, etc).
-    /// returns throttle duration in minutes if this is a *new* throttle,
-    /// and notifies all in-flight tasks to cancel immediately.
+    /// always increments `consecutive_failures`. only sets a new `throttled_until`
+    /// (and notifies waiters) if not already throttled.
     pub fn record_failure(&self) -> Option<u64> {
-        if self.is_throttled() {
-            return None;
-        }
-
         let failures = self
             .state
             .consecutive_failures
             .fetch_add(1, Ordering::AcqRel)
             + 1;
 
-        // 30 min, 60 min, 120 min, ... capped at ~512 hours
-        let base_minutes = 30u64;
+        if self.is_throttled() {
+            return None;
+        }
+
+        let base_secs = 15u64;
         let exponent = (failures as u32).saturating_sub(1);
-        let minutes = base_minutes * 2u64.pow(exponent.min(10));
-        let until = chrono::Utc::now().timestamp() + (minutes * 60) as i64;
+        let secs = (base_secs * 2u64.pow(exponent.min(10))).min(300);
+        #[cfg(debug_assertions)]
+        let secs = secs.min(1);
+
+        let until = chrono::Utc::now().timestamp() + secs as i64;
 
         self.state.throttled_until.store(until, Ordering::Release);
         self.state.failure_notify.notify_waiters();
 
-        Some(minutes)
+        Some(secs)
     }
 
     /// returns current timeout duration — 3s, 6s, or 12s depending on prior timeouts.
     pub fn timeout(&self) -> Duration {
         let n = self.state.consecutive_timeouts.load(Ordering::Acquire);
         Duration::from_secs(3 * 2u64.pow(n.min(2) as u32))
+    }
+
+    pub fn consecutive_failures(&self) -> usize {
+        self.state.consecutive_failures.load(Ordering::Acquire) as usize
     }
 
     /// returns whether the timeout attempts are exhausted

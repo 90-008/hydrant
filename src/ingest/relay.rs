@@ -524,10 +524,38 @@ impl RelayWorker {
         if is_pds {
             if let Some(host) = firehose.host_str() {
                 let count_key = keys::pds_account_count_key(host);
-                if !was_active && repo_state.active {
-                    ctx.state.db.update_count(&count_key, 1);
+                let changed = if !was_active && repo_state.active {
+                    Some(ctx.state.db.update_count(&count_key, 1))
                 } else if was_active && !repo_state.active {
-                    ctx.state.db.update_count(&count_key, -1);
+                    Some(ctx.state.db.update_count(&count_key, -1))
+                } else {
+                    None
+                };
+
+                if let Some(count) = changed {
+                    let (current_status, limit) = {
+                        let meta = ctx.state.pds_meta.load();
+                        (
+                            meta.status(host),
+                            meta.tier_for(host, &ctx.state.rate_tiers).account_limit,
+                        )
+                    };
+
+                    if let Some(status) = current_status.check_limit_transition(count, limit) {
+                        debug!(%host, count, ?limit, ?status, "account count crossed limit, shifting status");
+                        if let Err(e) = crate::db::pds_meta::set_status(
+                            &mut ctx.batch,
+                            &ctx.state.db.filter,
+                            host,
+                            status,
+                        ) {
+                            error!(err = %e, "failed to write host status");
+                        } else {
+                            crate::pds_meta::PdsMeta::update_host(&ctx.state.pds_meta, host, |h| {
+                                h.status = status
+                            });
+                        }
+                    }
                 }
             }
         }
@@ -847,6 +875,24 @@ impl WorkerContext<'_> {
             if pds_host.as_deref() != msg.firehose.host_str() {
                 warn!(did = %did, got = ?pds_host, expected = ?msg.firehose.host_str(), "message rejected: wrong host for new account");
                 return Ok(None);
+            }
+
+            if let Some(host) = msg.firehose.host_str() {
+                let tier = self
+                    .state
+                    .pds_meta
+                    .load()
+                    .tier_for(host, &self.state.rate_tiers);
+                if let Some(limit) = tier.account_limit {
+                    let count = self
+                        .state
+                        .db
+                        .get_count_sync(&crate::db::keys::pds_account_count_key(host));
+                    if count >= limit {
+                        warn!(did = %did, host, count, limit, "account limit reached for host, dropping new account");
+                        return Ok(None);
+                    }
+                }
             }
         }
 

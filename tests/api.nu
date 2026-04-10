@@ -272,7 +272,7 @@ def test-pds-tiers [url: string, pid: int] {
     let rate_tiers = (http get $"($url)/pds/rate-tiers")
     for tier_name in ["default", "trusted"] {
         let tier = ($rate_tiers | get $tier_name)
-        for field in ["per_second_base", "per_second_account_mul", "per_hour", "per_day"] {
+        for field in ["per_second_base", "per_second_account_mul", "per_hour", "per_day", "account_limit"] {
             if not ($field in $tier) {
                 fail $"($tier_name) tier missing field ($field)" $pid
             }
@@ -346,9 +346,7 @@ def test-pds-tiers [url: string, pid: int] {
 
     # remove the first host
     print "  DELETE /pds/tiers (first host)..."
-    http delete -f -e -t application/json $"($url)/pds/tiers" --data {
-        host: "pds.example.com"
-    } | assert-status 200 "DELETE /pds/tiers" $pid
+    http delete -f -e $"($url)/pds/tiers?host=pds.example.com" | assert-status 200 "DELETE /pds/tiers" $pid
     let after_del = (http get $"($url)/pds/tiers")
     if ($after_del.assignments | columns | length) != 1 {
         fail $"expected 1 assignment after delete, got ($after_del.assignments | columns | length)" $pid
@@ -359,15 +357,11 @@ def test-pds-tiers [url: string, pid: int] {
     print "  ok: correct host removed, other assignment intact"
 
     # remove the second host
-    http delete -f -e -t application/json $"($url)/pds/tiers" --data {
-        host: "other.example.com"
-    } | assert-status 200 "DELETE /pds/tiers second" $pid
+    http delete -f -e $"($url)/pds/tiers?host=other.example.com" | assert-status 200 "DELETE /pds/tiers second" $pid
 
     # deleting a non-existent host is idempotent (returns 200, not an error)
     print "  DELETE /pds/tiers (non-existent, expect 200)..."
-    http delete -f -e -t application/json $"($url)/pds/tiers" --data {
-        host: "pds.example.com"
-    } | assert-status 200 "DELETE /pds/tiers non-existent" $pid
+    http delete -f -e $"($url)/pds/tiers?host=pds.example.com" | assert-status 200 "DELETE /pds/tiers non-existent" $pid
     let after_idempotent = (http get $"($url)/pds/tiers")
     if ($after_idempotent.assignments | columns | length) != 0 {
         fail "expected empty assignments after cleanup" $pid

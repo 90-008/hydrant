@@ -1,6 +1,7 @@
 use crate::filter::{FilterHandle, FilterMode};
 use crate::ingest::stream::{FirehoseError, FirehoseStream, SubscribeReposMessage, decode_frame};
 use crate::ingest::{BufferTx, IngestMessage};
+use crate::pds_meta::HostStatus;
 use crate::state::AppState;
 use crate::util::throttle::ThrottleHandle;
 use crate::util::{
@@ -142,8 +143,15 @@ impl FirehoseIngestor {
                         || matches!(&e, FirehoseError::EmptyFrame);
                     let timeout = if do_throttle {
                         self.throttle.record_failure();
+                        if self.is_pds && self.throttle.consecutive_failures() >= 4 {
+                            if let Err(e) = self.set_host_status(HostStatus::Offline) {
+                                error!(err = %e, "failed to update host status to offline");
+                            }
+                        }
                         let until = self.throttle.throttled_until();
-                        Duration::from_secs((until - chrono::Utc::now().timestamp()) as u64)
+                        Duration::from_secs(
+                            0.max((until - chrono::Utc::now().timestamp()) as i64) as u64
+                        )
                     } else {
                         Duration::from_secs(10)
                     };
@@ -157,7 +165,10 @@ impl FirehoseIngestor {
 
             self.throttle.record_success();
             info!("firehose connected");
-            let connected_at = tokio::time::Instant::now();
+            let mut marked_active = false;
+            let active_sleep_secs = if cfg!(debug_assertions) { 1 } else { 60 };
+            let mut active_sleep =
+                std::pin::pin!(tokio::time::sleep(Duration::from_secs(active_sleep_secs)));
 
             let res = loop {
                 tokio::select! {
@@ -188,7 +199,7 @@ impl FirehoseIngestor {
                                         }
                                     }
                                 }
-                                self.handle_message(msg).await
+                                self.handle_message(msg).await;
                             },
                             Err(e) => match e {
                                 // dont disconnect on unknown op or type
@@ -204,8 +215,26 @@ impl FirehoseIngestor {
                                 e => break Err(e),
                             },
                         }
-                        if connected_at.elapsed() > Duration::from_secs(60) {
-                            backoff = Duration::from_secs(0);
+                    }
+                    _ = &mut active_sleep, if !marked_active => {
+                        marked_active = true;
+                        backoff = Duration::from_secs(0);
+                        if self.is_pds {
+                            let (current_status, tier) = {
+                                let meta = self.state.pds_meta.load();
+                                (meta.status(host), meta.tier_for(host, &self.state.rate_tiers))
+                            };
+                            if current_status != HostStatus::Banned {
+                                let count = self.state.db.get_count_sync(&count_key);
+                                let new_status = tier.account_limit.is_some_and(|l| count >= l)
+                                    .then_some(HostStatus::Throttled).unwrap_or(HostStatus::Active);
+
+                                if current_status != new_status {
+                                    if let Err(e) = self.set_host_status(new_status) {
+                                        error!(err = %e, "failed to update host status");
+                                    }
+                                }
+                            }
                         }
                     }
                     _ = self.enabled.changed() => {
@@ -218,20 +247,34 @@ impl FirehoseIngestor {
             };
 
             if let Err(e) = res {
-                if let FirehoseError::StreamClosed { code, reason } = &e
-                    && *code == 1001
-                {
-                    debug!(reason = %reason, "host gone away");
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                    continue;
-                }
-                if let FirehoseError::RelayError { error, message } = e {
-                    let message = message.map_or(Cow::Borrowed("<no message>"), Cow::Owned);
-                    error!(err = %error, "relay sent error: {message}");
-                } else if backoff.as_secs() < 60 {
-                    // stop logging errors after a minute of retries
-                    // as to not spam logs, unlikely for error to change atp
-                    error!(err = %e, "firehose stream error");
+                match &e {
+                    FirehoseError::StreamClosed { code: 1001, reason } => {
+                        debug!(reason = %reason, "host gone away");
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        continue;
+                    }
+                    FirehoseError::FutureCursor => {
+                        if self.is_pds
+                            && let Err(e) = self.set_host_status(HostStatus::Idle)
+                        {
+                            error!(err = %e, "failed to update host status to idle");
+                        }
+                        debug!("outdated cursor, backing off");
+                        tokio::time::sleep(Duration::from_secs(60)).await;
+                        continue;
+                    }
+                    FirehoseError::RelayError { error, message } => {
+                        let message = message
+                            .as_deref()
+                            .map_or(Cow::Borrowed("<no message>"), Cow::Borrowed);
+                        error!(err = %error, "relay sent error: {message}");
+                    }
+                    _ if backoff.as_secs() < 60 => {
+                        // stop logging errors after a minute of retries
+                        // as to not spam logs, unlikely for error to change atp
+                        error!(err = %e, "firehose stream error");
+                    }
+                    _ => {}
                 }
                 if backoff.is_zero() {
                     backoff = Duration::from_secs(5);
@@ -243,6 +286,22 @@ impl FirehoseIngestor {
                 backoff = (backoff * 2).min(MAX_BACKOFF);
             }
         }
+    }
+
+    fn set_host_status(&self, status: HostStatus) -> Result<()> {
+        let Some(host) = self.relay_host.host_str() else {
+            return Ok(());
+        };
+
+        debug!(host = %host, status = ?status, "updating host status");
+
+        let mut batch = self.state.db.inner.batch();
+        crate::db::pds_meta::set_status(&mut batch, &self.state.db.filter, host, status)?;
+        batch.commit().into_diagnostic()?;
+
+        crate::pds_meta::PdsMeta::update_host(&self.state.pds_meta, host, |h| h.status = status);
+
+        Ok(())
     }
 
     async fn handle_message(&self, msg: SubscribeReposMessage<'_>) {

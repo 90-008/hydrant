@@ -46,7 +46,7 @@ def main [--only: list<string> = [], --skip-creds] {
     print ""
 
     # discover all test scripts, excluding infrastructure files
-    mut excluded = ["common", "mock_relay", "run_all"]
+    mut excluded = ["common", "mock_relay", "mock_pds", "run_all"]
     if $skip_creds {
         $excluded = ($excluded | append ["authenticated_stream", "repo_sync_integrity"])
     }

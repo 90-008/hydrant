@@ -30,6 +30,7 @@
                 http-nu
                 clang
                 wild
+                psmisc
               ];
             };
           };

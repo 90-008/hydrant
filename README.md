@@ -171,7 +171,7 @@ directory, it will also be loaded automatically.
 | `CRAWLER_MAX_PENDING_REPOS` | `2000` | max pending repos for crawler. |
 | `CRAWLER_RESUME_PENDING_REPOS` | `1000` | resume threshold for crawler pending repos. |
 | `TRUSTED_HOSTS` | | comma-separated list of PDS hostnames to pre-assign to the `trusted` rate tier at startup. hosts not listed here use the `default` tier unless assigned via the API. |
-| `RATE_TIERS` | | comma-separated list of named rate tier definitions in `name:base/mul/hourly/daily` format (e.g. `trusted:5000/10.0/18000000/432000000`). built-in tiers (`default`, `trusted`) are always present and can be overridden. |
+| `RATE_TIERS` | | comma-separated list of named rate tier definitions in `name:base/mul/hourly/daily[/account_limit]` format (e.g. `trusted:5000/10.0/18000000/432000000/10000000`). the optional account limit prevents new accounts from being created on this PDS once reached. built-in tiers (`default`, `trusted`) are always present and can be overridden. |
 
 ## build features
 
@@ -329,6 +329,14 @@ tiers can be defined via `RATE_TIERS`.
 the per-second limit scales with the number of active accounts on the PDS:
 `max(per_second_base, accounts × per_second_account_mul)`.
 
+you can also define an optional `account_limit` for a rate tier. if a PDS
+exceeds this number of active accounts, hydrant will reject any new account
+creation events from it.
+
+the built-in tiers are defined as follows:
+- `default`: `50` per sec (floor), `+0.5` per account. max `3_600_000`/hr, `86_400_000`/day. `100` account limit.
+- `trusted`: `5000` per sec (floor), `+10.0` per account. max `18_000_000`/hr, `432_000_000`/day. `10_000_000` account limit.
+
 - `GET /pds/tiers`: list all current tier assignments alongside the available
   tier definitions.
   - returns `{ "assignments": [{ "host": string, "tier": string }], "rate_tiers": { <name>: { "per_second_base": int, "per_second_account_mul": float, "per_hour": int, "per_day": int } } }`.
@@ -342,10 +350,10 @@ the per-second limit scales with the number of active accounts on the PDS:
   - re-assigning the same host updates the tier in place without creating a duplicate.
 - `DELETE /pds/tiers`: remove an explicit tier assignment for a PDS, reverting
   it to the `default` tier.
-  - body: `{ "host": string }`.
+  - query parameter: `?host=<hostname>` (e.g. `?host=pds.example.com`).
   - returns `200` even if no assignment existed.
 - `GET /pds/rate-tiers`: list the available rate tier definitions.
-  - returns a map of tier name to `{ "per_second_base", "per_second_account_mul", "per_hour", "per_day" }`.
+  - returns a map of tier name to `{ "per_second_base", "per_second_account_mul", "per_hour", "per_day", "account_limit" }`.
 
 hosts listed in `TRUSTED_HOSTS` are seeded as `trusted` at startup, but only
 when no database assignment already exists for that host — DB entries always win.

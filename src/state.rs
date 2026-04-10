@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::future::Future;
 use std::sync::atomic::AtomicI64;
 use std::time::Duration;
@@ -55,27 +55,42 @@ impl AppState {
 
         let filter = new_filter_handle(filter_config);
 
-        // load persisted per-PDS tier assignments from the filter keyspace.
-        // trusted_hosts from config are merged in as defaults (not persisted here; they seed
-        // only if the host has no existing assignment in the DB).
-        let mut tiers: HashMap<String, SmolStr> = crate::db::pds_meta::load_tiers(&db.filter)
+        let tiers: HashMap<String, SmolStr> = crate::db::pds_meta::load_tiers(&db.filter)
             .unwrap_or_default()
             .into_iter()
             .map(|(host, tier)| (host.to_string(), tier))
             .collect();
+
+        let statuses: HashMap<String, crate::pds_meta::HostStatus> =
+            crate::db::pds_meta::load_statuses(&db.filter)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(host, stat)| (host.to_string(), stat))
+                .collect();
+
+        let mut hosts = HashMap::new();
+        for (host, tier) in tiers {
+            hosts
+                .entry(host)
+                .or_insert_with(crate::pds_meta::HostDesc::default)
+                .tier = Some(tier);
+        }
+        for (host, stat) in statuses {
+            hosts
+                .entry(host)
+                .or_insert_with(crate::pds_meta::HostDesc::default)
+                .status = stat;
+        }
         for host in &config.trusted_hosts {
-            tiers
+            let entry = hosts
                 .entry(host.clone())
-                .or_insert_with(|| SmolStr::new("trusted"));
+                .or_insert_with(crate::pds_meta::HostDesc::default);
+            if entry.tier.is_none() {
+                entry.tier = Some(SmolStr::new("trusted"));
+            }
         }
 
-        let banned: HashSet<String> = crate::db::pds_meta::load_banned(&db.filter)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|host| host.to_string())
-            .collect();
-
-        let pds_meta = new_pds_handle(PdsMeta { tiers, banned });
+        let pds_meta = new_pds_handle(PdsMeta { hosts });
 
         let relay_cursors = scc::HashIndex::new();
 

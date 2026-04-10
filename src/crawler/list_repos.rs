@@ -234,8 +234,8 @@ impl SignalChecker {
                         return (did, retry_state.into());
                     }
                     if is_throttle_worthy(&e) {
-                        if let Some(mins) = throttle.record_failure() {
-                            warn!(url = %pds_url, mins, "throttling pds due to hard failure");
+                        if let Some(secs) = throttle.record_failure() {
+                            warn!(url = %pds_url, secs, "throttling pds due to hard failure");
                         }
                         let mut retry_state = throttle.to_retry_state();
                         retry_state.status = e.status();

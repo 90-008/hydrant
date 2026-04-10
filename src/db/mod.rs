@@ -85,8 +85,8 @@ macro_rules! update_gauge_diff_impl {
         // pending
         match ($old, $new) {
             (GaugeState::Pending, GaugeState::Pending) => {}
-            (GaugeState::Pending, _) => $self.$update_method("pending", -1) $(.$await)?,
-            (_, GaugeState::Pending) => $self.$update_method("pending", 1) $(.$await)?,
+            (GaugeState::Pending, _) => {$self.$update_method("pending", -1) $(.$await)?;},
+            (_, GaugeState::Pending) => {$self.$update_method("pending", 1) $(.$await)?;},
             _ => {}
         }
 
@@ -94,8 +94,8 @@ macro_rules! update_gauge_diff_impl {
         let old_resync = $old.is_resync();
         let new_resync = $new.is_resync();
         match (old_resync, new_resync) {
-            (true, false) => $self.$update_method("resync", -1) $(.$await)?,
-            (false, true) => $self.$update_method("resync", 1) $(.$await)?,
+            (true, false) => {$self.$update_method("resync", -1) $(.$await)?;},
+            (false, true) => {$self.$update_method("resync", 1) $(.$await)?;},
             _ => {}
         }
 
@@ -697,7 +697,7 @@ impl Db {
             .into_diagnostic()?
     }
 
-    pub fn update_count(&self, key: &str, delta: i64) {
+    pub fn update_count(&self, key: &str, delta: i64) -> u64 {
         let mut entry = self.counts_map.entry_sync(SmolStr::new(key)).or_insert(0);
         if delta >= 0 {
             *entry = entry.saturating_add(delta as u64);
@@ -715,6 +715,7 @@ impl Db {
                 *entry -= decrement;
             }
         }
+        *entry
     }
 
     pub async fn update_count_async(&self, key: &str, delta: i64) {

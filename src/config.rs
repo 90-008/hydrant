@@ -22,6 +22,8 @@ pub struct RateTier {
     pub per_hour: u64,
     /// per-day limit.
     pub per_day: u64,
+    /// maximum active account limit for this host before dropping tracking of new accounts
+    pub account_limit: Option<u64>,
 }
 
 impl RateTier {
@@ -32,6 +34,7 @@ impl RateTier {
             per_second_account_mul: 10.0,
             per_hour: 5000 * 3600,
             per_day: 5000 * 86400,
+            account_limit: Some(10_000_000),
         }
     }
 
@@ -42,13 +45,14 @@ impl RateTier {
             per_second_account_mul: 0.5,
             per_hour: 1000 * 3600,
             per_day: 1000 * 86400,
+            account_limit: Some(100),
         }
     }
 
-    /// parse `base/mul/hourly/daily` format used by `HYDRANT_RATE_TIERS`.
+    /// parse `base/mul/hourly/daily[/account_limit]` format used by `HYDRANT_RATE_TIERS`.
     fn parse(s: &str) -> Option<Self> {
         let parts: Vec<&str> = s.split('/').collect();
-        if parts.len() != 4 {
+        if parts.len() < 4 || parts.len() > 5 {
             return None;
         }
         Some(Self {
@@ -56,6 +60,7 @@ impl RateTier {
             per_second_account_mul: parts[1].parse().ok()?,
             per_hour: parts[2].parse().ok()?,
             per_day: parts[3].parse().ok()?,
+            account_limit: parts.get(4).and_then(|p| p.parse().ok()),
         })
     }
 }

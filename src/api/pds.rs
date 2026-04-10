@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use axum::{
     Json, Router,
-    extract::State,
+    extract::{Query, State},
     http::StatusCode,
     routing::{delete, get, put},
 };
@@ -64,17 +64,17 @@ pub async fn set_tier(
 }
 
 #[derive(Deserialize)]
-pub struct RemoveTierBody {
+pub struct RemoveTierQuery {
     pub host: String,
 }
 
 pub async fn remove_tier(
     State(hydrant): State<Hydrant>,
-    Json(body): Json<RemoveTierBody>,
+    Query(query): Query<RemoveTierQuery>,
 ) -> Result<StatusCode, (StatusCode, String)> {
     hydrant
         .pds
-        .remove_tier(body.host)
+        .remove_tier(query.host)
         .await
         .map(|_| StatusCode::OK)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))

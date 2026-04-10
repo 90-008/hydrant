@@ -56,6 +56,7 @@ use stream::event_stream_thread;
 #[cfg(feature = "relay")]
 use stream::relay_stream_thread;
 
+#[derive(Debug, Clone)]
 /// infromation about a host hydrant is consuming from.
 pub struct Host {
     /// hostname of the host.
@@ -64,8 +65,8 @@ pub struct Host {
     pub seq: i64,
     /// the amount of accounts hydrant has seen from this host.
     pub account_count: u64,
-    /// whether this host is banned or not.
-    pub is_banned: bool,
+    /// the status of this host in hydrant.
+    pub status: crate::pds_meta::HostStatus,
 }
 
 /// an event emitted by the hydrant event stream.
@@ -767,25 +768,40 @@ impl Hydrant {
 
         tokio::task::spawn_blocking(move || {
             let key = keys::firehose_cursor_key(&hostname);
-            let Some(seq) = state.db.cursors.get(&key).into_diagnostic()? else {
-                return Ok(None);
-            };
-            let seq = i64::from_be_bytes(
-                seq.as_ref()
-                    .try_into()
-                    .into_diagnostic()
-                    .wrap_err("cursor value is not 8 bytes")?,
-            );
+
+            let mut seq = 0;
+            if let Some(cursor_bytes) = state.db.cursors.get(&key).into_diagnostic()? {
+                seq = i64::from_be_bytes(cursor_bytes.as_ref().try_into().into_diagnostic()?);
+            } else {
+                // if it has no cursor, check if it's explicitly tracked in hosts map
+                // or firehose tasks (recently added via API but no messages yet)
+                let meta = state.pds_meta.load();
+                if !meta.hosts.contains_key(hostname.as_str()) {
+                    // we should also allow it if it's an active firehose ingestor
+                    let mut found_in_cursors = false;
+                    state.firehose_cursors.iter_sync(|u, _| {
+                        if u.host_str() == Some(hostname.as_str()) {
+                            found_in_cursors = true;
+                        }
+                        !found_in_cursors // continue if not found
+                    });
+
+                    if !found_in_cursors {
+                        return Ok(None);
+                    }
+                }
+            }
+
             let account_count = state
                 .db
                 .get_count_sync(&keys::pds_account_count_key(&hostname));
-            let is_banned = state.pds_meta.load().is_banned(&hostname);
+            let status = state.pds_meta.load().status(&hostname);
 
             Ok(Some(Host {
                 name: hostname.into(),
                 seq,
                 account_count,
-                is_banned,
+                status,
             }))
         })
         .await
@@ -835,12 +851,12 @@ impl Hydrant {
                 let account_count = state
                     .db
                     .get_count_sync(&keys::pds_account_count_key(hostname));
-                let is_banned = state.pds_meta.load().is_banned(&hostname);
+                let status = state.pds_meta.load().status(hostname);
                 hosts.push(Host {
                     name: hostname.into(),
                     seq,
                     account_count,
-                    is_banned,
+                    status,
                 });
             }
 

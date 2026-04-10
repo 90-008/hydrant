@@ -47,6 +47,8 @@ pub enum FirehoseError {
     StreamClosed { code: u16, reason: String },
     #[error("tcp layer dropped")]
     TcpDropped,
+    #[error("future cursor")]
+    FutureCursor,
 }
 
 impl From<serde_ipld_dagcbor::DecodeError<Infallible>> for FirehoseError {
@@ -612,7 +614,13 @@ pub fn decode_frame<'i>(bytes: &'i [u8]) -> Result<SubscribeReposMessage<'i>, Fi
             SubscribeReposMessage::Identity(Box::new(Deserialize::deserialize(&mut de)?))
         }
         "#sync" => SubscribeReposMessage::Sync(Box::new(Deserialize::deserialize(&mut de)?)),
-        "#info" => SubscribeReposMessage::Info(Box::new(Deserialize::deserialize(&mut de)?)),
+        "#info" => {
+            let info: crate::ingest::stream::Info<'i> = Deserialize::deserialize(&mut de)?;
+            if info.name == InfoName::OutdatedCursor {
+                return Err(FirehoseError::FutureCursor);
+            }
+            SubscribeReposMessage::Info(Box::new(info))
+        }
         other => return Err(FirehoseError::UnknownType(other.to_string())),
     };
 
