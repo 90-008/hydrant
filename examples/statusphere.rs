@@ -19,12 +19,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::DateTime;
-use futures::StreamExt;
 use hydrant::FilterMode;
 use hydrant::config::Config;
 use hydrant::control::{EventStream, Hydrant, ReposControl};
-use jacquard_common::types::did::Did;
-use jacquard_common::types::tid::Tid;
+use hydrant::deps::futures::StreamExt;
+use hydrant::deps::jacquard::types::did::Did;
+use hydrant::deps::jacquard::types::tid::Tid;
 use scc::HashMap;
 
 const COLLECTION: &str = "xyz.statusphere.status";
@@ -159,7 +159,7 @@ async fn handle_stream(index: Arc<StatusIndex>, repos: ReposControl, mut stream:
 
 #[tokio::main]
 async fn main() -> miette::Result<()> {
-    rustls::crypto::aws_lc_rs::default_provider()
+    hydrant::deps::rustls::crypto::aws_lc_rs::default_provider()
         .install_default()
         .ok();
 

@@ -1,9 +1,18 @@
+/// hydrant configuration
 pub mod config;
 /// hydrant main api, includes the Hydrant type for programmatic control.
 pub mod control;
 pub(crate) mod filter;
 pub(crate) mod pds_meta;
 pub mod types;
+
+/// dependencies hydrant uses in it's public api
+pub mod deps {
+    pub use futures;
+    pub use jacquard_common as jacquard;
+    pub use rustls;
+    pub use smol_str;
+}
 
 #[cfg(all(feature = "relay", feature = "indexer"))]
 compile_error!("can't be relay and indexer at the same time");
