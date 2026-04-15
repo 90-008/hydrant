@@ -20,16 +20,27 @@ mod stream;
 mod xrpc;
 
 pub async fn serve(hydrant: Hydrant, port: u16) -> miette::Result<()> {
-    #[allow(unused_mut)]
-    let mut app = Router::new()
-        .route("/", get(async || include_str!("index.txt")))
+    let app = Router::new()
+        .route(
+            "/",
+            get(async || {
+                let kind = cfg!(feature = "indexer")
+                    .then_some("indexer")
+                    .unwrap_or("relay");
+                let subscribe = cfg!(feature = "indexer")
+                    .then_some("/stream")
+                    .unwrap_or("/xrpc/com.atproto.sync.subscribeRepos");
+                include_str!("index.txt")
+                    .replace("%type%", kind)
+                    .replace("%subscribe_url%", subscribe)
+            }),
+        )
         .route("/health", get(async || "OK"))
         .route("/_health", get(async || "OK"))
         .route("/stats", get(stats::get_stats));
     #[cfg(feature = "indexer")]
     let app = app.nest("/stream", stream::router());
-    #[allow(unused_mut)]
-    let mut app = app
+    let app = app
         .merge(xrpc::router())
         .merge(filter::router())
         .merge(pds::router())
@@ -39,9 +50,7 @@ pub async fn serve(hydrant: Hydrant, port: u16) -> miette::Result<()> {
         .merge(db::router());
 
     #[cfg(feature = "indexer")]
-    {
-        app = app.merge(crawler::router());
-    }
+    let app = app.merge(crawler::router());
 
     #[cfg(feature = "backlinks")]
     let app = app.merge(crate::backlinks::api::router());
