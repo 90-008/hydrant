@@ -181,10 +181,10 @@ API includes several management endpoints that do not require or support authent
 
 you should only expose the following paths:
 
-- `GET /xrpc/*`: XRPC endpoints.
-- `GET /stream`: hydrant's ordered event stream.
-- `GET /stats`: general database statistics.
-- `GET /health`: simple health check.
+- `/xrpc/*`: XRPC endpoints.
+- `/stream`: hydrant's ordered event stream.
+- `/stats`: general database statistics.
+- `/health`: simple health check.
 
 #### management endpoints (keep private)
 
@@ -198,7 +198,7 @@ the following endpoints allow modifying the indexer state and should be kept int
 - `/pds/tiers`: rate-limit tier assignments.
 - `/db/train` / `/db/compact`: database maintenance tasks.
 - `*/cursors`: cursor management.
-- `/debug/*`: introspection and testing endpoints (only when enabled).
+- `/debug/*`: introspection and testing endpoints.
 
 ## configuration
 
