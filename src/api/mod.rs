@@ -22,7 +22,8 @@ mod xrpc;
 pub async fn serve(hydrant: Hydrant, port: u16) -> miette::Result<()> {
     #[allow(unused_mut)]
     let mut app = Router::new()
-        .route("/health", get(|| async { "OK" }))
+        .route("/", get(async || include_str!("index.txt")))
+        .route("/health", get(async || "OK"))
         .route("/stats", get(stats::get_stats));
     #[cfg(feature = "indexer")]
     let app = app.nest("/stream", stream::router());

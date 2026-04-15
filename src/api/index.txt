@@ -1,0 +1,14 @@
+88                               88
+88                               88                                    ,d
+88                               88                                    88
+88,dPPYba,  8b       d8  ,adPPYb,88 8b,dPPYba, ,adPPYYba, 8b,dPPYba, MM88MMM
+88P'    "8a `8b     d8' a8"    `Y88 88P'   "Y8 ""     `Y8 88P'   `"8a  88
+88       88  `8b   d8'  8b       88 88         ,adPPPPP88 88       88  88
+88       88   `8b,d8'   "8a,   ,d88 88         88,    ,88 88       88  88,
+88       88     Y88'     `"8bbdP"Y8 88         `"8bbdP"Y8 88       88  "Y888
+                d8'
+               d8'
+
+this is an atproto relay instance, running the hydrant (https://tangled.org/ptr.pet/hydrant) implementation.
+
+subscribe to the relay at: /xrpc/com.atproto.sync.subscribeRepos
