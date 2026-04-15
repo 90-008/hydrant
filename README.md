@@ -184,7 +184,7 @@ you should only expose the following paths:
 - `/xrpc/*`: XRPC endpoints.
 - `/stream`: hydrant's ordered event stream.
 - `/stats`: general database statistics.
-- `/health`: simple health check.
+- `/health` / `/_health`: health check.
 
 #### management endpoints (keep private)
 

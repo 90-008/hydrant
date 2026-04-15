@@ -24,6 +24,7 @@ pub async fn serve(hydrant: Hydrant, port: u16) -> miette::Result<()> {
     let mut app = Router::new()
         .route("/", get(async || include_str!("index.txt")))
         .route("/health", get(async || "OK"))
+        .route("/_health", get(async || "OK"))
         .route("/stats", get(stats::get_stats));
     #[cfg(feature = "indexer")]
     let app = app.nest("/stream", stream::router());
