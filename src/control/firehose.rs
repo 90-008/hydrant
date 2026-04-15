@@ -1,7 +1,8 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use miette::{IntoDiagnostic, Result};
-use tokio::sync::watch;
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 use url::Url;
 
@@ -11,13 +12,14 @@ use crate::ingest::{BufferTx, firehose::FirehoseIngestor};
 use crate::state::AppState;
 
 pub(super) struct FirehoseIngestorHandle {
-    abort: tokio::task::AbortHandle,
+    id: usize,
+    cancel: CancellationToken,
     pub(super) is_pds: bool,
 }
 
 impl Drop for FirehoseIngestorHandle {
     fn drop(&mut self) {
-        self.abort.abort();
+        self.cancel.cancel();
     }
 }
 
@@ -46,6 +48,8 @@ pub struct FirehoseHandle {
     pub(super) tasks: Arc<scc::HashMap<Url, FirehoseIngestorHandle>>,
     /// set of urls persisted in the database (dynamically added sources).
     pub(super) persisted: Arc<scc::HashSet<Url>>,
+    /// ids assigned to spawned tasks
+    next_task_id: Arc<AtomicUsize>,
 }
 
 impl FirehoseHandle {
@@ -55,6 +59,7 @@ impl FirehoseHandle {
             shared: Arc::new(std::sync::OnceLock::new()),
             tasks: Arc::new(scc::HashMap::new()),
             persisted: Arc::new(scc::HashSet::new()),
+            next_task_id: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -87,23 +92,33 @@ impl FirehoseHandle {
         )
         .await;
 
-        let abort = tokio::spawn({
+        let id = self.next_task_id.fetch_add(1, Ordering::Relaxed);
+        let cancel = CancellationToken::new();
+
+        tokio::spawn({
             let relay_url = source.url.clone();
             let tasks = self.tasks.clone();
+            let token = cancel.clone();
             async move {
-                if let Err(e) = ingestor.run().await {
-                    error!(relay = %relay_url, err = %e, "firehose ingestor exited with error");
-                } else {
-                    // remove from tasks since we shutdown
-                    tasks.remove_async(&relay_url).await;
-                    info!(relay = %relay_url, "firehose shut down!");
+                tokio::select! {
+                    res = ingestor.run() => {
+                        // only remove our own entry because an upsert could replace us
+                        tasks.remove_if_async(&relay_url, |h| h.id == id).await;
+                        match res {
+                            Ok(()) => info!(relay = %relay_url, "firehose shut down!"),
+                            Err(e) => error!(relay = %relay_url, err = %e, "firehose ingestor exited with error"),
+                        }
+                    },
+                    _ = token.cancelled() => {
+                        info!(relay = %relay_url, "firehose ingestor cancelled");
+                    }
                 }
             }
-        })
-        .abort_handle();
+        });
 
         let handle = FirehoseIngestorHandle {
-            abort,
+            id,
+            cancel,
             is_pds: source.is_pds,
         };
         self.tasks.upsert_async(source.url.clone(), handle).await;
