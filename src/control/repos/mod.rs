@@ -27,7 +27,7 @@ mod indexer;
 #[cfg(feature = "indexer")]
 pub use indexer::*;
 
-/// information about a tracked or known repository. returned by [`ReposControl`] methods.
+/// information about a repository known to hydrant. returned by [`ReposControl`] methods.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct RepoInfo {
     /// the DID of the repository.
@@ -37,6 +37,8 @@ pub struct RepoInfo {
     pub status: RepoStatus,
     /// whether this repository is tracked or not.
     /// untracked repositories are not updated and they stay frozen.
+    ///
+    /// this will always be `true` in relay mode.
     pub tracked: bool,
     /// the revision of the root commit of this repository.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -66,15 +68,18 @@ pub struct RepoInfo {
     pub last_message_at: Option<DateTime<Utc>>,
 }
 
-/// control over which repositories are tracked and access to their state.
+/// control over repositories and access to their state.
 ///
-/// in `filter` mode, a repo is only indexed if it either matches a signal or is
-/// explicitly tracked via [`ReposControl::track`]. in `full` mode all repos are
-/// indexed and tracking is implicit.
+/// in indexer mode, repositories can be explicitly tracked or untracked:
+/// - in `filter` mode, a repo is only indexed if it matches a signal or is
+///   explicitly tracked via [`ReposControl::track`]. in `full` mode all repos
+///   are indexed and tracking is implicit.
+/// - tracking a DID that hydrant has never seen enqueues an immediate backfill.
+/// - tracking a DID that hydrant already knows about (but has marked untracked)
+///   re-enqueues it for backfill.
 ///
-/// tracking a DID that hydrant has never seen enqueues an immediate backfill.
-/// tracking a DID that hydrant already knows about (but has marked untracked)
-/// re-enqueues it for backfill.
+/// in relay mode, all observed repositories are passively indexed. explicit
+/// tracking and backfill do not apply; [`RepoInfo::tracked`] is always `true`.
 #[derive(Clone)]
 pub struct ReposControl(pub(super) Arc<AppState>);
 
@@ -82,8 +87,7 @@ impl ReposControl {
     pub(crate) fn iter_states(
         &self,
         cursor: Option<&Did<'_>>,
-    ) -> impl Iterator<Item = Result<(Did<'static>, RepoState<'static>, crate::types::RepoMetadata)>>
-    {
+    ) -> impl Iterator<Item = Result<(Did<'static>, RepoState<'static>)>> {
         let start_bound = if let Some(cursor) = cursor {
             let did_key = keys::repo_key(cursor);
             std::ops::Bound::Excluded(did_key)
@@ -91,31 +95,38 @@ impl ReposControl {
             std::ops::Bound::Unbounded
         };
 
-        let state = self.0.clone();
         self.0
             .db
             .repos
             .range((start_bound, std::ops::Bound::Unbounded))
-            .map(move |g| {
+            .map(|g| {
                 let (k, v) = g.into_inner().into_diagnostic()?;
                 let repo_state = crate::db::deser_repo_state(&v)?.into_static();
                 let did = TrimmedDid::try_from(k.as_ref())?.to_did();
-                let metadata_key = keys::repo_metadata_key(&did);
-                let metadata = state
-                    .db
-                    .repo_metadata
-                    .get(&metadata_key)
-                    .into_diagnostic()?
-                    .ok_or_else(|| miette::miette!("repo metadata not found for {}", did))?;
-                let metadata = crate::db::deser_repo_meta(metadata.as_ref())?;
-                Ok((did, repo_state, metadata))
+                Ok((did, repo_state))
             })
     }
 
     /// iterates through all repositories, returning their state.
     pub fn iter(&self, cursor: Option<&Did<'_>>) -> impl Iterator<Item = Result<RepoInfo>> {
-        self.iter_states(cursor)
-            .map(|r| r.map(|(did, s, m)| repo_state_to_info(did, s, m.tracked)))
+        #[cfg(feature = "indexer")]
+        let state = self.0.clone();
+        self.iter_states(cursor).map(move |r| {
+            r.and_then(|(did, s)| {
+                #[cfg(feature = "indexer")]
+                let tracked = state
+                    .db
+                    .repo_metadata
+                    .get(&keys::repo_metadata_key(&did))
+                    .into_diagnostic()?
+                    .map(|b| crate::db::deser_repo_meta(&b))
+                    .transpose()?
+                    .map_or(true, |m| m.tracked);
+                #[cfg(not(feature = "indexer"))]
+                let tracked = true;
+                Ok(repo_state_to_info(did, s, tracked))
+            })
+        })
     }
 
     /// gets a handle for a repository to read from it.
@@ -233,6 +244,7 @@ impl<'i> RepoHandle<'i> {
     pub async fn info(&self) -> Result<Option<RepoInfo>> {
         let did = self.did.clone().into_static();
         let did_key = keys::repo_key(&did);
+        #[cfg(feature = "indexer")]
         let metadata_key = keys::repo_metadata_key(&did);
         let app_state = self.state.clone();
 
@@ -243,15 +255,19 @@ impl<'i> RepoHandle<'i> {
             };
             let repo_state = crate::db::deser_repo_state(&state_bytes)?;
 
-            let metadata_bytes = app_state
+            #[cfg(feature = "indexer")]
+            let tracked = app_state
                 .db
                 .repo_metadata
                 .get(&metadata_key)
                 .into_diagnostic()?
-                .ok_or_else(|| miette::miette!("repo metadata not found for {}", did))?;
-            let metadata = crate::db::deser_repo_meta(&metadata_bytes)?;
+                .map(|b| crate::db::deser_repo_meta(&b))
+                .transpose()?
+                .map_or(true, |m| m.tracked);
+            #[cfg(not(feature = "indexer"))]
+            let tracked = true;
 
-            Ok(Some(repo_state_to_info(did, repo_state, metadata.tracked)))
+            Ok(Some(repo_state_to_info(did, repo_state, tracked)))
         })
         .await
         .into_diagnostic()?

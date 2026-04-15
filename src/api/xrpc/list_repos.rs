@@ -31,7 +31,7 @@ pub async fn handle(
         let mut next_cursor: Option<Did<'static>> = None;
 
         for item in hydrant.repos.iter_states(cursor.as_ref()) {
-            let (did, state, _metadata) = item?;
+            let (did, state) = item?;
 
             // skip repos that haven't been synced at least once
             let Some(commit) = state.root else {
