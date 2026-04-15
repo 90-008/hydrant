@@ -409,7 +409,7 @@ impl Hydrant {
                 );
                 for source in &relay_hosts {
                     firehose
-                        .spawn_firehose_ingestor(source, fire_shared)
+                        .spawn_firehose_ingestor(source, fire_shared, true)
                         .await?;
                 }
             }
@@ -427,7 +427,7 @@ impl Hydrant {
                     continue;
                 }
                 firehose
-                    .spawn_firehose_ingestor(source, fire_shared)
+                    .spawn_firehose_ingestor(source, fire_shared, true)
                     .await?;
             }
 

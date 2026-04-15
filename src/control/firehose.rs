@@ -1,7 +1,9 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 use miette::{IntoDiagnostic, Result};
+use rand::RngExt;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 use url::Url;
@@ -67,6 +69,7 @@ impl FirehoseHandle {
         &self,
         source: &FirehoseSource,
         shared: &FirehoseShared,
+        delay_startup: bool,
     ) -> Result<()> {
         use std::sync::atomic::AtomicI64;
         let state = &self.state;
@@ -100,6 +103,17 @@ impl FirehoseHandle {
             let tasks = self.tasks.clone();
             let token = cancel.clone();
             async move {
+                // jitter connection start so we dont cause thundering herd problems
+                if delay_startup {
+                    let jitter_ms = rand::rng().random_range(0u64..2000);
+                    tokio::select! {
+                        _ = tokio::time::sleep(Duration::from_millis(jitter_ms)) => {}
+                        _ = token.cancelled() => {
+                            info!(relay = %relay_url, "firehose ingestor cancelled");
+                            return;
+                        }
+                    }
+                }
                 tokio::select! {
                     res = ingestor.run() => {
                         // only remove our own entry because an upsert could replace us
@@ -185,7 +199,7 @@ impl FirehoseHandle {
 
         let _ = self.persisted.insert_async(url.clone()).await;
 
-        self.spawn_firehose_ingestor(&FirehoseSource { url, is_pds }, shared)
+        self.spawn_firehose_ingestor(&FirehoseSource { url, is_pds }, shared, false)
             .await?;
 
         Ok(())
