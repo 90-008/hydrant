@@ -52,7 +52,7 @@ pub async fn handle(
             repos.push(Repo {
                 active: Some(state.active),
                 did: did.clone(),
-                head: Cid::from(commit_cid),
+                head: Cid::Str(CowStr::Owned(commit_cid.to_smolstr())),
                 rev: atp_commit.rev,
                 status,
                 extra_data: None,
