@@ -3,11 +3,8 @@ use crate::ingest::stream::{FirehoseError, FirehoseStream, SubscribeReposMessage
 use crate::ingest::{BufferTx, IngestMessage};
 use crate::pds_meta::HostStatus;
 use crate::state::AppState;
+use crate::util::WatchEnabledExt;
 use crate::util::throttle::ThrottleHandle;
-use crate::util::{
-    WatchEnabledExt, is_io_error_their_fault, is_timeout, is_tls_cert_error,
-    is_tls_error_their_fault,
-};
 use jacquard_common::IntoStatic;
 use jacquard_common::types::did::Did;
 use miette::{IntoDiagnostic, Result};
@@ -18,38 +15,12 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tokio::sync::watch;
-use tokio_websockets::Error as WsError;
 use tracing::{Span, debug, error, info, trace, warn};
 use url::Url;
 
-fn is_throttle_worthy(e: &WsError) -> bool {
-    use std::error::Error;
-
-    if is_timeout(e) {
-        return true;
-    }
-
-    match e {
-        WsError::Rustls(e) if is_tls_error_their_fault(e) => return true,
-        WsError::Io(e) if is_io_error_their_fault(e) || is_tls_cert_error(e) => return true,
-        WsError::CannotResolveHost => return true,
-        // we treat every upgrade error as error because uh too bad so sad, im not doing anything wrong
-        WsError::Protocol(_) | WsError::PayloadTooLong { .. } | WsError::Upgrade(_) => return true,
-        _ => {}
-    }
-
-    let mut src = e.source();
-    while let Some(s) = src {
-        if let Some(io_err) = s.downcast_ref::<std::io::Error>() {
-            if is_tls_cert_error(io_err) {
-                return true;
-            }
-        }
-        src = s.source();
-    }
-
-    false
-}
+// these match ref relay
+const MAX_FAILURES: usize = 15;
+const MAX_BACKOFF: Duration = Duration::from_secs(60);
 
 trait AddJitter: rand::Rng {
     fn add_jitter(&mut self, timeout: Duration) -> Duration {
@@ -94,15 +65,10 @@ impl FirehoseIngestor {
         }
     }
 
-    #[tracing::instrument(skip(self), fields(relay = %self.relay_host))]
+    #[tracing::instrument(skip(self), fields(host = %self.relay_host))]
     pub async fn run(mut self) -> Result<()> {
         let host = self.relay_host.host_str().unwrap_or("");
         let count_key = crate::db::keys::pds_account_count_key(&host);
-
-        // this is not for connection throttling (thats handled by ThrottleHandle)
-        // its for stream errors (cbor decode etc)
-        let mut backoff = Duration::from_secs(0);
-        const MAX_BACKOFF: Duration = Duration::from_secs(60 * 60); // 1 hour
 
         let mut rng: SmallRng = rand::make_rng();
 
@@ -131,31 +97,10 @@ impl FirehoseIngestor {
             {
                 Ok(s) => s,
                 Err(e) => {
-                    // todo: figure out how to pass timeout to tungesteite i guess
-                    // if let FirehoseError::WebSocket(err) = &e
-                    //     && is_timeout(&err)
-                    // {
-                    //     if !self.throttle.record_timeout() {
-                    //         continue;
-                    //     }
-                    // }
-                    let do_throttle = matches!(&e, FirehoseError::WebSocket(e) if is_throttle_worthy(e))
-                        || matches!(&e, FirehoseError::EmptyFrame);
-                    let timeout = if do_throttle {
-                        self.throttle.record_failure();
-                        if self.is_pds && self.throttle.consecutive_failures() >= 4 {
-                            if let Err(e) = self.set_host_status(HostStatus::Offline) {
-                                error!(err = %e, "failed to update host status to offline");
-                            }
-                        }
-                        let until = self.throttle.throttled_until();
-                        Duration::from_secs(
-                            0.max((until - chrono::Utc::now().timestamp()) as i64) as u64
-                        )
-                    } else {
-                        Duration::from_secs(10)
+                    let Some(secs) = self.on_failure().await else {
+                        break Ok(());
                     };
-                    let timeout = rng.add_jitter(timeout);
+                    let timeout = rng.add_jitter(Duration::from_secs(secs).min(MAX_BACKOFF));
                     let fmt = humantime::format_duration(timeout);
                     error!(err = %e, in = %fmt, "failed to connect to firehose, retrying later");
                     tokio::time::sleep(timeout).await;
@@ -163,7 +108,6 @@ impl FirehoseIngestor {
                 }
             };
 
-            self.throttle.record_success();
             info!("firehose connected");
             let mut marked_active = false;
             let active_sleep_secs = if cfg!(debug_assertions) { 1 } else { 60 };
@@ -202,7 +146,7 @@ impl FirehoseIngestor {
                                 self.handle_message(msg).await;
                             },
                             Err(e) => match e {
-                                // dont disconnect on unknown op or type
+                                // don't disconnect on unknown op or type
                                 FirehoseError::UnknownOp(op) => {
                                     warn!(op = %op, "unknown frame op");
                                     continue;
@@ -218,21 +162,25 @@ impl FirehoseIngestor {
                     }
                     _ = &mut active_sleep, if !marked_active => {
                         marked_active = true;
-                        backoff = Duration::from_secs(0);
+                        // only reset failure state once the stream has been healthy for
+                        // a full window — prevents hosts that connect but immediately
+                        // send garbage from resetting their backoff on every attempt
+                        self.throttle.record_success();
                         if self.is_pds {
                             let (current_status, tier) = {
                                 let meta = self.state.pds_meta.load();
                                 (meta.status(host), meta.tier_for(host, &self.state.rate_tiers))
                             };
-                            if current_status != HostStatus::Banned {
-                                let count = self.state.db.get_count_sync(&count_key);
-                                let new_status = tier.account_limit.is_some_and(|l| count >= l)
-                                    .then_some(HostStatus::Throttled).unwrap_or(HostStatus::Active);
+                            if current_status == HostStatus::Banned {
+                                break Ok(());
+                            }
+                            let count = self.state.db.get_count_sync(&count_key);
+                            let new_status = tier.account_limit.is_some_and(|l| count >= l)
+                                .then_some(HostStatus::Throttled).unwrap_or(HostStatus::Active);
 
-                                if current_status != new_status {
-                                    if let Err(e) = self.set_host_status(new_status) {
-                                        error!(err = %e, "failed to update host status");
-                                    }
+                            if current_status != new_status {
+                                if let Err(e) = self.set_host_status(new_status) {
+                                    error!(err = %e, "failed to update host status");
                                 }
                             }
                         }
@@ -246,46 +194,65 @@ impl FirehoseIngestor {
                 }
             };
 
-            if let Err(e) = res {
-                match &e {
-                    FirehoseError::StreamClosed { code: 1001, reason } => {
-                        debug!(reason = %reason, "host gone away");
-                        tokio::time::sleep(Duration::from_secs(1)).await;
-                        continue;
-                    }
-                    FirehoseError::FutureCursor => {
-                        if self.is_pds
-                            && let Err(e) = self.set_host_status(HostStatus::Idle)
-                        {
-                            error!(err = %e, "failed to update host status to idle");
-                        }
-                        debug!("outdated cursor, backing off");
-                        tokio::time::sleep(Duration::from_secs(60)).await;
-                        continue;
-                    }
-                    FirehoseError::RelayError { error, message } => {
-                        let message = message
-                            .as_deref()
-                            .map_or(Cow::Borrowed("<no message>"), Cow::Borrowed);
-                        error!(err = %error, "relay sent error: {message}");
-                    }
-                    _ if backoff.as_secs() < 60 => {
-                        // stop logging errors after a minute of retries
-                        // as to not spam logs, unlikely for error to change atp
-                        error!(err = %e, "firehose stream error");
-                    }
-                    _ => {}
+            match res {
+                Ok(()) => {}
+                Err(FirehoseError::StreamClosed { code: 1001, reason }) => {
+                    debug!(reason = %reason, "host gone away");
+                    tokio::time::sleep(Duration::from_secs(1)).await;
                 }
-                if backoff.is_zero() {
-                    backoff = Duration::from_secs(5);
+                Err(FirehoseError::FutureCursor) => {
+                    if self.is_pds
+                        && let Err(e) = self.set_host_status(HostStatus::Idle)
+                    {
+                        error!(err = %e, "failed to update host status to idle");
+                    }
+                    debug!("outdated cursor, backing off");
+                    tokio::time::sleep(Duration::from_secs(60)).await;
                 }
-                let timeout = rng.add_jitter(backoff);
-                let fmt = humantime::format_duration(timeout);
-                error!(in = %fmt, "firehose disconnected, reconnecting later");
-                tokio::time::sleep(timeout).await;
-                backoff = (backoff * 2).min(MAX_BACKOFF);
+                Err(FirehoseError::RelayError { error, message }) => {
+                    let message = message
+                        .as_deref()
+                        .map_or(Cow::Borrowed("<no message>"), Cow::Borrowed);
+                    error!(err = %error, "relay sent error: {message}");
+                    let Some(secs) = self.on_failure().await else {
+                        break Ok(());
+                    };
+                    let timeout = rng.add_jitter(Duration::from_secs(secs).min(MAX_BACKOFF));
+                    let fmt = humantime::format_duration(timeout);
+                    error!(in = %fmt, "firehose disconnected, reconnecting later");
+                    tokio::time::sleep(timeout).await;
+                }
+                Err(e) => {
+                    let Some(secs) = self.on_failure().await else {
+                        break Ok(());
+                    };
+                    let timeout = rng.add_jitter(Duration::from_secs(secs).min(MAX_BACKOFF));
+                    let fmt = humantime::format_duration(timeout);
+                    error!(err = %e, in = %fmt, "firehose stream error, reconnecting later");
+                    tokio::time::sleep(timeout).await;
+                }
             }
         }
+    }
+
+    /// record a failure and return the backoff duration in seconds,
+    /// or `None` if the failure threshold was reached and the subscriber should stop
+    async fn on_failure(&self) -> Option<u64> {
+        let secs = self.throttle.record_failure().unwrap_or_else(|| {
+            let until = self.throttle.throttled_until();
+            0.max(until - chrono::Utc::now().timestamp()) as u64
+        });
+        let failures = self.throttle.consecutive_failures();
+        if failures >= MAX_FAILURES {
+            warn!(failures, "too many consecutive failures, giving up on host");
+            if self.is_pds {
+                if let Err(e) = self.set_host_status(HostStatus::Offline) {
+                    error!(err = %e, "failed to update host status to offline");
+                }
+            }
+            return None;
+        }
+        Some(secs)
     }
 
     fn set_host_status(&self, status: HostStatus) -> Result<()> {
