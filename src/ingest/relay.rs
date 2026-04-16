@@ -18,6 +18,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info, info_span, trace, warn};
 use url::Url;
 
+use crate::db::keys::pds_account_count_key;
 use crate::db::{self, keys};
 use crate::ingest::stream::AccountStatus;
 #[cfg(feature = "relay")]
@@ -523,7 +524,7 @@ impl RelayWorker {
         // update per-PDS active account count on transitions
         if is_pds {
             if let Some(host) = firehose.host_str() {
-                let count_key = keys::pds_account_count_key(host);
+                let count_key = pds_account_count_key(host);
                 let changed = if !was_active && repo_state.active {
                     Some(ctx.state.db.update_count(&count_key, 1))
                 } else if was_active && !repo_state.active {
@@ -533,28 +534,11 @@ impl RelayWorker {
                 };
 
                 if let Some(count) = changed {
-                    let (current_status, limit) = {
-                        let meta = ctx.state.pds_meta.load();
-                        (
-                            meta.status(host),
-                            meta.tier_for(host, &ctx.state.rate_tiers).account_limit,
-                        )
-                    };
-
-                    if let Some(status) = current_status.check_limit_transition(count, limit) {
-                        debug!(%host, count, ?limit, ?status, "account count crossed limit, shifting status");
-                        if let Err(e) = crate::db::pds_meta::set_status(
-                            &mut ctx.batch,
-                            &ctx.state.db.filter,
-                            host,
-                            status,
-                        ) {
-                            error!(err = %e, "failed to write host status");
-                        } else {
-                            crate::pds_meta::PdsMeta::update_host(&ctx.state.pds_meta, host, |h| {
-                                h.status = status
-                            });
-                        }
+                    let mut batch_for_status = ctx.state.db.inner.batch();
+                    ctx.state
+                        .apply_host_limit_status(&mut batch_for_status, host, count);
+                    if let Err(e) = batch_for_status.commit() {
+                        error!(%host, err = %e, "failed to commit host status update");
                     }
                 }
             }
@@ -878,20 +862,10 @@ impl WorkerContext<'_> {
             }
 
             if let Some(host) = msg.firehose.host_str() {
-                let tier = self
-                    .state
-                    .pds_meta
-                    .load()
-                    .tier_for(host, &self.state.rate_tiers);
-                if let Some(limit) = tier.account_limit {
-                    let count = self
-                        .state
-                        .db
-                        .get_count_sync(&crate::db::keys::pds_account_count_key(host));
-                    if count >= limit {
-                        warn!(did = %did, host, count, limit, "account limit reached for host, dropping new account");
-                        return Ok(None);
-                    }
+                let count = self.state.db.get_count_sync(&pds_account_count_key(host));
+                if self.state.is_over_account_limit(host, count) {
+                    warn!(did = %did, host, count, "account limit reached for host, dropping new account");
+                    return Ok(None);
                 }
             }
         }
@@ -924,7 +898,7 @@ impl WorkerContext<'_> {
         // track initial active state for per-PDS rate limiting
         if msg.is_pds && repo_state.active {
             if let Some(host) = msg.firehose.host_str() {
-                db.update_count(&keys::pds_account_count_key(host), 1);
+                db.update_count(&pds_account_count_key(host), 1);
             }
         }
 

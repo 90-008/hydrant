@@ -199,6 +199,12 @@ impl FirehoseHandle {
 
         let _ = self.persisted.insert_async(url.clone()).await;
 
+        // reset failure state so the fresh task gets a clean slate.
+        // if the previous task exited after max failures, the failure counter
+        // would otherwise cause the new task to exit immediately.
+        let throttle = self.state.throttler.get_handle(&url).await;
+        throttle.record_success();
+
         self.spawn_firehose_ingestor(&FirehoseSource { url, is_pds }, shared, false)
             .await?;
 

@@ -4,10 +4,12 @@ use std::sync::Arc;
 use miette::{IntoDiagnostic, Result};
 use serde::Serialize;
 use smol_str::SmolStr;
+use tracing::debug;
 
 use crate::config::RateTier;
+use crate::db::keys::pds_account_count_key;
 use crate::db::pds_meta as db_pds;
-use crate::pds_meta::{HostStatus, PdsMeta};
+use crate::pds_meta::{HostDesc, HostStatus, PdsMeta};
 use crate::state::AppState;
 
 /// a single PDS-to-tier assignment.
@@ -50,7 +52,7 @@ impl PdsControl {
         G: FnOnce(&mut PdsMeta),
     {
         let state = self.0.clone();
-        tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || -> Result<()> {
             let mut batch = state.db.inner.batch();
             db_op(&mut batch, &state.db.filter);
             batch.commit().into_diagnostic()?;
@@ -66,24 +68,21 @@ impl PdsControl {
         Ok(())
     }
 
-    fn check_limit_transition(&self, host: &str, account_limit: Option<u64>) -> Option<HostStatus> {
-        let count_key = crate::db::keys::pds_account_count_key(host);
-        let count = self.0.db.get_count_sync(&count_key);
-        let current_status = self.0.pds_meta.load().status(host);
-        current_status.check_limit_transition(count, account_limit)
-    }
-
-    /// list all current per-PDS tier assignments.
+    /// list all current per-PDS tier assignments (explicit api-assigned overrides only).
     pub async fn list_tiers(&self) -> HashMap<String, String> {
         let snapshot = self.0.pds_meta.load();
         snapshot
             .hosts
             .iter()
-            .filter_map(|(host, desc)| desc.tier.as_ref().map(|t| (host.clone(), t.to_string())))
+            .filter_map(|(host, desc): (&String, &HostDesc)| {
+                desc.tier
+                    .as_ref()
+                    .map(|t: &smol_str::SmolStr| (host.clone(), t.to_string()))
+            })
             .collect()
     }
 
-    /// returns the assigned tier for `host`, or "default" if none is assigned.
+    /// returns the assigned tier for `host`, or \"default\" if none is assigned.
     pub fn get_tier(&self, host: impl AsRef<str>) -> String {
         let snapshot = self.0.pds_meta.load();
         snapshot
@@ -105,7 +104,7 @@ impl PdsControl {
         snapshot
             .hosts
             .iter()
-            .filter_map(|(host, desc)| {
+            .filter_map(|(host, desc): (&String, &crate::pds_meta::HostDesc)| {
                 matches!(desc.status, HostStatus::Banned).then(|| host.clone())
             })
             .collect()
@@ -114,19 +113,22 @@ impl PdsControl {
     /// list all configured rate tier definitions.
     pub fn list_rate_tiers(&self) -> HashMap<String, PdsTierDefinition> {
         self.0
-            .rate_tiers
+            .tier_policy
+            .tiers
             .iter()
-            .map(|(name, tier)| (name.clone(), PdsTierDefinition::from(*tier)))
+            .map(|(name, tier): (&smol_str::SmolStr, &RateTier)| {
+                (name.to_string(), PdsTierDefinition::from(*tier))
+            })
             .collect()
     }
 
-    /// assign `host` to `tier`, persisting the change to the database.
+    /// assign `host` to `tier`.
     /// returns an error if `tier` is not a known tier name.
     pub async fn set_tier(&self, host: impl AsRef<str>, tier: String) -> Result<()> {
-        if !self.0.rate_tiers.contains_key(&tier) {
+        if !self.0.tier_policy.tiers.contains_key(tier.as_str()) {
             miette::bail!(
                 "unknown tier '{tier}'; known tiers: {:?}",
-                self.0.rate_tiers.keys().collect::<Vec<_>>()
+                self.0.tier_policy.tiers.keys().collect::<Vec<_>>()
             );
         }
 
@@ -134,8 +136,18 @@ impl PdsControl {
         let host_clone = host.clone();
         let tier_clone = tier.clone();
 
-        let new_tier_limit = self.0.rate_tiers.get(&tier).unwrap().account_limit;
-        let maybe_status = self.check_limit_transition(&host, new_tier_limit);
+        // read the new tier's account limit and check for a status transition,
+        // now that the override is about to change.
+        let new_tier_limit = self
+            .0
+            .tier_policy
+            .tiers
+            .get(tier.as_str())
+            .unwrap()
+            .account_limit;
+        let count = self.0.db.get_count_sync(&pds_account_count_key(&host));
+        let current_status = self.0.pds_meta.load().status(&host);
+        let maybe_status = current_status.check_limit_transition(count, new_tier_limit);
 
         self.update(
             move |batch, ks| {
@@ -156,17 +168,25 @@ impl PdsControl {
         .await
     }
 
-    /// remove any explicit tier assignment for `host`, reverting it to the default tier.
+    /// remove any explicit tier assignment for `host`, reverting it to the matched rule or default.
     pub async fn remove_tier(&self, host: impl AsRef<str>) -> Result<()> {
         let host = host.as_ref().to_string();
         let host_clone = host.clone();
 
-        let default_tier_limit = self
-            .0
-            .rate_tiers
-            .get("default")
-            .and_then(|t| t.account_limit);
-        let maybe_status = self.check_limit_transition(&host, default_tier_limit);
+        // after removing the override, the effective tier is determined by glob rules.
+        // resolve it without the override to get the correct limit.
+        let effective_limit = self.0.tier_policy.resolve(&host, None).account_limit;
+        let count = self.0.db.get_count_sync(&pds_account_count_key(&host));
+        let current_status = self.0.pds_meta.load().status(&host);
+        let maybe_status = current_status.check_limit_transition(count, effective_limit);
+        debug!(
+            host,
+            ?current_status,
+            ?effective_limit,
+            count,
+            ?maybe_status,
+            "remove_tier: computed status transition"
+        );
 
         self.update(
             move |batch, ks| {
@@ -187,7 +207,7 @@ impl PdsControl {
         .await
     }
 
-    /// ban `host`, persisting the change to the database.
+    /// ban `host`
     pub async fn ban(&self, host: impl AsRef<str>) -> Result<()> {
         let host = host.as_ref().to_string();
         let host_clone = host.clone();
@@ -204,7 +224,7 @@ impl PdsControl {
         .await
     }
 
-    /// unban `host`, removing it from the database.
+    /// unban `host`
     pub async fn unban(&self, host: impl AsRef<str>) -> Result<()> {
         let host = host.as_ref().to_string();
         let host_clone = host.clone();

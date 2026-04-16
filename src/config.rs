@@ -1,6 +1,7 @@
+use crate::pds_meta::{TierPolicy, TierRule};
 use miette::Result;
 use serde::{Deserialize, Serialize};
-use smol_str::ToSmolStr;
+use smol_str::{SmolStr, ToSmolStr};
 use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;
@@ -375,16 +376,21 @@ pub struct Config {
     ///
     /// set via `HYDRANT_SEED_HOSTS` as a comma-separated list of base URLs.
     pub seed_hosts: Vec<Url>,
-    /// list of trusted PDS/relay hosts to pre-assign to the "trusted" rate tier at startup.
-    /// set via `HYDRANT_TRUSTED_HOSTS` as a comma-separated list of hostnames.
-    /// hosts not present in this list use the "default" tier unless assigned via the API.
-    pub trusted_hosts: Vec<String>,
     /// named rate tier definitions for PDS rate limiting.
     ///
     /// built-in tiers ("default" and "trusted") are always present and may be overridden.
     /// set via `HYDRANT_RATE_TIERS` as a comma-separated list of `name:base/mul/hourly/daily` entries,
     /// e.g. `trusted:5000/10.0/18000000/432000000,custom:100/1.0/7200000/172800000`.
-    pub rate_tiers: HashMap<String, RateTier>,
+    ///
+    /// built from `HYDRANT_TIER_RULES` and `HYDRANT_RATE_TIERS` at startup.
+    pub tier_policy: TierPolicy,
+
+    /// glob rules mapping host patterns to named rate tiers.
+    ///
+    /// set via `HYDRANT_TIER_RULES` as a comma-separated list of `pattern:tiername` entries,
+    /// e.g. `*.bsky.network:trusted,pds.example.com:custom`. rules are evaluated in order;
+    /// api-assigned per-host overrides always take priority over these rules.
+    pub tier_rules: Vec<(String, String)>,
 
     /// db internals, tune only if you know what you're doing.
     ///
@@ -478,12 +484,15 @@ impl Default for Config {
             filter_collections: None,
             filter_excludes: None,
             enable_backlinks: false,
-            trusted_hosts: vec![],
-            rate_tiers: {
-                let mut m = HashMap::new();
-                m.insert("default".to_string(), RateTier::default_tier());
-                m.insert("trusted".to_string(), RateTier::trusted());
-                m
+            tier_rules: vec![],
+            tier_policy: {
+                let mut tiers = HashMap::new();
+                tiers.insert(SmolStr::new("default"), RateTier::default_tier());
+                tiers.insert(SmolStr::new("trusted"), RateTier::trusted());
+                TierPolicy {
+                    tiers,
+                    rules: vec![],
+                }
             },
             cache_size: 256,
             data_compression: Compression::Zstd,
@@ -651,16 +660,16 @@ impl Config {
 
         let enable_backlinks: bool = cfg!("ENABLE_BACKLINKS", defaults.enable_backlinks);
 
-        // start with built-in tiers, then layer in any env-defined overrides.
+        // start with built-in tier definitions, then layer in any env-defined overrides.
         // format: HYDRANT_RATE_TIERS=name:base/mul/hourly/daily,...
-        let mut rate_tiers = defaults.rate_tiers.clone();
+        let mut tiers = defaults.tier_policy.tiers.clone();
         if let Ok(s) = std::env::var("HYDRANT_RATE_TIERS") {
             for entry in s.split(',') {
                 let entry = entry.trim();
                 if let Some((name, spec)) = entry.split_once(':') {
                     match RateTier::parse(spec) {
                         Some(tier) => {
-                            rate_tiers.insert(name.trim().to_string(), tier);
+                            tiers.insert(SmolStr::new(name.trim()), tier);
                         }
                         None => tracing::warn!(
                             "ignoring invalid rate tier '{name}': expected base/mul/hourly/daily format"
@@ -688,15 +697,35 @@ impl Config {
             })
             .unwrap_or_else(|| defaults.seed_hosts.clone());
 
-        let trusted_hosts = std::env::var("HYDRANT_TRUSTED_HOSTS")
-            .ok()
-            .map(|s| {
-                s.split(',')
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect()
-            })
-            .unwrap_or_else(|| defaults.trusted_hosts.clone());
+        // build ordered glob rules from HYDRANT_TIER_RULES
+        let mut rules: Vec<TierRule> = vec![];
+        let mut tier_rules: Vec<(String, String)> = vec![];
+        if let Ok(s) = std::env::var("HYDRANT_TIER_RULES") {
+            for entry in s.split(',') {
+                let entry = entry.trim();
+                if entry.is_empty() {
+                    continue;
+                }
+                if let Some((pattern_str, tier_name)) = entry.split_once(':') {
+                    let pattern_str = pattern_str.trim();
+                    let tier_name = tier_name.trim();
+                    match glob::Pattern::new(pattern_str) {
+                        Ok(pattern) => {
+                            rules.push(TierRule {
+                                pattern,
+                                tier_name: SmolStr::new(tier_name),
+                            });
+                            tier_rules.push((pattern_str.to_string(), tier_name.to_string()));
+                        }
+                        Err(e) => tracing::warn!(
+                            "ignoring invalid tier rule pattern '{pattern_str}': {e}"
+                        ),
+                    }
+                }
+            }
+        }
+
+        let tier_policy = TierPolicy { tiers, rules };
 
         let default_mode = CrawlerMode::default_for(full_network);
         let crawler_sources = match std::env::var("HYDRANT_CRAWLER_URLS") {
@@ -743,8 +772,8 @@ impl Config {
             filter_collections,
             filter_excludes,
             enable_backlinks,
-            trusted_hosts,
-            rate_tiers,
+            tier_policy,
+            tier_rules,
             cache_size,
             data_compression,
             journal_compression,

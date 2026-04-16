@@ -237,8 +237,8 @@ directory, it will also be loaded automatically.
 | `ENABLE_CRAWLER` | `true` if full network or crawler sources are configured, `false` otherwise | whether to actively query the network for unknown repositories. |
 | `CRAWLER_MAX_PENDING_REPOS` | `2000` | max pending repos for crawler. |
 | `CRAWLER_RESUME_PENDING_REPOS` | `1000` | resume threshold for crawler pending repos. |
-| `TRUSTED_HOSTS` | | comma-separated list of PDS hostnames to pre-assign to the `trusted` rate tier at startup. hosts not listed here use the `default` tier unless assigned via the API. |
 | `RATE_TIERS` | | comma-separated list of named rate tier definitions in `name:base/mul/hourly/daily[/account_limit]` format (e.g. `trusted:5000/10.0/18000000/432000000/10000000`). the optional account limit prevents new accounts from being created on this PDS once reached. built-in tiers (`default`, `trusted`) are always present and can be overridden. |
+| `TIER_RULES` | | comma-separated ordered list of glob rules in `pattern:tier_name` format (e.g. `*.bsky.network:trusted`). rules are evaluated in order; first match wins. explicit API assignments via `PUT /pds/tiers` take precedence over rules; the `default` tier is the final fallback. uses standard glob wildcards (`*`, `?`) matched against the PDS hostname. |
 
 ## build features
 
@@ -407,30 +407,27 @@ the built-in tiers are defined as follows:
 - `GET /pds/tiers`: list all current tier assignments alongside the available
   tier definitions.
   - returns `{ "assignments": [{ "host": string, "tier": string }], "rate_tiers": { <name>: { "per_second_base": int, "per_second_account_mul": float, "per_hour": int, "per_day": int } } }`.
-  - `assignments` only contains PDSes with an explicit assignment; any PDS not
-    listed uses the `default` tier.
+  - `assignments` only contains PDSes with an explicit API assignment. hosts without one resolve via glob rules or fall back to `default`.
 - `PUT /pds/tiers`: assign a PDS to a named rate tier.
   - body: `{ "host": string, "tier": string }`.
   - `host` is the PDS hostname (e.g. `pds.example.com`).
   - `tier` must be one of the configured tier names. returns `400` if unknown.
   - assignments are persisted to the database and survive restarts.
   - re-assigning the same host updates the tier in place without creating a duplicate.
-- `DELETE /pds/tiers`: remove an explicit tier assignment for a PDS, reverting
-  it to the `default` tier.
+- `DELETE /pds/tiers`: remove an explicit tier assignment for a PDS.
   - query parameter: `?host=<hostname>` (e.g. `?host=pds.example.com`).
+  - reverts the host to glob-rule resolution (not necessarily `default`, a matching `TIER_RULES` pattern still applies).
   - returns `200` even if no assignment existed.
 - `GET /pds/rate-tiers`: list the available rate tier definitions.
   - returns a map of tier name to `{ "per_second_base", "per_second_account_mul", "per_hour", "per_day", "account_limit" }`.
 
-hosts listed in `TRUSTED_HOSTS` are seeded as `trusted` at startup, but only
-when no database assignment already exists for that host — DB entries always win.
-the seed is not written to the database, so it is re-applied on every restart.
-consequences: if you remove a host from `TRUSTED_HOSTS` and it has no DB entry,
-it will revert to `default` on the next restart. if you explicitly assign a host
-via the API (which writes to the DB), that assignment persists regardless of
-`TRUSTED_HOSTS`. if you delete a host's DB assignment via the API while it is
-still listed in `TRUSTED_HOSTS`, it will be re-seeded as `trusted` on the next
-restart.
+tiers are resolved in this order:
+
+1. **explicit API assignment**, set via `PUT /pds/tiers`, stored in the database, survives restarts.
+2. **glob rules**, from `TIER_RULES`, evaluated in order; first match wins.
+3. **`default` tier**, applied if no rule or explicit assignment matches.
+
+deleting an API assignment reverts the host to glob-rule resolution, not necessarily back to `default`. if a rule like `*.bsky.network:trusted` matches the host, it will become trusted again without any further action.
 
 ### repository management
 

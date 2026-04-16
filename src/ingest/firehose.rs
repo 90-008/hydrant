@@ -130,7 +130,8 @@ impl FirehoseIngestor {
                                         if banned {
                                             break Ok(());
                                         }
-                                        meta.tier_for(host, &self.state.rate_tiers)
+                                        let override_name = meta.hosts.get(host).and_then(|h| h.tier.as_ref());
+                                        self.state.tier_policy.resolve(host, override_name)
                                     };
                                     let accounts = self.state.db.get_count(&count_key).await;
                                     tokio::select! {
@@ -162,21 +163,30 @@ impl FirehoseIngestor {
                     }
                     _ = &mut active_sleep, if !marked_active => {
                         marked_active = true;
-                        // only reset failure state once the stream has been healthy for
-                        // a full window — prevents hosts that connect but immediately
-                        // send garbage from resetting their backoff on every attempt
+                        // only reset failure state once the stream has been healthy for a bit
+                        // so we dont get in a "connects successfully, sends garbage" situation
                         self.throttle.record_success();
                         if self.is_pds {
                             let (current_status, tier) = {
                                 let meta = self.state.pds_meta.load();
-                                (meta.status(host), meta.tier_for(host, &self.state.rate_tiers))
+                                let override_name = meta.hosts.get(host).and_then(|h| h.tier.as_ref());
+                                (meta.status(host), self.state.tier_policy.resolve(host, override_name))
                             };
                             if current_status == HostStatus::Banned {
                                 break Ok(());
                             }
                             let count = self.state.db.get_count_sync(&count_key);
                             let new_status = tier.account_limit.is_some_and(|l| count >= l)
-                                .then_some(HostStatus::Throttled).unwrap_or(HostStatus::Active);
+                                .then_some(HostStatus::Throttled)
+                                .unwrap_or(HostStatus::Active);
+                            debug!(
+                                host,
+                                ?current_status,
+                                account_limit = ?tier.account_limit,
+                                count,
+                                ?new_status,
+                                "active_sleep: computed status transition"
+                            );
 
                             if current_status != new_status {
                                 if let Err(e) = self.set_host_status(new_status) {

@@ -11,10 +11,10 @@ use tokio::sync::watch;
 use url::Url;
 
 use crate::{
-    config::{Config, RateTier},
+    config::Config,
     db::Db,
     filter::{FilterHandle, new_handle as new_filter_handle},
-    pds_meta::{PdsMeta, PdsMetaHandle, new_handle as new_pds_handle},
+    pds_meta::{PdsMeta, PdsMetaHandle, TierPolicy, new_handle as new_pds_handle},
     resolver::Resolver,
     util::throttle::Throttler,
 };
@@ -24,7 +24,7 @@ pub struct AppState {
     pub resolver: Resolver,
     pub(crate) filter: FilterHandle,
     pub(crate) pds_meta: PdsMetaHandle,
-    pub(crate) rate_tiers: HashMap<String, RateTier>,
+    pub(crate) tier_policy: TierPolicy,
     pub firehose_cursors: scc::HashIndex<Url, AtomicI64>,
     #[cfg(feature = "indexer")]
     pub backfill_notify: Notify,
@@ -81,14 +81,6 @@ impl AppState {
                 .or_insert_with(crate::pds_meta::HostDesc::default)
                 .status = stat;
         }
-        for host in &config.trusted_hosts {
-            let entry = hosts
-                .entry(host.clone())
-                .or_insert_with(crate::pds_meta::HostDesc::default);
-            if entry.tier.is_none() {
-                entry.tier = Some(SmolStr::new("trusted"));
-            }
-        }
 
         let pds_meta = new_pds_handle(PdsMeta { hosts });
 
@@ -105,7 +97,7 @@ impl AppState {
             resolver,
             filter,
             pds_meta,
-            rate_tiers: config.rate_tiers.clone(),
+            tier_policy: config.tier_policy.clone(),
             firehose_cursors: relay_cursors,
             #[cfg(feature = "indexer")]
             backfill_notify: Notify::new(),
@@ -152,5 +144,51 @@ impl AppState {
         self.backfill_enabled.send_replace(backfill_was);
 
         result
+    }
+
+    /// applies an account limit status transition for `host`, writing to `batch` and updating
+    /// in-memory state. call this after any event that changes the active account count for a PDS.
+    pub(crate) fn apply_host_limit_status(
+        &self,
+        batch: &mut fjall::OwnedWriteBatch,
+        host: &str,
+        count: u64,
+    ) {
+        use crate::db::pds_meta as db_pds;
+        use crate::pds_meta::PdsMeta;
+        use tracing::{debug, error};
+
+        let (current_status, limit) = {
+            let meta = self.pds_meta.load();
+            let override_name = meta.hosts.get(host).and_then(|h| h.tier.as_ref());
+            let tier = self.tier_policy.resolve(host, override_name);
+            (meta.status(host), tier.account_limit)
+        };
+
+        debug!(%host, ?current_status, ?limit, count, "apply_host_limit_status");
+
+        let Some(new_status) = current_status.check_limit_transition(count, limit) else {
+            return;
+        };
+
+        debug!(%host, count, ?limit, ?new_status, "account count crossed limit, shifting status");
+
+        if let Err(e) = db_pds::set_status(batch, &self.db.filter, host, new_status) {
+            error!(%host, err = %e, "failed to write host status");
+            return;
+        }
+
+        PdsMeta::update_host(&self.pds_meta, host, |h| h.status = new_status);
+    }
+
+    /// checks whether `host` is at or over its account limit at the given count.
+    /// does not modify any state.
+    pub(crate) fn is_over_account_limit(&self, host: &str, count: u64) -> bool {
+        let meta = self.pds_meta.load();
+        let override_name = meta.hosts.get(host).and_then(|h| h.tier.as_ref());
+        self.tier_policy
+            .resolve(host, override_name)
+            .account_limit
+            .is_some_and(|l| count >= l)
     }
 }

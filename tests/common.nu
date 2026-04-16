@@ -91,14 +91,25 @@ export def activate-account [pds_url: string, jwt: string] {
     curl -X POST -H "Content-Type: application/json" -H $"Authorization: Bearer ($jwt)" $"($pds_url)/xrpc/com.atproto.server.activateAccount"
 }
 
+# extract the hydrant executable path from cargo's json build output
+def parse-hydrant-executable [output: string] {
+    $output
+        | lines
+        | each { |line| try { $line | from json } catch { null } }
+        | compact
+        | where { |r| $r.reason? == "compiler-artifact" and $r.executable? != null and ($r.target?.name? == "hydrant") }
+        | last
+        | get executable
+}
+
 # build the hydrant binary
 export def build-hydrant [] {
     if ($env | get --optional HYDRANT_BINARY | is-not-empty) {
         return $env.HYDRANT_BINARY
     }
     print "building hydrant..."
-    cargo build
-    "target/debug/hydrant"
+    let out = (^cargo build --message-format json err> /dev/null | complete)
+    parse-hydrant-executable $out.stdout
 }
 
 # build the hydrant binary with extra cargo features (space-separated string)
@@ -107,8 +118,8 @@ export def build-hydrant-features [features: string] {
         return $env.HYDRANT_BINARY
     }
     print $"building hydrant with features: ($features)..."
-    cargo build --features $features
-    "target/debug/hydrant"
+    let out = (^cargo build --features $features --message-format json err> /dev/null | complete)
+    parse-hydrant-executable $out.stdout
 }
 
 # start hydrant in the background

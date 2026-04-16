@@ -1,5 +1,7 @@
 use futures::TryFutureExt;
-use jacquard_api::com_atproto::repo::describe_repo::{DescribeRepoOutput, DescribeRepoRequest};
+use jacquard_api::com_atproto::repo::describe_repo::{
+    DescribeRepoOutput, DescribeRepoRequest, DescribeRepoResponse,
+};
 
 use crate::util::invalid_handle;
 
@@ -9,7 +11,7 @@ pub async fn handle(
     State(hydrant): State<Hydrant>,
     ExtractXrpc(req): ExtractXrpc<DescribeRepoRequest>,
 ) -> XrpcResult<Json<DescribeRepoOutput<'static>>> {
-    let nsid = "com.atproto.repo.describeRepo";
+    let nsid = DescribeRepoResponse::NSID;
     let resolver = &hydrant.state.resolver;
 
     let did = resolver

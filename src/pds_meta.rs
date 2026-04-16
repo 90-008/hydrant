@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use smol_str::SmolStr;
 use std::collections::HashMap;
 use std::sync::Arc;
+use tracing::debug;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum HostStatus {
@@ -82,20 +83,6 @@ impl PdsMeta {
             next
         });
     }
-}
-
-impl PdsMeta {
-    pub fn tier_for(&self, host: &str, rate_tiers: &HashMap<String, RateTier>) -> RateTier {
-        let default = rate_tiers
-            .get("default")
-            .copied()
-            .unwrap_or_else(RateTier::default_tier);
-        self.hosts
-            .get(host)
-            .and_then(|h| h.tier.as_ref())
-            .and_then(|name| rate_tiers.get(name.as_str()).copied())
-            .unwrap_or(default)
-    }
 
     pub fn status(&self, host: &str) -> HostStatus {
         self.hosts
@@ -113,4 +100,57 @@ pub(crate) type PdsMetaHandle = Arc<ArcSwap<PdsMeta>>;
 
 pub(crate) fn new_handle(meta: PdsMeta) -> PdsMetaHandle {
     Arc::new(ArcSwap::new(Arc::new(meta)))
+}
+
+#[derive(Debug, Clone)]
+pub struct TierRule {
+    pub pattern: glob::Pattern,
+    pub tier_name: SmolStr,
+}
+
+/// policy for resolving rate tiers for PDS hosts.
+///
+/// resolution order:
+/// 1. explicit api-assigned override for the host (stored in `HostDesc.tier`)
+/// 2. first matching rule in `rules` (config glob patterns, in order)
+/// 3. built-in `"default"` tier
+#[derive(Debug, Clone)]
+pub struct TierPolicy {
+    /// named rate tier definitions.
+    pub tiers: HashMap<SmolStr, RateTier>,
+    /// ordered glob rules, first match wins (for unassigned hosts).
+    pub rules: Vec<TierRule>,
+}
+
+impl TierPolicy {
+    /// resolves the effective `RateTier` for `host`.
+    ///
+    /// `override_name` is the api-assigned tier name from `HostDesc.tier`, if any.
+    pub fn resolve(&self, host: &str, override_name: Option<&SmolStr>) -> RateTier {
+        let default = self
+            .tiers
+            .get("default")
+            .copied()
+            .unwrap_or_else(RateTier::default_tier);
+
+        if let Some(name) = override_name {
+            let tier = self.tiers.get(name).copied().unwrap_or(default);
+            debug!(host, override = %name, account_limit = ?tier.account_limit, "tier resolved via explicit override");
+            return tier;
+        }
+
+        let matched = self.rules.iter().find(|r| r.pattern.matches(host));
+
+        let tier = matched
+            .and_then(|r| self.tiers.get(&r.tier_name).copied())
+            .unwrap_or(default);
+
+        debug!(
+            host,
+            matched_rule = matched.map(|r| format!("{}:{}", r.pattern, r.tier_name)).as_deref(),
+            account_limit = ?tier.account_limit,
+            "tier resolved via glob rules"
+        );
+        tier
+    }
 }
