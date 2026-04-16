@@ -20,6 +20,7 @@ mod stream;
 mod xrpc;
 
 pub async fn serve(hydrant: Hydrant, port: u16) -> miette::Result<()> {
+    let blocks_available = hydrant.state.is_block_storage_enabled();
     let app = Router::new()
         .route(
             "/",
@@ -41,7 +42,7 @@ pub async fn serve(hydrant: Hydrant, port: u16) -> miette::Result<()> {
     #[cfg(feature = "indexer")]
     let app = app.nest("/stream", stream::router());
     let app = app
-        .merge(xrpc::router())
+        .merge(xrpc::router(blocks_available))
         .merge(filter::router())
         .merge(pds::router())
         .merge(repos::router())

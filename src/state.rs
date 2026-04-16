@@ -115,6 +115,10 @@ impl AppState {
         })
     }
 
+    pub fn is_block_storage_enabled(&self) -> bool {
+        !self.ephemeral && !self.only_index_links
+    }
+
     #[cfg(feature = "indexer")]
     pub fn notify_backfill(&self) {
         self.backfill_notify.notify_one();

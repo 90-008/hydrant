@@ -64,7 +64,7 @@ mod request_crawl;
 #[cfg(feature = "relay")]
 mod subscribe_repos;
 
-pub fn router() -> Router<Hydrant> {
+pub fn router(blocks_available: bool) -> Router<Hydrant> {
     let r = Router::new()
         .route(GetHostStatusRequest::PATH, get(get_host_status::handle))
         .route(ListHostsRequest::PATH, get(list_hosts::handle))
@@ -74,15 +74,21 @@ pub fn router() -> Router<Hydrant> {
 
     #[cfg(feature = "indexer")]
     let r = r
-        .route(GetRecordRequest::PATH, get(get_record::handle))
-        .route(ListRecordsRequest::PATH, get(list_records::handle))
         .route(CountRecords::PATH, get(count_records::handle))
-        .route(GetRepoRequest::PATH, get(get_repo::handle))
         .route(DescribeRepo::PATH, get(describe_repo::handle))
         .route(
             AtprotoDescribeRepoRequest::PATH,
             get(com_atproto_describe_repo::handle),
         );
+
+    #[cfg(feature = "indexer")]
+    let r = if blocks_available {
+        r.route(GetRecordRequest::PATH, get(get_record::handle))
+            .route(ListRecordsRequest::PATH, get(list_records::handle))
+            .route(GetRepoRequest::PATH, get(get_repo::handle))
+    } else {
+        r
+    };
 
     #[cfg(feature = "relay")]
     let r = r
