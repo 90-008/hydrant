@@ -34,6 +34,7 @@ pub struct AppState {
     #[cfg(feature = "indexer")]
     pub backfill_enabled: watch::Sender<bool>,
     pub ephemeral_ttl: Duration,
+    pub only_index_links: bool,
     pub throttler: Throttler,
 }
 
@@ -107,6 +108,7 @@ impl AppState {
             #[cfg(feature = "indexer")]
             backfill_enabled,
             ephemeral_ttl: config.ephemeral_ttl.clone(),
+            only_index_links: config.only_index_links,
             throttler: Throttler::new(),
         })
     }

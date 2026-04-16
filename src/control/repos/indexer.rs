@@ -334,6 +334,10 @@ impl ReposControl {
 impl<'i> RepoHandle<'i> {
     /// gets a record from this repository.
     pub async fn get_record(&self, collection: &str, rkey: &str) -> Result<Option<Record>> {
+        if self.state.only_index_links {
+            miette::bail!("block storage is disabled (HYDRANT_ONLY_INDEX_LINKS)");
+        }
+
         let did = self.did.clone().into_static();
         let db_key = keys::record_key(&did, collection, &DbRkey::new(rkey));
 
@@ -376,6 +380,9 @@ impl<'i> RepoHandle<'i> {
         reverse: bool,
         cursor: Option<&str>,
     ) -> Result<RecordList> {
+        if self.state.only_index_links {
+            miette::bail!("block storage is disabled (HYDRANT_ONLY_INDEX_LINKS)");
+        }
         let did = self.did.clone().into_static();
 
         let state = self.state.clone();
@@ -479,6 +486,9 @@ impl<'i> RepoHandle<'i> {
         &self,
     ) -> Result<Option<impl futures::Stream<Item = std::io::Result<bytes::Bytes>> + Send + 'static>>
     {
+        if self.state.only_index_links {
+            miette::bail!("block storage is disabled (HYDRANT_ONLY_INDEX_LINKS)");
+        }
         use iroh_car::{CarHeader, CarWriter};
         use jacquard_repo::{BlockStore, MemoryBlockStore, Mst};
         use miette::WrapErr;

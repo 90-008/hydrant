@@ -567,6 +567,7 @@ async fn process_did<'i>(
 
         tokio::task::spawn_blocking(move || {
             let filter = app_state.filter.load();
+            let only_index_links = app_state.only_index_links;
             let mut count = 0;
             let mut delta = 0;
             let mut added_blocks = 0;
@@ -646,7 +647,9 @@ async fn process_did<'i>(
                     let cid_raw = cid.to_bytes();
                     let block_key = Slice::from(keys::block_key(collection, &cid_raw));
                     if !ephemeral {
-                        batch.insert(&app_state.db.blocks, block_key.clone(), val.as_ref());
+                        if !only_index_links {
+                            batch.insert(&app_state.db.blocks, block_key.clone(), val.as_ref());
+                        }
                         batch.insert(&app_state.db.records, db_key, cid_raw);
                         #[cfg(feature = "backlinks")]
                         if let Ok(value) = serde_ipld_dagcbor::from_slice::<jacquard_common::Data>(val.as_ref()) {
@@ -675,7 +678,13 @@ async fn process_did<'i>(
                         collection: CowStr::Borrowed(collection),
                         rkey,
                         action,
-                        data: ephemeral.then_some(StoredData::Block(val)).unwrap_or_else(|| StoredData::Ptr(cid_obj.to_ipld().expect("valid cid"))),
+                        data: if ephemeral {
+                            StoredData::Block(val)
+                        } else if only_index_links {
+                            StoredData::Nothing
+                        } else {
+                            StoredData::Ptr(cid_obj.to_ipld().expect("valid cid"))
+                        },
                     };
                     let bytes = rmp_serde::to_vec(&evt).into_diagnostic()?;
                     batch.insert(&app_state.db.events, keys::event_key(event_id), bytes);

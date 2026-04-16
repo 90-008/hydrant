@@ -219,6 +219,7 @@ directory, it will also be loaded automatically.
 | `PLC_URL` | `https://plc.wtf`, `https://plc.directory` if full network | base URL(s) of the PLC directory (comma-separated for multiple). |
 | `EPHEMERAL` | `false` | if enabled, no records are stored. events are deleted after a certain duration (`EPHEMERAL_TTL`). |
 | `EPHEMERAL_TTL` | `60min`, `3d` in relay mode | decides after how long events should be deleted. |
+| `ONLY_INDEX_LINKS` | `false` | indexer only. if enabled, record blocks are not stored, only the index (records, counts, events) is kept. `getRecord`, `listRecords`, and `getRepo` will return errors. the event stream still works but create/update events will not include record values. |
 | `FULL_NETWORK` | `false` (indexer), `true` (relay) | if `true`, discovers and indexes all repositories in the network. |
 | `FILTER_SIGNALS` | | comma-separated list of NSID patterns to use for the filter (e.g. `app.bsky.feed.post,app.bsky.graph.*`). |
 | `FILTER_COLLECTIONS` | | comma-separated list of NSID patterns to use for the collections filter. |

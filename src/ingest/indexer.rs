@@ -476,6 +476,7 @@ impl FirehoseWorker {
             validated,
             &ctx.state.filter.load(),
             ctx.ephemeral,
+            ctx.state.only_index_links,
         )?;
         let repo_state = res.repo_state;
         *ctx.added_blocks += res.blocks_count;

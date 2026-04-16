@@ -368,6 +368,13 @@ pub struct Config {
     /// set via `HYDRANT_ENABLE_BACKLINKS=true`.
     pub enable_backlinks: bool,
 
+    /// if `true`, record blocks are not stored; only the index (records, counts, events) is kept.
+    /// `getRecord`, `listRecords`, and `getRepo` will return errors when this is enabled.
+    /// event stream still functions but create/update events will not include record values.
+    /// only valid in indexer mode (not relay).
+    /// set via `HYDRANT_ONLY_INDEX_LINKS=true`.
+    pub only_index_links: bool,
+
     /// base URL(s) of relay or aggregator services to seed firehose PDS sources from at startup.
     ///
     /// hydrant calls `com.atproto.sync.listHosts` on each URL and adds the returned PDSes
@@ -484,6 +491,7 @@ impl Default for Config {
             filter_collections: None,
             filter_excludes: None,
             enable_backlinks: false,
+            only_index_links: false,
             tier_rules: vec![],
             tier_policy: {
                 let mut tiers = HashMap::new();
@@ -659,6 +667,7 @@ impl Config {
         });
 
         let enable_backlinks: bool = cfg!("ENABLE_BACKLINKS", defaults.enable_backlinks);
+        let only_index_links: bool = cfg!("ONLY_INDEX_LINKS", defaults.only_index_links);
 
         // start with built-in tier definitions, then layer in any env-defined overrides.
         // format: HYDRANT_RATE_TIERS=name:base/mul/hourly/daily,...
@@ -772,6 +781,7 @@ impl Config {
             filter_collections,
             filter_excludes,
             enable_backlinks,
+            only_index_links,
             tier_policy,
             tier_rules,
             cache_size,
@@ -885,6 +895,9 @@ impl fmt::Display for Config {
         }
         if self.enable_backlinks {
             config_line!(f, "backlinks", "enabled")?;
+        }
+        if self.only_index_links {
+            config_line!(f, "only index links", "true")?;
         }
         if !self.seed_hosts.is_empty() {
             config_line!(

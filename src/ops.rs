@@ -210,6 +210,7 @@ pub fn apply_commit<'s>(
     validated: ValidatedCommit<'_>,
     filter: &FilterConfig,
     ephemeral: bool,
+    only_index_links: bool,
 ) -> Result<ApplyCommitResults<'s>> {
     let commit = validated.commit;
     let parsed = validated.parsed_blocks;
@@ -257,7 +258,9 @@ pub fn apply_commit<'s>(
 
                 blocks_count += 1;
                 if !ephemeral {
-                    batch.insert(&db.blocks, block_key.clone(), bytes.as_ref());
+                    if !only_index_links {
+                        batch.insert(&db.blocks, block_key.clone(), bytes.as_ref());
+                    }
                     batch.insert(&db.records, db_key.clone(), cid_raw);
                     // accumulate counts
                     if action == DbAction::Create {
@@ -314,10 +317,12 @@ pub fn apply_commit<'s>(
             data: block
                 .map(StoredData::Block)
                 .or_else(|| {
-                    op.cid
-                        .as_ref()
-                        .map(|c| c.to_ipld().expect("valid cid"))
-                        .map(StoredData::Ptr)
+                    (!only_index_links).then(|| {
+                        op.cid
+                            .as_ref()
+                            .map(|c| c.to_ipld().expect("valid cid"))
+                            .map(StoredData::Ptr)
+                    })?
                 })
                 .unwrap_or(StoredData::Nothing),
         };

@@ -128,6 +128,11 @@ impl Hydrant {
     pub async fn new(config: Config) -> Result<Self> {
         info!("{config}");
 
+        #[cfg(feature = "relay")]
+        if config.only_index_links {
+            miette::bail!("HYDRANT_ONLY_INDEX_LINKS is not supported in relay mode");
+        }
+
         // 1. open database and construct AppState
         let state = AppState::new(&config)?;
 
