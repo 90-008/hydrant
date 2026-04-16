@@ -116,12 +116,10 @@ enum RepoProcessResult<'s, 'c> {
 pub struct FirehoseWorker {
     state: Arc<AppState>,
     rx: IndexerRx,
-    ephemeral: bool,
     num_shards: usize,
 }
 
 struct WorkerContext<'a> {
-    ephemeral: bool,
     state: &'a AppState,
     batch: OwnedWriteBatch,
     added_blocks: &'a mut i64,
@@ -130,11 +128,10 @@ struct WorkerContext<'a> {
 }
 
 impl FirehoseWorker {
-    pub fn new(state: Arc<AppState>, rx: IndexerRx, ephemeral: bool, num_shards: usize) -> Self {
+    pub fn new(state: Arc<AppState>, rx: IndexerRx, num_shards: usize) -> Self {
         Self {
             state,
             rx,
-            ephemeral,
             num_shards,
         }
     }
@@ -152,12 +149,11 @@ impl FirehoseWorker {
             shards.push(tx);
 
             let state = self.state.clone();
-            let ephemeral = self.ephemeral;
             let handle = handle.clone();
             std::thread::Builder::new()
                 .name(format!("ingest-shard-{i}"))
                 .spawn(move || {
-                    Self::shard(i, rx, state, ephemeral, handle);
+                    Self::shard(i, rx, state, handle);
                 })
                 .into_diagnostic()?;
         }
@@ -193,7 +189,6 @@ impl FirehoseWorker {
         id: usize,
         mut rx: mpsc::UnboundedReceiver<IndexerMessage>,
         state: Arc<AppState>,
-        ephemeral: bool,
         handle: TokioHandle,
     ) {
         let _guard = handle.enter();
@@ -214,7 +209,6 @@ impl FirehoseWorker {
                 added_blocks: &mut added_blocks,
                 records_delta: &mut records_delta,
                 broadcast_events: &mut broadcast_events,
-                ephemeral,
             };
 
             match msg {
@@ -471,12 +465,10 @@ impl FirehoseWorker {
 
         let res = ops::apply_commit(
             &mut ctx.batch,
-            db,
+            ctx.state,
             repo_state,
             validated,
             &ctx.state.filter.load(),
-            ctx.ephemeral,
-            ctx.state.only_index_links,
         )?;
         let repo_state = res.repo_state;
         *ctx.added_blocks += res.blocks_count;

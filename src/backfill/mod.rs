@@ -40,7 +40,6 @@ pub struct BackfillWorker {
     http: reqwest::Client,
     semaphore: Arc<Semaphore>,
     verify_signatures: bool,
-    ephemeral: bool,
     in_flight: Arc<scc::HashSet<Did<'static>>>,
     enabled: tokio::sync::watch::Receiver<bool>,
 }
@@ -52,7 +51,6 @@ impl BackfillWorker {
         timeout: Duration,
         concurrency_limit: usize,
         verify_signatures: bool,
-        ephemeral: bool,
         enabled: tokio::sync::watch::Receiver<bool>,
     ) -> Self {
         Self {
@@ -67,7 +65,6 @@ impl BackfillWorker {
                 .expect("failed to build http client"),
             semaphore: Arc::new(Semaphore::new(concurrency_limit)),
             verify_signatures,
-            ephemeral,
             in_flight: Arc::new(scc::HashSet::new()),
             enabled,
         }
@@ -143,16 +140,13 @@ impl BackfillWorker {
                 let did = did.clone();
                 let buffer_tx = self.buffer_tx.clone();
                 let verify = self.verify_signatures;
-                let ephemeral = self.ephemeral;
 
                 let span = tracing::info_span!("backfill", did = %did);
                 tokio::spawn(
                     async move {
                         let _guard = guard;
-                        let res = did_task(
-                            &state, http, buffer_tx, &did, key, permit, verify, ephemeral,
-                        )
-                        .await;
+                        let res =
+                            did_task(&state, http, buffer_tx, &did, key, permit, verify).await;
 
                         if let Err(e) = res {
                             error!(err = %e, "process failed");
@@ -187,11 +181,10 @@ async fn did_task(
     pending_key: Slice,
     _permit: tokio::sync::OwnedSemaphorePermit,
     verify_signatures: bool,
-    ephemeral: bool,
 ) -> Result<(), BackfillError> {
     let db = &state.db;
 
-    match process_did(&state, &http, &did, verify_signatures, ephemeral).await {
+    match process_did(&state, &http, &did, verify_signatures).await {
         Ok(Some(_repo_state)) => {
             let did_key = keys::repo_key(&did);
 
@@ -391,7 +384,6 @@ async fn process_did<'i>(
     http: &reqwest::Client,
     did: &Did<'static>,
     verify_signatures: bool,
-    ephemeral: bool,
 ) -> Result<Option<RepoState<'static>>, BackfillError> {
     debug!("starting...");
 
@@ -567,6 +559,7 @@ async fn process_did<'i>(
 
         tokio::task::spawn_blocking(move || {
             let filter = app_state.filter.load();
+            let ephemeral = app_state.ephemeral;
             let only_index_links = app_state.only_index_links;
             let mut count = 0;
             let mut delta = 0;

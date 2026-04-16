@@ -268,7 +268,6 @@ impl Hydrant {
                         config.verify_signatures,
                         SignatureVerification::Full | SignatureVerification::BackfillOnly
                     ),
-                    config.ephemeral,
                     state.backfill_enabled.subscribe(),
                 )
                 .run()
@@ -618,15 +617,7 @@ impl Hydrant {
                 let state = state.clone();
                 let handle = tokio::runtime::Handle::current();
                 let config = config.clone();
-                move || {
-                    FirehoseWorker::new(
-                        state,
-                        indexer_rx,
-                        config.ephemeral,
-                        config.firehose_workers,
-                    )
-                    .run(handle)
-                }
+                move || FirehoseWorker::new(state, indexer_rx, config.firehose_workers).run(handle)
             });
 
             #[cfg(feature = "indexer")]

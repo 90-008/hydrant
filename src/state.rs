@@ -33,6 +33,7 @@ pub struct AppState {
     pub firehose_enabled: watch::Sender<bool>,
     #[cfg(feature = "indexer")]
     pub backfill_enabled: watch::Sender<bool>,
+    pub ephemeral: bool,
     pub ephemeral_ttl: Duration,
     pub only_index_links: bool,
     pub throttler: Throttler,
@@ -107,6 +108,7 @@ impl AppState {
             firehose_enabled,
             #[cfg(feature = "indexer")]
             backfill_enabled,
+            ephemeral: config.ephemeral,
             ephemeral_ttl: config.ephemeral_ttl.clone(),
             only_index_links: config.only_index_links,
             throttler: Throttler::new(),

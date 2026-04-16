@@ -15,6 +15,7 @@ use crate::db::{self, Db, keys};
 use crate::filter::FilterConfig;
 use crate::ingest::stream::Commit;
 use crate::ingest::validation::ValidatedCommit;
+use crate::state::AppState;
 use crate::types::StoredData;
 use crate::types::{
     AccountEvt, BroadcastEvent, IdentityEvt, MarshallableEvt, RepoState, RepoStatus, ResyncState,
@@ -205,13 +206,14 @@ pub struct ApplyCommitResults<'s> {
 
 pub fn apply_commit<'s>(
     batch: &mut OwnedWriteBatch,
-    db: &Db,
+    state: &AppState,
     mut repo_state: RepoState<'s>,
     validated: ValidatedCommit<'_>,
     filter: &FilterConfig,
-    ephemeral: bool,
-    only_index_links: bool,
 ) -> Result<ApplyCommitResults<'s>> {
+    let db = &state.db;
+    let ephemeral = state.ephemeral;
+    let only_index_links = state.only_index_links;
     let commit = validated.commit;
     let parsed = validated.parsed_blocks;
     let did = &commit.repo;
