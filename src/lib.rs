@@ -14,10 +14,16 @@ pub mod deps {
     pub use smol_str;
 }
 
-#[cfg(all(feature = "relay", feature = "indexer"))]
+#[cfg(all(
+    feature = "relay",
+    any(feature = "indexer", feature = "indexer_stream", feature = "backlinks")
+))]
 compile_error!("can't be relay and indexer at the same time");
-#[cfg(all(feature = "relay", feature = "backlinks"))]
-compile_error!("can't index backlinks while running as a relay");
+#[cfg(all(
+    not(feature = "indexer"),
+    any(feature = "indexer_stream", feature = "backlinks")
+))]
+compile_error!("indexer dependent features (stream, backlinks) without indexer can't be enabled");
 
 pub(crate) mod api;
 #[cfg(feature = "indexer")]

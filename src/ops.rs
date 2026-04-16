@@ -1,13 +1,11 @@
 use fjall::OwnedWriteBatch;
 use fjall::Slice;
 
-use jacquard_common::CowStr;
 #[cfg(feature = "backlinks")]
 use jacquard_common::Data;
 use jacquard_common::types::did::Did;
 use miette::{Context, IntoDiagnostic, Result};
 use std::collections::HashMap;
-use std::sync::atomic::Ordering;
 use tracing::debug;
 
 use crate::db::types::{DbAction, DbRkey, DbTid, TrimmedDid};
@@ -16,10 +14,15 @@ use crate::filter::FilterConfig;
 use crate::ingest::stream::Commit;
 use crate::ingest::validation::ValidatedCommit;
 use crate::state::AppState;
-use crate::types::StoredData;
-use crate::types::{
-    AccountEvt, BroadcastEvent, IdentityEvt, MarshallableEvt, RepoState, RepoStatus, ResyncState,
-    StoredEvent,
+use crate::types::{RepoState, RepoStatus, ResyncState};
+
+#[cfg(feature = "indexer_stream")]
+use {
+    crate::types::{
+        AccountEvt, BroadcastEvent, IdentityEvt, MarshallableEvt, StoredData, StoredEvent,
+    },
+    jacquard_common::CowStr,
+    std::sync::atomic::Ordering,
 };
 
 pub fn persist_to_resync_buffer(db: &Db, did: &Did, commit: &Commit) -> Result<()> {
@@ -36,6 +39,7 @@ pub fn persist_to_resync_buffer(db: &Db, did: &Did, commit: &Commit) -> Result<(
 
 // emitting identity is ephemeral
 // we dont replay these, consumers can just fetch identity themselves if they need it
+#[cfg(feature = "indexer_stream")]
 pub fn make_identity_event(db: &Db, evt: IdentityEvt<'static>) -> BroadcastEvent {
     let event_id = db.next_event_id.fetch_add(1, Ordering::SeqCst);
     let marshallable = MarshallableEvt {
@@ -48,6 +52,7 @@ pub fn make_identity_event(db: &Db, evt: IdentityEvt<'static>) -> BroadcastEvent
     BroadcastEvent::Ephemeral(Box::new(marshallable))
 }
 
+#[cfg(feature = "indexer_stream")]
 pub fn make_account_event(db: &Db, evt: AccountEvt<'static>) -> BroadcastEvent {
     let event_id = db.next_event_id.fetch_add(1, Ordering::SeqCst);
     let marshallable = MarshallableEvt {
@@ -237,10 +242,11 @@ pub fn apply_commit<'s>(
         let rkey = DbRkey::new(rkey);
         let db_key = keys::record_key(did, collection, &rkey);
 
+        #[cfg(feature = "indexer_stream")]
         let event_id = db.next_event_id.fetch_add(1, Ordering::SeqCst);
 
         let action = DbAction::try_from(op.action.as_str())?;
-        let block = match action {
+        let block: Option<bytes::Bytes> = match action {
             DbAction::Create | DbAction::Update => {
                 let Some(cid) = &op.cid else {
                     continue;
@@ -281,10 +287,17 @@ pub fn apply_commit<'s>(
                         )?;
                     }
                     None
-                } else if action == DbAction::Create || action == DbAction::Update {
-                    Some(bytes.clone())
                 } else {
-                    unreachable!("we tested if we are in create or update action")
+                    // in ephemeral mode, capture bytes inline for event emission
+                    #[cfg(feature = "indexer_stream")]
+                    {
+                        Some(bytes.clone())
+                    }
+                    #[cfg(not(feature = "indexer_stream"))]
+                    {
+                        let _ = bytes;
+                        None
+                    }
                 }
             }
             DbAction::Delete => {
@@ -309,28 +322,32 @@ pub fn apply_commit<'s>(
             }
         };
 
-        let evt = StoredEvent {
-            live: true,
-            did: TrimmedDid::from(did),
-            rev: DbTid::from(&commit.rev),
-            collection: CowStr::Borrowed(collection),
-            rkey,
-            action,
-            data: block
-                .map(StoredData::Block)
-                .or_else(|| {
-                    (!only_index_links).then(|| {
-                        op.cid
-                            .as_ref()
-                            .map(|c| c.to_ipld().expect("valid cid"))
-                            .map(StoredData::Ptr)
-                    })?
-                })
-                .unwrap_or(StoredData::Nothing),
-        };
-
-        let bytes = rmp_serde::to_vec(&evt).into_diagnostic()?;
-        batch.insert(&db.events, keys::event_key(event_id), bytes);
+        #[cfg(feature = "indexer_stream")]
+        {
+            let evt = StoredEvent {
+                live: true,
+                did: TrimmedDid::from(did),
+                rev: DbTid::from(&commit.rev),
+                collection: CowStr::Borrowed(collection),
+                rkey,
+                action,
+                data: block
+                    .map(StoredData::Block)
+                    .or_else(|| {
+                        (!only_index_links).then(|| {
+                            op.cid
+                                .as_ref()
+                                .map(|c| c.to_ipld().expect("valid cid"))
+                                .map(StoredData::Ptr)
+                        })?
+                    })
+                    .unwrap_or(StoredData::Nothing),
+            };
+            let bytes = rmp_serde::to_vec(&evt).into_diagnostic()?;
+            batch.insert(&db.events, keys::event_key(event_id), bytes);
+        }
+        #[cfg(not(feature = "indexer_stream"))]
+        drop(block);
     }
 
     // update counts

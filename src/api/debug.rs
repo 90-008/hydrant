@@ -1,6 +1,8 @@
 use crate::api::AppState;
 use crate::db::keys;
-use crate::types::{RepoState, ResyncState, StoredEvent};
+#[cfg(feature = "indexer_stream")]
+use crate::types::StoredEvent;
+use crate::types::{RepoState, ResyncState};
 use axum::routing::{get, post};
 use axum::{
     Json,
@@ -32,7 +34,10 @@ pub fn router() -> axum::Router<Arc<AppState>> {
     let r = axum::Router::new()
         .route("/debug/get", get(handle_debug_get))
         .route("/debug/iter", get(handle_debug_iter))
-        .route("/debug/compact", post(handle_debug_compact))
+        .route("/debug/compact", post(handle_debug_compact));
+
+    #[cfg(any(feature = "indexer_stream", feature = "relay"))]
+    let r = r
         .route(
             "/debug/ephemeral_ttl_tick",
             post(handle_debug_ephemeral_ttl_tick),
@@ -100,6 +105,7 @@ fn deserialize_value(partition: &str, value: &[u8]) -> Value {
                 return serde_json::to_value(state).unwrap_or(Value::Null);
             }
         }
+        #[cfg(feature = "indexer_stream")]
         "events" => {
             if let Ok(event) = rmp_serde::from_slice::<StoredEvent>(value) {
                 return serde_json::to_value(event).unwrap_or(Value::Null);
@@ -279,7 +285,7 @@ fn get_keyspace_by_name(db: &crate::db::Db, name: &str) -> Result<fjall::Keyspac
         "pending" => Ok(db.pending.clone()),
         #[cfg(feature = "indexer")]
         "resync" => Ok(db.resync.clone()),
-        #[cfg(feature = "indexer")]
+        #[cfg(feature = "indexer_stream")]
         "events" => Ok(db.events.clone()),
         #[cfg(feature = "indexer")]
         "records" => Ok(db.records.clone()),
@@ -312,15 +318,16 @@ pub async fn handle_debug_compact(
     Ok(StatusCode::OK)
 }
 
+#[cfg(any(feature = "indexer_stream", feature = "relay"))]
 pub async fn handle_debug_ephemeral_ttl_tick(
     State(state): State<Arc<AppState>>,
 ) -> Result<StatusCode, StatusCode> {
-    tokio::task::spawn_blocking(move || {
-        #[cfg(feature = "indexer")]
-        let res = crate::db::ephemeral::ephemeral_ttl_tick(&state.db, &state.ephemeral_ttl);
+    tokio::task::spawn_blocking(move || -> miette::Result<()> {
+        #[cfg(feature = "indexer_stream")]
+        crate::db::ephemeral::ephemeral_ttl_tick(&state.db, &state.ephemeral_ttl)?;
         #[cfg(feature = "relay")]
-        let res = crate::db::ephemeral::relay_events_ttl_tick(&state.db, &state.ephemeral_ttl);
-        res
+        crate::db::ephemeral::relay_events_ttl_tick(&state.db, &state.ephemeral_ttl)?;
+        Ok(())
     })
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
@@ -330,6 +337,7 @@ pub async fn handle_debug_ephemeral_ttl_tick(
 }
 
 #[derive(Deserialize)]
+#[cfg(any(feature = "indexer_stream", feature = "relay"))]
 pub struct DebugSeedWatermarkRequest {
     /// unix timestamp (seconds) to write the watermark at
     pub ts: u64,
@@ -340,20 +348,31 @@ pub struct DebugSeedWatermarkRequest {
 /// writes an event watermark entry directly to the cursors keyspace, using identical
 /// key/value encoding to the real TTL worker. used in tests to plant a past watermark
 /// so the real `ephemeral_ttl_tick` code path is exercised without waiting 3600 seconds.
+#[cfg(any(feature = "indexer_stream", feature = "relay"))]
 pub async fn handle_debug_seed_watermark(
     State(state): State<Arc<AppState>>,
     Query(req): Query<DebugSeedWatermarkRequest>,
 ) -> Result<StatusCode, StatusCode> {
-    tokio::task::spawn_blocking(move || {
-        #[cfg(feature = "indexer")]
-        let key = crate::db::keys::event_watermark_key(req.ts);
-        #[cfg(feature = "relay")]
-        let key = crate::db::keys::relay_event_watermark_key(req.ts);
+    tokio::task::spawn_blocking(move || -> Result<(), StatusCode> {
+        #[cfg(feature = "indexer_stream")]
         state
             .db
             .cursors
-            .insert(key, req.event_id.to_be_bytes())
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+            .insert(
+                crate::db::keys::event_watermark_key(req.ts),
+                req.event_id.to_be_bytes(),
+            )
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        #[cfg(feature = "relay")]
+        state
+            .db
+            .cursors
+            .insert(
+                crate::db::keys::relay_event_watermark_key(req.ts),
+                req.event_id.to_be_bytes(),
+            )
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        Ok(())
     })
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)??;

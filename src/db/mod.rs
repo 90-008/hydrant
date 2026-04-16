@@ -1,10 +1,11 @@
 use crate::config::Compression;
 use crate::db::compaction::DropPrefixFilterFactory;
-#[cfg(feature = "indexer")]
+use crate::types::{RepoMetadata, RepoState};
+
+#[cfg(feature = "indexer_stream")]
 use crate::types::BroadcastEvent;
 #[cfg(feature = "relay")]
 use crate::types::RelayBroadcast;
-use crate::types::{RepoMetadata, RepoState};
 
 use fjall::config::{BlockSizePolicy, CompressionPolicy, RestartIntervalPolicy};
 use fjall::{
@@ -18,8 +19,6 @@ use smol_str::SmolStr;
 use std::cell::RefCell;
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
-
 use url::Url;
 
 pub mod compaction;
@@ -30,8 +29,10 @@ pub mod migration;
 pub mod pds_meta;
 pub mod types;
 
-use tokio::sync::broadcast;
 use tracing::error;
+
+#[cfg(any(feature = "indexer_stream", feature = "relay"))]
+use {std::sync::atomic::AtomicU64, tokio::sync::broadcast};
 
 fn default_opts() -> KeyspaceCreateOptions {
     KeyspaceCreateOptions::default()
@@ -56,13 +57,13 @@ pub struct Db {
     pub resync: Keyspace,
     #[cfg(feature = "indexer")]
     pub resync_buffer: Keyspace,
-    #[cfg(feature = "indexer")]
+    #[cfg(feature = "indexer_stream")]
     pub events: Keyspace,
     #[cfg(feature = "backlinks")]
     pub backlinks: Keyspace,
-    #[cfg(feature = "indexer")]
+    #[cfg(feature = "indexer_stream")]
     pub(crate) event_tx: broadcast::Sender<BroadcastEvent>,
-    #[cfg(feature = "indexer")]
+    #[cfg(feature = "indexer_stream")]
     pub next_event_id: Arc<AtomicU64>,
     #[cfg(feature = "relay")]
     pub(crate) relay_events: Keyspace,
@@ -323,7 +324,7 @@ impl Db {
                 .data_block_compression_policy(CompressionPolicy::disabled())
                 .data_block_restart_interval_policy(RestartIntervalPolicy::all(16)),
         )?;
-        #[cfg(feature = "indexer")]
+        #[cfg(feature = "indexer_stream")]
         let events = open_ks(
             "events",
             opts()
@@ -433,7 +434,7 @@ impl Db {
         // when adding new keyspaces, make sure to add them to the /stats endpoint
         // and also update any relevant /debug/* endpoints
 
-        #[cfg(feature = "indexer")]
+        #[cfg(feature = "indexer_stream")]
         let (event_tx, _) = broadcast::channel(10000);
 
         #[cfg(feature = "relay")]
@@ -455,17 +456,17 @@ impl Db {
             resync,
             #[cfg(feature = "indexer")]
             resync_buffer,
-            #[cfg(feature = "indexer")]
+            #[cfg(feature = "indexer_stream")]
             events,
             counts,
             filter,
             crawler,
             #[cfg(feature = "backlinks")]
             backlinks,
-            #[cfg(feature = "indexer")]
+            #[cfg(feature = "indexer_stream")]
             event_tx,
             counts_map: HashMap::new(),
-            #[cfg(feature = "indexer")]
+            #[cfg(feature = "indexer_stream")]
             next_event_id: Arc::new(AtomicU64::new(0)),
             #[cfg(feature = "relay")]
             relay_events,
@@ -493,7 +494,7 @@ impl Db {
                 .store(last_relay_seq + 1, std::sync::atomic::Ordering::Relaxed);
         }
 
-        #[cfg(feature = "indexer")]
+        #[cfg(feature = "indexer_stream")]
         {
             let mut last_id = 0;
             if let Some(guard) = this.events.iter().next_back() {
@@ -529,7 +530,7 @@ impl Db {
         let ks = match ks_name {
             #[cfg(feature = "indexer")]
             "blocks" => &self.blocks,
-            #[cfg(feature = "indexer")]
+            #[cfg(feature = "indexer_stream")]
             "events" => &self.events,
             "repos" => &self.repos,
             #[cfg(feature = "backlinks")]
@@ -647,8 +648,9 @@ impl Db {
             tasks.push(compact(self.pending.clone()));
             tasks.push(compact(self.resync.clone()));
             tasks.push(compact(self.resync_buffer.clone()));
-            tasks.push(compact(self.events.clone()));
         }
+        #[cfg(feature = "indexer_stream")]
+        tasks.push(compact(self.events.clone()));
 
         #[cfg(feature = "relay")]
         tasks.push(compact(self.relay_events.clone()));

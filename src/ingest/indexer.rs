@@ -4,16 +4,14 @@ use crate::ingest::stream::{Account, Commit, Identity};
 use crate::ingest::validation;
 use crate::resolver::{NoSigningKeyError, ResolverError};
 use crate::state::AppState;
-use crate::types::{
-    AccountEvt, BroadcastEvent, GaugeState, IdentityEvt, RepoMetadata, RepoState, RepoStatus,
-};
+use crate::types::{GaugeState, RepoMetadata, RepoState, RepoStatus};
 use crate::{ops, util};
 
 use fjall::OwnedWriteBatch;
 
 use jacquard_common::IntoStatic;
-use jacquard_common::cowstr::ToCowStr;
 use jacquard_common::types::did::Did;
+
 use jacquard_repo::error::CommitError;
 use miette::{Diagnostic, IntoDiagnostic, Result};
 use std::sync::Arc;
@@ -22,6 +20,11 @@ use thiserror::Error;
 use tokio::runtime::Handle as TokioHandle;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
+#[cfg(feature = "indexer_stream")]
+use {
+    crate::types::{AccountEvt, BroadcastEvent, IdentityEvt},
+    jacquard_common::cowstr::ToCowStr,
+};
 
 #[derive(Debug)]
 pub struct IndexerCommitData {
@@ -124,6 +127,7 @@ struct WorkerContext<'a> {
     batch: OwnedWriteBatch,
     added_blocks: &'a mut i64,
     records_delta: &'a mut i64,
+    #[cfg(feature = "indexer_stream")]
     broadcast_events: &'a mut Vec<BroadcastEvent>,
 }
 
@@ -194,10 +198,12 @@ impl FirehoseWorker {
         let _guard = handle.enter();
         debug!(shard = id, "shard started");
 
+        #[cfg(feature = "indexer_stream")]
         let mut broadcast_events = Vec::new();
 
         while let Some(msg) = rx.blocking_recv() {
             let batch = state.db.inner.batch();
+            #[cfg(feature = "indexer_stream")]
             broadcast_events.clear();
 
             let mut added_blocks = 0;
@@ -208,6 +214,7 @@ impl FirehoseWorker {
                 batch,
                 added_blocks: &mut added_blocks,
                 records_delta: &mut records_delta,
+                #[cfg(feature = "indexer_stream")]
                 broadcast_events: &mut broadcast_events,
             };
 
@@ -393,6 +400,7 @@ impl FirehoseWorker {
             if records_delta != 0 {
                 state.db.update_count("records", records_delta);
             }
+            #[cfg(feature = "indexer_stream")]
             for evt in broadcast_events.drain(..) {
                 let _ = state.db.event_tx.send(evt);
             }
@@ -473,26 +481,31 @@ impl FirehoseWorker {
         let repo_state = res.repo_state;
         *ctx.added_blocks += res.blocks_count;
         *ctx.records_delta += res.records_delta;
+        #[cfg(feature = "indexer_stream")]
         ctx.broadcast_events
             .push(BroadcastEvent::Persisted(db.next_event_id.load(SeqCst) - 1));
 
         Ok(RepoProcessResult::Ok(repo_state))
     }
 
+    #[cfg_attr(not(feature = "indexer_stream"), allow(unused_variables))]
     fn handle_identity<'s>(
         ctx: &mut WorkerContext,
         repo_state: RepoState<'s>,
         identity: &Identity<'_>,
         changed: bool,
     ) -> Result<RepoProcessResult<'s, 'static>, IngestError> {
-        let db = &ctx.state.db;
-        let did = &identity.did;
-        if changed {
-            let evt = IdentityEvt {
-                did: did.clone().into_static(),
-                handle: repo_state.handle.clone().map(IntoStatic::into_static),
-            };
-            ctx.broadcast_events.push(ops::make_identity_event(db, evt));
+        #[cfg(feature = "indexer_stream")]
+        {
+            let db = &ctx.state.db;
+            let did = &identity.did;
+            if changed {
+                let evt = IdentityEvt {
+                    did: did.clone().into_static(),
+                    handle: repo_state.handle.clone().map(IntoStatic::into_static),
+                };
+                ctx.broadcast_events.push(ops::make_identity_event(db, evt));
+            }
         }
 
         Ok(RepoProcessResult::Ok(repo_state))
@@ -508,6 +521,7 @@ impl FirehoseWorker {
         let db = &ctx.state.db;
         let did = &account.did;
         let is_inactive = !account.active;
+        #[cfg(feature = "indexer_stream")]
         let evt = AccountEvt {
             did: did.clone().into_static(),
             active: account.active,
@@ -537,6 +551,7 @@ impl FirehoseWorker {
             }
         }
 
+        #[cfg(feature = "indexer_stream")]
         if changed {
             ctx.broadcast_events.push(ops::make_account_event(db, evt));
         }

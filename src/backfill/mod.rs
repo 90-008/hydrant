@@ -4,18 +4,15 @@ use crate::filter::FilterMode;
 use crate::ops;
 use crate::resolver::ResolverError;
 use crate::state::AppState;
-use crate::types::{
-    AccountEvt, BroadcastEvent, Commit, GaugeState, RepoState, RepoStatus, ResyncErrorKind,
-    ResyncState, StoredData, StoredEvent,
-};
+use crate::types::{Commit, GaugeState, RepoState, RepoStatus, ResyncErrorKind, ResyncState};
 
 use fjall::Slice;
 use jacquard_api::com_atproto::sync::get_repo::{GetRepo, GetRepoError};
+use jacquard_common::IntoStatic;
 use jacquard_common::error::{ClientError, ClientErrorKind};
 use jacquard_common::types::cid::Cid;
 use jacquard_common::types::did::Did;
 use jacquard_common::xrpc::{XrpcError, XrpcExt};
-use jacquard_common::{CowStr, IntoStatic};
 use jacquard_repo::mst::Mst;
 use jacquard_repo::{BlockStore, MemoryBlockStore};
 use miette::{Diagnostic, IntoDiagnostic, Result};
@@ -23,11 +20,17 @@ use reqwest::StatusCode;
 use smol_str::{SmolStr, ToSmolStr};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
+
 use thiserror::Error;
 use tokio::sync::Semaphore;
 use tracing::{Instrument, debug, error, info, trace, warn};
+#[cfg(feature = "indexer_stream")]
+use {
+    crate::types::{AccountEvt, BroadcastEvent, StoredData, StoredEvent},
+    jacquard_common::CowStr,
+    std::sync::atomic::Ordering,
+};
 
 pub mod manager;
 
@@ -412,6 +415,7 @@ async fn process_did<'i>(
     );
     state.update_from_doc(doc);
 
+    #[cfg(feature = "indexer_stream")]
     let emit_identity = |status: &RepoStatus, active: bool| {
         let status = match status {
             RepoStatus::Deactivated => "deactivated",
@@ -463,6 +467,7 @@ async fn process_did<'i>(
             if let Some(status) = inactive_status {
                 warn!(?status, "repo is inactive, stopping backfill");
 
+                #[cfg(feature = "indexer_stream")]
                 emit_identity(&status, false);
 
                 let resync_state = ResyncState::Gone {
@@ -491,6 +496,7 @@ async fn process_did<'i>(
     };
 
     // emit identity event so any consumers know, but only if something changed
+    #[cfg(feature = "indexer_stream")]
     if state.active != previous_state.active
         || state.status != previous_state.status
         || previous_state.pds.is_none()
@@ -555,6 +561,7 @@ async fn process_did<'i>(
     let result = {
         let app_state = app_state.clone();
         let did = did.clone();
+        #[cfg(feature = "indexer_stream")]
         let rev = root_commit.rev;
 
         tokio::task::spawn_blocking(move || {
@@ -663,24 +670,27 @@ async fn process_did<'i>(
                         *collection_counts.entry(path.0.clone()).or_default() += 1;
                     }
 
-                    let event_id = app_state.db.next_event_id.fetch_add(1, Ordering::SeqCst);
-                    let evt = StoredEvent {
-                        live: false,
-                        did: TrimmedDid::from(&did),
-                        rev,
-                        collection: CowStr::Borrowed(collection),
-                        rkey,
-                        action,
-                        data: if ephemeral {
-                            StoredData::Block(val)
-                        } else if only_index_links {
-                            StoredData::Nothing
-                        } else {
-                            StoredData::Ptr(cid_obj.to_ipld().expect("valid cid"))
-                        },
-                    };
-                    let bytes = rmp_serde::to_vec(&evt).into_diagnostic()?;
-                    batch.insert(&app_state.db.events, keys::event_key(event_id), bytes);
+                    #[cfg(feature = "indexer_stream")]
+                    {
+                        let event_id = app_state.db.next_event_id.fetch_add(1, Ordering::SeqCst);
+                        let evt = StoredEvent {
+                            live: false,
+                            did: TrimmedDid::from(&did),
+                            rev,
+                            collection: CowStr::Borrowed(collection),
+                            rkey,
+                            action,
+                            data: if ephemeral {
+                                StoredData::Block(val)
+                            } else if only_index_links {
+                                StoredData::Nothing
+                            } else {
+                                StoredData::Ptr(cid_obj.to_ipld().expect("valid cid"))
+                            },
+                        };
+                        let bytes = rmp_serde::to_vec(&evt).into_diagnostic()?;
+                        batch.insert(&app_state.db.events, keys::event_key(event_id), bytes);
+                    }
 
                     count += 1;
                 }
@@ -705,18 +715,21 @@ async fn process_did<'i>(
                     &rkey.to_smolstr(),
                 )?;
 
-                let event_id = app_state.db.next_event_id.fetch_add(1, Ordering::SeqCst);
-                let evt = StoredEvent {
-                    live: false,
-                    did: TrimmedDid::from(&did),
-                    rev,
-                    collection: CowStr::Borrowed(&collection),
-                    rkey,
-                    action: DbAction::Delete,
-                    data: StoredData::Nothing,
-                };
-                let bytes = rmp_serde::to_vec(&evt).into_diagnostic()?;
-                batch.insert(&app_state.db.events, keys::event_key(event_id), bytes);
+                #[cfg(feature = "indexer_stream")]
+                {
+                    let event_id = app_state.db.next_event_id.fetch_add(1, Ordering::SeqCst);
+                    let evt = StoredEvent {
+                        live: false,
+                        did: TrimmedDid::from(&did),
+                        rev,
+                        collection: CowStr::Borrowed(&collection),
+                        rkey,
+                        action: DbAction::Delete,
+                        data: StoredData::Nothing,
+                    };
+                    let bytes = rmp_serde::to_vec(&evt).into_diagnostic()?;
+                    batch.insert(&app_state.db.events, keys::event_key(event_id), bytes);
+                }
 
                 delta -= 1;
                 count += 1;
@@ -812,6 +825,7 @@ async fn process_did<'i>(
         "committed backfill batch"
     );
 
+    #[cfg(feature = "indexer_stream")]
     let _ = db.event_tx.send(BroadcastEvent::Persisted(
         db.next_event_id.load(Ordering::SeqCst) - 1,
     ));

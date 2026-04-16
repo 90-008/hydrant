@@ -51,6 +51,7 @@ pub fn relay_event_watermark_key(timestamp_secs: u64) -> Vec<u8> {
 }
 
 // key format: {SEQ}
+#[cfg(any(feature = "indexer_stream", feature = "relay"))]
 pub fn event_key(seq: u64) -> [u8; 8] {
     seq.to_be_bytes()
 }

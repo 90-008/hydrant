@@ -11,7 +11,10 @@ use serde::{Deserialize, Serialize, Serializer};
 use serde_json::Value;
 use smol_str::{SmolStr, ToSmolStr};
 
-use crate::db::types::{DbAction, DbRkey, DbTid, DidKey, TrimmedDid};
+use crate::db::types::{DbTid, DidKey};
+
+#[cfg(feature = "indexer_stream")]
+use crate::db::types::{DbAction, DbRkey, TrimmedDid};
 use crate::resolver::MiniDoc;
 
 pub(crate) mod v2 {
@@ -200,6 +203,7 @@ mod indexer {
         }
     }
 
+    #[cfg(feature = "indexer_stream")]
     #[derive(Clone, Debug)]
     pub(crate) enum BroadcastEvent {
         #[allow(dead_code)]
@@ -367,6 +371,7 @@ pub struct AccountEvt<'i> {
     pub status: Option<CowStr<'i>>,
 }
 
+#[cfg(feature = "indexer_stream")]
 #[derive(Serialize, Deserialize, Clone)]
 pub(crate) enum StoredData {
     Nothing,
@@ -375,18 +380,21 @@ pub(crate) enum StoredData {
     Block(Bytes),
 }
 
+#[cfg(feature = "indexer_stream")]
 impl StoredData {
     pub fn is_nothing(&self) -> bool {
         matches!(self, StoredData::Nothing)
     }
 }
 
+#[cfg(feature = "indexer_stream")]
 impl Default for StoredData {
     fn default() -> Self {
         Self::Nothing
     }
 }
 
+#[cfg(feature = "indexer_stream")]
 impl Debug for StoredData {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -397,6 +405,7 @@ impl Debug for StoredData {
     }
 }
 
+#[cfg(feature = "indexer_stream")]
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(bound(deserialize = "'i: 'de"))]
 pub(crate) struct StoredEvent<'i> {

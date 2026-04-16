@@ -1,12 +1,15 @@
-use crate::db::{Db, keys};
-use fjall::Keyspace;
-use miette::{IntoDiagnostic, WrapErr};
-use std::sync::Arc;
-use std::sync::atomic::Ordering;
-use std::time::Duration;
-use tracing::{debug, error, info};
+#[cfg(any(feature = "indexer_stream", feature = "relay"))]
+use {
+    crate::db::{Db, keys},
+    fjall::Keyspace,
+    miette::{IntoDiagnostic, WrapErr},
+    std::sync::Arc,
+    std::sync::atomic::Ordering,
+    std::time::Duration,
+    tracing::{debug, error, info},
+};
 
-#[cfg(feature = "indexer")]
+#[cfg(feature = "indexer_stream")]
 pub fn ephemeral_ttl_worker(state: Arc<crate::state::AppState>) {
     info!("ephemeral TTL worker started");
     loop {
@@ -28,7 +31,7 @@ pub fn relay_events_ttl_worker(state: Arc<crate::state::AppState>) {
     }
 }
 
-#[cfg(feature = "indexer")]
+#[cfg(feature = "indexer_stream")]
 pub fn ephemeral_ttl_tick(db: &Db, ttl: &Duration) -> miette::Result<()> {
     let current_seq = db.next_event_id.load(Ordering::SeqCst);
     ttl_tick_inner(
@@ -54,6 +57,7 @@ pub fn relay_events_ttl_tick(db: &Db, ttl: &Duration) -> miette::Result<()> {
     )
 }
 
+#[cfg(any(feature = "indexer_stream", feature = "relay"))]
 fn ttl_tick_inner(
     db: &Db,
     ttl: &Duration,

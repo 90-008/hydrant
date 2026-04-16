@@ -1,5 +1,6 @@
 use super::*;
 
+#[cfg(feature = "indexer_stream")]
 /// a stream of [`Event`]s. returned by [`Hydrant::subscribe`].
 ///
 /// implements [`futures::Stream`] and can be used with `StreamExt::next`,
@@ -7,6 +8,7 @@ use super::*;
 /// the stream terminates when the underlying channel closes (i.e. hydrant shuts down).
 pub struct EventStream(mpsc::Receiver<Event>);
 
+#[cfg(feature = "indexer_stream")]
 impl Stream for EventStream {
     type Item = Event;
 
@@ -42,6 +44,7 @@ impl BackfillHandle {
     }
 }
 
+#[cfg(feature = "indexer_stream")]
 impl Hydrant {
     /// subscribe to the ordered event stream.
     ///

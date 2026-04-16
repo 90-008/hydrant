@@ -7,7 +7,7 @@ use crate::db::keys;
 use crate::state::AppState;
 use std::sync::atomic::Ordering;
 
-#[cfg(feature = "indexer")]
+#[cfg(feature = "indexer_stream")]
 use {
     super::Event,
     crate::db,
@@ -20,7 +20,7 @@ use {
     sha2::{Digest, Sha256},
 };
 
-#[cfg(feature = "indexer")]
+#[cfg(feature = "indexer_stream")]
 pub(super) fn event_stream_thread(
     state: Arc<AppState>,
     tx: mpsc::Sender<Event>,
@@ -156,7 +156,7 @@ pub(super) fn relay_stream_thread(
     }
 }
 
-#[cfg(feature = "indexer")]
+#[cfg(feature = "indexer_stream")]
 fn stored_to_event(state: &AppState, id: u64, stored: StoredEvent<'_>) -> Option<Event> {
     let StoredEvent {
         live,

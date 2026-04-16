@@ -48,10 +48,10 @@ use crate::filter::FilterMode;
 use crate::ingest::indexer::FirehoseWorker;
 use crate::pds_meta::{PdsMeta, PdsMetaHandle};
 use crate::state::AppState;
+#[cfg(feature = "indexer_stream")]
 use crate::types::MarshallableEvt;
-
 use firehose::FirehoseShared;
-#[cfg(feature = "indexer")]
+#[cfg(feature = "indexer_stream")]
 use stream::event_stream_thread;
 #[cfg(feature = "relay")]
 use stream::relay_stream_thread;
@@ -77,6 +77,7 @@ pub struct Host {
 /// - `"account"`: a repo's active/inactive status changed. carries an [`AccountEvt`]. ephemeral, not replayable.
 ///
 /// the `id` field is a monotonically increasing sequence number usable as a cursor for [`Hydrant::subscribe`].
+#[cfg(feature = "indexer_stream")]
 pub type Event = MarshallableEvt<'static>;
 
 /// the top-level handle to a hydrant instance.
@@ -294,7 +295,7 @@ impl Hydrant {
             }
 
             // 7. ephemeral GC thread (not used in relay mode)
-            #[cfg(feature = "indexer")]
+            #[cfg(feature = "indexer_stream")]
             if config.ephemeral {
                 let state = state.clone();
                 std::thread::Builder::new()
@@ -344,10 +345,11 @@ impl Hydrant {
             });
 
             // 9. events/sec stats ticker
+            #[cfg(any(feature = "indexer_stream", feature = "relay"))]
             tokio::spawn({
                 let state = state.clone();
                 let get_id = |state: &AppState| {
-                    #[cfg(feature = "indexer")]
+                    #[cfg(feature = "indexer_stream")]
                     let id = state.db.next_event_id.load(Ordering::Relaxed);
                     #[cfg(feature = "relay")]
                     let id = state.db.next_relay_seq.load(Ordering::Relaxed);
@@ -681,6 +683,10 @@ impl Hydrant {
             count_keys.push("resync");
         }
 
+        #[cfg_attr(
+            not(any(feature = "indexer_stream", feature = "relay")),
+            allow(unused_mut)
+        )]
         let mut counts: BTreeMap<&'static str, u64> =
             futures::future::join_all(count_keys.into_iter().map(|name| {
                 let state = state.clone();
@@ -690,7 +696,7 @@ impl Hydrant {
             .into_iter()
             .collect();
 
-        #[cfg(feature = "indexer")]
+        #[cfg(feature = "indexer_stream")]
         counts.insert("events", state.db.events.approximate_len() as u64);
 
         #[cfg(feature = "relay")]
@@ -714,8 +720,9 @@ impl Hydrant {
                 s.insert("pending", state.db.pending.disk_space());
                 s.insert("resync", state.db.resync.disk_space());
                 s.insert("resync_buffer", state.db.resync_buffer.disk_space());
-                s.insert("events", state.db.events.disk_space());
             }
+            #[cfg(feature = "indexer_stream")]
+            s.insert("events", state.db.events.disk_space());
 
             #[cfg(feature = "relay")]
             s.insert("relay_events", state.db.relay_events.disk_space());

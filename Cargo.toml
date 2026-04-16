@@ -4,11 +4,12 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
-default = ["indexer"]
+default = ["indexer", "indexer_stream"]
 __persist_sync_all = []
 backlinks = []
 relay = []
 indexer = []
+indexer_stream = ["indexer"]
 
 [dependencies]
 tokio = { version = "1.0", features = ["full"] }
