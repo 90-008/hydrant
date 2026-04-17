@@ -151,22 +151,27 @@ impl FirehoseHandle {
         *self.state.firehose_enabled.borrow()
     }
 
-    /// returns `true` if this URL is already a known firehose source — either currently
-    /// running or persisted (e.g. the host is offline but was previously added).
+    /// returns `true` if this URL is already a known firehose source.
+    /// either currently running or persisted (e.g. the host is offline but was previously added).
     pub fn is_source_known(&self, url: &Url) -> bool {
         self.known_sources.contains_sync(url)
     }
 
+    /// return `true` if this source has a running firehose task (eg. its not offline).
+    pub fn is_source_running(&self, url: &Url) -> bool {
+        self.tasks.contains_sync(url)
+    }
+
     /// list all currently active firehose sources.
     pub async fn list_sources(&self) -> Vec<FirehoseSourceInfo> {
-        let mut out = Vec::new();
+        let mut out = Vec::with_capacity(self.tasks.capacity());
         self.tasks
-            .any_async(|url, handle| {
+            .iter_async(|url, handle| {
                 out.push(FirehoseSourceInfo {
                     url: url.clone(),
                     is_pds: handle.is_pds,
                 });
-                false
+                true
             })
             .await;
         out

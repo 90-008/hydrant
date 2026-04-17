@@ -24,6 +24,11 @@ pub async fn handle(
         });
     }
 
+    // if this host is already running, everything is already ok
+    if hydrant.firehose.is_source_running(&url) {
+        return Ok(StatusCode::OK);
+    }
+
     // enforce daily new pds limit on unknown hosts
     if !hydrant.firehose.is_source_known(&url) {
         let (allowed, to_persist) = hydrant.state.pds_daily_limit.try_increment();
