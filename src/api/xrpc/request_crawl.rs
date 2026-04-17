@@ -1,6 +1,7 @@
 use jacquard_api::com_atproto::sync::request_crawl::{
     RequestCrawlError, RequestCrawlRequest, RequestCrawlResponse,
 };
+use miette::IntoDiagnostic;
 use url::Url;
 
 use super::*;
@@ -21,6 +22,30 @@ pub async fn handle(
                 "host is banned".into(),
             ))),
         });
+    }
+
+    // enforce daily new pds limit on unknown hosts
+    if !hydrant.firehose.is_source_known(&url) {
+        let (allowed, to_persist) = hydrant.state.pds_daily_limit.try_increment();
+        if !allowed {
+            return Err(rate_limited(
+                nsid,
+                "daily limit for new PDS sources reached",
+            ));
+        }
+
+        // persist the new count before returning so a crash cannot reset the counter
+        // and allow the budget to be replayed.
+        if let Some((day, count)) = to_persist {
+            let state = hydrant.state.clone();
+            tokio::task::spawn_blocking(move || {
+                crate::db::save_pds_daily_adds(&state.db, day, count)
+            })
+            .await
+            .into_diagnostic()
+            .flatten()
+            .map_err(|e| internal_error(nsid, e))?;
+        }
     }
 
     hydrant

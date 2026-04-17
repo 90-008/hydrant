@@ -238,6 +238,7 @@ directory, it will also be loaded automatically.
 | `ENABLE_CRAWLER` | `true` if full network or crawler sources are configured, `false` otherwise | whether to actively query the network for unknown repositories. |
 | `CRAWLER_MAX_PENDING_REPOS` | `2000` | max pending repos for crawler. |
 | `CRAWLER_RESUME_PENDING_REPOS` | `1000` | resume threshold for crawler pending repos. |
+| `NEW_HOST_LIMIT` | `50` | in relay mode, decides how many new hosts can be added via `com.atproto.sync.requestCrawl` in a day. | 
 | `RATE_TIERS` | | comma-separated list of named rate tier definitions in `name:base/mul/hourly/daily[/account_limit]` format (e.g. `trusted:5000/10.0/18000000/432000000/10000000`). the optional account limit prevents new accounts from being created on this PDS once reached. built-in tiers (`default`, `trusted`) are always present and can be overridden. |
 | `TIER_RULES` | | comma-separated ordered list of glob rules in `pattern:tier_name` format (e.g. `*.bsky.network:trusted`). rules are evaluated in order; first match wins. explicit API assignments via `PUT /pds/tiers` take precedence over rules; the `default` tier is the final fallback. uses standard glob wildcards (`*`, `?`) matched against the PDS hostname. |
 

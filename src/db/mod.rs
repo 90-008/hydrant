@@ -836,6 +836,36 @@ pub fn persist_counts(db: &Db) -> Result<()> {
     batch.commit().into_diagnostic()
 }
 
+/// load the persisted (day, count) pair for the daily PDS add counter, if present.
+/// returns `None` if no entry exists or the stored data is malformed.
+#[cfg(feature = "relay")]
+pub fn load_pds_daily_adds(db: &Db) -> Result<Option<(u64, u64)>> {
+    let Some(val) = db.cursors.get(keys::PDS_DAILY_ADDS_KEY).into_diagnostic()? else {
+        return Ok(None);
+    };
+    if val.len() < 16 {
+        miette::bail!("malformed pds daily limit value");
+    }
+    let day = u64::from_be_bytes(val[..8].try_into().into_diagnostic()?);
+    let count = u64::from_be_bytes(val[8..].try_into().into_diagnostic()?);
+    Ok(Some((day, count)))
+}
+
+/// persist the daily PDS add counter (day, count) to the cursors keyspace.
+/// value layout: [day: u64 BE][count: u64 BE] = 16 bytes.
+///
+/// takes the `cursors` keyspace directly so the caller can clone it into a
+/// `spawn_blocking` closure without needing an owned `Db`.
+#[cfg(feature = "relay")]
+pub fn save_pds_daily_adds(db: &Db, day: u64, count: u64) -> Result<()> {
+    let mut value = [0u8; 16];
+    value[..8].copy_from_slice(&day.to_be_bytes());
+    value[8..].copy_from_slice(&count.to_be_bytes());
+    db.cursors
+        .insert(keys::PDS_DAILY_ADDS_KEY, value)
+        .into_diagnostic()
+}
+
 pub fn load_persisted_firehose_sources(
     db: &crate::db::Db,
 ) -> Result<Vec<crate::config::FirehoseSource>> {

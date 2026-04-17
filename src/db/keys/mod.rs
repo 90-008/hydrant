@@ -100,3 +100,8 @@ pub fn firehose_source_key(url: &str) -> Vec<u8> {
 pub fn pds_account_count_key(host: &str) -> String {
     format!("p|{host}")
 }
+
+/// key for the persisted daily-PDS-add counter in the cursors keyspace.
+/// value layout: [day: u64 BE][count: u64 BE] = 16 bytes.
+#[cfg(feature = "relay")]
+pub const PDS_DAILY_ADDS_KEY: &[u8] = b"pds_daily_adds";

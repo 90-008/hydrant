@@ -375,6 +375,11 @@ pub struct Config {
     /// set via `HYDRANT_ONLY_INDEX_LINKS=true`.
     pub only_index_links: bool,
 
+    /// maximum number of new PDS sources that may be added (via seeding or API) in a single
+    /// UTC calendar day. `None` means unlimited.
+    /// set via `HYDRANT_NEW_HOST_LIMIT`.
+    pub new_host_limit: Option<u64>,
+
     /// base URL(s) of relay or aggregator services to seed firehose PDS sources from at startup.
     ///
     /// hydrant calls `com.atproto.sync.listHosts` on each URL and adds the returned PDSes
@@ -495,6 +500,7 @@ impl Default for Config {
             filter_excludes: None,
             enable_backlinks: false,
             only_index_links: false,
+            new_host_limit: Some(50),
             tier_rules: vec![],
             tier_policy: {
                 let mut tiers = HashMap::new();
@@ -671,6 +677,9 @@ impl Config {
 
         let enable_backlinks: bool = cfg!("ENABLE_BACKLINKS", defaults.enable_backlinks);
         let only_index_links: bool = cfg!("ONLY_INDEX_LINKS", defaults.only_index_links);
+        let max_pds_added_per_day: Option<u64> = std::env::var("HYDRANT_NEW_HOST_LIMIT")
+            .ok()
+            .and_then(|s| s.parse().ok());
 
         // start with built-in tier definitions, then layer in any env-defined overrides.
         // format: HYDRANT_RATE_TIERS=name:base/mul/hourly/daily,...
@@ -785,6 +794,7 @@ impl Config {
             filter_excludes,
             enable_backlinks,
             only_index_links,
+            new_host_limit: max_pds_added_per_day,
             tier_policy,
             tier_rules,
             cache_size,
@@ -914,6 +924,9 @@ impl fmt::Display for Config {
                         .collect::<Vec<_>>()
                 )
             )?;
+        }
+        if let Some(limit) = self.new_host_limit {
+            config_line!(f, "max pds/day", limit)?;
         }
         Ok(())
     }

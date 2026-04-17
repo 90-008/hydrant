@@ -10,6 +10,8 @@ use tokio::sync::Notify;
 use tokio::sync::watch;
 use url::Url;
 
+#[cfg(feature = "relay")]
+use crate::pds_daily_limit::PdsDailyLimit;
 use crate::{
     config::Config,
     db::Db,
@@ -22,21 +24,23 @@ use crate::{
 pub struct AppState {
     pub db: Db,
     pub resolver: Resolver,
+    pub throttler: Throttler,
     pub(crate) filter: FilterHandle,
     pub(crate) pds_meta: PdsMetaHandle,
+    #[cfg(feature = "relay")]
+    pub(crate) pds_daily_limit: PdsDailyLimit,
     pub(crate) tier_policy: TierPolicy,
     pub firehose_cursors: scc::HashIndex<Url, AtomicI64>,
+    pub firehose_enabled: watch::Sender<bool>,
     #[cfg(feature = "indexer")]
     pub backfill_notify: Notify,
     #[cfg(feature = "indexer")]
     pub crawler_enabled: watch::Sender<bool>,
-    pub firehose_enabled: watch::Sender<bool>,
     #[cfg(feature = "indexer")]
     pub backfill_enabled: watch::Sender<bool>,
     pub ephemeral: bool,
     pub ephemeral_ttl: Duration,
     pub only_index_links: bool,
-    pub throttler: Throttler,
 }
 
 impl AppState {
@@ -87,6 +91,9 @@ impl AppState {
         let pds_meta = new_pds_handle(PdsMeta { hosts });
 
         let relay_cursors = scc::HashIndex::new();
+        #[cfg(feature = "relay")]
+        let pds_daily_limit =
+            PdsDailyLimit::new(config.new_host_limit, crate::db::load_pds_daily_adds(&db)?);
 
         #[cfg(feature = "indexer")]
         let (crawler_enabled, _) = watch::channel(crawler_default);
@@ -112,6 +119,8 @@ impl AppState {
             ephemeral_ttl: config.ephemeral_ttl.clone(),
             only_index_links: config.only_index_links,
             throttler: Throttler::new(),
+            #[cfg(feature = "relay")]
+            pds_daily_limit,
         })
     }
 

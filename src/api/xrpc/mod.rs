@@ -179,6 +179,23 @@ fn bad_request<E: std::error::Error + IntoStatic>(
     }
 }
 
+#[cfg(feature = "relay")]
+fn rate_limited<E: std::error::Error + IntoStatic>(
+    nsid: &'static str,
+    message: impl Display,
+) -> XrpcErrorResponse<E> {
+    XrpcErrorResponse {
+        status: StatusCode::TOO_MANY_REQUESTS,
+        error: XrpcError::Generic(GenericXrpcError {
+            error: "RateLimitExceeded".into(),
+            message: Some(message.to_smolstr()),
+            nsid,
+            method: "POST",
+            http_status: StatusCode::TOO_MANY_REQUESTS,
+        }),
+    }
+}
+
 #[cfg(feature = "indexer")]
 fn upstream_error<E: std::error::Error + IntoStatic>(
     nsid: &'static str,

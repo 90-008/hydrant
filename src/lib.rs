@@ -3,6 +3,8 @@ pub mod config;
 /// hydrant main api, includes the Hydrant type for programmatic control.
 pub mod control;
 pub(crate) mod filter;
+#[cfg(feature = "relay")]
+pub(crate) mod pds_daily_limit;
 pub(crate) mod pds_meta;
 pub mod types;
 

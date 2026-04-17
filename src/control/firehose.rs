@@ -34,8 +34,6 @@ pub(super) struct FirehoseShared {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct FirehoseSourceInfo {
     pub url: Url,
-    /// true if added via the API and persisted to the database; false for `RELAY_HOSTS` sources.
-    pub persisted: bool,
     /// true when this is a direct PDS connection; enables host authority enforcement.
     pub is_pds: bool,
 }
@@ -48,8 +46,8 @@ pub struct FirehoseHandle {
     pub(super) shared: Arc<std::sync::OnceLock<FirehoseShared>>,
     /// per-relay running tasks, keyed by url.
     pub(super) tasks: Arc<scc::HashMap<Url, FirehoseIngestorHandle>>,
-    /// set of urls persisted in the database (dynamically added sources).
-    pub(super) persisted: Arc<scc::HashSet<Url>>,
+    /// set of known source urls, includes API-added (db-persisted) and static config sources.
+    pub(super) known_sources: Arc<scc::HashSet<Url>>,
     /// ids assigned to spawned tasks
     next_task_id: Arc<AtomicUsize>,
 }
@@ -60,7 +58,7 @@ impl FirehoseHandle {
             state,
             shared: Arc::new(std::sync::OnceLock::new()),
             tasks: Arc::new(scc::HashMap::new()),
-            persisted: Arc::new(scc::HashSet::new()),
+            known_sources: Arc::new(scc::HashSet::new()),
             next_task_id: Arc::new(AtomicUsize::new(0)),
         }
     }
@@ -153,6 +151,12 @@ impl FirehoseHandle {
         *self.state.firehose_enabled.borrow()
     }
 
+    /// returns `true` if this URL is already a known firehose source — either currently
+    /// running or persisted (e.g. the host is offline but was previously added).
+    pub fn is_source_known(&self, url: &Url) -> bool {
+        self.known_sources.contains_sync(url)
+    }
+
     /// list all currently active firehose sources.
     pub async fn list_sources(&self) -> Vec<FirehoseSourceInfo> {
         let mut out = Vec::new();
@@ -160,7 +164,6 @@ impl FirehoseHandle {
             .any_async(|url, handle| {
                 out.push(FirehoseSourceInfo {
                     url: url.clone(),
-                    persisted: self.persisted.contains_sync(url),
                     is_pds: handle.is_pds,
                 });
                 false
@@ -197,7 +200,7 @@ impl FirehoseHandle {
         .await
         .into_diagnostic()??;
 
-        let _ = self.persisted.insert_async(url.clone()).await;
+        let _ = self.known_sources.insert_async(url.clone()).await;
 
         // reset failure state so the fresh task gets a clean slate.
         // if the previous task exited after max failures, the failure counter
@@ -217,7 +220,7 @@ impl FirehoseHandle {
     /// if the source was added via the API, it is removed from the database;
     /// if it came from the static config, only the running task is stopped.
     pub async fn remove_source(&self, url: &Url) -> Result<bool> {
-        if self.persisted.contains_async(url).await {
+        if self.known_sources.contains_async(url).await {
             let url_str = url.to_string();
             tokio::task::spawn_blocking({
                 let state = self.state.clone();
@@ -232,7 +235,7 @@ impl FirehoseHandle {
             })
             .await
             .into_diagnostic()??;
-            self.persisted.remove_async(url).await;
+            self.known_sources.remove_async(url).await;
         }
 
         Ok(self.tasks.remove_async(url).await.is_some())

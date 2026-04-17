@@ -32,9 +32,6 @@ pub(super) struct CrawlerShared {
 pub struct CrawlerSourceInfo {
     pub url: Url,
     pub mode: crate::config::CrawlerMode,
-    /// whether this source is persisted in the database (i.e. it was dynamically added
-    /// and will survive restarts). config-sourced entries have `persisted: false`.
-    pub persisted: bool,
 }
 
 pub(super) fn spawn_crawler_producer(
@@ -179,7 +176,6 @@ impl CrawlerHandle {
                 sources.push(CrawlerSourceInfo {
                     url: url.clone(),
                     mode: h.mode,
-                    persisted: self.persisted.contains_sync(url),
                 });
                 true
             })

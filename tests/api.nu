@@ -30,10 +30,7 @@ def test-crawler-sources [url: string, pid: int] {
     if $s.mode != "list_repos" {
         fail $"expected mode=list_repos, got ($s.mode)" $pid
     }
-    if not $s.persisted {
-        fail "expected persisted=true for dynamically added source" $pid
-    }
-    print $"  ok: 1 source, url=($s.url), mode=($s.mode), persisted=($s.persisted)"
+    print $"  ok: 1 source, url=($s.url), mode=($s.mode)"
 
     # posting the same URL with a different mode replaces the existing entry
     print "  POST /crawler/sources (should override)..."
@@ -113,9 +110,6 @@ def test-source-persistence [binary: string, db_path: string, port: int] {
         fail $"expected 1 source after restart, got ($after | length)" $instance2.pid
     }
     let s = ($after | first)
-    if not $s.persisted {
-        fail "expected persisted=true after restart" $instance2.pid
-    }
     if $s.mode != "by_collection" {
         fail $"expected mode=by_collection after restart, got ($s.mode)" $instance2.pid
     }
@@ -141,16 +135,13 @@ def test-config-source-not-persisted [binary: string, db_path: string, port: int
         fail "hydrant did not start"
     }
 
-    # config source should appear, but with persisted=false
-    print "  checking config source appears with persisted=false..."
+    # config source should appear
+    print "  checking config source appears..."
     let sources = (http get $"($url)/crawler/sources")
     if ($sources | length) != 1 {
         fail $"expected 1 source, got ($sources | length)" $instance.pid
     }
-    if ($sources | first).persisted {
-        fail "expected persisted=false for a CRAWLER_URLS source" $instance.pid
-    }
-    print "  ok: config source has persisted=false"
+    print "  ok: config source present"
 
     # the task can be stopped at runtime
     print "  deleting config source at runtime..."
@@ -178,9 +169,6 @@ def test-config-source-not-persisted [binary: string, db_path: string, port: int
     let after_restart = (http get $"($url)/crawler/sources")
     if ($after_restart | length) != 1 {
         fail $"expected config source to reappear after restart, got ($after_restart | length)" $instance2.pid
-    }
-    if ($after_restart | first).persisted {
-        fail "expected persisted=false after restart" $instance2.pid
     }
     print "  ok: config source reappears on restart (not persisted to DB)"
 
@@ -213,10 +201,7 @@ def test-firehose-sources [url: string, pid: int] {
         fail $"expected 1 source, got ($sources | length)" $pid
     }
     let s = ($sources | first)
-    if not $s.persisted {
-        fail "expected persisted=true for dynamically added source" $pid
-    }
-    print $"  ok: 1 source, url=($s.url), persisted=($s.persisted)"
+    print $"  ok: 1 source, url=($s.url)"
 
     # posting the same URL replaces the existing entry
     print "  POST /firehose/sources (should override)..."
