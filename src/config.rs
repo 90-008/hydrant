@@ -380,6 +380,11 @@ pub struct Config {
     /// set via `HYDRANT_NEW_HOST_LIMIT`.
     pub new_host_limit: Option<u64>,
 
+    /// how often offline firehose sources are automatically retried.
+    /// set via `HYDRANT_OFFLINE_HOST_RETRY_INTERVAL` (humantime duration, e.g. `30min`).
+    /// set to `none` to disable automatic retries.
+    pub offline_host_retry_interval: Option<Duration>,
+
     /// base URL(s) of relay or aggregator services to seed firehose PDS sources from at startup.
     ///
     /// hydrant calls `com.atproto.sync.listHosts` on each URL and adds the returned PDSes
@@ -501,6 +506,7 @@ impl Default for Config {
             enable_backlinks: false,
             only_index_links: false,
             new_host_limit: Some(50),
+            offline_host_retry_interval: Some(Duration::from_secs(30 * 60)),
             tier_rules: vec![],
             tier_policy: {
                 let mut tiers = HashMap::new();
@@ -681,6 +687,18 @@ impl Config {
             .ok()
             .and_then(|s| s.parse().ok());
 
+        let offline_retry_interval: Option<Duration> =
+            match std::env::var("HYDRANT_OFFLINE_HOST_RETRY_INTERVAL")
+                .ok()
+                .as_deref()
+            {
+                None => defaults.offline_host_retry_interval,
+                Some("none") => None,
+                Some(s) => humantime::parse_duration(s)
+                    .ok()
+                    .or(defaults.offline_host_retry_interval),
+            };
+
         // start with built-in tier definitions, then layer in any env-defined overrides.
         // format: HYDRANT_RATE_TIERS=name:base/mul/hourly/daily,...
         let mut tiers = defaults.tier_policy.tiers.clone();
@@ -795,6 +813,7 @@ impl Config {
             enable_backlinks,
             only_index_links,
             new_host_limit: max_pds_added_per_day,
+            offline_host_retry_interval: offline_retry_interval,
             tier_policy,
             tier_rules,
             cache_size,
@@ -927,6 +946,14 @@ impl fmt::Display for Config {
         }
         if let Some(limit) = self.new_host_limit {
             config_line!(f, "max pds/day", limit)?;
+        }
+        match self.offline_host_retry_interval {
+            Some(d) => config_line!(
+                f,
+                "offline retry interval",
+                format_args!("{}sec", d.as_secs())
+            )?,
+            None => config_line!(f, "offline retry interval", "disabled")?,
         }
         Ok(())
     }

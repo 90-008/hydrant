@@ -46,8 +46,8 @@ pub struct FirehoseHandle {
     pub(super) shared: Arc<std::sync::OnceLock<FirehoseShared>>,
     /// per-relay running tasks, keyed by url.
     pub(super) tasks: Arc<scc::HashMap<Url, FirehoseIngestorHandle>>,
-    /// set of known source urls, includes API-added (db-persisted) and static config sources.
-    pub(super) known_sources: Arc<scc::HashSet<Url>>,
+    /// known source urls → is_pds flag; includes API-added (db-persisted) and static config sources.
+    pub(super) known_sources: Arc<scc::HashMap<Url, bool>>,
     /// ids assigned to spawned tasks
     next_task_id: Arc<AtomicUsize>,
 }
@@ -58,7 +58,7 @@ impl FirehoseHandle {
             state,
             shared: Arc::new(std::sync::OnceLock::new()),
             tasks: Arc::new(scc::HashMap::new()),
-            known_sources: Arc::new(scc::HashSet::new()),
+            known_sources: Arc::new(scc::HashMap::new()),
             next_task_id: Arc::new(AtomicUsize::new(0)),
         }
     }
@@ -205,7 +205,7 @@ impl FirehoseHandle {
         .await
         .into_diagnostic()??;
 
-        let _ = self.known_sources.insert_async(url.clone()).await;
+        let _ = self.known_sources.insert_async(url.clone(), is_pds).await;
 
         // reset failure state so the fresh task gets a clean slate.
         // if the previous task exited after max failures, the failure counter
@@ -244,6 +244,21 @@ impl FirehoseHandle {
         }
 
         Ok(self.tasks.remove_async(url).await.is_some())
+    }
+
+    /// restart an offline firehose source without touching the database or daily limits.
+    pub(super) async fn restart_source(&self, url: Url, is_pds: bool) -> Result<()> {
+        let shared = self
+            .shared
+            .get()
+            .ok_or_else(|| miette::miette!("firehose worker not started"))?;
+
+        // clear the failure counter so the new task isn't immediately terminated
+        let throttle = self.state.throttler.get_handle(&url).await;
+        throttle.record_success();
+
+        self.spawn_firehose_ingestor(&FirehoseSource { url, is_pds }, shared, true)
+            .await
     }
 
     /// reset the stored firehose cursor for a given URL.

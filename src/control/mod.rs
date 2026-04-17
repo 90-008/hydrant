@@ -55,6 +55,7 @@ use firehose::FirehoseShared;
 use stream::event_stream_thread;
 #[cfg(feature = "relay")]
 use stream::relay_stream_thread;
+use url::Url;
 
 #[derive(Debug, Clone)]
 /// infromation about a host hydrant is consuming from.
@@ -416,7 +417,7 @@ impl Hydrant {
                 for source in &relay_hosts {
                     let _ = firehose
                         .known_sources
-                        .insert_async(source.url.clone())
+                        .insert_async(source.url.clone(), source.is_pds)
                         .await;
                     firehose
                         .spawn_firehose_ingestor(source, fire_shared, true)
@@ -434,7 +435,7 @@ impl Hydrant {
             for source in &persisted_sources {
                 let _ = firehose
                     .known_sources
-                    .insert_async(source.url.clone())
+                    .insert_async(source.url.clone(), source.is_pds)
                     .await;
                 if firehose.tasks.contains_async(&source.url).await {
                     continue;
@@ -451,6 +452,41 @@ impl Hydrant {
                 let state = state.clone();
                 tokio::spawn(async move {
                     seed::seed_from_list_hosts(&seed_urls, &firehose, &state).await;
+                });
+            }
+
+            // 10d. periodic retry of offline firehose sources
+            if let Some(retry_interval) = config.offline_host_retry_interval {
+                tokio::spawn({
+                    let firehose = firehose.clone();
+                    async move {
+                        loop {
+                            tokio::time::sleep(retry_interval).await;
+
+                            let mut to_restart: Vec<(Url, bool)> = Vec::new();
+                            {
+                                let meta = firehose.state.pds_meta.load();
+                                firehose
+                                    .known_sources
+                                    .iter_async(|url, &is_pds| {
+                                        if firehose.tasks.contains_sync(url) {
+                                            return true;
+                                        }
+                                        let host = url.host_str().unwrap_or(url.as_str());
+                                        if meta.is_banned(host) {
+                                            return true;
+                                        }
+                                        to_restart.push((url.clone(), is_pds));
+                                        true
+                                    })
+                                    .await;
+                            }
+
+                            for (url, is_pds) in to_restart {
+                                let _ = firehose.restart_source(url, is_pds).await;
+                            }
+                        }
+                    }
                 });
             }
 
