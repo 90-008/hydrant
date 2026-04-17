@@ -217,7 +217,7 @@ directory, it will also be loaded automatically.
 | `SEED_HOSTS` | `https://bsky.network` (relay) | comma-separated list of base URLs to call `com.atproto.sync.listHosts` on at startup. hydrant adds every non-banned host as a PDS firehose source. see [firehose seeding](#firehose-seeding). |
 | `CRAWLER_URLS` | relay hosts in full-network mode, `https://lightrail.microcosm.blue` in filter mode | comma-separated list of `[mode::]url` crawler sources. mode is `relay` or `by_collection`; bare URLs use the default mode. set to empty string to disable crawling. |
 | `PLC_URL` | `https://plc.wtf`, `https://plc.directory` if full network | base URL(s) of the PLC directory (comma-separated for multiple). |
-| `EPHEMERAL` | `false` | if enabled, no records are stored. events are deleted after a certain duration (`EPHEMERAL_TTL`). |
+| `EPHEMERAL` | `false` (indexer), `true` (relay) | if enabled, no records are stored (in indexer mode). events are deleted after a certain duration (`EPHEMERAL_TTL`). |
 | `EPHEMERAL_TTL` | `60min`, `3d` in relay mode | decides after how long events should be deleted. |
 | `ONLY_INDEX_LINKS` | `false` | indexer only. if enabled, record blocks are not stored, only the index (records, counts, events) is kept. `getRecord`, `listRecords`, and `getRepo` will return errors. the event stream still works but create/update events will not include record values. |
 | `FULL_NETWORK` | `false` (indexer), `true` (relay) | if `true`, discovers and indexes all repositories in the network. |

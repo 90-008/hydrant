@@ -450,7 +450,10 @@ impl Default for Config {
         const BASE_MEMTABLE_MB: u64 = 32;
         Self {
             database_path: PathBuf::from("./hydrant.db"),
+            #[cfg(feature = "indexer")]
             ephemeral: false,
+            #[cfg(feature = "relay")]
+            ephemeral: true,
             #[cfg(feature = "indexer")]
             ephemeral_ttl: Duration::from_secs(3600), // 1 hour
             #[cfg(feature = "relay")]
