@@ -38,7 +38,13 @@
               clang
               wild
               psmisc
-              inputs'.verbiage.packages.default
+              (pkgs.writeShellApplication {
+                name = "verbiage";
+                runtimeInputs = [ inputs'.verbiage.packages.default ];
+                text = ''
+                  VERBIAGE_TITLE="hydrant" verbiage "$@"
+                '';
+              })
             ]);
           });
         };
