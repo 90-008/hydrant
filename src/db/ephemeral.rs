@@ -117,7 +117,11 @@ fn ttl_tick_inner(
 
     batch.commit().into_diagnostic()?;
 
-    debug!(pruned, "pruned old events");
+    if pruned > 0 {
+        info!(pruned, "pruned old events");
+    } else {
+        debug!("no events were pruned");
+    }
 
     Ok(())
 }
