@@ -8,7 +8,12 @@ list all currently active crawler sources. returns a JSON array of `{ "url": str
 
 ## POST /crawler/sources
 
-add a crawler source at runtime. body: `{ "url": string, "mode": "relay" | "by_collection" }`.
+add a crawler source at runtime.
+
+| field | description |
+| :--- | :--- |
+| `url` | URL of the crawler source |
+| `mode` | `"relay"` or `"by_collection"` |
 
 the source is written to the database before the producer task is started, so it is safe to add sources and then immediately restart without losing them.
 
@@ -18,7 +23,11 @@ returns `201 Created` on success.
 
 ## DELETE /crawler/sources
 
-remove a crawler source at runtime. body: `{ "url": string }`.
+remove a crawler source at runtime.
+
+| field | description |
+| :--- | :--- |
+| `url` | URL of the source to remove |
 
 the producer task is stopped immediately.
 
@@ -30,4 +39,10 @@ returns `200 OK` if the source was found and removed, `404 Not Found` otherwise.
 
 ## DELETE /crawler/cursors
 
-reset stored cursors for a given crawler URL. body: `{ "key": "..." }` where key is a URL. clears the list-repos crawler cursor as well as any by-collection cursors associated with that URL. causes the next crawler pass to restart from the beginning.
+reset stored cursors for a given crawler URL.
+
+| field | description |
+| :--- | :--- |
+| `key` | URL of the crawler source to reset |
+
+clears the list-repos crawler cursor as well as any by-collection cursors associated with that URL. causes the next crawler pass to restart from the beginning.

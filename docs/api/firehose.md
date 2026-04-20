@@ -8,7 +8,12 @@ list all currently active firehose sources. returns a JSON array of `{ "url": st
 
 ## POST /firehose/sources
 
-add a firehose source at runtime. body: `{ "url": string, "is_pds": bool }`. `is_pds` defaults to `false`.
+add a firehose source at runtime.
+
+| field | description |
+| :--- | :--- |
+| `url` | URL of the firehose source |
+| `is_pds` | whether the source is a direct PDS connection (default `false`) |
 
 the source is persisted to the database before the ingestor task is started.
 
@@ -18,7 +23,11 @@ returns `201 Created` on success.
 
 ## DELETE /firehose/sources
 
-remove a firehose relay at runtime. body: `{ "url": string }`.
+remove a firehose relay at runtime.
+
+| field | description |
+| :--- | :--- |
+| `url` | URL of the source to remove |
 
 the ingestor task is stopped immediately.
 
@@ -30,4 +39,10 @@ returns `200 OK` if the relay was found and removed, `404 Not Found` otherwise.
 
 ## DELETE /firehose/cursors
 
-reset the stored cursor for a given firehose relay URL. body: `{ "key": "..." }` where key is a URL. causes the next firehose connection to restart from the beginning.
+reset the stored cursor for a given firehose relay URL.
+
+| field | description |
+| :--- | :--- |
+| `key` | URL of the firehose source to reset |
+
+causes the next firehose connection to restart from the beginning.

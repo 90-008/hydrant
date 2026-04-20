@@ -25,15 +25,22 @@ list all current tier assignments alongside the available tier definitions. retu
 
 ## PUT /pds/tiers
 
-assign a PDS to a named rate tier. body: `{ "host": string, "tier": string }`.
+assign a PDS to a named rate tier.
 
-`host` is the PDS hostname (e.g. `pds.example.com`). `tier` must be one of the configured tier names; returns `400` if unknown.
+| field | description |
+| :--- | :--- |
+| `host` | PDS hostname (e.g. `pds.example.com`) |
+| `tier` | name of the rate tier to assign; returns `400` if unknown |
 
 assignments are persisted to the database and survive restarts. re-assigning the same host updates the tier in place without creating a duplicate.
 
 ## DELETE /pds/tiers
 
-remove an explicit tier assignment for a PDS. query parameter: `?host=<hostname>` (e.g. `?host=pds.example.com`).
+remove an explicit tier assignment for a PDS. query parameter:
+
+| param | description |
+| :--- | :--- |
+| `host` | PDS hostname (e.g. `?host=pds.example.com`) |
 
 reverts the host to glob-rule resolution (not necessarily `default`; a matching `TIER_RULES` pattern still applies).
 
