@@ -27,7 +27,7 @@ use {
 
 pub fn persist_to_resync_buffer(db: &Db, did: &Did, commit: &Commit) -> Result<()> {
     let key = keys::resync_buffer_key(did, DbTid::from(&commit.rev));
-    let value = rmp_serde::to_vec(commit).into_diagnostic()?;
+    let value = rmp_serde::to_vec_named(commit).into_diagnostic()?;
     db.resync_buffer.insert(key, value).into_diagnostic()?;
     debug!(
         did = %did,
