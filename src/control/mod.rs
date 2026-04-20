@@ -403,6 +403,7 @@ impl Hydrant {
                 .expect("firehose shared already set");
             let fire_shared = firehose.shared.get().unwrap();
 
+            // add hosts from config
             let relay_hosts = config.relays.clone();
             if !relay_hosts.is_empty() {
                 info!(
@@ -425,13 +426,13 @@ impl Hydrant {
                 }
             }
 
+            // add persisted hosts
             let persisted_sources = tokio::task::spawn_blocking({
                 let state = state.clone();
                 move || load_persisted_firehose_sources(&state.db)
             })
             .await
             .into_diagnostic()??;
-
             for source in &persisted_sources {
                 let _ = firehose
                     .known_sources
@@ -444,6 +445,10 @@ impl Hydrant {
                     .spawn_firehose_ingestor(source, fire_shared, true)
                     .await?;
             }
+            // we use spawn_firehose_ingestor directly here since we dont want
+            // to go through the whole add_source machinery and checks
+            // its ok since we block here before running stuff like seed_hosts
+            // and whatnot
 
             // 10c. seed firehose PDS sources from listHosts on configured seed URLs
             if !config.seed_hosts.is_empty() {

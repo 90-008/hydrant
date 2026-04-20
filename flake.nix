@@ -13,6 +13,7 @@
         {
           pkgs,
           config,
+          inputs',
           ...
         }:
         {
