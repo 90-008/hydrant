@@ -17,6 +17,16 @@
           ...
         }:
         let
+          redirects = pkgs.writeTextFile {
+            name = "_redirects";
+            text = ''
+            /static/* /static/:splat 200!
+            /docs/w/* /:splat 301!
+            /~ / 301!
+            / /docs/w/~ 200!
+            /* /docs/w/:splat 200!
+            '';
+          };
           buildDocs = pkgs.writeShellApplication {
             name = "build-docs";
             runtimeInputs = [ inputs'.verbiage.packages.build ];
@@ -27,7 +37,7 @@
               export VERBIAGE_TITLE
               out="''${2:-$(pwd)/docs-dist}"
               verbiage-build docs "$out"
-              printf '/static/* /static/:splat 200!\n/docs/w/* /:splat 301!\n/ /docs/w/~ 200!\n/* /docs/w/:splat 200!\n' > "$out/_redirects"
+              cp -f ${redirects} "$out/_redirects"
             '';
           };
           deployDocs = pkgs.writeShellApplication {
