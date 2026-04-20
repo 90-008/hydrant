@@ -7,3 +7,4 @@ mock_debug.log
 hydrant.log
 .gitnexus
 .claude
+/docs-dist
