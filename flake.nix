@@ -2,6 +2,7 @@
   inputs.parts.url = "github:hercules-ci/flake-parts";
   inputs.nixpkgs.url = "github:nixos/nixpkgs/nixpkgs-unstable";
   inputs.nci.url = "github:90-008/nix-cargo-integration";
+  inputs.verbiage.url = "github:90-008/verbiage";
 
   outputs =
     inp:
@@ -36,6 +37,7 @@
               clang
               wild
               psmisc
+              inputs'.verbiage.packages.default
             ]);
           });
         };

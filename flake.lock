@@ -143,6 +143,22 @@
         "type": "github"
       }
     },
+    "nixpkgs_3": {
+      "locked": {
+        "lastModified": 1776329215,
+        "narHash": "sha256-a8BYi3mzoJ/AcJP8UldOx8emoPRLeWqALZWu4ZvjPXw=",
+        "owner": "nixos",
+        "repo": "nixpkgs",
+        "rev": "b86751bc4085f48661017fa226dee99fab6c651b",
+        "type": "github"
+      },
+      "original": {
+        "owner": "nixos",
+        "ref": "nixpkgs-unstable",
+        "repo": "nixpkgs",
+        "type": "github"
+      }
+    },
     "parts": {
       "inputs": {
         "nixpkgs-lib": [
@@ -232,7 +248,8 @@
       "inputs": {
         "nci": "nci",
         "nixpkgs": "nixpkgs_2",
-        "parts": "parts_2"
+        "parts": "parts_2",
+        "verbiage": "verbiage"
       }
     },
     "rust-overlay": {
@@ -297,6 +314,24 @@
       "original": {
         "owner": "numtide",
         "repo": "treefmt-nix",
+        "type": "github"
+      }
+    },
+    "verbiage": {
+      "inputs": {
+        "nixpkgs": "nixpkgs_3"
+      },
+      "locked": {
+        "lastModified": 1776647130,
+        "narHash": "sha256-XCMjiqN2bvJ016q7JEW6tKOfk3pPrzPsACmbtSJPY50=",
+        "owner": "90-008",
+        "repo": "verbiage",
+        "rev": "cf8cfa6e7cb4d9ab1fc4b5088c01235b09928850",
+        "type": "github"
+      },
+      "original": {
+        "owner": "90-008",
+        "repo": "verbiage",
         "type": "github"
       }
     }
