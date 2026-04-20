@@ -42,7 +42,8 @@ pub fn router() -> axum::Router<Arc<AppState>> {
             "/debug/ephemeral_ttl_tick",
             post(handle_debug_ephemeral_ttl_tick),
         )
-        .route("/debug/seed_watermark", post(handle_debug_seed_watermark));
+        .route("/debug/seed_watermark", post(handle_debug_seed_watermark))
+        .route("/debug/seed_events", post(handle_debug_seed_events));
 
     #[cfg(feature = "indexer")]
     let r = r.route("/debug/count", get(handle_debug_count));
@@ -182,7 +183,7 @@ pub async fn handle_debug_iter(
     Query(req): Query<DebugIterRequest>,
 ) -> Result<Json<DebugIterResponse>, StatusCode> {
     let ks = get_keyspace_by_name(&state.db, &req.partition)?;
-    let is_events = req.partition == "events";
+    let is_events = req.partition == "events" || req.partition == "relay_events";
     let partition = req.partition.clone();
 
     let parse_bound = |s: Option<String>| -> Result<Option<Vec<u8>>, StatusCode> {
@@ -287,6 +288,8 @@ fn get_keyspace_by_name(db: &crate::db::Db, name: &str) -> Result<fjall::Keyspac
         "resync" => Ok(db.resync.clone()),
         #[cfg(feature = "indexer_stream")]
         "events" => Ok(db.events.clone()),
+        #[cfg(feature = "relay")]
+        "relay_events" => Ok(db.relay_events.clone()),
         #[cfg(feature = "indexer")]
         "records" => Ok(db.records.clone()),
         _ => Err(StatusCode::BAD_REQUEST),
@@ -371,6 +374,60 @@ pub async fn handle_debug_seed_watermark(
                 crate::db::keys::relay_event_watermark_key(req.ts),
                 req.event_id.to_be_bytes(),
             )
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        Ok(())
+    })
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)??;
+
+    Ok(StatusCode::OK)
+}
+
+#[derive(Deserialize)]
+#[cfg(any(feature = "indexer_stream", feature = "relay"))]
+pub struct DebugSeedEventsRequest {
+    pub partition: String,
+    pub count: u64,
+}
+
+#[cfg(any(feature = "indexer_stream", feature = "relay"))]
+pub async fn handle_debug_seed_events(
+    State(state): State<Arc<AppState>>,
+    Query(req): Query<DebugSeedEventsRequest>,
+) -> Result<StatusCode, StatusCode> {
+    tokio::task::spawn_blocking(move || -> Result<(), StatusCode> {
+        let mut batch = state.db.inner.batch();
+        if req.partition == "events" {
+            #[cfg(feature = "indexer_stream")]
+            {
+                for _ in 0..req.count {
+                    let seq = state
+                        .db
+                        .next_event_id
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    batch.insert(&state.db.events, crate::db::keys::event_key(seq), b"dummy");
+                }
+            }
+        } else if req.partition == "relay_events" {
+            #[cfg(feature = "relay")]
+            {
+                for _ in 0..req.count {
+                    let seq = state
+                        .db
+                        .next_relay_seq
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    batch.insert(
+                        &state.db.relay_events,
+                        crate::db::keys::relay_event_key(seq),
+                        b"dummy",
+                    );
+                }
+            }
+        } else {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+        batch
+            .commit()
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         Ok(())
     })

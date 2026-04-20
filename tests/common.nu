@@ -122,6 +122,16 @@ export def build-hydrant-features [features: string] {
     parse-hydrant-executable $out.stdout
 }
 
+# build the hydrant binary for relay only (no default features)
+export def build-hydrant-relay [] {
+    if ($env | get --optional HYDRANT_BINARY | is-not-empty) {
+        return $env.HYDRANT_BINARY
+    }
+    print "building hydrant for relay only..."
+    let out = (^cargo build --no-default-features --features relay --message-format json err> /dev/null | complete)
+    parse-hydrant-executable $out.stdout
+}
+
 # start hydrant in the background
 export def start-hydrant [binary: string, db_path: string, port: int] {
     let log_file = $"($db_path)/hydrant.log"

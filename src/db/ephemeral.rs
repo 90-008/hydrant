@@ -76,9 +76,12 @@ fn ttl_tick_inner(
 
     // find the watermark entry closest to and <= cutoff_ts
     let cutoff_key = watermark_key(cutoff_ts);
+    let start: &[u8] = watermark_prefix;
+    let end: &[u8] = cutoff_key.as_slice();
+
     let cutoff_seq = db
         .cursors
-        .range(..=cutoff_key.as_slice())
+        .range(start..=end)
         .next_back()
         .map(|g| g.into_inner().into_diagnostic())
         .transpose()?
@@ -97,18 +100,41 @@ fn ttl_tick_inner(
         return Ok(());
     };
 
+    let mut pruned_key = Vec::with_capacity(7 + watermark_prefix.len());
+    pruned_key.extend_from_slice(b"pruned|");
+    pruned_key.extend_from_slice(watermark_prefix);
+
+    let last_pruned_seq = db
+        .cursors
+        .get(&pruned_key)
+        .into_diagnostic()?
+        .map(|v| {
+            v.as_ref()
+                .try_into()
+                .into_diagnostic()
+                .wrap_err("expected last pruned seq to be u64")
+        })
+        .transpose()?
+        .map(u64::from_be_bytes)
+        .unwrap_or(0);
+
+    let start_key_events = keys::event_key(last_pruned_seq);
     let cutoff_key_events = keys::event_key(cutoff_seq);
     let mut batch = db.inner.batch();
     let mut pruned = 0usize;
 
-    for guard in events_ks.range(..cutoff_key_events) {
+    for guard in events_ks.range(start_key_events..cutoff_key_events) {
         let k = guard.key().into_diagnostic()?;
         batch.remove(events_ks, k);
         pruned += 1;
     }
 
+    batch.insert(&db.cursors, pruned_key, cutoff_seq.to_be_bytes());
+
     // clean up consumed watermark entries (everything up to and including cutoff_ts)
-    for guard in db.cursors.range(..=cutoff_key) {
+    let start: &[u8] = watermark_prefix;
+    let end: &[u8] = cutoff_key.as_slice();
+    for guard in db.cursors.range(start..=end) {
         let k = guard.key().into_diagnostic()?;
         if k.starts_with(watermark_prefix) {
             batch.remove(&db.cursors, k);
