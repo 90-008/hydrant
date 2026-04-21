@@ -60,12 +60,7 @@
           apps.deploy-docs = { type = "app"; program = "${deployDocs}/bin/deploy-docs"; };
           devShells.default = config.nci.outputs."hydrant".devShell.overrideAttrs (old: {
             packages = (old.packages or []) ++ (with pkgs; [
-              rustPlatform.rustLibSrc
-              rust-analyzer
-              cargo
               cargo-outdated
-              rustc
-              rustfmt
               gemini-cli
               go
               cmake
