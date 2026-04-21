@@ -10,6 +10,7 @@ you can see [random.wisp.place](https://tangled.org/did:plc:dfl62fgb7wtjj3fcbb72
 
 ## what's here
 
+- [vs tap](concepts/vs-tap.md): comparison against tap, the go sync utility
 - [getting started](getting-started.md): building, running, reverse proxying
 - [configuration](configuration.md): all environment variables
 - [build features](build-features.md): optional cargo features (`relay`, `backlinks`, etc.)
