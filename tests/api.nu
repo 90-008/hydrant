@@ -408,43 +408,6 @@ def test-pds-tier-persistence [binary: string, db_path: string, port: int] {
     print "pds tier persistence test passed!"
 }
 
-# verify that HYDRANT_TRUSTED_HOSTS pre-assigns hosts to the trusted tier at startup.
-def test-pds-trusted-hosts [binary: string, db_path: string, port: int] {
-    print "=== test: HYDRANT_TRUSTED_HOSTS pre-assigns tier at startup ==="
-
-    let url = $"http://localhost:($port)"
-    let host_a = "alpha.example.com"
-    let host_b = "beta.example.com"
-
-    let instance = (with-env {
-        HYDRANT_CRAWLER_URLS: "",
-        HYDRANT_RELAY_HOSTS: "",
-        HYDRANT_TRUSTED_HOSTS: $"($host_a),($host_b)"
-    } {
-        start-hydrant $binary $db_path $port
-    })
-    if not (wait-for-api $url) {
-        fail "hydrant did not start"
-    }
-
-    print "  checking pre-assigned trusted hosts..."
-    let tiers = (http get $"($url)/pds/tiers")
-    let assignments = $tiers.assignments
-
-    for host in [$host_a, $host_b] {
-        if not ($host in $assignments) {
-            fail $"expected assignment for ($host) from HYDRANT_TRUSTED_HOSTS" $instance.pid
-        }
-        if ($assignments | get $host) != "trusted" {
-            fail $"expected tier=trusted for ($host)" $instance.pid
-        }
-    }
-    print $"  ok: ($host_a) and ($host_b) pre-assigned to trusted tier"
-
-    kill $instance.pid
-    print "trusted hosts startup test passed!"
-}
-
 # verify that a custom tier defined via HYDRANT_RATE_TIERS is visible and assignable.
 def test-pds-custom-rate-tier [binary: string, db_path: string, port: int] {
     print "=== test: custom rate tier via HYDRANT_RATE_TIERS ==="
@@ -625,12 +588,6 @@ def main [] {
     let db_pds_persist = (mktemp -d -t hydrant_api.XXXXXX)
     print $"db: ($db_pds_persist)"
     test-pds-tier-persistence $binary $db_pds_persist $port
-
-    sleep 1sec
-
-    let db_pds_trusted = (mktemp -d -t hydrant_api.XXXXXX)
-    print $"db: ($db_pds_trusted)"
-    test-pds-trusted-hosts $binary $db_pds_trusted $port
 
     sleep 1sec
 

@@ -19,7 +19,7 @@ use tracing::{debug, error, info, info_span, trace, warn};
 use url::Url;
 
 use crate::db::keys::pds_account_count_key;
-use crate::db::{self, keys};
+use crate::db::{self, CountDeltas, keys};
 use crate::ingest::stream::AccountStatus;
 #[cfg(feature = "relay")]
 use crate::ingest::stream::encode_frame;
@@ -41,6 +41,7 @@ struct WorkerContext<'a> {
     state: &'a AppState,
     vctx: ValidationContext<'a>,
     batch: OwnedWriteBatch,
+    count_deltas: CountDeltas,
     #[cfg(feature = "relay")]
     pending_broadcasts: Vec<RelayBroadcast>,
     #[cfg(feature = "indexer")]
@@ -191,6 +192,7 @@ impl RelayWorker {
                 opts: &validation_opts,
             },
             batch: state.db.inner.batch(),
+            count_deltas: CountDeltas::default(),
             #[cfg(feature = "relay")]
             pending_broadcasts: Vec::with_capacity(2),
             #[cfg(feature = "indexer")]
@@ -202,6 +204,7 @@ impl RelayWorker {
         };
 
         while let Some(msg) = rx.blocking_recv() {
+            ctx.count_deltas = CountDeltas::default();
             let (did, seq) = match &msg.msg {
                 SubscribeReposMessage::Commit(c) => (c.repo.clone(), c.seq),
                 SubscribeReposMessage::Identity(i) => (i.did.clone(), i.seq),
@@ -217,11 +220,19 @@ impl RelayWorker {
                 error!(did = %did, err = %e, "relay shard: error processing message");
             }
 
-            let res = std::mem::replace(&mut ctx.batch, ctx.state.db.inner.batch()).commit();
+            let mut batch = std::mem::replace(&mut ctx.batch, ctx.state.db.inner.batch());
+            let reservation = ctx
+                .state
+                .db
+                .stage_count_deltas(&mut batch, &ctx.count_deltas);
+            let res = batch.commit();
             if let Err(e) = res {
                 error!(shard = id, err = %e, "relay shard: failed to commit batch");
+                drop(reservation);
                 continue;
             }
+            ctx.state.db.apply_count_deltas(&ctx.count_deltas);
+            drop(reservation);
 
             #[cfg(feature = "relay")]
             for broadcast in ctx.pending_broadcasts.drain(..) {
@@ -525,21 +536,19 @@ impl RelayWorker {
         if is_pds {
             if let Some(host) = firehose.host_str() {
                 let count_key = pds_account_count_key(host);
-                let changed = if !was_active && repo_state.active {
-                    Some(ctx.state.db.update_count(&count_key, 1))
+                let delta = if !was_active && repo_state.active {
+                    1
                 } else if was_active && !repo_state.active {
-                    Some(ctx.state.db.update_count(&count_key, -1))
+                    -1
                 } else {
-                    None
+                    0
                 };
 
-                if let Some(count) = changed {
-                    let mut batch_for_status = ctx.state.db.inner.batch();
+                if delta != 0 {
+                    ctx.count_deltas.add(&count_key, delta);
+                    let count = ctx.count_deltas.projected_count(&ctx.state.db, &count_key);
                     ctx.state
-                        .apply_host_limit_status(&mut batch_for_status, host, count);
-                    if let Err(e) = batch_for_status.commit() {
-                        error!(%host, err = %e, "failed to commit host status update");
-                    }
+                        .apply_host_limit_status(&mut ctx.batch, host, count);
                 }
             }
         }
@@ -893,12 +902,12 @@ impl WorkerContext<'_> {
                 ));
         }
 
-        db.update_count("repos", 1);
+        self.count_deltas.add("repos", 1);
 
         // track initial active state for per-PDS rate limiting
         if msg.is_pds && repo_state.active {
             if let Some(host) = msg.firehose.host_str() {
-                db.update_count(&pds_account_count_key(host), 1);
+                self.count_deltas.add(&pds_account_count_key(host), 1);
             }
         }
 

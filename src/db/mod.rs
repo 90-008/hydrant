@@ -1,5 +1,5 @@
 use crate::config::Compression;
-use crate::db::compaction::DropPrefixFilterFactory;
+use crate::db::compaction::CountsGcFilterFactory;
 use crate::types::{RepoMetadata, RepoState};
 
 #[cfg(feature = "indexer_stream")]
@@ -17,8 +17,9 @@ use scc::HashMap;
 use smol_str::SmolStr;
 
 use std::cell::RefCell;
-use std::collections::HashSet;
-use std::sync::Arc;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use url::Url;
 
 pub mod compaction;
@@ -32,7 +33,7 @@ pub mod types;
 use tracing::error;
 
 #[cfg(any(feature = "indexer_stream", feature = "relay"))]
-use {std::sync::atomic::AtomicU64, tokio::sync::broadcast};
+use tokio::sync::broadcast;
 
 fn default_opts() -> KeyspaceCreateOptions {
     KeyspaceCreateOptions::default()
@@ -72,53 +73,115 @@ pub struct Db {
     #[cfg(feature = "relay")]
     pub(crate) relay_broadcast_tx: broadcast::Sender<RelayBroadcast>,
     pub counts_map: HashMap<SmolStr, u64>,
+    next_count_delta_id: Arc<AtomicU64>,
+    count_delta_checkpoint_watermark: Arc<AtomicU64>,
+    count_delta_gc_watermark: Arc<AtomicU64>,
+    count_delta_in_flight: Arc<Mutex<BTreeSet<u64>>>,
 }
 
-#[cfg(feature = "indexer")]
-macro_rules! update_gauge_diff_impl {
-    ($self:ident, $old:ident, $new:ident, $update_method:ident $(, $await:tt)?) => {{
-        use crate::types::GaugeState;
+#[derive(Debug, Clone, Default)]
+pub struct CountDeltas {
+    deltas: BTreeMap<SmolStr, i64>,
+}
 
-        if $old == $new {
+impl CountDeltas {
+    pub(crate) fn add(&mut self, key: &str, delta: i64) {
+        if delta == 0 {
             return;
         }
 
-        // pending
-        match ($old, $new) {
+        let entry = self.deltas.entry(SmolStr::new(key)).or_insert(0);
+        *entry += delta;
+        if *entry == 0 {
+            self.deltas.remove(key);
+        }
+    }
+
+    #[cfg(feature = "indexer")]
+    pub(crate) fn add_gauge_diff(
+        &mut self,
+        old: &crate::types::GaugeState,
+        new: &crate::types::GaugeState,
+    ) {
+        use crate::types::GaugeState;
+
+        if old == new {
+            return;
+        }
+
+        match (old, new) {
             (GaugeState::Pending, GaugeState::Pending) => {}
-            (GaugeState::Pending, _) => {$self.$update_method("pending", -1) $(.$await)?;},
-            (_, GaugeState::Pending) => {$self.$update_method("pending", 1) $(.$await)?;},
+            (GaugeState::Pending, _) => self.add("pending", -1),
+            (_, GaugeState::Pending) => self.add("pending", 1),
             _ => {}
         }
 
-        // resync
-        let old_resync = $old.is_resync();
-        let new_resync = $new.is_resync();
-        match (old_resync, new_resync) {
-            (true, false) => {$self.$update_method("resync", -1) $(.$await)?;},
-            (false, true) => {$self.$update_method("resync", 1) $(.$await)?;},
+        match (old.is_resync(), new.is_resync()) {
+            (true, false) => self.add("resync", -1),
+            (false, true) => self.add("resync", 1),
             _ => {}
         }
 
-        // error kinds
-        if let GaugeState::Resync(Some(kind)) = $old {
-            let key = match kind {
-                crate::types::ResyncErrorKind::Ratelimited => "error_ratelimited",
-                crate::types::ResyncErrorKind::Transport => "error_transport",
-                crate::types::ResyncErrorKind::Generic => "error_generic",
-            };
-            $self.$update_method(key, -1) $(.$await)?;
+        if let GaugeState::Resync(Some(kind)) = old {
+            self.add(
+                match kind {
+                    crate::types::ResyncErrorKind::Ratelimited => "error_ratelimited",
+                    crate::types::ResyncErrorKind::Transport => "error_transport",
+                    crate::types::ResyncErrorKind::Generic => "error_generic",
+                },
+                -1,
+            );
         }
 
-        if let GaugeState::Resync(Some(kind)) = $new {
-            let key = match kind {
-                crate::types::ResyncErrorKind::Ratelimited => "error_ratelimited",
-                crate::types::ResyncErrorKind::Transport => "error_transport",
-                crate::types::ResyncErrorKind::Generic => "error_generic",
-            };
-            $self.$update_method(key, 1) $(.$await)?;
+        if let GaugeState::Resync(Some(kind)) = new {
+            self.add(
+                match kind {
+                    crate::types::ResyncErrorKind::Ratelimited => "error_ratelimited",
+                    crate::types::ResyncErrorKind::Transport => "error_transport",
+                    crate::types::ResyncErrorKind::Generic => "error_generic",
+                },
+                1,
+            );
         }
-    }};
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.deltas.is_empty()
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.deltas.len()
+    }
+
+    pub(crate) fn get(&self, key: &str) -> i64 {
+        self.deltas.get(key).copied().unwrap_or(0)
+    }
+
+    pub(crate) fn projected_count(&self, db: &Db, key: &str) -> u64 {
+        apply_count_delta(db.get_count_sync(key), self.get(key))
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (&SmolStr, &i64)> {
+        self.deltas.iter()
+    }
+}
+
+pub(crate) struct CountDeltaReservation {
+    in_flight: Arc<Mutex<BTreeSet<u64>>>,
+    start_id: u64,
+}
+
+impl Drop for CountDeltaReservation {
+    fn drop(&mut self) {
+        let Ok(mut in_flight) = self.in_flight.lock() else {
+            error!(
+                start_id = self.start_id,
+                "count delta reservations poisoned"
+            );
+            return;
+        };
+        in_flight.remove(&self.start_id);
+    }
 }
 
 const fn kb(v: u32) -> u32 {
@@ -128,8 +191,17 @@ const fn mb(v: u64) -> u64 {
     v * 1024 * 1024
 }
 
+fn apply_count_delta(current: u64, delta: i64) -> u64 {
+    if delta >= 0 {
+        current.saturating_add(delta as u64)
+    } else {
+        current.saturating_sub(delta.unsigned_abs())
+    }
+}
+
 impl Db {
     pub fn open(cfg: &crate::config::Config) -> Result<Self> {
+        let count_delta_gc_watermark = Arc::new(AtomicU64::new(0));
         let db = Database::builder(&cfg.database_path)
             .cache_size(cfg.cache_size * 2_u64.pow(20) / 2)
             .manual_journal_persist(true)
@@ -142,12 +214,12 @@ impl Db {
             .max_journaling_size(mb(cfg.db_max_journaling_size_mb))
             .with_compaction_filter_factories({
                 let ephemeral = cfg.ephemeral;
+                let count_delta_gc_watermark = count_delta_gc_watermark.clone();
                 let f = move |ks: &str| match ks {
-                    "counts" => ephemeral.then(|| -> Arc<dyn Factory> {
-                        Arc::new(DropPrefixFilterFactory {
-                            prefix: keys::COUNT_COLLECTION_PREFIX,
-                        })
-                    }),
+                    "counts" => Some(Arc::new(CountsGcFilterFactory {
+                        drop_collection_counts: ephemeral,
+                        delta_gc_watermark: count_delta_gc_watermark.clone(),
+                    }) as Arc<dyn Factory>),
                     _ => None,
                 };
                 Arc::new(f)
@@ -474,6 +546,10 @@ impl Db {
             next_relay_seq: Arc::new(AtomicU64::new(0)),
             #[cfg(feature = "relay")]
             relay_broadcast_tx,
+            next_count_delta_id: Arc::new(AtomicU64::new(0)),
+            count_delta_checkpoint_watermark: Arc::new(AtomicU64::new(0)),
+            count_delta_gc_watermark,
+            count_delta_in_flight: Arc::new(Mutex::new(BTreeSet::new())),
         };
 
         migration::run(&this)?;
@@ -517,11 +593,31 @@ impl Db {
             let name = std::str::from_utf8(&k[keys::COUNT_KS_PREFIX.len()..])
                 .into_diagnostic()
                 .wrap_err("expected valid utf8 for ks count key")?;
-            let _ = this.counts_map.insert_sync(
-                SmolStr::new(name),
-                u64::from_be_bytes(v.as_ref().try_into().unwrap()),
-            );
+            let _ = this
+                .counts_map
+                .insert_sync(SmolStr::new(name), read_u64_counter(&v)?);
         }
+
+        let durable_watermark = load_count_delta_watermark(&this)?;
+        replay_count_deltas(&this, durable_watermark)?;
+        this.count_delta_checkpoint_watermark
+            .store(durable_watermark, Ordering::Relaxed);
+        this.count_delta_gc_watermark
+            .store(durable_watermark, Ordering::Relaxed);
+
+        let next_count_delta_id = this
+            .counts
+            .prefix(keys::COUNT_DELTA_PREFIX)
+            .next_back()
+            .map(|guard| -> Result<u64> {
+                let key = guard.key().into_diagnostic()?;
+                let (id, _) = keys::parse_count_delta_key(&key)?;
+                Ok(id + 1)
+            })
+            .transpose()?
+            .unwrap_or(durable_watermark.saturating_add(1));
+        this.next_count_delta_id
+            .store(next_count_delta_id, Ordering::Relaxed);
 
         Ok(this)
     }
@@ -699,23 +795,101 @@ impl Db {
             .into_diagnostic()?
     }
 
+    pub(crate) fn stage_count_deltas(
+        &self,
+        batch: &mut OwnedWriteBatch,
+        deltas: &CountDeltas,
+    ) -> Option<CountDeltaReservation> {
+        if deltas.is_empty() {
+            return None;
+        }
+
+        let start_id = self
+            .next_count_delta_id
+            .fetch_add(deltas.len() as u64, Ordering::SeqCst);
+        self.count_delta_in_flight
+            .lock()
+            .expect("count delta reservations poisoned")
+            .insert(start_id);
+
+        for (offset, (key, delta)) in deltas.iter().enumerate() {
+            batch.insert(
+                &self.counts,
+                keys::count_delta_key(start_id + offset as u64, key),
+                delta.to_be_bytes(),
+            );
+        }
+
+        Some(CountDeltaReservation {
+            in_flight: self.count_delta_in_flight.clone(),
+            start_id,
+        })
+    }
+
+    pub(crate) fn apply_count_deltas(&self, deltas: &CountDeltas) {
+        for (key, delta) in deltas.iter() {
+            self.update_count(key, *delta);
+        }
+    }
+
+    pub fn checkpoint_count_deltas(&self) -> Result<Option<u64>> {
+        let start = self
+            .count_delta_checkpoint_watermark
+            .load(Ordering::SeqCst)
+            .saturating_add(1);
+
+        let mut end = self
+            .next_count_delta_id
+            .load(Ordering::SeqCst)
+            .saturating_sub(1);
+
+        let lowest_in_flight = self
+            .count_delta_in_flight
+            .lock()
+            .expect("count delta reservations poisoned")
+            .first()
+            .copied();
+        if let Some(lowest_in_flight) = lowest_in_flight {
+            end = end.min(lowest_in_flight.saturating_sub(1));
+        }
+
+        if end < start {
+            return Ok(None);
+        }
+
+        let aggregated = load_count_delta_range(self, start, end)?;
+        let mut batch = self.inner.batch();
+
+        for (name, delta) in aggregated {
+            let current = get_persisted_ks_count(self, &name)?;
+            set_ks_count(&mut batch, self, &name, apply_count_delta(current, delta));
+        }
+
+        set_count_delta_watermark(&mut batch, self, end);
+        batch.commit().into_diagnostic()?;
+        self.count_delta_checkpoint_watermark
+            .store(end, Ordering::SeqCst);
+
+        Ok(Some(end))
+    }
+
+    pub fn mark_count_checkpoint_persisted(&self, watermark: u64) {
+        self.count_delta_gc_watermark
+            .store(watermark, Ordering::SeqCst);
+    }
+
     pub fn update_count(&self, key: &str, delta: i64) -> u64 {
         let mut entry = self.counts_map.entry_sync(SmolStr::new(key)).or_insert(0);
-        if delta >= 0 {
-            *entry = entry.saturating_add(delta as u64);
+        if delta < 0 && *entry < delta.unsigned_abs() {
+            error!(
+                key,
+                current = *entry,
+                decrement = delta.unsigned_abs(),
+                "count underflow !!! this is a bug"
+            );
+            *entry = 0;
         } else {
-            let decrement = delta.unsigned_abs();
-            if *entry < decrement {
-                error!(
-                    key,
-                    current = *entry,
-                    decrement,
-                    "count underflow !!! this is a bug"
-                );
-                *entry = 0;
-            } else {
-                *entry -= decrement;
-            }
+            *entry = apply_count_delta(*entry, delta);
         }
         *entry
     }
@@ -726,21 +900,16 @@ impl Db {
             .entry_async(SmolStr::new(key))
             .await
             .or_insert(0);
-        if delta >= 0 {
-            *entry = entry.saturating_add(delta as u64);
+        if delta < 0 && *entry < delta.unsigned_abs() {
+            error!(
+                key,
+                current = *entry,
+                decrement = delta.unsigned_abs(),
+                "count underflow !!! this is a bug"
+            );
+            *entry = 0;
         } else {
-            let decrement = delta.unsigned_abs();
-            if *entry < decrement {
-                error!(
-                    key,
-                    current = *entry,
-                    decrement,
-                    "count underflow !!! this is a bug"
-                );
-                *entry = 0;
-            } else {
-                *entry -= decrement;
-            }
+            *entry = apply_count_delta(*entry, delta);
         }
     }
 
@@ -827,13 +996,72 @@ pub fn set_ks_count(batch: &mut OwnedWriteBatch, db: &Db, name: &str, count: u64
     batch.insert(&db.counts, key, count.to_be_bytes());
 }
 
-pub fn persist_counts(db: &Db) -> Result<()> {
-    let mut batch = db.inner.batch();
-    db.counts_map.iter_sync(|k, v| {
-        set_ks_count(&mut batch, db, k, *v);
-        true
-    });
-    batch.commit().into_diagnostic()
+pub fn set_count_delta_watermark(batch: &mut OwnedWriteBatch, db: &Db, watermark: u64) {
+    batch.insert(
+        &db.counts,
+        keys::COUNT_DELTA_WATERMARK_KEY,
+        watermark.to_be_bytes(),
+    );
+}
+
+pub fn load_count_delta_watermark(db: &Db) -> Result<u64> {
+    db.counts
+        .get(keys::COUNT_DELTA_WATERMARK_KEY)
+        .into_diagnostic()?
+        .map(|value| read_u64_counter(&value))
+        .transpose()
+        .map(|watermark| watermark.unwrap_or(0))
+}
+
+fn read_u64_counter(value: &[u8]) -> Result<u64> {
+    value
+        .try_into()
+        .into_diagnostic()
+        .wrap_err("counter value must be 8 bytes")
+        .map(u64::from_be_bytes)
+}
+
+fn read_i64_counter_delta(value: &[u8]) -> Result<i64> {
+    value
+        .try_into()
+        .into_diagnostic()
+        .wrap_err("counter delta must be 8 bytes")
+        .map(i64::from_be_bytes)
+}
+
+fn replay_count_deltas(db: &Db, watermark: u64) -> Result<()> {
+    let start = watermark.saturating_add(1);
+    for (name, delta) in load_count_delta_range(db, start, u64::MAX)? {
+        db.update_count(&name, delta);
+    }
+    Ok(())
+}
+
+fn load_count_delta_range(db: &Db, start: u64, end: u64) -> Result<BTreeMap<SmolStr, i64>> {
+    let mut aggregated = BTreeMap::new();
+    for guard in db.counts.range(keys::count_delta_start_key(start)..) {
+        let (key, value) = guard.into_inner().into_diagnostic()?;
+        if !key.starts_with(keys::COUNT_DELTA_PREFIX) {
+            break;
+        }
+
+        let (id, name) = keys::parse_count_delta_key(&key)?;
+        if id > end {
+            break;
+        }
+
+        *aggregated.entry(SmolStr::new(name)).or_insert(0) += read_i64_counter_delta(&value)?;
+    }
+    Ok(aggregated)
+}
+
+fn get_persisted_ks_count(db: &Db, name: &str) -> Result<u64> {
+    db.counts
+        .get(keys::count_keyspace_key(name))
+        .into_diagnostic()?
+        .map(|value| read_u64_counter(&value))
+        .transpose()
+        .map(|count| count.unwrap_or(0))
 }
 
 /// load the persisted (day, count) pair for the daily PDS add counter, if present.
@@ -885,4 +1113,116 @@ pub fn load_persisted_firehose_sources(
         });
     }
     Ok(sources)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_config(path: &std::path::Path) -> crate::config::Config {
+        crate::config::Config {
+            database_path: path.to_path_buf(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn count_deltas_replay_and_checkpoint_across_restart() -> Result<()> {
+        let tmp = tempfile::tempdir().into_diagnostic()?;
+        let cfg = test_config(tmp.path());
+
+        {
+            let db = Db::open(&cfg)?;
+            let mut batch = db.inner.batch();
+            set_ks_count(&mut batch, &db, "repos", 10);
+            batch.commit().into_diagnostic()?;
+
+            let mut batch = db.inner.batch();
+            let mut deltas = CountDeltas::default();
+            deltas.add("repos", 2);
+            deltas.add("pending", 1);
+            let reservation = db
+                .stage_count_deltas(&mut batch, &deltas)
+                .expect("count deltas should reserve ids");
+            batch.commit().into_diagnostic()?;
+            db.apply_count_deltas(&deltas);
+            drop(reservation);
+            db.persist()?;
+        }
+
+        {
+            let db = Db::open(&cfg)?;
+            assert_eq!(db.get_count_sync("repos"), 12);
+            assert_eq!(db.get_count_sync("pending"), 1);
+            let checkpointed_watermark = db
+                .checkpoint_count_deltas()?
+                .expect("checkpoint should fold pending deltas");
+            db.persist()?;
+            db.mark_count_checkpoint_persisted(checkpointed_watermark);
+            assert_eq!(load_count_delta_watermark(&db)?, checkpointed_watermark);
+        }
+
+        {
+            let db = Db::open(&cfg)?;
+            assert_eq!(db.get_count_sync("repos"), 12);
+            assert_eq!(db.get_count_sync("pending"), 1);
+            assert!(load_count_delta_watermark(&db)? >= 1);
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn checkpoint_skips_inflight_deltas() -> Result<()> {
+        let tmp = tempfile::tempdir().into_diagnostic()?;
+        let cfg = test_config(tmp.path());
+        let db = Db::open(&cfg)?;
+
+        let mut batch = db.inner.batch();
+        let mut deltas = CountDeltas::default();
+        deltas.add("repos", 1);
+        let reservation = db
+            .stage_count_deltas(&mut batch, &deltas)
+            .expect("count deltas should reserve ids");
+
+        assert!(db.checkpoint_count_deltas()?.is_none());
+
+        batch.commit().into_diagnostic()?;
+        db.apply_count_deltas(&deltas);
+        drop(reservation);
+
+        assert!(db.checkpoint_count_deltas()?.is_some());
+
+        Ok(())
+    }
+
+    #[test]
+    fn checkpointed_count_deltas_are_gcable() -> Result<()> {
+        let tmp = tempfile::tempdir().into_diagnostic()?;
+        let cfg = test_config(tmp.path());
+        let db = Db::open(&cfg)?;
+
+        let mut batch = db.inner.batch();
+        let mut deltas = CountDeltas::default();
+        deltas.add("repos", 1);
+        let reservation = db
+            .stage_count_deltas(&mut batch, &deltas)
+            .expect("count deltas should reserve ids");
+        batch.commit().into_diagnostic()?;
+        db.apply_count_deltas(&deltas);
+        drop(reservation);
+
+        let watermark = db
+            .checkpoint_count_deltas()?
+            .expect("checkpoint should fold pending deltas");
+        db.persist()?;
+        db.mark_count_checkpoint_persisted(watermark);
+
+        db.counts.rotate_memtable_and_wait().into_diagnostic()?;
+        db.counts.major_compact().into_diagnostic()?;
+
+        assert_eq!(db.counts.prefix(keys::COUNT_DELTA_PREFIX).count(), 0);
+
+        Ok(())
+    }
 }

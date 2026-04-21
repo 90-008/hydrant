@@ -1,5 +1,5 @@
 use crate::db::types::{DbAction, DbRkey, TrimmedDid};
-use crate::db::{self, Db, keys, ser_repo_state};
+use crate::db::{self, CountDeltas, Db, keys, ser_repo_state};
 use crate::filter::FilterMode;
 use crate::ops;
 use crate::resolver::ResolverError;
@@ -194,19 +194,19 @@ async fn did_task(
             // determine old gauge state
             // if it was error/suspended etc, we need to know which error kind it was to decrement correctly.
             let mut batch = db.inner.batch();
+            let mut count_deltas = CountDeltas::default();
             // unconditionally remove from pending
             batch.remove(&db.pending, pending_key);
             // remove from resync, just in case
             batch.remove(&db.resync, &did_key);
+            count_deltas.add_gauge_diff(&GaugeState::Pending, &GaugeState::Synced);
+            let reservation = db.stage_count_deltas(&mut batch, &count_deltas);
 
             tokio::task::spawn_blocking(move || batch.commit().into_diagnostic())
                 .await
                 .into_diagnostic()??;
-
-            state
-                .db
-                .update_gauge_diff_async(&GaugeState::Pending, &GaugeState::Synced)
-                .await;
+            db.apply_count_deltas(&count_deltas);
+            drop(reservation);
 
             let state = state.clone();
             tokio::task::spawn_blocking(move || {
@@ -227,17 +227,19 @@ async fn did_task(
             }
             Ok(())
         }
-        Ok(None) => {
-            // signal mode: repo had no matching records, was cleaned up by process_did
-            state.db.update_count_async("repos", -1).await;
-            state.db.update_count_async("pending", -1).await;
-            Ok(())
-        }
+        Ok(None) => Ok(()),
         Err(BackfillError::Deleted) => {
             warn!("orphaned pending entry, cleaning up");
-            // orphaned pending entry, clean it up
-            Db::remove(db.pending.clone(), pending_key).await?;
-            state.db.update_count_async("pending", -1).await;
+            let mut batch = db.inner.batch();
+            let mut count_deltas = CountDeltas::default();
+            batch.remove(&db.pending, pending_key);
+            count_deltas.add("pending", -1);
+            let reservation = db.stage_count_deltas(&mut batch, &count_deltas);
+            tokio::task::spawn_blocking(move || batch.commit().into_diagnostic())
+                .await
+                .into_diagnostic()??;
+            db.apply_count_deltas(&count_deltas);
+            drop(reservation);
             Ok(())
         }
         Err(e) => {
@@ -286,12 +288,19 @@ async fn did_task(
                 retry_count,
                 next_retry,
             };
+            let old_gauge = prev_kind
+                .map(|k| GaugeState::Resync(Some(k)))
+                .unwrap_or(GaugeState::Pending);
+            let new_gauge = GaugeState::Resync(Some(error_kind.clone()));
+            let mut count_deltas = CountDeltas::default();
+            count_deltas.add_gauge_diff(&old_gauge, &new_gauge);
 
             let error_string = e.to_string();
 
             tokio::task::spawn_blocking({
                 let state = state.clone();
                 let did_key = did_key.into_static();
+                let count_deltas = count_deltas.clone();
                 move || {
                     // 3. save to resync
                     let serialized_resync_state =
@@ -316,22 +325,15 @@ async fn did_task(
                     if let Some(state_bytes) = serialized_repo_state {
                         batch.insert(&state.db.repos, &did_key, state_bytes);
                     }
-                    batch.commit().into_diagnostic()
+                    let reservation = state.db.stage_count_deltas(&mut batch, &count_deltas);
+                    batch.commit().into_diagnostic().inspect(|_| {
+                        state.db.apply_count_deltas(&count_deltas);
+                        drop(reservation);
+                    })
                 }
             })
             .await
             .into_diagnostic()??;
-
-            let old_gauge = prev_kind
-                .map(|k| GaugeState::Resync(Some(k)))
-                .unwrap_or(GaugeState::Pending);
-
-            let new_gauge = GaugeState::Resync(Some(error_kind));
-
-            state
-                .db
-                .update_gauge_diff_async(&old_gauge, &new_gauge)
-                .await;
 
             Err(e)
         }
@@ -776,9 +778,19 @@ async fn process_did<'i>(
                 )?;
             }
 
+            let mut count_deltas = CountDeltas::default();
+            if delta != 0 {
+                count_deltas.add("records", delta);
+            }
+            if added_blocks > 0 {
+                count_deltas.add("blocks", added_blocks);
+            }
+            let reservation = app_state.db.stage_count_deltas(&mut batch, &count_deltas);
             batch.commit().into_diagnostic()?;
+            app_state.db.apply_count_deltas(&count_deltas);
+            drop(reservation);
 
-            Ok::<_, miette::Report>(Some((state, delta, added_blocks, count)))
+            Ok::<_, miette::Report>(Some(count))
         })
         .await
         .into_diagnostic()??
@@ -792,17 +804,24 @@ async fn process_did<'i>(
         .ok_or_else(|| miette::miette!("repo metadata not found for {}", did))?;
     let metadata = crate::db::deser_repo_meta(metadata_bytes.as_ref())?;
 
-    let Some((_state, records_cnt_delta, added_blocks, count)) = result else {
+    let Some(count) = result else {
         // signal mode: no signal-matching records found, clean up the optimistically-added repo
         let did_key = keys::repo_key(did);
         let backfill_pending_key = keys::pending_key(metadata.index_id);
         let app_state = app_state.clone();
         tokio::task::spawn_blocking(move || {
             let mut batch = app_state.db.inner.batch();
+            let mut count_deltas = CountDeltas::default();
             batch.remove(&app_state.db.repos, &did_key);
             batch.remove(&app_state.db.repo_metadata, &metadata_key);
             batch.remove(&app_state.db.pending, backfill_pending_key);
-            batch.commit().into_diagnostic()
+            count_deltas.add("repos", -1);
+            count_deltas.add("pending", -1);
+            let reservation = app_state.db.stage_count_deltas(&mut batch, &count_deltas);
+            batch.commit().into_diagnostic().inspect(|_| {
+                app_state.db.apply_count_deltas(&count_deltas);
+                drop(reservation);
+            })
         })
         .await
         .into_diagnostic()??;
@@ -810,20 +829,6 @@ async fn process_did<'i>(
     };
 
     trace!(ops = count, elapsed = %start.elapsed().as_secs_f32(), "did ops");
-
-    // do the counts
-    if records_cnt_delta != 0 {
-        app_state
-            .db
-            .update_count_async("records", records_cnt_delta)
-            .await;
-    }
-    if added_blocks > 0 {
-        app_state
-            .db
-            .update_count_async("blocks", added_blocks)
-            .await;
-    }
     trace!(
         elapsed = %start.elapsed().as_secs_f32(),
         "committed backfill batch"

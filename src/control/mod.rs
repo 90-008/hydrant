@@ -333,14 +333,29 @@ impl Hydrant {
                         true
                     });
 
-                    if let Err(e) = db::persist_counts(&state.db) {
-                        error!(err = %e, "failed to persist counts");
-                        db::check_poisoned_report(&e);
-                    }
+                    let checkpoint_watermark = match state.db.checkpoint_count_deltas() {
+                        Ok(watermark) => watermark,
+                        Err(e) => {
+                            error!(err = %e, "failed to checkpoint count deltas");
+                            db::check_poisoned_report(&e);
+                            None
+                        }
+                    };
 
                     if let Err(e) = state.db.persist() {
                         error!(err = %e, "db persist failed");
                         db::check_poisoned_report(&e);
+                    } else {
+                        let watermark = checkpoint_watermark
+                            .map(Ok)
+                            .unwrap_or_else(|| db::load_count_delta_watermark(&state.db));
+                        match watermark {
+                            Ok(watermark) => state.db.mark_count_checkpoint_persisted(watermark),
+                            Err(e) => {
+                                error!(err = %e, "failed to load durable count checkpoint watermark");
+                                db::check_poisoned_report(&e);
+                            }
+                        }
                     }
                 }
             });

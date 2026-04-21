@@ -67,6 +67,48 @@ pub fn count_keyspace_key(name: &str) -> Vec<u8> {
     key
 }
 
+pub const COUNT_DELTA_PREFIX: &[u8] = &[b'd', SEP];
+
+pub fn count_delta_key(id: u64, name: &str) -> Vec<u8> {
+    let mut key = Vec::with_capacity(COUNT_DELTA_PREFIX.len() + 8 + 1 + name.len());
+    key.extend_from_slice(COUNT_DELTA_PREFIX);
+    key.extend_from_slice(&id.to_be_bytes());
+    key.push(SEP);
+    key.extend_from_slice(name.as_bytes());
+    key
+}
+
+pub fn count_delta_start_key(id: u64) -> Vec<u8> {
+    let mut key = Vec::with_capacity(COUNT_DELTA_PREFIX.len() + 8);
+    key.extend_from_slice(COUNT_DELTA_PREFIX);
+    key.extend_from_slice(&id.to_be_bytes());
+    key
+}
+
+pub fn parse_count_delta_key(key: &[u8]) -> miette::Result<(u64, &str)> {
+    let min_len = COUNT_DELTA_PREFIX.len() + 8 + 1;
+    if key.len() < min_len || !key.starts_with(COUNT_DELTA_PREFIX) {
+        miette::bail!("invalid count delta key");
+    }
+
+    let id_start = COUNT_DELTA_PREFIX.len();
+    let id_end = id_start + 8;
+    let id = u64::from_be_bytes(
+        key[id_start..id_end]
+            .try_into()
+            .map_err(|e| miette::miette!("invalid count delta key id: {e}"))?,
+    );
+    if key[id_end] != SEP {
+        miette::bail!("invalid count delta key separator");
+    }
+
+    let name = std::str::from_utf8(&key[id_end + 1..])
+        .map_err(|e| miette::miette!("invalid count delta key name: {e}"))?;
+    Ok((id, name))
+}
+
+pub const COUNT_DELTA_WATERMARK_KEY: &[u8] = b"w|count_delta_watermark";
+
 pub const COUNT_COLLECTION_PREFIX: &[u8] = &[b'r', SEP];
 
 pub fn did_collection_prefix(did: &Did) -> Vec<u8> {

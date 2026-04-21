@@ -9,14 +9,6 @@ use crate::db::{Db, deser_repo_state, keys, ser_repo_state};
 use crate::types::RepoState;
 
 impl Db {
-    pub(crate) fn update_gauge_diff(&self, old: &GaugeState, new: &GaugeState) {
-        update_gauge_diff_impl!(self, old, new, update_count);
-    }
-
-    pub(crate) async fn update_gauge_diff_async(&self, old: &GaugeState, new: &GaugeState) {
-        update_gauge_diff_impl!(self, old, new, update_count_async, await);
-    }
-
     pub(crate) fn update_repo_state<F, T>(
         batch: &mut OwnedWriteBatch,
         repos: &Keyspace,

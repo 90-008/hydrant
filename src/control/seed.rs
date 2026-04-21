@@ -9,7 +9,7 @@ use tracing::{info, warn};
 use url::Url;
 
 use super::firehose::FirehoseHandle;
-use crate::db::{self, keys};
+use crate::db::{self, CountDeltas, keys};
 use crate::state::AppState;
 
 const MAX_CONCURRENT_SEEDS: usize = 4;
@@ -137,7 +137,24 @@ async fn seed_one(
                 let count_key = keys::pds_account_count_key(host.hostname.as_ref());
                 let current = state.db.get_count(&count_key).await;
                 if current == 0 {
-                    state.db.update_count_async(&count_key, count).await;
+                    let state = state.clone();
+                    let count_key = count_key.clone();
+                    let result = tokio::task::spawn_blocking(move || -> miette::Result<()> {
+                        let mut batch = state.db.inner.batch();
+                        let mut count_deltas = CountDeltas::default();
+                        count_deltas.add(&count_key, count);
+                        let reservation = state.db.stage_count_deltas(&mut batch, &count_deltas);
+                        batch.commit().into_diagnostic()?;
+                        state.db.apply_count_deltas(&count_deltas);
+                        drop(reservation);
+                        Ok(())
+                    })
+                    .await
+                    .into_diagnostic()
+                    .flatten();
+                    if let Err(e) = result {
+                        warn!(hostname = %host.hostname, err = %e, "failed to seed host account count");
+                    }
                 }
             }
 

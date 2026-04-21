@@ -1,4 +1,4 @@
-use crate::db::{keys, ser_repo_state};
+use crate::db::{CountDeltas, keys, ser_repo_state};
 use crate::state::AppState;
 use crate::types::{RepoMetadata, RepoState};
 use miette::{IntoDiagnostic, Result};
@@ -144,6 +144,7 @@ impl CrawlerWorker {
                 let mut rng: SmallRng = rand::make_rng();
                 let mut batch = app_state.db.inner.batch();
                 let mut surviving = Vec::new();
+                let mut count_deltas = CountDeltas::default();
                 for guard in guards {
                     let did_key = keys::repo_key(&*guard);
                     let metadata_key = keys::repo_metadata_key(&*guard);
@@ -172,13 +173,19 @@ impl CrawlerWorker {
                     // clear any stale retry entry, this DID is confirmed and being enqueued
                     batch.remove(&app_state.db.crawler, keys::crawler_retry_key(&*guard));
                     trace!(did = %*guard, "enqueuing repo");
+                    count_deltas.add("repos", 1);
+                    #[cfg(feature = "indexer")]
+                    count_deltas.add("pending", 1);
                     surviving.push(guard);
                 }
                 if let Some(cursor) = cursor_update {
                     batch.insert(&app_state.db.cursors, cursor.key, cursor.value);
                 }
+                let reservation = app_state.db.stage_count_deltas(&mut batch, &count_deltas);
                 // todo: repo state overwrites here are acceptable?
                 batch.commit().into_diagnostic()?;
+                app_state.db.apply_count_deltas(&count_deltas);
+                drop(reservation);
                 Ok(surviving)
             }),
         )
@@ -197,14 +204,6 @@ impl CrawlerWorker {
 
         if count > 0 {
             self.stats.record_processed(count);
-            self.state
-                .db
-                .update_count_async("repos", count as i64)
-                .await;
-            self.state
-                .db
-                .update_count_async("pending", count as i64)
-                .await;
             #[cfg(feature = "indexer")]
             self.state.notify_backfill();
         }

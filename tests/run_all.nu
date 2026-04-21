@@ -25,7 +25,7 @@ def run-test [] {
         HYDRANT_API_PORT: $in.api
         HYDRANT_DEBUG_PORT: $in.debug
         HYDRANT_TEST_MOCK_PORT: $in.mock
-        HYDRANT_BINARY: "target/debug/hydrant"
+        HYDRANT_BINARY: "target/x86_64-unknown-linux-gnu/debug/hydrant"
     } {
         ^nu $"tests/($in.name).nu" | complete
     })

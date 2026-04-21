@@ -1,5 +1,5 @@
 use super::*;
-use crate::db::{self, keys, ser_repo_meta};
+use crate::db::{self, CountDeltas, keys, ser_repo_meta};
 use crate::ingest::stream::{Account, Commit, Identity};
 use crate::ingest::validation;
 use crate::resolver::{NoSigningKeyError, ResolverError};
@@ -127,6 +127,7 @@ struct WorkerContext<'a> {
     batch: OwnedWriteBatch,
     added_blocks: &'a mut i64,
     records_delta: &'a mut i64,
+    count_deltas: &'a mut CountDeltas,
     #[cfg(feature = "indexer_stream")]
     broadcast_events: &'a mut Vec<BroadcastEvent>,
 }
@@ -208,12 +209,14 @@ impl FirehoseWorker {
 
             let mut added_blocks = 0;
             let mut records_delta = 0;
+            let mut count_deltas = CountDeltas::default();
 
             let mut ctx = WorkerContext {
                 state: &state,
                 batch,
                 added_blocks: &mut added_blocks,
                 records_delta: &mut records_delta,
+                count_deltas: &mut count_deltas,
                 #[cfg(feature = "indexer_stream")]
                 broadcast_events: &mut broadcast_events,
             };
@@ -340,7 +343,7 @@ impl FirehoseWorker {
                             ) {
                                 Ok(RepoProcessResult::Ok(_)) => {}
                                 Ok(RepoProcessResult::Deleted) => {
-                                    state.db.update_count("repos", -1);
+                                    ctx.count_deltas.add("repos", -1);
                                 }
                                 Ok(RepoProcessResult::NeedsBackfill(Some(commit))) => {
                                     try_persist(commit);
@@ -390,16 +393,21 @@ impl FirehoseWorker {
                 }
             }
 
-            if let Err(e) = ctx.batch.commit() {
-                error!(shard = id, err = %e, "failed to commit batch");
-            }
-
+            let mut batch = ctx.batch;
             if added_blocks > 0 {
-                state.db.update_count("blocks", added_blocks);
+                count_deltas.add("blocks", added_blocks);
             }
             if records_delta != 0 {
-                state.db.update_count("records", records_delta);
+                count_deltas.add("records", records_delta);
             }
+            let reservation = state.db.stage_count_deltas(&mut batch, &count_deltas);
+            if let Err(e) = batch.commit() {
+                error!(shard = id, err = %e, "failed to commit batch");
+                drop(reservation);
+                continue;
+            }
+            state.db.apply_count_deltas(&count_deltas);
+            drop(reservation);
             #[cfg(feature = "indexer_stream")]
             for evt in broadcast_events.drain(..) {
                 let _ = state.db.event_tx.send(evt);
@@ -540,14 +548,16 @@ impl FirehoseWorker {
                     // status update logic is now handled in RelayWorker;
                     // FirehoseWorker just needs to update gauges if status changed.
                     if changed && was_active {
-                        db.update_gauge_diff(&GaugeState::Synced, &GaugeState::Resync(None));
+                        ctx.count_deltas
+                            .add_gauge_diff(&GaugeState::Synced, &GaugeState::Resync(None));
                     }
                 }
             }
         } else {
             // if account became active, update gauges
             if !was_active {
-                db.update_gauge_diff(&GaugeState::Resync(None), &GaugeState::Synced);
+                ctx.count_deltas
+                    .add_gauge_diff(&GaugeState::Resync(None), &GaugeState::Synced);
             }
         }
 
@@ -614,6 +624,7 @@ impl FirehoseWorker {
     ) -> Result<RepoState<'s>, IngestError> {
         let db = &ctx.state.db;
         let mut batch = db.inner.batch();
+        let mut count_deltas = CountDeltas::default();
         let repo_key = keys::repo_key(did);
         let meta_key = keys::repo_metadata_key(did);
 
@@ -643,10 +654,15 @@ impl FirehoseWorker {
         metadata.index_id = rand::random::<u64>();
         batch.insert(&db.pending, keys::pending_key(metadata.index_id), &repo_key);
         batch.insert(&db.repo_metadata, &meta_key, ser_repo_meta(&metadata)?);
+        if !was_pending {
+            count_deltas.add_gauge_diff(&old_gauge, &crate::types::GaugeState::Pending);
+        }
+        let reservation = db.stage_count_deltas(&mut batch, &count_deltas);
         batch.commit().into_diagnostic()?;
+        db.apply_count_deltas(&count_deltas);
+        drop(reservation);
 
         if !was_pending {
-            db.update_gauge_diff(&old_gauge, &crate::types::GaugeState::Pending);
             ctx.state.notify_backfill();
         }
 

@@ -1,5 +1,5 @@
 use crate::db::types::TrimmedDid;
-use crate::db::{self, keys};
+use crate::db::{self, CountDeltas, keys};
 use crate::state::AppState;
 use crate::types::{GaugeState, ResyncState};
 use miette::{IntoDiagnostic, Result};
@@ -10,7 +10,8 @@ use tracing::{debug, error, info};
 
 pub fn queue_gone_backfills(state: &Arc<AppState>) -> Result<()> {
     debug!("scanning for deactivated/takendown repos to retry...");
-    let mut transitions = Vec::new();
+    let mut transitions = 0usize;
+    let mut count_deltas = CountDeltas::default();
 
     let mut batch = state.db.inner.batch();
 
@@ -61,24 +62,24 @@ pub fn queue_gone_backfills(state: &Arc<AppState>) -> Result<()> {
                     crate::db::ser_repo_meta(&metadata)?,
                 );
 
-                transitions.push((GaugeState::Resync(None), GaugeState::Pending));
+                count_deltas.add_gauge_diff(&GaugeState::Resync(None), &GaugeState::Pending);
+                transitions += 1;
             }
         }
     }
 
-    if transitions.is_empty() {
+    if transitions == 0 {
         return Ok(());
     }
 
+    let reservation = state.db.stage_count_deltas(&mut batch, &count_deltas);
     batch.commit().into_diagnostic()?;
-
-    for (old_gauge, new_gauge) in &transitions {
-        state.db.update_gauge_diff(old_gauge, new_gauge);
-    }
+    state.db.apply_count_deltas(&count_deltas);
+    drop(reservation);
 
     state.notify_backfill();
 
-    info!(count = transitions.len(), "queued gone backfills");
+    info!(count = transitions, "queued gone backfills");
     Ok(())
 }
 
@@ -90,7 +91,8 @@ pub fn retry_worker(state: Arc<AppState>) {
         std::thread::sleep(Duration::from_secs(60));
 
         let now = chrono::Utc::now().timestamp();
-        let mut transitions = Vec::new();
+        let mut transitions = 0usize;
+        let mut count_deltas = CountDeltas::default();
 
         let mut batch = state.db.inner.batch();
 
@@ -161,7 +163,9 @@ pub fn retry_worker(state: Arc<AppState>) {
                         };
                         batch.insert(&state.db.repo_metadata, &metadata_key, serialized_metadata);
 
-                        transitions.push((GaugeState::Resync(Some(kind)), GaugeState::Pending));
+                        count_deltas
+                            .add_gauge_diff(&GaugeState::Resync(Some(kind)), &GaugeState::Pending);
+                        transitions += 1;
                     }
                 }
                 Ok(_) => {
@@ -174,20 +178,19 @@ pub fn retry_worker(state: Arc<AppState>) {
             }
         }
 
-        if transitions.is_empty() {
+        if transitions == 0 {
             continue;
         }
 
+        let reservation = state.db.stage_count_deltas(&mut batch, &count_deltas);
         if let Err(e) = batch.commit() {
             error!(err = %e, "failed to commit batch");
             db::check_poisoned(&e);
             continue;
         }
-
-        for (old_gauge, new_gauge) in &transitions {
-            state.db.update_gauge_diff(old_gauge, new_gauge);
-        }
+        state.db.apply_count_deltas(&count_deltas);
+        drop(reservation);
         state.notify_backfill();
-        info!(count = transitions.len(), "queued retries");
+        info!(count = transitions, "queued retries");
     }
 }

@@ -2,6 +2,7 @@ use futures::{FutureExt, TryFutureExt};
 use rand::Rng;
 
 use super::*;
+use crate::db::CountDeltas;
 
 impl ReposControl {
     /// iterates through pending repositories, returning their state.
@@ -104,7 +105,7 @@ impl ReposControl {
         db: &Db,
         did: &Did<'_>,
         batch: &mut fjall::OwnedWriteBatch,
-        transitions: &mut Vec<(GaugeState, GaugeState)>,
+        count_deltas: &mut CountDeltas,
     ) -> Result<bool> {
         let did_key = keys::repo_key(did);
         let metadata_key = keys::repo_metadata_key(did);
@@ -144,7 +145,7 @@ impl ReposControl {
                     &metadata_key,
                     crate::db::ser_repo_meta(&metadata)?,
                 );
-                transitions.push((old, GaugeState::Pending));
+                count_deltas.add_gauge_diff(&old, &GaugeState::Pending);
                 return Ok(true);
             }
         }
@@ -167,28 +168,27 @@ impl ReposControl {
         let dids: Vec<Did<'static>> = dids.into_iter().map(|d| d.into_static()).collect();
         let state = self.0.clone();
 
-        let (queued, transitions) = tokio::task::spawn_blocking(move || {
+        let queued = tokio::task::spawn_blocking(move || {
             let db = &state.db;
             let mut batch = db.inner.batch();
             let mut queued: Vec<Did<'static>> = Vec::new();
-            let mut transitions: Vec<(GaugeState, GaugeState)> = Vec::new();
+            let mut count_deltas = CountDeltas::default();
 
             for did in dids {
-                if Self::_resync(db, &did, &mut batch, &mut transitions)? {
+                if Self::_resync(db, &did, &mut batch, &mut count_deltas)? {
                     queued.push(did);
                 }
             }
 
+            let reservation = db.stage_count_deltas(&mut batch, &count_deltas);
             batch.commit().into_diagnostic()?;
+            db.apply_count_deltas(&count_deltas);
+            drop(reservation);
             state.db.persist()?;
-            Ok::<_, miette::Report>((queued, transitions))
+            Ok::<_, miette::Report>(queued)
         })
         .await
         .into_diagnostic()??;
-
-        for (old, new) in transitions {
-            self.0.db.update_gauge_diff_async(&old, &new).await;
-        }
         if !queued.is_empty() {
             self.0.notify_backfill();
         }
@@ -208,12 +208,11 @@ impl ReposControl {
         let dids: Vec<Did<'static>> = dids.into_iter().map(|d| d.into_static()).collect();
         let state = self.0.clone();
 
-        let (new_count, queued, transitions) = tokio::task::spawn_blocking(move || {
+        let queued = tokio::task::spawn_blocking(move || {
             let db = &state.db;
             let mut batch = db.inner.batch();
-            let mut added = 0i64;
             let mut queued: Vec<Did<'static>> = Vec::new();
-            let mut transitions: Vec<(GaugeState, GaugeState)> = Vec::new();
+            let mut count_deltas = CountDeltas::default();
 
             for did in dids {
                 let did_key = keys::repo_key(&did);
@@ -225,7 +224,8 @@ impl ReposControl {
                     .transpose()?;
 
                 if let Some(metadata) = existing_metadata {
-                    if !metadata.tracked && Self::_resync(db, &did, &mut batch, &mut transitions)? {
+                    if !metadata.tracked && Self::_resync(db, &did, &mut batch, &mut count_deltas)?
+                    {
                         queued.push(did);
                     }
                 } else {
@@ -238,25 +238,21 @@ impl ReposControl {
                         crate::db::ser_repo_meta(&metadata)?,
                     );
                     batch.insert(&db.pending, keys::pending_key(metadata.index_id), &did_key);
-                    added += 1;
+                    count_deltas.add("repos", 1);
+                    count_deltas.add_gauge_diff(&GaugeState::Synced, &GaugeState::Pending);
                     queued.push(did);
-                    transitions.push((GaugeState::Synced, GaugeState::Pending));
                 }
             }
 
+            let reservation = db.stage_count_deltas(&mut batch, &count_deltas);
             batch.commit().into_diagnostic()?;
+            db.apply_count_deltas(&count_deltas);
+            drop(reservation);
             state.db.persist()?;
-            Ok::<_, miette::Report>((added, queued, transitions))
+            Ok::<_, miette::Report>(queued)
         })
         .await
         .into_diagnostic()??;
-
-        if new_count > 0 {
-            self.0.db.update_count_async("repos", new_count).await;
-        }
-        for (old, new) in transitions {
-            self.0.db.update_gauge_diff_async(&old, &new).await;
-        }
         self.0.notify_backfill();
         Ok(queued)
     }
@@ -271,11 +267,11 @@ impl ReposControl {
         let dids: Vec<Did<'static>> = dids.into_iter().map(|d| d.into_static()).collect();
         let state = self.0.clone();
 
-        let (untracked, gauge_decrements) = tokio::task::spawn_blocking(move || {
+        let untracked = tokio::task::spawn_blocking(move || {
             let db = &state.db;
             let mut batch = db.inner.batch();
             let mut untracked: Vec<Did<'static>> = Vec::new();
-            let mut gauge_decrements = Vec::new();
+            let mut count_deltas = CountDeltas::default();
 
             for did in dids {
                 let did_key = keys::repo_key(&did);
@@ -306,7 +302,7 @@ impl ReposControl {
                             batch.remove(&db.pending, keys::pending_key(metadata.index_id));
                             batch.remove(&db.resync, &did_key);
                             if old != GaugeState::Synced {
-                                gauge_decrements.push(old);
+                                count_deltas.add_gauge_diff(&old, &GaugeState::Synced);
                             }
                             untracked.push(did);
                         }
@@ -314,19 +310,15 @@ impl ReposControl {
                 }
             }
 
+            let reservation = db.stage_count_deltas(&mut batch, &count_deltas);
             batch.commit().into_diagnostic()?;
+            db.apply_count_deltas(&count_deltas);
+            drop(reservation);
             state.db.persist()?;
-            Ok::<_, miette::Report>((untracked, gauge_decrements))
+            Ok::<_, miette::Report>(untracked)
         })
         .await
         .into_diagnostic()??;
-
-        for gauge in gauge_decrements {
-            self.0
-                .db
-                .update_gauge_diff_async(&gauge, &GaugeState::Synced)
-                .await;
-        }
         Ok(untracked)
     }
 }
