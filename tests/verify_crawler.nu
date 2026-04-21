@@ -67,7 +67,7 @@ def main [] {
             
             # retry check for 30s
             for i in 1..30 {
-                let stats = (http get $"($url)/stats?accurate=true").counts
+                let stats = (http get $"($url)/stats").counts
                 let pending = ($stats.pending | into int)
                 let repos = ($stats.repos | default 0 | into int) 
                 

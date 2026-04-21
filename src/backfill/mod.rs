@@ -628,6 +628,8 @@ async fn process_did<'i>(
                     let path = (collection.to_smolstr(), rkey.clone());
                     let cid_obj = Cid::ipld(cid);
 
+                    *collection_counts.entry(path.0.clone()).or_default() += 1;
+
                     // check if this record already exists with same CID
                     let existing_cid = existing_cids.remove(&path);
                     let action = if let Some(existing_cid) = &existing_cid {
@@ -667,7 +669,6 @@ async fn process_did<'i>(
                     added_blocks += 1;
                     if action == DbAction::Create {
                         delta += 1;
-                        *collection_counts.entry(path.0.clone()).or_default() += 1;
                     }
 
                     #[cfg(feature = "indexer_stream")]
@@ -767,9 +768,12 @@ async fn process_did<'i>(
 
             // add the counts
             if !ephemeral {
-                for (col, cnt) in collection_counts {
-                    db::set_record_count(&mut batch, &app_state.db, &did, &col, cnt);
-                }
+                db::replace_record_counts(
+                    &mut batch,
+                    &app_state.db,
+                    &did,
+                    collection_counts.iter().map(|(col, cnt)| (col.as_str(), *cnt)),
+                )?;
             }
 
             batch.commit().into_diagnostic()?;
@@ -808,7 +812,7 @@ async fn process_did<'i>(
     trace!(ops = count, elapsed = %start.elapsed().as_secs_f32(), "did ops");
 
     // do the counts
-    if records_cnt_delta > 0 {
+    if records_cnt_delta != 0 {
         app_state
             .db
             .update_count_async("records", records_cnt_delta)

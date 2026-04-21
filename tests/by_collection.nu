@@ -69,7 +69,7 @@ def main [] {
     print "waiting for collection-index discovery pass..."
     mut discovered = false
     for i in 1..60 {
-        let stats = (try { (http get $"($url)/stats?accurate=true").counts } catch { {} })
+        let stats = (try { (http get $"($url)/stats").counts } catch { {} })
         let repos = ($stats | get --optional repos | default 0 | into int)
         print $"[($i)/60] repos: ($repos)"
         if $repos >= ($known_dids | length) {

@@ -174,7 +174,7 @@ export def wait-for-api [url: string] {
 export def wait-for-backfill [url: string] {
     print "waiting for backfill to complete..."
     for i in 1..120 {
-        let stats = (http get $"($url)/stats?accurate=true").counts
+        let stats = (http get $"($url)/stats").counts
         let pending = ($stats.pending | into int)
         let records = ($stats.records | into int)
         let repos = ($stats.repos | into int)

@@ -67,7 +67,7 @@ def main [] {
             
             sleep 2sec
             
-            let stats = (http get $"($url)/stats?accurate=true").counts
+            let stats = (http get $"($url)/stats").counts
             let events_count = ($stats.events | into int)
             print $"total events in db: ($events_count)"
             

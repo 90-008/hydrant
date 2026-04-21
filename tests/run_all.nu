@@ -48,7 +48,7 @@ def main [--only: list<string> = [], --skip-creds] {
     # discover all test scripts, excluding infrastructure files
     mut excluded = ["common", "mock_relay", "mock_pds", "run_all"]
     if $skip_creds {
-        $excluded = ($excluded | append ["authenticated_stream", "repo_sync_integrity"])
+        $excluded = ($excluded | append ["authenticated_stream", "count_tracking", "repo_sync_integrity"])
     }
     let discovered = (
         ls tests/*.nu
@@ -78,6 +78,7 @@ def main [--only: list<string> = [], --skip-creds] {
 
     let groups = {
         "authenticated_stream": "event_dependent",
+        "count_tracking": "event_dependent",
         "signal_filter": "event_dependent",
     }
     let grouped = $assigned | group-by {|t| $groups | get -o $t.name | default $t.name}

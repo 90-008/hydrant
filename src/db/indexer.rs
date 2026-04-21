@@ -99,6 +99,25 @@ pub fn set_record_count(
     batch.insert(&db.counts, key, count.to_be_bytes());
 }
 
+pub fn replace_record_counts<'a>(
+    batch: &mut OwnedWriteBatch,
+    db: &Db,
+    did: &Did<'_>,
+    counts: impl IntoIterator<Item = (&'a str, u64)>,
+) -> Result<()> {
+    let prefix = keys::did_collection_prefix(did);
+    for guard in db.counts.prefix(&prefix) {
+        let key = guard.key().into_diagnostic()?;
+        batch.remove(&db.counts, key);
+    }
+
+    for (collection, count) in counts {
+        set_record_count(batch, db, did, collection, count);
+    }
+
+    Ok(())
+}
+
 pub fn update_record_count(
     batch: &mut OwnedWriteBatch,
     db: &Db,
@@ -163,4 +182,44 @@ pub fn load_persisted_crawler_sources(
         sources.push(crate::config::CrawlerSource { url, mode });
     }
     Ok(sources)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn replace_record_counts_clears_stale_collections() -> Result<()> {
+        let tmp = tempfile::tempdir().into_diagnostic()?;
+        let cfg = crate::config::Config {
+            database_path: tmp.path().to_path_buf(),
+            ..Default::default()
+        };
+        let db = Db::open(&cfg)?;
+        let did = Did::new("did:plc:yk4q3id7id6p5z3bypvshc64").into_diagnostic()?;
+
+        let mut batch = db.inner.batch();
+        set_record_count(&mut batch, &db, &did, "app.bsky.feed.post", 3);
+        set_record_count(&mut batch, &db, &did, "app.bsky.feed.like", 2);
+        batch.commit().into_diagnostic()?;
+
+        let mut batch = db.inner.batch();
+        replace_record_counts(
+            &mut batch,
+            &db,
+            &did,
+            [("app.bsky.feed.like", 7), ("app.bsky.actor.profile", 1)],
+        )?;
+        batch.commit().into_diagnostic()?;
+
+        assert_eq!(get_record_count(&db, &did, "app.bsky.feed.post")?, 0);
+        assert_eq!(get_record_count(&db, &did, "app.bsky.feed.like")?, 7);
+        assert_eq!(get_record_count(&db, &did, "app.bsky.actor.profile")?, 1);
+        assert_eq!(
+            db.counts.prefix(keys::did_collection_prefix(&did)).count(),
+            2
+        );
+
+        Ok(())
+    }
 }
