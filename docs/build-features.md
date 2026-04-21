@@ -1,4 +1,6 @@
-# build features
+---
+title: build features
+---
 
 `hydrant` has several optional compile-time features:
 

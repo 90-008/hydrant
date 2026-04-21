@@ -1,4 +1,6 @@
-# ingestion control
+---
+title: ingestion control
+---
 
 ## GET /ingestion
 

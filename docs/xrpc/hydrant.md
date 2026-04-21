@@ -1,4 +1,6 @@
-# systems.gaze.hydrant.*
+---
+title: systems.gaze.hydrant.*
+---
 
 these are some non-standard XRPCs that might be useful.
 

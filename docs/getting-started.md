@@ -1,4 +1,6 @@
-# getting started
+---
+title: getting started
+---
 
 ## requirements
 

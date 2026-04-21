@@ -1,4 +1,6 @@
-# PDS management
+---
+title: PDS management
+---
 
 hydrant rate-limits firehose events per PDS. each PDS is assigned to a named rate tier that controls how aggressively hydrant limits events from it. two built-in tiers are always present: `default` (conservative limits for unknown operators) and `trusted` (higher limits for well-behaved operators). additional tiers can be defined via `RATE_TIERS`.
 

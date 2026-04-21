@@ -1,4 +1,6 @@
-# com.atproto.*
+---
+title: com.atproto.*
+---
 
 these are standard atproto endpoints. you can look at [the atproto api reference](https://docs.bsky.app/docs/category/http-reference) for more info.
 

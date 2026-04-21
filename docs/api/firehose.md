@@ -1,4 +1,6 @@
-# firehose management
+---
+title: firehose management
+---
 
 ## GET /firehose/sources
 

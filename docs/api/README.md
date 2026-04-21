@@ -1,4 +1,6 @@
-# rest api
+---
+title: rest api
+---
 
 hydrant's REST API is split into public endpoints (safe to expose) and management endpoints (keep private). see [getting started](../getting-started.md#reverse-proxying) for guidance on what to expose.
 

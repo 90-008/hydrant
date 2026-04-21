@@ -1,4 +1,6 @@
-# repository management
+---
+title: repository management
+---
 
 all `/repos` endpoints that return lists respond with NDJSON by default. send `Accept: application/json` or `Content-Type: application/json` to get a JSON array instead.
 

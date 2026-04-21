@@ -1,4 +1,6 @@
-# xrpc
+---
+title: xrpc
+---
 
 `hydrant` implements the following XRPC endpoints under `/xrpc/`. only expose `/xrpc/*` publicly, see [getting started](../getting-started.md#reverse-proxying) for guidance.
 

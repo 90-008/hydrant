@@ -1,4 +1,6 @@
-# blue.microcosm.links.*
+---
+title: blue.microcosm.links.*
+---
 
 hydrant implements a subset of [microcosm constellation](https://constellation.microcosm.blue/) when it's built with the `backlinks` cargo feature (`cargo build --features backlinks`).
 

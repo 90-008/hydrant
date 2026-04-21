@@ -1,4 +1,6 @@
-# configuration
+---
+title: configuration
+---
 
 hydrant is configured via environment variables, all prefixed with `HYDRANT_` (except `RUST_LOG`). a `.env` file in the working directory is loaded automatically.
 

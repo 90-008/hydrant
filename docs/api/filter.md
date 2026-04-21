@@ -1,4 +1,6 @@
-# filter management
+---
+title: filter management
+---
 
 - `GET /filter`: get the current filter configuration.
 - `PATCH /filter`: update the filter configuration.
