@@ -21,8 +21,8 @@ rustPlatform.buildRustPackage {
     lockFile = ./Cargo.lock;
     outputHashes = {
       "rmp-0.8.15" = "sha256-0VATbSR2lGiCJ8Ww4a5pkOHSRUjoysnFonpKS/oMzgU=";
-      "fjall-3.1.2" = "sha256-6G2B9DDYCb8OLgT05uG1S2kvooDGKyydLr0tQfxkib0=";
-      "lsm-tree-3.1.2" = "sha256-9tOdxX/3nZQkvF7dJSBXiTKZHcQPwCLFB+dwaD1j0ts=";
+      "fjall-3.1.4" = "sha256-QO1EvdSwAetH24TOxiHSkguE4JBKViJy4JXQvi9hi/A=";
+      "lsm-tree-3.1.4" = "sha256-6fhVvfuZQXeUIXmDAaHpEDLZwZsMTLCMNQAAac3/WkM=";
     };
   };
 }
