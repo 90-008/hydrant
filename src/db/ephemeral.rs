@@ -4,10 +4,17 @@ use {
     fjall::Keyspace,
     miette::{IntoDiagnostic, WrapErr},
     std::sync::Arc,
-    std::sync::atomic::Ordering,
+    std::sync::atomic::{AtomicU64, Ordering},
     std::time::Duration,
-    tracing::{debug, error, info},
+    tracing::{debug, error, info, warn},
 };
+
+#[cfg(any(feature = "indexer_stream", feature = "relay"))]
+const AUTO_COMPACT_PRUNED_SEQ_INTERVAL: u64 = 250_000;
+#[cfg(feature = "indexer_stream")]
+static LAST_EVENTS_COMPACTED_SEQ: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "relay")]
+static LAST_RELAY_EVENTS_COMPACTED_SEQ: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(feature = "indexer_stream")]
 pub fn ephemeral_ttl_worker(state: Arc<crate::state::AppState>) {
@@ -41,6 +48,7 @@ pub fn ephemeral_ttl_tick(db: &Db, ttl: &Duration) -> miette::Result<()> {
         keys::event_watermark_key,
         &db.events,
         current_seq,
+        &LAST_EVENTS_COMPACTED_SEQ,
     )
 }
 
@@ -54,6 +62,7 @@ pub fn relay_events_ttl_tick(db: &Db, ttl: &Duration) -> miette::Result<()> {
         keys::relay_event_watermark_key,
         &db.relay_events,
         current_seq,
+        &LAST_RELAY_EVENTS_COMPACTED_SEQ,
     )
 }
 
@@ -65,6 +74,7 @@ fn ttl_tick_inner(
     watermark_key: fn(u64) -> Vec<u8>,
     events_ks: &Keyspace,
     current_seq: u64,
+    last_compacted_seq: &AtomicU64,
 ) -> miette::Result<()> {
     let now = chrono::Utc::now().timestamp() as u64;
     let cutoff_ts = now.saturating_sub(ttl.as_secs());
@@ -147,6 +157,31 @@ fn ttl_tick_inner(
         info!(pruned, "pruned old events");
     } else {
         debug!("no events were pruned");
+    }
+
+    let pruned_since_compaction =
+        cutoff_seq.saturating_sub(last_compacted_seq.load(Ordering::Relaxed));
+    if pruned_since_compaction >= AUTO_COMPACT_PRUNED_SEQ_INTERVAL {
+        let compact_res = events_ks
+            .rotate_memtable_and_wait()
+            .into_diagnostic()
+            .wrap_err("failed to rotate memtable before TTL compaction")
+            .and_then(|_| {
+                events_ks
+                    .compact(Arc::new(fjall::compaction::Leveled::default()))
+                    .into_diagnostic()
+                    .wrap_err("failed TTL-triggered keyspace compaction")
+            });
+
+        if let Err(err) = compact_res {
+            warn!(err = %err, "TTL-triggered compaction failed");
+        } else {
+            last_compacted_seq.fetch_max(cutoff_seq, Ordering::Relaxed);
+            info!(
+                pruned_since_compaction,
+                "completed TTL-triggered keyspace compaction"
+            );
+        }
     }
 
     Ok(())
