@@ -19,9 +19,10 @@ use crate::types::{RepoState, RepoStatus, ResyncState};
 #[cfg(feature = "indexer_stream")]
 use {
     crate::types::{
-        AccountEvt, BroadcastEvent, IdentityEvt, MarshallableEvt, StoredData, StoredEvent,
+        AccountEvt, BroadcastEvent, IdentityEvt, LiveRecordEvent, MarshallableEvt, StoredData,
+        StoredEvent,
     },
-    jacquard_common::CowStr,
+    jacquard_common::{CowStr, IntoStatic},
     std::sync::atomic::Ordering,
 };
 
@@ -207,6 +208,10 @@ pub struct ApplyCommitResults<'s> {
     pub repo_state: RepoState<'s>,
     pub records_delta: i64,
     pub blocks_count: i64,
+    #[cfg(feature = "indexer_stream")]
+    pub live_events: Vec<LiveRecordEvent>,
+    #[cfg(feature = "indexer_stream")]
+    pub last_event_id: Option<u64>,
 }
 
 pub fn apply_commit<'s>(
@@ -231,6 +236,14 @@ pub fn apply_commit<'s>(
     let mut records_delta = 0;
     let mut blocks_count = 0;
     let mut collection_deltas: HashMap<&str, i64> = HashMap::new();
+    let rev = DbTid::from(&commit.rev);
+
+    #[cfg(feature = "indexer_stream")]
+    let should_broadcast_live = db.event_tx.receiver_count() > 0;
+    #[cfg(feature = "indexer_stream")]
+    let mut live_events = Vec::new();
+    #[cfg(feature = "indexer_stream")]
+    let mut last_event_id = None;
 
     for op in &commit.ops {
         let (collection, rkey) = parse_path(&op.path)?;
@@ -242,11 +255,16 @@ pub fn apply_commit<'s>(
         let rkey = DbRkey::new(rkey);
         let db_key = keys::record_key(did, collection, &rkey);
 
-        #[cfg(feature = "indexer_stream")]
-        let event_id = db.next_event_id.fetch_add(1, Ordering::SeqCst);
-
         let action = DbAction::try_from(op.action.as_str())?;
-        let block: Option<bytes::Bytes> = match action {
+
+        #[cfg(feature = "indexer_stream")]
+        let mut cid_for_event: Option<jacquard_common::types::cid::IpldCid> = None;
+        #[cfg(feature = "indexer_stream")]
+        let mut block_inline_for_event: Option<bytes::Bytes> = None;
+        #[cfg(feature = "indexer_stream")]
+        let mut inline_block: Option<bytes::Bytes> = None;
+
+        match action {
             DbAction::Create | DbAction::Update => {
                 let Some(cid) = &op.cid else {
                     continue;
@@ -255,6 +273,10 @@ pub fn apply_commit<'s>(
                     .to_ipld()
                     .into_diagnostic()
                     .wrap_err("expected valid cid from relay")?;
+                #[cfg(feature = "indexer_stream")]
+                {
+                    cid_for_event = Some(cid_ipld.clone());
+                }
 
                 let Some(bytes) = parsed.blocks.get(&cid_ipld) else {
                     return Err(miette::miette!(
@@ -286,17 +308,16 @@ pub fn apply_commit<'s>(
                             &value,
                         )?;
                     }
-                    None
+                    #[cfg(feature = "indexer_stream")]
+                    if should_broadcast_live && !only_index_links {
+                        // inline record bytes for live tailing so we don't have to load from blocks.
+                        inline_block = Some(bytes.clone());
+                    }
                 } else {
-                    // in ephemeral mode, capture bytes inline for event emission
                     #[cfg(feature = "indexer_stream")]
                     {
-                        Some(bytes.clone())
-                    }
-                    #[cfg(not(feature = "indexer_stream"))]
-                    {
-                        let _ = bytes;
-                        None
+                        // in ephemeral mode, the event payload is the only place we persist the record.
+                        block_inline_for_event = Some(bytes.clone());
                     }
                 }
             }
@@ -317,37 +338,54 @@ pub fn apply_commit<'s>(
                         &rkey.to_smolstr(),
                     )?;
                 }
-
-                None
             }
         };
 
         #[cfg(feature = "indexer_stream")]
         {
+            let data = block_inline_for_event
+                .clone()
+                .map(StoredData::Block)
+                .or_else(|| {
+                    (!only_index_links)
+                        .then(|| cid_for_event.clone().map(StoredData::Ptr))
+                        .flatten()
+                })
+                .unwrap_or(StoredData::Nothing);
+
+            let event_id = db.next_event_id.fetch_add(1, Ordering::SeqCst);
+            last_event_id = Some(event_id);
+            let did_trimmed = TrimmedDid::from(did);
+            let collection = CowStr::Borrowed(collection);
+
             let evt = StoredEvent {
                 live: true,
-                did: TrimmedDid::from(did),
-                rev: DbTid::from(&commit.rev),
-                collection: CowStr::Borrowed(collection),
-                rkey,
+                did: did_trimmed.clone(),
+                rev,
+                collection: collection.clone(),
+                rkey: rkey.clone(),
                 action,
-                data: block
-                    .map(StoredData::Block)
-                    .or_else(|| {
-                        (!only_index_links).then(|| {
-                            op.cid
-                                .as_ref()
-                                .map(|c| c.to_ipld().expect("valid cid"))
-                                .map(StoredData::Ptr)
-                        })?
-                    })
-                    .unwrap_or(StoredData::Nothing),
+                data: data.clone(),
             };
             let bytes = rmp_serde::to_vec(&evt).into_diagnostic()?;
             batch.insert(&db.events, keys::event_key(event_id), bytes);
+
+            if should_broadcast_live {
+                live_events.push(LiveRecordEvent {
+                    id: event_id,
+                    stored: StoredEvent {
+                        live: evt.live,
+                        did: did_trimmed.into_static(),
+                        rev: evt.rev,
+                        collection: collection.into_static(),
+                        rkey,
+                        action: evt.action,
+                        data,
+                    },
+                    inline_block,
+                });
+            }
         }
-        #[cfg(not(feature = "indexer_stream"))]
-        drop(block);
     }
 
     // update counts
@@ -361,6 +399,10 @@ pub fn apply_commit<'s>(
         repo_state,
         records_delta,
         blocks_count,
+        #[cfg(feature = "indexer_stream")]
+        live_events,
+        #[cfg(feature = "indexer_stream")]
+        last_event_id,
     })
 }
 

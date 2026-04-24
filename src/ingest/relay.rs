@@ -921,6 +921,8 @@ impl WorkerContext<'_> {
         let frame = make_frame(seq as i64)?;
         self.batch
             .insert(&db.relay_events, keys::relay_event_key(seq), frame.as_ref());
+        self.pending_broadcasts
+            .push(RelayBroadcast::Ephemeral(seq, frame));
         self.pending_broadcasts.push(RelayBroadcast::Persisted(seq));
         Ok(())
     }

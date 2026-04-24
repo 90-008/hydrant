@@ -490,8 +490,19 @@ impl FirehoseWorker {
         *ctx.added_blocks += res.blocks_count;
         *ctx.records_delta += res.records_delta;
         #[cfg(feature = "indexer_stream")]
-        ctx.broadcast_events
-            .push(BroadcastEvent::Persisted(db.next_event_id.load(SeqCst) - 1));
+        {
+            use std::sync::Arc;
+
+            let mut live_events = res.live_events;
+            for evt in live_events.drain(..) {
+                ctx.broadcast_events
+                    .push(BroadcastEvent::LiveRecord(Arc::new(evt)));
+            }
+            if let Some(last_id) = res.last_event_id {
+                ctx.broadcast_events
+                    .push(BroadcastEvent::Persisted(last_id));
+            }
+        }
 
         Ok(RepoProcessResult::Ok(repo_state))
     }

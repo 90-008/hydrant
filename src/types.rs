@@ -206,8 +206,11 @@ mod indexer {
     #[cfg(feature = "indexer_stream")]
     #[derive(Clone, Debug)]
     pub(crate) enum BroadcastEvent {
-        #[allow(dead_code)]
-        Persisted(u64),
+        Persisted(#[allow(dead_code)] u64),
+        /// a durable record event with optional inline block bytes for live tailing.
+        ///
+        /// used to avoid re-reading `events`/`blocks` from the database when tailing.
+        LiveRecord(std::sync::Arc<super::LiveRecordEvent>),
         Ephemeral(Box<MarshallableEvt<'static>>),
     }
 
@@ -423,10 +426,22 @@ pub(crate) struct StoredEvent<'i> {
     pub data: StoredData,
 }
 
+/// a durable record event that is also emitted on the in-memory stream after commit.
+///
+/// `inline_block` is only used for live tailing to avoid loading the record block from `blocks`.
+/// cursor replay continues to read from the database.
+#[cfg(feature = "indexer_stream")]
+#[derive(Debug, Clone)]
+pub(crate) struct LiveRecordEvent {
+    pub id: u64,
+    pub stored: StoredEvent<'static>,
+    pub inline_block: Option<Bytes>,
+}
+
 #[cfg(feature = "relay")]
 #[derive(Clone)]
 pub(crate) enum RelayBroadcast {
     Persisted(#[allow(dead_code)] u64),
     #[allow(dead_code)]
-    Ephemeral(bytes::Bytes),
+    Ephemeral(u64, bytes::Bytes),
 }
