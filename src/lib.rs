@@ -31,7 +31,7 @@ pub(crate) mod api;
 #[cfg(feature = "indexer")]
 pub(crate) mod backfill;
 #[cfg(feature = "backlinks")]
-pub(crate) mod backlinks;
+pub mod backlinks;
 #[cfg(feature = "indexer")]
 pub(crate) mod crawler;
 pub(crate) mod db;
@@ -39,7 +39,7 @@ pub(crate) mod ingest;
 #[cfg(feature = "indexer")]
 pub(crate) mod ops;
 pub(crate) mod patch;
-pub(crate) mod resolver;
+pub mod resolver;
 pub(crate) mod state;
 pub(crate) mod util;
 

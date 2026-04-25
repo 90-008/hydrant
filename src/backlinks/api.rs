@@ -21,6 +21,8 @@ pub struct GetBacklinksParams {
     pub subject: String,
     /// filter by source collection, optionally with a path suffix `collection:path`
     pub source: Option<String>,
+    #[serde(default)]
+    pub did: Vec<String>,
     pub limit: Option<u64>,
     pub cursor: Option<String>,
     pub reverse: Option<bool>,
@@ -43,6 +45,8 @@ pub struct GetBacklinksOutput {
 pub struct GetBacklinksCountParams {
     pub subject: String,
     pub source: Option<String>,
+    #[serde(default)]
+    pub did: Vec<String>,
 }
 
 #[derive(Serialize)]

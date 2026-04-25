@@ -1,7 +1,7 @@
 pub mod links;
 pub mod store;
 
-pub(crate) mod api;
+pub mod api;
 
 use std::ops::Bound;
 use std::sync::Arc;
@@ -35,6 +35,7 @@ impl BacklinksControl {
             subject: subject.into(),
             collection: None,
             path: None,
+            dids: Vec::new(),
             limit: 50,
             reverse: false,
             cursor: None,
@@ -48,6 +49,7 @@ impl BacklinksControl {
             subject: subject.into(),
             collection: None,
             path: None,
+            dids: Vec::new(),
         }
     }
 }
@@ -60,6 +62,7 @@ pub struct BacklinksFetch {
     subject: String,
     collection: Option<String>,
     path: Option<String>,
+    dids: Vec<String>,
     limit: usize,
     reverse: bool,
     cursor: Option<Vec<u8>>,
@@ -69,6 +72,12 @@ impl BacklinksFetch {
     /// filter results to the given source collection NSID.
     pub fn collection(mut self, collection: impl Into<String>) -> Self {
         self.collection = Some(collection.into());
+        self
+    }
+
+    /// filter results to specific source author DIDs.
+    pub fn dids(mut self, dids: Vec<String>) -> Self {
+        self.dids = dids;
         self
     }
 
@@ -161,6 +170,13 @@ impl BacklinksFetch {
                     warn!("backlinks: could not extract source from reverse key");
                     continue;
                 };
+
+                if !self.dids.is_empty() {
+                    if !self.dids.iter().any(|d| d == did) {
+                        continue;
+                    }
+                }
+
                 let Some(cid) = store::lookup_cid_from_ks(&db.records, did, col, rkey) else {
                     // record deleted after backlink was written
                     continue;
@@ -190,12 +206,19 @@ pub struct BacklinksCount {
     subject: String,
     collection: Option<String>,
     path: Option<String>,
+    dids: Vec<String>,
 }
 
 impl BacklinksCount {
     /// filter to the given source collection NSID.
     pub fn collection(mut self, collection: impl Into<String>) -> Self {
         self.collection = Some(collection.into());
+        self
+    }
+
+    /// filter results to specific source author DIDs.
+    pub fn dids(mut self, dids: Vec<String>) -> Self {
+        self.dids = dids;
         self
     }
 
@@ -224,7 +247,23 @@ impl BacklinksCount {
                 self.collection.as_deref(),
                 self.path.as_deref(),
             );
-            Ok(db.backlinks.prefix(&scan_prefix).count() as u64)
+
+            if !self.dids.is_empty() {
+                let mut count = 0;
+                for item in db.backlinks.prefix(&scan_prefix) {
+                    let key = item.key().into_diagnostic()?;
+                    let Some((_col, _path, did, _rkey)) = store::source_from_reverse_key(&key)
+                    else {
+                        continue;
+                    };
+                    if self.dids.iter().any(|d| d == did) {
+                        count += 1;
+                    }
+                }
+                Ok(count)
+            } else {
+                Ok(db.backlinks.prefix(&scan_prefix).count() as u64)
+            }
         })
         .await
         .into_diagnostic()?

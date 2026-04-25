@@ -122,6 +122,11 @@ pub struct Hydrant {
 }
 
 impl Hydrant {
+    /// Returns a reference to the internal DID resolver.
+    pub fn resolver(&self) -> &crate::resolver::Resolver {
+        &self.state.resolver
+    }
+    
     /// open the database and configure hydrant from `config`.
     ///
     /// this sets up the database, applies any filter configuration from `config`, and
