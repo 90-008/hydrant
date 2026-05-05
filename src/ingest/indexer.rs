@@ -141,16 +141,13 @@ impl FirehoseWorker {
         }
     }
 
-    // starts the worker threads and the main dispatch loop
-    // the dispatch loop reads from the firehose channel and
-    // distributes messages to shards based on the hash of the DID
-    pub fn run(mut self, handle: TokioHandle) -> Result<()> {
-        let mut shards = Vec::with_capacity(self.num_shards);
+    pub fn run(self, handle: TokioHandle) -> Result<()> {
+        use futures::{StreamExt, future::BoxFuture, stream::FuturesUnordered};
+
+        let mut shards: Vec<mpsc::Sender<IndexerMessage>> = Vec::with_capacity(self.num_shards);
 
         for i in 0..self.num_shards {
-            // unbounded here so we dont block other shards potentially
-            // if one has a small lag or something
-            let (tx, rx) = mpsc::unbounded_channel();
+            let (tx, rx) = mpsc::channel(64);
             shards.push(tx);
 
             let state = self.state.clone();
@@ -165,24 +162,51 @@ impl FirehoseWorker {
 
         info!(num = self.num_shards, "started shards");
 
-        while let Some(msg) = self.rx.blocking_recv() {
-            let did = match &msg {
-                IndexerMessage::Event(e) => match &e.data {
-                    IndexerEventData::Commit(m) => &m.commit.repo,
-                    IndexerEventData::Identity(m) => &m.identity.did,
-                    IndexerEventData::Account(m) => &m.account.did,
-                    IndexerEventData::Sync(did) => did,
-                },
-                IndexerMessage::NewRepo(did) => did,
-                IndexerMessage::BackfillFinished(did) => did,
-            };
+        let num_shards = self.num_shards;
+        let mut rx = self.rx;
 
-            let shard_idx = (util::hash(did) as usize) % self.num_shards;
-            if let Err(e) = shards[shard_idx].send(msg) {
-                error!(shard = shard_idx, err = %e, "failed to send message to shard, shard panicked?");
-                break;
+        handle.block_on(async move {
+            let mut pending: FuturesUnordered<
+                BoxFuture<'_, Result<(), mpsc::error::SendError<IndexerMessage>>>,
+            > = FuturesUnordered::new();
+
+            loop {
+                tokio::select! {
+                    msg = rx.recv(), if pending.len() < num_shards => {
+                        let Some(msg) = msg else { break; };
+                        let shard_idx = {
+                            let did = match &msg {
+                                IndexerMessage::Event(e) => match &e.data {
+                                    IndexerEventData::Commit(m) => &m.commit.repo,
+                                    IndexerEventData::Identity(m) => &m.identity.did,
+                                    IndexerEventData::Account(m) => &m.account.did,
+                                    IndexerEventData::Sync(did) => did,
+                                },
+                                IndexerMessage::NewRepo(did) => did,
+                                IndexerMessage::BackfillFinished(did) => did,
+                            };
+                            (util::hash(did) as usize) % num_shards
+                        };
+                        match shards[shard_idx].try_send(msg) {
+                            Ok(()) => {}
+                            Err(mpsc::error::TrySendError::Full(msg)) => {
+                                pending.push(Box::pin(shards[shard_idx].send(msg)));
+                            }
+                            Err(mpsc::error::TrySendError::Closed(_)) => {
+                                error!(shard = shard_idx, "shard closed unexpectedly");
+                                break;
+                            }
+                        }
+                    }
+                    Some(result) = pending.next(), if !pending.is_empty() => {
+                        if let Err(e) = result {
+                            error!(err = %e, "failed to send to shard, shard panicked?");
+                            break;
+                        }
+                    }
+                }
             }
-        }
+        });
 
         Err(miette::miette!(
             "firehose worker dispatcher shutting down, shard died?"
@@ -192,7 +216,7 @@ impl FirehoseWorker {
     #[inline(always)]
     fn shard(
         id: usize,
-        mut rx: mpsc::UnboundedReceiver<IndexerMessage>,
+        mut rx: mpsc::Receiver<IndexerMessage>,
         state: Arc<AppState>,
         handle: TokioHandle,
     ) {
