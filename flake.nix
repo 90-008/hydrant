@@ -69,6 +69,7 @@
               clang
               wild
               psmisc
+              rtk
               (pkgs.writeShellApplication {
                 name = "verbiage";
                 runtimeInputs = [ inputs'.verbiage.packages.default ];

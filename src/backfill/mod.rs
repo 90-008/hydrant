@@ -520,7 +520,12 @@ async fn process_did<'i>(
     trace!(elapsed = %start.elapsed().as_secs_f32(), "parsed car");
 
     let start = Instant::now();
+    let root_cid = parsed.root;
     let store = Arc::new(MemoryBlockStore::new_from_blocks(parsed.blocks));
+    // parsed.blocks was moved into the store; parsed.root is now root_cid. drop the raw
+    // CAR bytes here so we don't hold two copies of the block data (raw + parsed) for
+    // the entire duration of the spawn_blocking call below.
+    drop(car_bytes);
     trace!(
         blocks = store.len(),
         elapsed = ?start.elapsed(),
@@ -529,7 +534,7 @@ async fn process_did<'i>(
 
     // 4. parse root commit to get mst root
     let root_bytes = store
-        .get(&parsed.root)
+        .get(&root_cid)
         .await
         .into_diagnostic()?
         .ok_or_else(|| miette::miette!("root block missing from CAR"))?;
@@ -575,7 +580,11 @@ async fn process_did<'i>(
             let mut added_blocks = 0;
             let mut collection_counts: HashMap<SmolStr, u64> = HashMap::new();
             let mut batch = app_state.db.inner.batch();
-            let store = mst.storage();
+            // clone the Arc so we hold an independent reference to the block store,
+            // allowing mst (and its entire loaded node tree) to be freed immediately
+            // rather than surviving until the end of spawn_blocking.
+            let store = mst.storage().clone();
+            drop(mst);
 
             let prefix = keys::record_prefix_did(&did);
             let mut existing_cids: HashMap<(SmolStr, DbRkey), SmolStr> = HashMap::new();
@@ -698,6 +707,10 @@ async fn process_did<'i>(
                     count += 1;
                 }
             }
+
+            // all blocks have been read; free the MemoryBlockStore now so it does not
+            // survive through the final batch commit or any fjall backpressure stall.
+            drop(store);
 
             // remove any remaining existing records (they weren't in the new MST)
             for ((collection, rkey), cid) in existing_cids {

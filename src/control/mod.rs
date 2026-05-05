@@ -126,7 +126,7 @@ impl Hydrant {
     pub fn resolver(&self) -> &crate::resolver::Resolver {
         &self.state.resolver
     }
-    
+
     /// open the database and configure hydrant from `config`.
     ///
     /// this sets up the database, applies any filter configuration from `config`, and
