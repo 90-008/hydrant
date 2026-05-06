@@ -58,6 +58,34 @@ use stream::relay_stream_thread;
 use url::Url;
 
 #[derive(Debug, Clone)]
+pub struct ApiBinds {
+    head: std::net::SocketAddr,
+    tail: Vec<std::net::SocketAddr>,
+}
+
+impl ApiBinds {
+    pub fn new(addr: std::net::SocketAddr) -> Self {
+        Self {
+            head: addr,
+            tail: Vec::new(),
+        }
+    }
+
+    pub fn try_from_iter<I: IntoIterator<Item = std::net::SocketAddr>>(iter: I) -> Option<Self> {
+        let mut iter = iter.into_iter();
+        let head = iter.next()?;
+        Some(Self {
+            head,
+            tail: iter.collect(),
+        })
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = std::net::SocketAddr> + '_ {
+        std::iter::once(self.head).chain(self.tail.iter().copied())
+    }
+}
+
+#[derive(Debug, Clone)]
 /// infromation about a host hydrant is consuming from.
 pub struct Host {
     /// hostname of the host.
@@ -90,15 +118,16 @@ pub type Event = MarshallableEvt<'static>;
 /// # example
 ///
 /// ```rust,no_run
-/// use hydrant::control::Hydrant;
+/// use hydrant::control::{ApiBinds, Hydrant};
 ///
 /// #[tokio::main]
 /// async fn main() -> miette::Result<()> {
 ///     let hydrant = Hydrant::from_env().await?;
+///     let binds = ApiBinds::new("0.0.0.0:3000".parse().unwrap());
 ///
 ///     tokio::select! {
-///         r = hydrant.run()?        => r,
-///         r = hydrant.serve(3000)  => r,
+///         r = hydrant.run()?       => r,
+///         r = hydrant.serve(binds) => r,
 ///     }
 /// }
 /// ```
@@ -806,7 +835,7 @@ impl Hydrant {
         Ok(StatsResponse { counts, sizes })
     }
 
-    /// returns a future that runs the HTTP management API server on `0.0.0.0:{port}`.
+    /// returns a future that runs the HTTP management API server on the given bind addresses.
     ///
     /// the server exposes all management endpoints (`/filter`, `/repos`, `/ingestion`,
     /// `/stream`, `/stats`, `/db/*`, `/xrpc/*`). it runs indefinitely and resolves
@@ -816,9 +845,9 @@ impl Hydrant {
     /// of `self` is deferred until the future is first polled.
     ///
     /// to disable the HTTP API entirely, simply don't call this method.
-    pub fn serve(&self, port: u16) -> impl Future<Output = Result<()>> {
+    pub fn serve(&self, binds: ApiBinds) -> impl Future<Output = Result<()>> {
         let hydrant = self.clone();
-        async move { crate::api::serve(hydrant, port).await }
+        async move { crate::api::serve(hydrant, binds).await }
     }
 
     /// returns a future that runs the debug HTTP API server on `127.0.0.1:{port}`.

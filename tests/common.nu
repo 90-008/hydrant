@@ -141,7 +141,7 @@ export def start-hydrant [binary: string, db_path: string, port: int] {
     let env_vars = {
         HYDRANT_DATABASE_PATH: ($db_path),
         HYDRANT_FULL_NETWORK: "false",
-        HYDRANT_API_PORT: ($port | into string),
+        HYDRANT_API_BIND: $"127.0.0.1:($port)",
         HYDRANT_ENABLE_DEBUG: "true",
         HYDRANT_DEBUG_PORT: (resolve-test-debug-port ($port + 1) | into string),
         HYDRANT_PLC_URL: "https://plc.klbr.net",

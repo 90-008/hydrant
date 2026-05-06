@@ -10,9 +10,9 @@ hydrant is configured via environment variables, all prefixed with `HYDRANT_` (e
 | :--- | :--- | :--- |
 | `DATABASE_PATH` | `./hydrant.db` | path to the database folder |
 | `RUST_LOG` | `info` | log filter directives (e.g., `debug`, `hydrant=trace`). [tracing env-filter syntax](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html) |
-| `API_PORT` | `3000` | port for the API server |
+| `API_BIND` | `0.0.0.0:3000,[::]:3000` | comma-separated list of `<ip>:<port>` socket addresses to bind the API server to. literal IPs only (hostnames not resolved). when both an ipv4 and ipv6 entry share the same port, the v6 listener is set to v6-only to avoid bind collision; a lone `[::]:<port>` listens dual-stack |
 | `ENABLE_DEBUG` | `false` | enable debug endpoints |
-| `DEBUG_PORT` | `API_PORT + 1` | port for debug endpoints (if enabled) |
+| `DEBUG_PORT` | first `API_BIND` port + 1 | port for debug endpoints (if enabled) |
 
 ## indexing mode
 

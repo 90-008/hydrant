@@ -40,7 +40,7 @@ def main [] {
             HYDRANT_RELAY_HOST: ($mock_url),
             HYDRANT_DISABLE_FIREHOSE: "true",
             HYDRANT_DISABLE_BACKFILL: "true", # disable backfill so pending count stays up
-            HYDRANT_API_PORT: ($port | into string),
+            HYDRANT_API_BIND: $"127.0.0.1:($port)",
             HYDRANT_LOG_LEVEL: "debug",
             RUST_LOG: "debug",
             HYDRANT_CRAWLER_MAX_PENDING_REPOS: "2",

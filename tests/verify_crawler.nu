@@ -45,7 +45,7 @@ def main [] {
             HYDRANT_RELAY_HOST: ($mock_url),
             HYDRANT_DISABLE_FIREHOSE: "true",
             HYDRANT_DISABLE_BACKFILL: "true",
-            HYDRANT_API_PORT: ($port | into string),
+            HYDRANT_API_BIND: $"127.0.0.1:($port)",
             HYDRANT_ENABLE_DEBUG: "true", # for stats checking
             HYDRANT_DEBUG_PORT: (resolve-test-debug-port ($port + 1) | into string),
             HYDRANT_LOG_LEVEL: "debug",
