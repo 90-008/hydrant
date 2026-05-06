@@ -6,7 +6,7 @@ hydrant's REST API is split into public endpoints (safe to expose) and managemen
 
 ## public
 
-- `GET /stream`: subscribe to the event stream. query params: `cursor` (optional, start from a specific event ID).
+- `GET /stream`: subscribe to the event stream. query params: `cursor` (optional, start from a specific event ID). slow consumers may receive a `{"type":"error","error":"ConsumerTooSlow",...}` frame before the connection closes.
 - `GET /stats`: get stats about the database (counts of repos, records, events; sizes of keyspaces on disk).
 - `GET /health` / `GET /_health`: health check.
 

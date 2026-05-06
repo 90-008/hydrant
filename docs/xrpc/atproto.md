@@ -15,4 +15,4 @@ the following are implemented currently:
 - `com.atproto.sync.listRepos`
 - `com.atproto.sync.getLatestCommit`
 - `com.atproto.sync.requestCrawl` (adds the host to firehose sources in relay mode)
-- `com.atproto.sync.subscribeRepos` (WebSocket firehose stream, requires `relay` feature)
+- `com.atproto.sync.subscribeRepos` (WebSocket firehose stream, requires `relay` feature; slow consumers may receive a `ConsumerTooSlow` error frame before the connection closes)

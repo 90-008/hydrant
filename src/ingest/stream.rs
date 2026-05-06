@@ -635,6 +635,20 @@ struct EncodeHeader<'a> {
 }
 
 #[cfg(feature = "relay")]
+#[derive(Serialize)]
+struct EncodeErrorHeader {
+    op: i64,
+}
+
+#[cfg(feature = "relay")]
+#[derive(Serialize)]
+struct EncodeErrorFrame<'a> {
+    error: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message: Option<&'a str>,
+}
+
+#[cfg(feature = "relay")]
 pub fn encode_frame<T: serde::Serialize>(t: &str, msg: &T) -> miette::Result<bytes::Bytes> {
     let mut buf = serde_ipld_dagcbor::to_vec(&EncodeHeader { op: 1, t })
         .map_err(|e| miette::miette!("encode_frame header: {e}"))?;
@@ -644,8 +658,21 @@ pub fn encode_frame<T: serde::Serialize>(t: &str, msg: &T) -> miette::Result<byt
     Ok(bytes::Bytes::from(buf))
 }
 
+#[cfg(feature = "relay")]
+pub fn encode_error_frame(error: &str, message: Option<&str>) -> miette::Result<bytes::Bytes> {
+    let mut buf = serde_ipld_dagcbor::to_vec(&EncodeErrorHeader { op: -1 })
+        .map_err(|e| miette::miette!("encode_error_frame header: {e}"))?;
+    buf.extend_from_slice(
+        &serde_ipld_dagcbor::to_vec(&EncodeErrorFrame { error, message })
+            .map_err(|e| miette::miette!("encode_error_frame body: {e}"))?,
+    );
+    Ok(bytes::Bytes::from(buf))
+}
+
 #[cfg(test)]
 mod test {
+    #[cfg(feature = "relay")]
+    use super::FirehoseError;
     use super::{SubscribeReposMessage, decode_frame};
 
     #[test]
@@ -668,5 +695,17 @@ mod test {
             panic!("expected Commit");
         };
         assert!(c.since.is_none(), "since should be None for empty string");
+    }
+
+    #[cfg(feature = "relay")]
+    #[test]
+    fn test_decode_encoded_error_frame() {
+        let bytes = super::encode_error_frame("ConsumerTooSlow", Some("blocked")).unwrap();
+        let Err(FirehoseError::RelayError { error, message }) = decode_frame(&bytes) else {
+            panic!("expected relay error");
+        };
+
+        assert_eq!(error, "ConsumerTooSlow");
+        assert_eq!(message.as_deref(), Some("blocked"));
     }
 }
