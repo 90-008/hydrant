@@ -113,7 +113,14 @@ async fn handle_stream(index: Arc<StatusIndex>, repos: ReposControl, mut stream:
             .map(|h| h.to_string())
             .unwrap_or_else(|| did.to_string())
     };
-    while let Some(event) = stream.next().await {
+    while let Some(item) = stream.next().await {
+        let event = match item {
+            Ok(event) => event,
+            Err(err) => {
+                tracing::warn!(err = %err, "hydrant stream closed");
+                break;
+            }
+        };
         if let Some(rec) = event.record {
             let did = rec.did.as_str().to_owned();
             match rec.action.as_str() {

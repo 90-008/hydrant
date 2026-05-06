@@ -11,6 +11,10 @@ use {
 
 #[cfg(any(feature = "indexer_stream", feature = "relay"))]
 const AUTO_COMPACT_PRUNED_SEQ_INTERVAL: u64 = 250_000;
+#[cfg(any(feature = "indexer_stream", feature = "relay"))]
+const TTL_PRUNE_BATCH_SIZE: usize = 10_000;
+#[cfg(any(feature = "indexer_stream", feature = "relay"))]
+const TTL_PRUNE_BATCH_PAUSE: Duration = Duration::from_millis(10);
 #[cfg(feature = "indexer_stream")]
 static LAST_EVENTS_COMPACTED_SEQ: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "relay")]
@@ -128,17 +132,46 @@ fn ttl_tick_inner(
         .map(u64::from_be_bytes)
         .unwrap_or(0);
 
-    let start_key_events = keys::event_key(last_pruned_seq);
-    let cutoff_key_events = keys::event_key(cutoff_seq);
-    let mut batch = db.inner.batch();
     let mut pruned = 0usize;
+    let mut next_prune_seq = last_pruned_seq;
 
-    for guard in events_ks.range(start_key_events..cutoff_key_events) {
-        let k = guard.key().into_diagnostic()?;
-        batch.remove(events_ks, k);
-        pruned += 1;
+    loop {
+        let start_key_events = keys::event_key(next_prune_seq);
+        let cutoff_key_events = keys::event_key(cutoff_seq);
+        let mut keys_to_remove = Vec::with_capacity(TTL_PRUNE_BATCH_SIZE);
+        let mut last_removed_seq = None;
+
+        for guard in events_ks.range(start_key_events..cutoff_key_events) {
+            let k = guard.key().into_diagnostic()?;
+            last_removed_seq = Some(read_event_seq(&k)?);
+            keys_to_remove.push(k);
+
+            if keys_to_remove.len() >= TTL_PRUNE_BATCH_SIZE {
+                break;
+            }
+        }
+
+        let Some(last_removed_seq) = last_removed_seq else {
+            break;
+        };
+
+        let mut batch = db.inner.batch();
+        for key in keys_to_remove {
+            batch.remove(events_ks, key);
+            pruned += 1;
+        }
+        batch.insert(
+            &db.cursors,
+            pruned_key.clone(),
+            last_removed_seq.to_be_bytes(),
+        );
+        batch.commit().into_diagnostic()?;
+
+        next_prune_seq = last_removed_seq.saturating_add(1);
+        std::thread::sleep(TTL_PRUNE_BATCH_PAUSE);
     }
 
+    let mut batch = db.inner.batch();
     batch.insert(&db.cursors, pruned_key, cutoff_seq.to_be_bytes());
 
     // clean up consumed watermark entries (everything up to and including cutoff_ts)
@@ -185,4 +218,12 @@ fn ttl_tick_inner(
     }
 
     Ok(())
+}
+
+#[cfg(any(feature = "indexer_stream", feature = "relay"))]
+fn read_event_seq(key: &[u8]) -> miette::Result<u64> {
+    key.try_into()
+        .into_diagnostic()
+        .wrap_err("event key must be 8 bytes")
+        .map(u64::from_be_bytes)
 }

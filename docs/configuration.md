@@ -66,6 +66,10 @@ hydrant is configured via environment variables, all prefixed with `HYDRANT_` (e
 | variable | default | description |
 | :--- | :--- | :--- |
 | `CACHE_SIZE` | `256` | size of the database cache in MB |
+| `STREAM_REPLAY_CHUNK_SIZE` | `64` | number of persisted events read per `/stream` replay batch |
+| `STREAM_REPLAY_CHUNK_PAUSE` | `2ms` | pause between replay batches so database flush/compaction work can run |
+| `STREAM_PENDING_EVENT_LIMIT` | `4096` | maximum live events buffered per stream subscriber while it catches up |
+| `STREAM_SEND_TIMEOUT` | `30sec` | maximum time a stream subscriber may block delivery before being disconnected |
 
 ## rate limiting (relay mode)
 

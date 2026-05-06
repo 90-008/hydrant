@@ -4,13 +4,29 @@ use super::*;
 /// a stream of [`Event`]s. returned by [`Hydrant::subscribe`].
 ///
 /// implements [`futures::Stream`] and can be used with `StreamExt::next`,
-/// `while let Some(evt) = stream.next().await`, `forward`, etc.
+/// `while let Some(item) = stream.next().await`, `forward`, etc.
 /// the stream terminates when the underlying channel closes (i.e. hydrant shuts down).
-pub struct EventStream(mpsc::Receiver<Event>);
+pub struct EventStream(mpsc::Receiver<Result<Event, StreamError>>);
+
+#[cfg(feature = "indexer_stream")]
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum StreamError {
+    #[error("stream consumer too slow: {reason}")]
+    ConsumerTooSlow { reason: String },
+}
+
+#[cfg(feature = "indexer_stream")]
+impl StreamError {
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::ConsumerTooSlow { .. } => "ConsumerTooSlow",
+        }
+    }
+}
 
 #[cfg(feature = "indexer_stream")]
 impl Stream for EventStream {
-    type Item = Event;
+    type Item = Result<Event, StreamError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         self.0.poll_recv(cx)
@@ -59,20 +75,26 @@ impl Hydrant {
     /// a specific repository.
     ///
     /// multiple concurrent subscribers each receive a full independent copy of the stream.
-    /// the stream ends when the `EventStream` is dropped.
+    /// the stream ends when the `EventStream` is dropped. slow consumers receive
+    /// [`StreamError::ConsumerTooSlow`] before the stream terminates when possible.
     pub fn subscribe(&self, cursor: Option<u64>) -> EventStream {
         let (tx, rx) = mpsc::channel(500);
         let state = self.state.clone();
         let runtime = tokio::runtime::Handle::current();
+        let opts = stream::EventStreamOptions::from_config(&self.config);
 
         std::thread::Builder::new()
             .name("hydrant-stream".into())
             .spawn(move || {
                 let _g = runtime.enter();
-                event_stream_thread(state, tx, cursor);
+                event_stream_thread(state, tx, cursor, opts);
             })
             .expect("failed to spawn stream thread");
 
         EventStream(rx)
+    }
+
+    pub(crate) fn stream_send_timeout(&self) -> std::time::Duration {
+        self.config.stream_send_timeout
     }
 }

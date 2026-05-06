@@ -453,6 +453,19 @@ pub struct Config {
     /// in-memory write buffer (memtable) size for the records keyspace in MB.
     /// set via `HYDRANT_DB_RECORDS_MEMTABLE_SIZE_MB`.
     pub db_records_memtable_size_mb: u64,
+
+    /// maximum number of persisted events read from the database per replay batch.
+    /// set via `HYDRANT_STREAM_REPLAY_CHUNK_SIZE`.
+    pub stream_replay_chunk_size: usize,
+    /// pause between replay batches, giving database maintenance work a chance to run.
+    /// set via `HYDRANT_STREAM_REPLAY_CHUNK_PAUSE` (humantime duration, e.g. `2ms`).
+    pub stream_replay_chunk_pause: Duration,
+    /// maximum number of live in-memory stream events buffered per subscriber while it catches up.
+    /// set via `HYDRANT_STREAM_PENDING_EVENT_LIMIT`.
+    pub stream_pending_event_limit: usize,
+    /// maximum time a subscriber may block stream delivery before being disconnected.
+    /// set via `HYDRANT_STREAM_SEND_TIMEOUT` (humantime duration, e.g. `30sec`).
+    pub stream_send_timeout: Duration,
 }
 
 impl Default for Config {
@@ -526,6 +539,10 @@ impl Default for Config {
             db_repos_memtable_size_mb: BASE_MEMTABLE_MB / 2,
             db_events_memtable_size_mb: BASE_MEMTABLE_MB,
             db_records_memtable_size_mb: BASE_MEMTABLE_MB / 3 * 2,
+            stream_replay_chunk_size: 64,
+            stream_replay_chunk_pause: Duration::from_millis(2),
+            stream_pending_event_limit: 4096,
+            stream_send_timeout: Duration::from_secs(30),
         }
     }
 }
@@ -650,6 +667,20 @@ impl Config {
             "DB_REPOS_MEMTABLE_SIZE_MB",
             defaults.db_repos_memtable_size_mb
         );
+        let stream_replay_chunk_size = cfg!(
+            "STREAM_REPLAY_CHUNK_SIZE",
+            defaults.stream_replay_chunk_size
+        );
+        let stream_replay_chunk_pause = cfg!(
+            "STREAM_REPLAY_CHUNK_PAUSE",
+            defaults.stream_replay_chunk_pause,
+            sec
+        );
+        let stream_pending_event_limit = cfg!(
+            "STREAM_PENDING_EVENT_LIMIT",
+            defaults.stream_pending_event_limit
+        );
+        let stream_send_timeout = cfg!("STREAM_SEND_TIMEOUT", defaults.stream_send_timeout, sec);
 
         let crawler_max_pending_repos = cfg!(
             "CRAWLER_MAX_PENDING_REPOS",
@@ -825,6 +856,10 @@ impl Config {
             db_repos_memtable_size_mb,
             db_events_memtable_size_mb,
             db_records_memtable_size_mb,
+            stream_replay_chunk_size,
+            stream_replay_chunk_pause,
+            stream_pending_event_limit,
+            stream_send_timeout,
         })
     }
 }
@@ -901,6 +936,18 @@ impl fmt::Display for Config {
             f,
             "db records memtable",
             format_args!("{} mb", self.db_records_memtable_size_mb)
+        )?;
+        config_line!(f, "stream replay chunk", self.stream_replay_chunk_size)?;
+        config_line!(
+            f,
+            "stream replay pause",
+            format_args!("{}ms", self.stream_replay_chunk_pause.as_millis())
+        )?;
+        config_line!(f, "stream pending limit", self.stream_pending_event_limit)?;
+        config_line!(
+            f,
+            "stream send timeout",
+            format_args!("{}sec", self.stream_send_timeout.as_secs())
         )?;
         config_line!(f, "crawler max pending", self.crawler_max_pending_repos)?;
         config_line!(
