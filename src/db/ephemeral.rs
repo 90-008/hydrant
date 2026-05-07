@@ -4,21 +4,10 @@ use {
     fjall::Keyspace,
     miette::{IntoDiagnostic, WrapErr},
     std::sync::Arc,
-    std::sync::atomic::{AtomicU64, Ordering},
+    std::sync::atomic::Ordering,
     std::time::Duration,
-    tracing::{debug, error, info, warn},
+    tracing::{debug, error, info},
 };
-
-#[cfg(any(feature = "indexer_stream", feature = "relay"))]
-const AUTO_COMPACT_PRUNED_SEQ_INTERVAL: u64 = 250_000;
-#[cfg(any(feature = "indexer_stream", feature = "relay"))]
-const TTL_PRUNE_BATCH_SIZE: usize = 10_000;
-#[cfg(any(feature = "indexer_stream", feature = "relay"))]
-const TTL_PRUNE_BATCH_PAUSE: Duration = Duration::from_millis(10);
-#[cfg(feature = "indexer_stream")]
-static LAST_EVENTS_COMPACTED_SEQ: AtomicU64 = AtomicU64::new(0);
-#[cfg(feature = "relay")]
-static LAST_RELAY_EVENTS_COMPACTED_SEQ: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(feature = "indexer_stream")]
 pub fn ephemeral_ttl_worker(state: Arc<crate::state::AppState>) {
@@ -52,7 +41,6 @@ pub fn ephemeral_ttl_tick(db: &Db, ttl: &Duration) -> miette::Result<()> {
         keys::event_watermark_key,
         &db.events,
         current_seq,
-        &LAST_EVENTS_COMPACTED_SEQ,
     )
 }
 
@@ -66,7 +54,6 @@ pub fn relay_events_ttl_tick(db: &Db, ttl: &Duration) -> miette::Result<()> {
         keys::relay_event_watermark_key,
         &db.relay_events,
         current_seq,
-        &LAST_RELAY_EVENTS_COMPACTED_SEQ,
     )
 }
 
@@ -78,7 +65,6 @@ fn ttl_tick_inner(
     watermark_key: fn(u64) -> Vec<u8>,
     events_ks: &Keyspace,
     current_seq: u64,
-    last_compacted_seq: &AtomicU64,
 ) -> miette::Result<()> {
     let now = chrono::Utc::now().timestamp() as u64;
     let cutoff_ts = now.saturating_sub(ttl.as_secs());
@@ -114,65 +100,50 @@ fn ttl_tick_inner(
         return Ok(());
     };
 
-    let mut pruned_key = Vec::with_capacity(7 + watermark_prefix.len());
-    pruned_key.extend_from_slice(b"pruned|");
-    pruned_key.extend_from_slice(watermark_prefix);
+    let mut dropped_key = Vec::with_capacity(8 + watermark_prefix.len());
+    dropped_key.extend_from_slice(b"dropped|");
+    dropped_key.extend_from_slice(watermark_prefix);
 
-    let last_pruned_seq = db
+    let last_dropped_cutoff_seq = db
         .cursors
-        .get(&pruned_key)
+        .get(&dropped_key)
         .into_diagnostic()?
         .map(|v| {
             v.as_ref()
                 .try_into()
                 .into_diagnostic()
-                .wrap_err("expected last pruned seq to be u64")
+                .wrap_err("expected last dropped cutoff seq to be u64")
         })
         .transpose()?
         .map(u64::from_be_bytes)
         .unwrap_or(0);
 
-    let mut pruned = 0usize;
-    let mut next_prune_seq = last_pruned_seq;
+    let drop_stats = (cutoff_seq > last_dropped_cutoff_seq)
+        .then(|| -> miette::Result<_> {
+            events_ks
+                .rotate_memtable_and_wait()
+                .into_diagnostic()
+                .wrap_err("failed to rotate memtable before TTL range drop")?;
 
-    loop {
-        let start_key_events = keys::event_key(next_prune_seq);
-        let cutoff_key_events = keys::event_key(cutoff_seq);
-        let mut keys_to_remove = Vec::with_capacity(TTL_PRUNE_BATCH_SIZE);
-        let mut last_removed_seq = None;
+            let before_space = events_ks.disk_space();
+            let before_tables = events_ks.table_count();
 
-        for guard in events_ks.range(start_key_events..cutoff_key_events) {
-            let k = guard.key().into_diagnostic()?;
-            last_removed_seq = Some(read_event_seq(&k)?);
-            keys_to_remove.push(k);
+            events_ks
+                .drop_range(..keys::event_key(cutoff_seq))
+                .into_diagnostic()
+                .wrap_err("failed TTL range drop for old events")?;
 
-            if keys_to_remove.len() >= TTL_PRUNE_BATCH_SIZE {
-                break;
-            }
-        }
+            let after_space = events_ks.disk_space();
+            let after_tables = events_ks.table_count();
 
-        let Some(last_removed_seq) = last_removed_seq else {
-            break;
-        };
-
-        let mut batch = db.inner.batch();
-        for key in keys_to_remove {
-            batch.remove(events_ks, key);
-            pruned += 1;
-        }
-        batch.insert(
-            &db.cursors,
-            pruned_key.clone(),
-            last_removed_seq.to_be_bytes(),
-        );
-        batch.commit().into_diagnostic()?;
-
-        next_prune_seq = last_removed_seq.saturating_add(1);
-        std::thread::sleep(TTL_PRUNE_BATCH_PAUSE);
-    }
+            Ok((before_space, after_space, before_tables, after_tables))
+        })
+        .transpose()?;
 
     let mut batch = db.inner.batch();
-    batch.insert(&db.cursors, pruned_key, cutoff_seq.to_be_bytes());
+    if drop_stats.is_some() {
+        batch.insert(&db.cursors, dropped_key, cutoff_seq.to_be_bytes());
+    }
 
     // clean up consumed watermark entries (everything up to and including cutoff_ts)
     let start: &[u8] = watermark_prefix;
@@ -186,44 +157,304 @@ fn ttl_tick_inner(
 
     batch.commit().into_diagnostic()?;
 
-    if pruned > 0 {
-        info!(pruned, "pruned old events");
+    if let Some((before_space, after_space, before_tables, after_tables)) = drop_stats {
+        info!(
+            cutoff_seq,
+            reclaimed_bytes = before_space.saturating_sub(after_space),
+            dropped_tables = before_tables.saturating_sub(after_tables),
+            before_space,
+            after_space,
+            before_tables,
+            after_tables,
+            "dropped old event tables for TTL"
+        );
     } else {
-        debug!("no events were pruned");
-    }
-
-    let pruned_since_compaction =
-        cutoff_seq.saturating_sub(last_compacted_seq.load(Ordering::Relaxed));
-    if pruned_since_compaction >= AUTO_COMPACT_PRUNED_SEQ_INTERVAL {
-        let compact_res = events_ks
-            .rotate_memtable_and_wait()
-            .into_diagnostic()
-            .wrap_err("failed to rotate memtable before TTL compaction")
-            .and_then(|_| {
-                events_ks
-                    .compact(Arc::new(fjall::compaction::Leveled::default()))
-                    .into_diagnostic()
-                    .wrap_err("failed TTL-triggered keyspace compaction")
-            });
-
-        if let Err(err) = compact_res {
-            warn!(err = %err, "TTL-triggered compaction failed");
-        } else {
-            last_compacted_seq.fetch_max(cutoff_seq, Ordering::Relaxed);
-            info!(
-                pruned_since_compaction,
-                "completed TTL-triggered keyspace compaction"
-            );
-        }
+        debug!(cutoff_seq, "no new event TTL range to drop");
     }
 
     Ok(())
 }
 
-#[cfg(any(feature = "indexer_stream", feature = "relay"))]
-fn read_event_seq(key: &[u8]) -> miette::Result<u64> {
-    key.try_into()
-        .into_diagnostic()
-        .wrap_err("event key must be 8 bytes")
-        .map(u64::from_be_bytes)
+#[cfg(all(test, feature = "relay"))]
+mod tests {
+    use super::*;
+    use crate::config::{Compression, Config};
+    use miette::IntoDiagnostic;
+
+    fn read_relay_seq(key: &[u8]) -> miette::Result<u64> {
+        key.try_into()
+            .into_diagnostic()
+            .wrap_err("relay event key must be 8 bytes")
+            .map(u64::from_be_bytes)
+    }
+
+    fn first_relay_seq(db: &crate::db::Db) -> miette::Result<u64> {
+        let Some(guard) = db.relay_events.iter().next() else {
+            miette::bail!("expected at least one relay event");
+        };
+        let key = guard.key().into_diagnostic()?;
+        read_relay_seq(&key)
+    }
+
+    fn open_test_relay_db() -> miette::Result<(tempfile::TempDir, crate::db::Db)> {
+        let dir = tempfile::tempdir().into_diagnostic()?;
+        let cfg = Config {
+            database_path: dir.path().to_path_buf(),
+            cache_size: 16,
+            data_compression: Compression::None,
+            journal_compression: Compression::None,
+            db_worker_threads: 2,
+            db_events_memtable_size_mb: 1,
+            ..Config::default()
+        };
+        let db = crate::db::Db::open(&cfg)?;
+
+        Ok((dir, db))
+    }
+
+    fn insert_relay_events(
+        db: &crate::db::Db,
+        start_seq: u64,
+        count: u64,
+        payload: &[u8],
+    ) -> miette::Result<()> {
+        let mut batch = db.inner.batch();
+        for seq in start_seq..start_seq + count {
+            batch.insert(&db.relay_events, keys::relay_event_key(seq), payload);
+        }
+        batch.commit().into_diagnostic()?;
+        db.next_relay_seq.store(start_seq + count, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn seed_relay_event_table(
+        db: &crate::db::Db,
+        start_seq: u64,
+        count: u64,
+        payload: &[u8],
+    ) -> miette::Result<()> {
+        insert_relay_events(db, start_seq, count, payload)?;
+        db.relay_events
+            .rotate_memtable_and_wait()
+            .into_diagnostic()?;
+        Ok(())
+    }
+
+    fn seed_compacted_relay_events(
+        db: &crate::db::Db,
+        count: u64,
+        payload: &[u8],
+    ) -> miette::Result<()> {
+        seed_relay_event_table(db, 0, count, payload)?;
+        db.relay_events.major_compact().into_diagnostic()?;
+        Ok(())
+    }
+
+    fn seed_past_relay_watermark(db: &crate::db::Db, cutoff_seq: u64) -> miette::Result<()> {
+        let past_ts = chrono::Utc::now().timestamp() as u64 - 60 * 60;
+        db.cursors
+            .insert(
+                keys::relay_event_watermark_key(past_ts),
+                cutoff_seq.to_be_bytes(),
+            )
+            .into_diagnostic()
+    }
+
+    fn compact_relay_events_once(db: &crate::db::Db) -> miette::Result<()> {
+        db.relay_events
+            .compact(Arc::new(fjall::compaction::Leveled::default()))
+            .into_diagnostic()
+    }
+
+    fn wait_for_relay_table_count(db: &crate::db::Db, min_tables: usize) -> miette::Result<()> {
+        for _ in 0..200 {
+            if db.relay_events.table_count() >= min_tables {
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        miette::bail!(
+            "timed out waiting for at least {min_tables} relay event tables, saw {}",
+            db.relay_events.table_count()
+        );
+    }
+
+    fn prune_prefix_with_per_key_tombstones(
+        db: &crate::db::Db,
+        cutoff_seq: u64,
+    ) -> miette::Result<()> {
+        let mut batch = db.inner.batch();
+        for seq in 0..cutoff_seq {
+            batch.remove(&db.relay_events, keys::relay_event_key(seq));
+        }
+        batch.commit().into_diagnostic()?;
+        db.relay_events
+            .rotate_memtable_and_wait()
+            .into_diagnostic()?;
+        Ok(())
+    }
+
+    #[test]
+    fn relay_ttl_tick_drops_old_append_only_event_tables() -> miette::Result<()> {
+        let (_dir, db) = open_test_relay_db()?;
+        let old_tables = 2u64;
+        let retained_tables = 1u64;
+        let events_per_table = 64u64;
+        let old_count = old_tables * events_per_table;
+        let retained_count = retained_tables * events_per_table;
+        let payload = vec![0x42; 4 * 1024];
+
+        let mut start_seq = 0;
+        for _ in 0..old_tables + retained_tables {
+            seed_relay_event_table(&db, start_seq, events_per_table, &payload)?;
+            start_seq += events_per_table;
+        }
+
+        let before_prune = db.relay_events.disk_space();
+        let before_tables = db.relay_events.table_count();
+        seed_past_relay_watermark(&db, old_count)?;
+
+        relay_events_ttl_tick(&db, &Duration::from_secs(60 * 60))?;
+
+        let after_prune = db.relay_events.disk_space();
+        let after_tables = db.relay_events.table_count();
+        assert_eq!(
+            retained_count as usize,
+            db.relay_events.iter().count(),
+            "TTL should keep the tables at or after the cutoff sequence"
+        );
+        assert!(
+            after_tables <= before_tables.saturating_sub(old_tables as usize),
+            "TTL drop_range should remove old relay event tables; before={before_tables}, after={after_tables}"
+        );
+        assert!(
+            after_prune < before_prune / 2,
+            "TTL drop_range should reclaim old relay event tables; before={before_prune}, after={after_prune}"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn relay_ttl_drop_range_retains_only_cutoff_boundary_table() -> miette::Result<()> {
+        let (_dir, db) = open_test_relay_db()?;
+        let table_count = 5u64;
+        let events_per_table = 64u64;
+        let fully_expired_tables = 2u64;
+        let cutoff_seq = fully_expired_tables * events_per_table + events_per_table / 2;
+        let payload = vec![0x42; 4 * 1024];
+
+        let mut start_seq = 0;
+        for _ in 0..table_count {
+            seed_relay_event_table(&db, start_seq, events_per_table, &payload)?;
+            compact_relay_events_once(&db)?;
+            start_seq += events_per_table;
+        }
+
+        let before_tables = db.relay_events.table_count();
+        seed_past_relay_watermark(&db, cutoff_seq)?;
+
+        relay_events_ttl_tick(&db, &Duration::from_secs(60 * 60))?;
+
+        let after_tables = db.relay_events.table_count();
+        assert!(
+            after_tables <= before_tables.saturating_sub(fully_expired_tables as usize),
+            "drop_range should drop tables fully below the cutoff; before={before_tables}, after={after_tables}"
+        );
+        assert_eq!(
+            fully_expired_tables * events_per_table,
+            first_relay_seq(&db)?,
+            "the table that straddles the cutoff should be retained"
+        );
+        assert_eq!(
+            ((table_count - fully_expired_tables) * events_per_table) as usize,
+            db.relay_events.iter().count(),
+            "only the boundary table and newer tables should remain"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn relay_ttl_drop_range_reclaims_after_sustained_auto_flushes() -> miette::Result<()> {
+        let (_dir, db) = open_test_relay_db()?;
+        let events_per_second = 600u64;
+        let total_seconds = 8u64;
+        let ttl_seconds = 4u64;
+        let payload = vec![0x42; 2 * 1024];
+
+        for second in 0..total_seconds {
+            insert_relay_events(&db, second * events_per_second, events_per_second, &payload)?;
+            wait_for_relay_table_count(&db, second as usize + 1)?;
+            compact_relay_events_once(&db)?;
+        }
+
+        let cutoff_seq = events_per_second * ttl_seconds;
+        let before_space = db.relay_events.disk_space();
+        let before_tables = db.relay_events.table_count();
+        assert!(
+            before_tables >= total_seconds as usize,
+            "sustained writes should have produced multiple SSTs; tables={before_tables}"
+        );
+
+        seed_past_relay_watermark(&db, cutoff_seq)?;
+        relay_events_ttl_tick(&db, &Duration::from_secs(60 * 60))?;
+
+        let after_space = db.relay_events.disk_space();
+        let after_tables = db.relay_events.table_count();
+        let first_seq = first_relay_seq(&db)?;
+        let remaining_events = db.relay_events.iter().count() as u64;
+
+        assert!(
+            after_tables < before_tables,
+            "TTL drop_range should remove old SSTs while newer writes remain; before={before_tables}, after={after_tables}"
+        );
+        assert!(
+            after_space < before_space * 3 / 4,
+            "TTL drop_range should reclaim a substantial old prefix; before={before_space}, after={after_space}"
+        );
+        assert!(
+            first_seq >= cutoff_seq.saturating_sub(events_per_second),
+            "boundary retention should be bounded to roughly one simulated second; cutoff={cutoff_seq}, first={first_seq}"
+        );
+        assert!(
+            first_seq <= cutoff_seq,
+            "drop_range should not drop newer-than-cutoff relay events; cutoff={cutoff_seq}, first={first_seq}"
+        );
+        assert!(
+            remaining_events <= (total_seconds - ttl_seconds + 1) * events_per_second,
+            "retained relay events should be bounded to the live window plus one boundary SST; remaining={remaining_events}"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn relay_leveled_compaction_does_not_reclaim_prefix_tombstones() -> miette::Result<()> {
+        let (_dir, db) = open_test_relay_db()?;
+        let old_count = 512u64;
+        let retained_count = 512u64;
+        let payload = vec![0x42; 8 * 1024];
+
+        seed_compacted_relay_events(&db, old_count + retained_count, &payload)?;
+        let before_prune = db.relay_events.disk_space();
+        prune_prefix_with_per_key_tombstones(&db, old_count)?;
+        let after_delete = db.relay_events.disk_space();
+
+        for _ in 0..16 {
+            db.relay_events
+                .compact(Arc::new(fjall::compaction::Leveled::default()))
+                .into_diagnostic()?;
+        }
+
+        let after_leveled = db.relay_events.disk_space();
+        assert_eq!(retained_count as usize, db.relay_events.iter().count());
+        assert!(
+            after_leveled >= before_prune * 9 / 10,
+            "leveled compaction should not be expected to reclaim prefix tombstones quickly; before={before_prune}, after_delete={after_delete}, after_leveled={after_leveled}"
+        );
+
+        Ok(())
+    }
 }
