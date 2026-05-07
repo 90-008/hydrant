@@ -69,6 +69,10 @@ ahash = "0.8.12"
 [dev-dependencies]
 tempfile = "3.26.0"
 
+[[example]]
+name = "statusphere"
+required-features = ["indexer_stream"]
+
 [profile.dev]
 opt-level = 1
 
@@ -79,3 +83,6 @@ lto = "thin"
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+[lints.clippy]
+obfuscated_if_else = "allow"

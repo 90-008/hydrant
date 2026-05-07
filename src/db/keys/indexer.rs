@@ -96,7 +96,7 @@ pub fn resync_buffer_key(did: &Did, rev: DbTid) -> Vec<u8> {
     let mut key = Vec::with_capacity(repo.len() + 1 + 8);
     repo.write_to_vec(&mut key);
     key.push(SEP);
-    key.extend_from_slice(&rev.as_bytes());
+    key.extend_from_slice(rev.as_bytes());
     key
 }
 

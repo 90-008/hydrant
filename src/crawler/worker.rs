@@ -146,8 +146,8 @@ impl CrawlerWorker {
                 let mut surviving = Vec::new();
                 let mut count_deltas = CountDeltas::default();
                 for guard in guards {
-                    let did_key = keys::repo_key(&*guard);
-                    let metadata_key = keys::repo_metadata_key(&*guard);
+                    let did_key = keys::repo_key(&guard);
+                    let metadata_key = keys::repo_metadata_key(&guard);
                     if app_state
                         .db
                         .repos
@@ -171,7 +171,7 @@ impl CrawlerWorker {
                         &did_key,
                     );
                     // clear any stale retry entry, this DID is confirmed and being enqueued
-                    batch.remove(&app_state.db.crawler, keys::crawler_retry_key(&*guard));
+                    batch.remove(&app_state.db.crawler, keys::crawler_retry_key(&guard));
                     trace!(did = %*guard, "enqueuing repo");
                     count_deltas.add("repos", 1);
                     #[cfg(feature = "indexer")]

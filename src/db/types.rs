@@ -67,21 +67,6 @@ impl<'s> TrimmedDid<'s> {
             TrimmedDid::Other(s) => buf.extend_from_slice(s.as_bytes()),
         }
     }
-
-    pub fn to_string(&self) -> String {
-        match self {
-            TrimmedDid::Plc(bytes) => {
-                let mut s = String::with_capacity(28);
-                s.push_str("plc:");
-                s.push_str(&BASE32_NOPAD.encode(bytes).to_ascii_lowercase());
-                s
-            }
-            TrimmedDid::Web(s) => {
-                format!("web:{}", s)
-            }
-            TrimmedDid::Other(s) => s.to_string(),
-        }
-    }
 }
 
 impl Display for TrimmedDid<'_> {
@@ -106,10 +91,10 @@ impl<'a> From<&'a Did<'a>> for TrimmedDid<'a> {
         if let Some(rest) = s.strip_prefix("did:plc:") {
             if rest.len() == 24 {
                 // decode
-                if let Ok(bytes) = BASE32_NOPAD.decode(rest.to_ascii_uppercase().as_bytes()) {
-                    if bytes.len() == 15 {
-                        return TrimmedDid::Plc(bytes.try_into().unwrap());
-                    }
+                if let Ok(bytes) = BASE32_NOPAD.decode(rest.to_ascii_uppercase().as_bytes())
+                    && bytes.len() == 15
+                {
+                    return TrimmedDid::Plc(bytes.try_into().unwrap());
                 }
             }
         } else if let Some(rest) = s.strip_prefix("did:web:") {
@@ -151,18 +136,18 @@ impl<'a> TryFrom<&'a [u8]> for TrimmedDid<'a> {
     }
 }
 
-impl<'a> Into<UserKey> for TrimmedDid<'a> {
-    fn into(self) -> UserKey {
+impl<'a> From<TrimmedDid<'a>> for UserKey {
+    fn from(val: TrimmedDid<'a>) -> Self {
         let mut vec = Vec::with_capacity(32);
-        self.write_to_vec(&mut vec);
+        val.write_to_vec(&mut vec);
         UserKey::new(&vec)
     }
 }
 
-impl<'a> Into<UserKey> for &TrimmedDid<'a> {
-    fn into(self) -> UserKey {
+impl<'a> From<&TrimmedDid<'a>> for UserKey {
+    fn from(val: &TrimmedDid<'a>) -> Self {
         let mut vec = Vec::with_capacity(32);
-        self.write_to_vec(&mut vec);
+        val.write_to_vec(&mut vec);
         UserKey::new(&vec)
     }
 }
@@ -220,11 +205,11 @@ impl DbTid {
         &self.0
     }
 
-    pub fn to_tid(&self) -> Tid {
+    pub fn to_tid(self) -> Tid {
         Tid::raw(self.to_smolstr())
     }
 
-    fn to_smolstr(&self) -> SmolStr {
+    fn to_smolstr(self) -> SmolStr {
         let mut i = u64::from_be_bytes(self.0);
         let mut s = SmolStrBuilder::new();
         for _ in 0..13 {
@@ -269,12 +254,14 @@ impl Display for DbTid {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u8)]
+#[cfg_attr(not(feature = "indexer"), allow(dead_code))]
 pub enum DbAction {
     Create = 0,
     Update = 1,
     Delete = 2,
 }
 
+#[cfg_attr(not(feature = "indexer"), allow(dead_code))]
 impl DbAction {
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -306,11 +293,13 @@ impl Display for DbAction {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(untagged)]
+#[cfg_attr(not(feature = "indexer"), allow(dead_code))]
 pub enum DbRkey {
     Tid(DbTid),
     Str(SmolStr),
 }
 
+#[cfg_attr(not(feature = "indexer"), allow(dead_code))]
 impl DbRkey {
     pub fn new(s: &str) -> Self {
         if let Ok(tid) = Tid::new(s) {

@@ -187,9 +187,9 @@ async fn did_task(
 ) -> Result<(), BackfillError> {
     let db = &state.db;
 
-    match process_did(&state, &http, &did, verify_signatures).await {
+    match process_did(state, &http, did, verify_signatures).await {
         Ok(Some(_repo_state)) => {
-            let did_key = keys::repo_key(&did);
+            let did_key = keys::repo_key(did);
 
             // determine old gauge state
             // if it was error/suspended etc, we need to know which error kind it was to decrement correctly.
@@ -263,7 +263,7 @@ async fn did_task(
                 BackfillError::Deleted => unreachable!("already handled"),
             };
 
-            let did_key = keys::repo_key(&did);
+            let did_key = keys::repo_key(did);
 
             // 1. get current retry count
             let existing_state = Db::get(db.resync.clone(), &did_key).await.and_then(|b| {
@@ -284,14 +284,14 @@ async fn did_task(
             let next_retry = ResyncState::next_backoff(retry_count);
 
             let resync_state = ResyncState::Error {
-                kind: error_kind.clone(),
+                kind: error_kind,
                 retry_count,
                 next_retry,
             };
             let old_gauge = prev_kind
                 .map(|k| GaugeState::Resync(Some(k)))
                 .unwrap_or(GaugeState::Pending);
-            let new_gauge = GaugeState::Resync(Some(error_kind.clone()));
+            let new_gauge = GaugeState::Resync(Some(error_kind));
             let mut count_deltas = CountDeltas::default();
             count_deltas.add_gauge_diff(&old_gauge, &new_gauge);
 
@@ -384,7 +384,7 @@ impl From<ResolverError> for BackfillError {
     }
 }
 
-async fn process_did<'i>(
+async fn process_did(
     app_state: &Arc<AppState>,
     http: &reqwest::Client,
     did: &Did<'static>,

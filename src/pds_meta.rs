@@ -6,8 +6,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::debug;
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub enum HostStatus {
+    #[default]
     Active,
     Idle,
     Offline,
@@ -45,12 +46,6 @@ impl HostStatus {
             None if self == Self::Throttled => Some(Self::Active),
             _ => None,
         }
-    }
-}
-
-impl Default for HostStatus {
-    fn default() -> Self {
-        Self::Active
     }
 }
 

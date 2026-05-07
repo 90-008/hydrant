@@ -98,6 +98,7 @@ impl ChainBreak {
 
 /// a successfully validated `#commit` message, carrying pre-parsed data for apply_commit
 pub struct ValidatedCommit<'c> {
+    #[cfg_attr(not(feature = "indexer"), allow(dead_code))]
     pub commit: &'c Commit<'c>,
     /// result of parse_car_bytes, already done so apply_commit does not re-parse
     pub parsed_blocks: ParsedCar,
@@ -185,10 +186,10 @@ pub fn validate_commit<'c>(
     }
 
     // 2. stale rev, skip if msg.rev <= last known rev (lexicographic order)
-    if let Some(root) = &repo_state.root {
-        if msg.rev.as_str() <= root.rev.to_tid().as_str() {
-            return Err(CommitValidationError::StaleRev);
-        }
+    if let Some(root) = &repo_state.root
+        && msg.rev.as_str() <= root.rev.to_tid().as_str()
+    {
+        return Err(CommitValidationError::StaleRev);
     }
 
     // 3. future rev, reject if rev timestamp is more than clock_skew_secs ahead of now

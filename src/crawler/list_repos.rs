@@ -113,15 +113,15 @@ fn is_throttle_worthy(e: &reqwest::Error) -> bool {
 
     let mut src = e.source();
     while let Some(s) = src {
-        if let Some(e) = s.downcast_ref::<std::io::Error>() {
-            if is_io_error_their_fault(&e) || is_tls_cert_error(e) {
-                return true;
-            }
+        if let Some(e) = s.downcast_ref::<std::io::Error>()
+            && (is_io_error_their_fault(e) || is_tls_cert_error(e))
+        {
+            return true;
         }
         src = s.source();
     }
 
-    e.status().map_or(false, |s| {
+    e.status().is_some_and(|s| {
         // lets not consider internal server errors for throttling
         // a server might be having a hard time on one request, but not on the rest
         s.as_u16() != 500 && is_status_their_fault(s.as_u16())

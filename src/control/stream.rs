@@ -787,7 +787,7 @@ fn stored_to_event(
                 let block = state
                     .db
                     .blocks
-                    .get(&keys::block_key(collection.as_str(), &cid.to_bytes()));
+                    .get(keys::block_key(collection.as_str(), &cid.to_bytes()));
                 match block {
                     Ok(Some(bytes)) => {
                         match serde_ipld_dagcbor::from_slice::<RawData>(bytes.as_ref()) {

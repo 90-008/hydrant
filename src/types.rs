@@ -375,8 +375,9 @@ pub struct AccountEvt<'i> {
 }
 
 #[cfg(feature = "indexer_stream")]
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Default)]
 pub(crate) enum StoredData {
+    #[default]
     Nothing,
     Ptr(IpldCid),
     #[serde(with = "jacquard_common::serde_bytes_helper")]
@@ -387,13 +388,6 @@ pub(crate) enum StoredData {
 impl StoredData {
     pub fn is_nothing(&self) -> bool {
         matches!(self, StoredData::Nothing)
-    }
-}
-
-#[cfg(feature = "indexer_stream")]
-impl Default for StoredData {
-    fn default() -> Self {
-        Self::Nothing
     }
 }
 

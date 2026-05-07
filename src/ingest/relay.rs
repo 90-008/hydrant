@@ -147,7 +147,7 @@ impl RelayWorker {
                                 InfoName::Other(name) => {
                                     let message = inf
                                         .message
-                                        .unwrap_or_else(|| CowStr::Borrowed("<no message>"));
+                                        .unwrap_or(CowStr::Borrowed("<no message>"));
                                     info!(name = %name, "relay sent info: {message}");
                                 }
                             }
@@ -190,6 +190,7 @@ impl RelayWorker {
         Err(miette::miette!("relay worker dispatcher shutting down"))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn shard(
         id: usize,
         mut rx: mpsc::Receiver<WorkerMessage>,
@@ -553,23 +554,21 @@ impl RelayWorker {
         }
 
         // update per-PDS active account count on transitions
-        if is_pds {
-            if let Some(host) = firehose.host_str() {
-                let count_key = pds_account_count_key(host);
-                let delta = if !was_active && repo_state.active {
-                    1
-                } else if was_active && !repo_state.active {
-                    -1
-                } else {
-                    0
-                };
+        if is_pds && let Some(host) = firehose.host_str() {
+            let count_key = pds_account_count_key(host);
+            let delta = if !was_active && repo_state.active {
+                1
+            } else if was_active && !repo_state.active {
+                -1
+            } else {
+                0
+            };
 
-                if delta != 0 {
-                    ctx.count_deltas.add(&count_key, delta);
-                    let count = ctx.count_deltas.projected_count(&ctx.state.db, &count_key);
-                    ctx.state
-                        .apply_host_limit_status(&mut ctx.batch, host, count);
-                }
+            if delta != 0 {
+                ctx.count_deltas.add(&count_key, delta);
+                let count = ctx.count_deltas.projected_count(&ctx.state.db, &count_key);
+                ctx.state
+                    .apply_host_limit_status(&mut ctx.batch, host, count);
             }
         }
 
@@ -829,7 +828,7 @@ impl WorkerContext<'_> {
             .map(|bytes| db::deser_repo_meta(&bytes))
             .transpose()?;
 
-        if metadata.map_or(false, |m| !m.tracked) {
+        if metadata.is_some_and(|m| !m.tracked) {
             trace!(did = %did, "ignoring message, repo is explicitly untracked");
             return Ok(None);
         }
@@ -925,10 +924,11 @@ impl WorkerContext<'_> {
         self.count_deltas.add("repos", 1);
 
         // track initial active state for per-PDS rate limiting
-        if msg.is_pds && repo_state.active {
-            if let Some(host) = msg.firehose.host_str() {
-                self.count_deltas.add(&pds_account_count_key(host), 1);
-            }
+        if msg.is_pds
+            && repo_state.active
+            && let Some(host) = msg.firehose.host_str()
+        {
+            self.count_deltas.add(&pds_account_count_key(host), 1);
         }
 
         Ok(Some(repo_state))

@@ -80,6 +80,6 @@ pub async fn handle(
         handle: doc.handle,
         pds: doc.pds.to_smolstr(),
         signing_key: doc.signing_key,
-        collections: collections.into_iter().map(|(k, _)| k).collect(),
+        collections: collections.into_keys().collect(),
     }))
 }

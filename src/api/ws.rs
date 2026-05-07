@@ -11,6 +11,7 @@ const CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
 
 pub(super) enum WsAction {
     Send(Message),
+    #[cfg_attr(not(feature = "indexer_stream"), allow(dead_code))]
     Skip,
     Close(Option<Message>),
 }

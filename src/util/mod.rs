@@ -20,15 +20,15 @@ pub fn is_timeout(err: &dyn std::error::Error) -> bool {
     let mut source = err.source();
 
     while let Some(err) = source {
-        if let Some(hyper_err) = err.downcast_ref::<hyper::Error>() {
-            if hyper_err.is_timeout() {
-                return true;
-            }
+        if let Some(hyper_err) = err.downcast_ref::<hyper::Error>()
+            && hyper_err.is_timeout()
+        {
+            return true;
         }
-        if let Some(io) = err.downcast_ref::<std::io::Error>() {
-            if io.kind() == std::io::ErrorKind::TimedOut {
-                return true;
-            }
+        if let Some(io) = err.downcast_ref::<std::io::Error>()
+            && io.kind() == std::io::ErrorKind::TimedOut
+        {
+            return true;
         }
         source = err.source();
     }
@@ -91,9 +91,9 @@ pub fn is_tls_error_their_fault(e: &rustls::Error) -> bool {
 
 // use this for public (unauth) xrpc errors
 pub fn is_status_their_fault(status: u16) -> bool {
-    return (status >= 100 && status < 200) // informational, why are we here?
-        || (status >= 500 && status < 600) // server error :>
-        || (status >= 300 && status < 400) // any 3xx error doesnt make sense in the context of a pds / relay
+    (100..200).contains(&status) // informational, why are we here?
+        || (500..600).contains(&status) // server error :>
+        || (300..400).contains(&status) // any 3xx error doesnt make sense in the context of a pds / relay
         || matches!(
             status,
             404 // NOT FOUND: we know its not our fault because we use known xrpcs..
@@ -101,7 +101,7 @@ pub fn is_status_their_fault(status: u16) -> bool {
             | 403 // FORBIDDEN: sob
             | 401 // UNAUTHORIZED: sob
             | 410 // GONE: sob
-        );
+        )
 }
 
 /// outcome of [`RetryWithBackoff::retry`] when the operation does not succeed.

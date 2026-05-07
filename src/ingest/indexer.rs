@@ -53,6 +53,7 @@ pub struct IndexerAccountData {
 }
 
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum IndexerEventData {
     Commit(IndexerCommitData),
     Identity(IndexerIdentityData),
@@ -107,6 +108,7 @@ impl From<miette::Report> for IngestError {
 }
 
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 enum RepoProcessResult<'s, 'c> {
     // message processed successfully, here is the (possibly updated) state
     Ok(RepoState<'s>),
@@ -673,13 +675,18 @@ impl FirehoseWorker {
             .map(|b| crate::db::deser_repo_meta(&b))
             .transpose()?;
         let had_metadata = existing_metadata.is_some();
-        let mut metadata = existing_metadata.unwrap_or_else(|| RepoMetadata {
+        let mut metadata = existing_metadata.unwrap_or(RepoMetadata {
             index_id: 0, // this is set later
             tracked: true,
         });
 
         let old_pkey = keys::pending_key(metadata.index_id);
-        let was_pending = had_metadata && db.pending.get(&old_pkey).into_diagnostic()?.is_some();
+        let was_pending = had_metadata
+            && db
+                .pending
+                .get(old_pkey.as_slice())
+                .into_diagnostic()?
+                .is_some();
         // remove old pending entry and insert new one with fresh index_id
         if had_metadata {
             // only remove if we had one so we dont delete a random entry

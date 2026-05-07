@@ -124,8 +124,8 @@ pub fn delete_repo(
     Ok(())
 }
 
-pub fn transition_repo<'batch, 's>(
-    batch: &'batch mut OwnedWriteBatch,
+pub fn transition_repo<'s>(
+    batch: &mut OwnedWriteBatch,
     db: &Db,
     did: &Did,
     mut repo_state: RepoState<'s>,
@@ -144,12 +144,12 @@ pub fn transition_repo<'batch, 's>(
         // manage queues
         match &new_status {
             RepoStatus::Synced => {
-                batch.remove(&db.pending, &pending_key);
+                batch.remove(&db.pending, pending_key.as_slice());
                 // we dont have to remove from resync here because it has to transition resync -> pending first
             }
             RepoStatus::Error(msg) => {
                 tracing::warn!("transitioning to error: {msg}");
-                batch.remove(&db.pending, &pending_key);
+                batch.remove(&db.pending, pending_key.as_slice());
                 // TODO: we need to make errors have kind instead of "message" in repo status
                 // and then pass it to resync error kind
                 let resync_state = crate::types::ResyncState::Error {
@@ -177,12 +177,12 @@ pub fn transition_repo<'batch, 's>(
             }
             RepoStatus::Deleted => {
                 // terminal state: remove from queues, no resync entry needed
-                batch.remove(&db.pending, &pending_key);
+                batch.remove(&db.pending, pending_key.as_slice());
                 batch.remove(&db.resync, &repo_key);
             }
             RepoStatus::Desynchronized | RepoStatus::Throttled => {
                 // like an error: remove from pending and schedule a resync attempt
-                batch.remove(&db.pending, &pending_key);
+                batch.remove(&db.pending, pending_key.as_slice());
                 let resync_state = crate::types::ResyncState::Error {
                     kind: crate::types::ResyncErrorKind::Generic,
                     retry_count: 0,
@@ -236,6 +236,7 @@ pub fn apply_commit<'s>(
     let mut records_delta = 0;
     let mut blocks_count = 0;
     let mut collection_deltas: HashMap<&str, i64> = HashMap::new();
+    #[cfg(feature = "indexer_stream")]
     let rev = DbTid::from(&commit.rev);
 
     #[cfg(feature = "indexer_stream")]
@@ -275,7 +276,7 @@ pub fn apply_commit<'s>(
                     .wrap_err("expected valid cid from relay")?;
                 #[cfg(feature = "indexer_stream")]
                 {
-                    cid_for_event = Some(cid_ipld.clone());
+                    cid_for_event = Some(cid_ipld);
                 }
 
                 let Some(bytes) = parsed.blocks.get(&cid_ipld) else {
@@ -348,7 +349,7 @@ pub fn apply_commit<'s>(
                 .map(StoredData::Block)
                 .or_else(|| {
                     (!only_index_links)
-                        .then(|| cid_for_event.clone().map(StoredData::Ptr))
+                        .then(|| cid_for_event.map(StoredData::Ptr))
                         .flatten()
                 })
                 .unwrap_or(StoredData::Nothing);

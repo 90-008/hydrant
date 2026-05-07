@@ -34,6 +34,7 @@ pub struct CrawlerSourceInfo {
     pub mode: crate::config::CrawlerMode,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn spawn_crawler_producer(
     source: &crate::config::CrawlerSource,
     http: &reqwest::Client,

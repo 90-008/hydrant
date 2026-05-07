@@ -171,10 +171,8 @@ impl BacklinksFetch {
                     continue;
                 };
 
-                if !self.dids.is_empty() {
-                    if !self.dids.iter().any(|d| d == did) {
-                        continue;
-                    }
+                if !self.dids.is_empty() && !self.dids.iter().any(|d| d == did) {
+                    continue;
                 }
 
                 let Some(cid) = store::lookup_cid_from_ks(&db.records, did, col, rkey) else {

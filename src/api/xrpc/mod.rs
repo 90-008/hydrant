@@ -64,7 +64,9 @@ mod request_crawl;
 #[cfg(feature = "relay")]
 mod subscribe_repos;
 
-pub fn router(blocks_available: bool) -> Router<Hydrant> {
+pub fn router(
+    #[cfg_attr(not(feature = "indexer"), allow(unused_variables))] blocks_available: bool,
+) -> Router<Hydrant> {
     let r = Router::new()
         .route(GetHostStatusRequest::PATH, get(get_host_status::handle))
         .route(ListHostsRequest::PATH, get(list_hosts::handle))

@@ -76,7 +76,7 @@ pub async fn handle_get_repos(
         let json = serde_json::to_string(&item).ok()?;
         Some(Ok::<_, std::io::Error>(format!("{json}\n")))
     }))
-    .filter_map(|x| futures::future::ready(x));
+    .filter_map(futures::future::ready);
 
     let body = Body::from_stream(stream);
 

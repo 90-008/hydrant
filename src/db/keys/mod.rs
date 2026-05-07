@@ -21,7 +21,7 @@ pub const RELAY_EVENT_WATERMARK_PREFIX: &[u8] = b"rwm|";
 pub const VERSIONING_KEY: &[u8] = b"db_version";
 
 // key format: {DID}
-pub fn repo_key<'a>(did: &'a Did) -> Vec<u8> {
+pub fn repo_key(did: &Did) -> Vec<u8> {
     let mut vec = Vec::with_capacity(32);
     TrimmedDid::from(did).write_to_vec(&mut vec);
     vec
@@ -29,7 +29,7 @@ pub fn repo_key<'a>(did: &'a Did) -> Vec<u8> {
 
 pub const REPO_METADATA_PREFIX: &[u8] = b"rm|";
 
-pub fn repo_metadata_key<'a>(did: &'a Did) -> Vec<u8> {
+pub fn repo_metadata_key(did: &Did) -> Vec<u8> {
     let mut vec = Vec::with_capacity(REPO_METADATA_PREFIX.len() + 32);
     vec.extend_from_slice(REPO_METADATA_PREFIX);
     TrimmedDid::from(did).write_to_vec(&mut vec);

@@ -112,16 +112,17 @@ impl ReposControl {
         #[cfg(feature = "indexer")]
         let state = self.0.clone();
         self.iter_states(cursor).map(move |r| {
+            #[allow(clippy::bind_instead_of_map)]
             r.and_then(|(did, s)| {
                 #[cfg(feature = "indexer")]
                 let tracked = state
                     .db
                     .repo_metadata
-                    .get(&keys::repo_metadata_key(&did))
+                    .get(keys::repo_metadata_key(&did))
                     .into_diagnostic()?
                     .map(|b| crate::db::deser_repo_meta(&b))
                     .transpose()?
-                    .map_or(true, |m| m.tracked);
+                    .is_none_or(|m| m.tracked);
                 #[cfg(not(feature = "indexer"))]
                 let tracked = true;
                 Ok(repo_state_to_info(did, s, tracked))
@@ -263,7 +264,7 @@ impl<'i> RepoHandle<'i> {
                 .into_diagnostic()?
                 .map(|b| crate::db::deser_repo_meta(&b))
                 .transpose()?
-                .map_or(true, |m| m.tracked);
+                .is_none_or(|m| m.tracked);
             #[cfg(not(feature = "indexer"))]
             let tracked = true;
 
@@ -325,12 +326,12 @@ impl<'i> RepoHandle<'i> {
                 };
 
                 let metadata = crate::db::deser_repo_meta(metadata_bytes.as_ref())?;
-                return Ok(app_state
+                Ok(app_state
                     .db
                     .pending
                     .get(crate::db::keys::pending_key(metadata.index_id))
                     .into_diagnostic()?
-                    .is_some());
+                    .is_some())
             })
             .await
             .map_err(|e| MiniDocError::Other(miette::miette!(e)))?

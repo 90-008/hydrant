@@ -52,8 +52,7 @@ impl ReposControl {
                     repo_state_to_info(did, repo_state.into_static(), metadata.tracked),
                 )))
             })
-            .map(|b| b.transpose())
-            .flatten()
+            .filter_map(|b| b.transpose())
     }
 
     #[allow(dead_code)]
@@ -97,8 +96,7 @@ impl ReposControl {
                     metadata.tracked,
                 )))
             })
-            .map(|b| b.transpose())
-            .flatten()
+            .filter_map(|b| b.transpose())
     }
 
     pub(crate) fn _resync(
@@ -136,7 +134,7 @@ impl ReposControl {
                 metadata.tracked = true;
                 // insert into pending with new index_id
                 let old_pending = keys::pending_key(metadata.index_id);
-                batch.remove(&db.pending, &old_pending);
+                batch.remove(&db.pending, old_pending);
                 metadata.index_id = rand::Rng::next_u64(&mut rand::rng());
                 batch.insert(&db.pending, keys::pending_key(metadata.index_id), &did_key);
                 batch.remove(&db.resync, &did_key);
@@ -289,23 +287,23 @@ impl ReposControl {
                         .map(|b| crate::db::deser_repo_meta(&b))
                         .transpose()?;
 
-                    if let Some(mut metadata) = existing_metadata {
-                        if metadata.tracked {
-                            let resync = db.resync.get(&did_key).into_diagnostic()?;
-                            let old = db::Db::repo_gauge_state(&repo_state, resync.as_deref());
-                            metadata.tracked = false;
-                            batch.insert(
-                                &db.repo_metadata,
-                                &metadata_key,
-                                crate::db::ser_repo_meta(&metadata)?,
-                            );
-                            batch.remove(&db.pending, keys::pending_key(metadata.index_id));
-                            batch.remove(&db.resync, &did_key);
-                            if old != GaugeState::Synced {
-                                count_deltas.add_gauge_diff(&old, &GaugeState::Synced);
-                            }
-                            untracked.push(did);
+                    if let Some(mut metadata) = existing_metadata
+                        && metadata.tracked
+                    {
+                        let resync = db.resync.get(&did_key).into_diagnostic()?;
+                        let old = db::Db::repo_gauge_state(&repo_state, resync.as_deref());
+                        metadata.tracked = false;
+                        batch.insert(
+                            &db.repo_metadata,
+                            &metadata_key,
+                            crate::db::ser_repo_meta(&metadata)?,
+                        );
+                        batch.remove(&db.pending, keys::pending_key(metadata.index_id));
+                        batch.remove(&db.resync, &did_key);
+                        if old != GaugeState::Synced {
+                            count_deltas.add_gauge_diff(&old, &GaugeState::Synced);
                         }
+                        untracked.push(did);
                     }
                 }
             }
@@ -437,7 +435,7 @@ impl<'i> RepoHandle<'i> {
                 if let Ok(Some(block_bytes)) = state
                     .db
                     .blocks
-                    .get(&keys::block_key(collection.as_str(), &cid_bytes))
+                    .get(keys::block_key(collection.as_str(), &cid_bytes))
                 {
                     let value: Data =
                         serde_ipld_dagcbor::from_slice(&block_bytes).unwrap_or(Data::Null);
@@ -471,9 +469,9 @@ impl<'i> RepoHandle<'i> {
     ///
     /// ## notes
     /// - calling this if you are using collection allowlist will always result
-    /// in an error since the commit root won't match the reconstructed CID.
+    ///   in an error since the commit root won't match the reconstructed CID.
     /// - calling this for big repositories will incur more resource cost due to
-    /// hydrant's structure, the whole MST is always reconstructed.
+    ///   hydrant's structure, the whole MST is always reconstructed.
     pub async fn generate_car(
         &self,
     ) -> Result<Option<impl futures::Stream<Item = std::io::Result<bytes::Bytes>> + Send + 'static>>

@@ -146,7 +146,7 @@ impl ThrottleHandle {
     }
 
     pub fn consecutive_failures(&self) -> usize {
-        self.state.consecutive_failures.load(Ordering::Acquire) as usize
+        self.state.consecutive_failures.load(Ordering::Acquire)
     }
 
     /// returns whether the timeout attempts are exhausted

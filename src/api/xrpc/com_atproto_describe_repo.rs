@@ -45,7 +45,7 @@ pub async fn handle(
         handle,
         handle_is_correct,
         did_doc,
-        collections: collections.into_iter().map(|(k, _)| k).collect(),
+        collections: collections.into_keys().collect(),
         extra_data: Default::default(),
     }))
 }

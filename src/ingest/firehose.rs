@@ -68,7 +68,7 @@ impl FirehoseIngestor {
     #[tracing::instrument(skip(self), fields(host = %self.relay_host))]
     pub async fn run(mut self) -> Result<()> {
         let host = self.relay_host.host_str().unwrap_or("");
-        let count_key = crate::db::keys::pds_account_count_key(&host);
+        let count_key = crate::db::keys::pds_account_count_key(host);
 
         let mut rng: SmallRng = rand::make_rng();
 
@@ -188,10 +188,10 @@ impl FirehoseIngestor {
                                 "active_sleep: computed status transition"
                             );
 
-                            if current_status != new_status {
-                                if let Err(e) = self.set_host_status(new_status) {
-                                    error!(err = %e, "failed to update host status");
-                                }
+                            if current_status != new_status
+                                && let Err(e) = self.set_host_status(new_status)
+                            {
+                                error!(err = %e, "failed to update host status");
                             }
                         }
                     }
@@ -255,10 +255,10 @@ impl FirehoseIngestor {
         let failures = self.throttle.consecutive_failures();
         if failures >= MAX_FAILURES {
             warn!(failures, "too many consecutive failures, giving up on host");
-            if self.is_pds {
-                if let Err(e) = self.set_host_status(HostStatus::Offline) {
-                    error!(err = %e, "failed to update host status to offline");
-                }
+            if self.is_pds
+                && let Err(e) = self.set_host_status(HostStatus::Offline)
+            {
+                error!(err = %e, "failed to update host status to offline");
             }
             return None;
         }

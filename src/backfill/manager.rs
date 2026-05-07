@@ -25,46 +25,46 @@ pub fn queue_gone_backfills(state: &Arc<AppState>) -> Result<()> {
             }
         };
 
-        if let Ok(resync_state) = rmp_serde::from_slice::<ResyncState>(&val) {
-            if matches!(resync_state, ResyncState::Gone { .. }) {
-                debug!(did = %did, "queuing retry for gone repo");
+        if let Ok(resync_state) = rmp_serde::from_slice::<ResyncState>(&val)
+            && matches!(resync_state, ResyncState::Gone { .. })
+        {
+            debug!(did = %did, "queuing retry for gone repo");
 
-                let metadata_key = keys::repo_metadata_key(&did);
-                let metadata_bytes = match state
-                    .db
-                    .repo_metadata
-                    .get(&metadata_key)
-                    .map(|b| b.ok_or_else(|| miette::miette!("repo metadata not found")))
-                    .into_diagnostic()
-                    .flatten()
-                {
-                    Ok(b) => b,
-                    Err(e) => {
-                        error!(did = %did, err = %e, "failed to get repo metadata");
-                        continue;
-                    }
-                };
-                let mut metadata = crate::db::deser_repo_meta(&metadata_bytes)?;
+            let metadata_key = keys::repo_metadata_key(&did);
+            let metadata_bytes = match state
+                .db
+                .repo_metadata
+                .get(&metadata_key)
+                .map(|b| b.ok_or_else(|| miette::miette!("repo metadata not found")))
+                .into_diagnostic()
+                .flatten()
+            {
+                Ok(b) => b,
+                Err(e) => {
+                    error!(did = %did, err = %e, "failed to get repo metadata");
+                    continue;
+                }
+            };
+            let mut metadata = crate::db::deser_repo_meta(&metadata_bytes)?;
 
-                // move from resync back into pending
-                batch.remove(&state.db.resync, key.clone());
-                let old_pending = keys::pending_key(metadata.index_id);
-                batch.remove(&state.db.pending, old_pending);
-                metadata.index_id = rand::random::<u64>();
-                batch.insert(
-                    &state.db.pending,
-                    keys::pending_key(metadata.index_id),
-                    key.clone(),
-                );
-                batch.insert(
-                    &state.db.repo_metadata,
-                    &metadata_key,
-                    crate::db::ser_repo_meta(&metadata)?,
-                );
+            // move from resync back into pending
+            batch.remove(&state.db.resync, key.clone());
+            let old_pending = keys::pending_key(metadata.index_id);
+            batch.remove(&state.db.pending, old_pending);
+            metadata.index_id = rand::random::<u64>();
+            batch.insert(
+                &state.db.pending,
+                keys::pending_key(metadata.index_id),
+                key.clone(),
+            );
+            batch.insert(
+                &state.db.repo_metadata,
+                &metadata_key,
+                crate::db::ser_repo_meta(&metadata)?,
+            );
 
-                count_deltas.add_gauge_diff(&GaugeState::Resync(None), &GaugeState::Pending);
-                transitions += 1;
-            }
+            count_deltas.add_gauge_diff(&GaugeState::Resync(None), &GaugeState::Pending);
+            transitions += 1;
         }
     }
 

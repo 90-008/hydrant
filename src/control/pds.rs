@@ -104,9 +104,8 @@ impl PdsControl {
         snapshot
             .hosts
             .iter()
-            .filter_map(|(host, desc): (&String, &crate::pds_meta::HostDesc)| {
-                matches!(desc.status, HostStatus::Banned).then(|| host.clone())
-            })
+            .filter(|(_, desc)| matches!(desc.status, HostStatus::Banned))
+            .map(|(host, _)| host.clone())
             .collect()
     }
 
@@ -151,7 +150,7 @@ impl PdsControl {
 
         self.update(
             move |batch, ks| {
-                let _ = db_pds::set_tier(batch, ks, &host_clone, &tier_clone);
+                db_pds::set_tier(batch, ks, &host_clone, &tier_clone);
                 if let Some(status) = maybe_status {
                     let _ = db_pds::set_status(batch, ks, &host_clone, status);
                 }
@@ -190,7 +189,7 @@ impl PdsControl {
 
         self.update(
             move |batch, ks| {
-                let _ = db_pds::remove_tier(batch, ks, &host_clone);
+                db_pds::remove_tier(batch, ks, &host_clone);
                 if let Some(status) = maybe_status {
                     let _ = db_pds::set_status(batch, ks, &host_clone, status);
                 }

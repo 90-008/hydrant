@@ -235,14 +235,14 @@ impl Db {
 
         let load_dict = |name: &str| -> Option<Arc<[u8]>> {
             let path = cfg.database_path.join(format!("dict_{name}.bin"));
-            if path.exists() {
-                if let Ok(bytes) = std::fs::read(&path) {
-                    tracing::debug!(
-                        "loaded zstd dictionary for keyspace {name} ({} bytes)",
-                        bytes.len()
-                    );
-                    return Some(bytes.into());
-                }
+            if path.exists()
+                && let Ok(bytes) = std::fs::read(&path)
+            {
+                tracing::debug!(
+                    "loaded zstd dictionary for keyspace {name} ({} bytes)",
+                    bytes.len()
+                );
+                return Some(bytes.into());
             }
             None
         };
@@ -961,6 +961,7 @@ pub async fn get_firehose_cursor(db: &Db, relay: &Url) -> Result<Option<i64>> {
         .transpose()
 }
 
+#[cfg(feature = "indexer")]
 pub fn ser_repo_meta(state: &RepoMetadata) -> Result<Vec<u8>> {
     rmp_serde::to_vec(&state).into_diagnostic()
 }

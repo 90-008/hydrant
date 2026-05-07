@@ -358,11 +358,11 @@ impl Hydrant {
 
                     state.firehose_cursors.iter_sync(|relay, cursor| {
                         let seq = cursor.load(Ordering::SeqCst);
-                        if seq > 0 {
-                            if let Err(e) = db::set_firehose_cursor(&state.db, relay, seq) {
-                                error!(relay = %relay, err = %e, "failed to save cursor");
-                                db::check_poisoned_report(&e);
-                            }
+                        if seq > 0
+                            && let Err(e) = db::set_firehose_cursor(&state.db, relay, seq)
+                        {
+                            error!(relay = %relay, err = %e, "failed to save cursor");
+                            db::check_poisoned_report(&e);
                         }
                         true
                     });
@@ -898,7 +898,7 @@ impl Hydrant {
             let status = state.pds_meta.load().status(&hostname);
 
             Ok(Some(Host {
-                name: hostname.into(),
+                name: hostname,
                 seq,
                 account_count,
                 status,

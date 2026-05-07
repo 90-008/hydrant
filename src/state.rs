@@ -116,7 +116,7 @@ impl AppState {
             #[cfg(feature = "indexer")]
             backfill_enabled,
             ephemeral: config.ephemeral,
-            ephemeral_ttl: config.ephemeral_ttl.clone(),
+            ephemeral_ttl: config.ephemeral_ttl,
             only_index_links: config.only_index_links,
             throttler: Throttler::new(),
             #[cfg(feature = "relay")]

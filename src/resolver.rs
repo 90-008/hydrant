@@ -75,11 +75,13 @@ impl Resolver {
         let mut jacquards = Vec::with_capacity(plc_urls.len());
 
         for url in plc_urls {
-            let mut opts = ResolverOptions::default();
-            opts.plc_source = PlcSource::PlcDirectory {
-                base: url_to_fluent_uri(&url),
+            let opts = ResolverOptions {
+                plc_source: PlcSource::PlcDirectory {
+                    base: url_to_fluent_uri(&url),
+                },
+                request_timeout: Some(Duration::from_secs(3)),
+                ..Default::default()
             };
-            opts.request_timeout = Some(Duration::from_secs(3));
 
             jacquards.push(JacquardResolver::new(http.clone(), opts).with_system_dns());
         }
@@ -200,10 +202,7 @@ impl Resolver {
     ) -> Result<PublicKey<'static>, ResolverError> {
         let did = did.clone().into_static();
         let mini = self.resolve_doc(&did).await?;
-        Ok(mini
-            .key
-            .ok_or_else(|| NoSigningKeyError(did))
-            .into_diagnostic()?)
+        Ok(mini.key.ok_or(NoSigningKeyError(did)).into_diagnostic()?)
     }
 
     /// resolves the full DID document as raw [`Data`] without caching, and

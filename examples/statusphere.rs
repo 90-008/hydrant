@@ -75,7 +75,7 @@ impl StatusIndex {
             true
         });
         let mut ranked: Vec<_> = counts.into_iter().collect();
-        ranked.sort_by(|a, b| b.1.cmp(&a.1));
+        ranked.sort_by_key(|b| std::cmp::Reverse(b.1));
         ranked.truncate(n);
         ranked
     }

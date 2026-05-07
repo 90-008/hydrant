@@ -42,7 +42,7 @@ pub(crate) async fn seed_from_list_hosts(
         })
         .buffer_unordered(MAX_CONCURRENT_SEEDS);
 
-    while let Some(_) = futs.next().await {}
+    while futs.next().await.is_some() {}
 }
 
 #[tracing::instrument(skip_all, fields(seed_url = %seed_url))]
