@@ -19,6 +19,8 @@ mod repos;
 mod stats;
 #[cfg(feature = "indexer_stream")]
 mod stream;
+#[cfg(any(feature = "relay", feature = "indexer_stream"))]
+mod ws;
 mod xrpc;
 
 pub async fn serve(hydrant: Hydrant, binds: ApiBinds) -> miette::Result<()> {

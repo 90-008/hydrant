@@ -110,7 +110,6 @@ impl FirehoseStream {
                     }
                     return Ok(bytes);
                 }
-                msg if msg.is_ping() => self.ws.send(WsMsg::pong(msg.into_payload())).await?,
                 // if ws closed treat it as an error, since why would a host close the stream??
                 // TODO: treat hosts that return these as offline ??????
                 msg if msg.is_close() => {
@@ -120,6 +119,7 @@ impl FirehoseStream {
                     );
                     return Err(FirehoseError::StreamClosed { code, reason });
                 }
+                msg if msg.is_ping() => self.ws.send(WsMsg::pong(msg.into_payload())).await?,
                 msg if msg.is_pong() => continue,
                 x => {
                     trace!(msg = ?x, "host sent unexpected message");

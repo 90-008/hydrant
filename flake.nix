@@ -66,6 +66,7 @@
               cmake
               websocat
               http-nu
+              nushell
               clang
               wild
               psmisc

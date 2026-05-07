@@ -26,7 +26,7 @@ def run-auth-test [did: string, password: string, pds_url: string, relays: strin
         let output_file = $"($db_path)/stream_output.txt"
         print $"starting stream listener -> ($output_file)"
         # use websocat to capture output.
-        let stream_pid = (bash -c $"websocat '($ws_url)' > '($output_file)' & echo $!" | str trim | into int)
+        let stream_pid = (bash -c $"websocat -n '($ws_url)' > '($output_file)' & echo $!" | str trim | into int)
         print $"listener pid: ($stream_pid)"
 
         # 4. add repo to hydrant (backfill trigger)

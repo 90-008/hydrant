@@ -25,7 +25,7 @@ def main [] {
         print $"starting stream listener -> ($live_output)"
         
         # start websocat in background to capture live events (no cursor = live only)
-        let stream_pid = (bash -c $"websocat '($ws_url)' > '($live_output)' 2>&1 & echo $!" | str trim | into int)
+        let stream_pid = (bash -c $"websocat -n '($ws_url)' > '($live_output)' 2>&1 & echo $!" | str trim | into int)
         print $"stream listener pid: ($stream_pid)"
         sleep 1sec
         
@@ -77,7 +77,7 @@ def main [] {
                 # use same approach as test 1: background process with file output
                 # cursor=0 replays from the beginning (no cursor = live-tail only)
                 print "starting historical stream listener..."
-                let history_pid = (bash -c $"websocat '($ws_url)?cursor=0' > '($history_output)' 2>&1 & echo $!" | str trim | into int)
+                let history_pid = (bash -c $"websocat -n '($ws_url)?cursor=0' > '($history_output)' 2>&1 & echo $!" | str trim | into int)
                 print $"history listener pid: ($history_pid)"
                 
                 # wait for events to be streamed (should be fast for historical replay)

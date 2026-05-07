@@ -6,9 +6,10 @@ use axum::{
     response::IntoResponse,
 };
 use axum_tws::{Message, WebSocket, WebSocketUpgrade};
-use futures::StreamExt;
 use serde::Deserialize;
 use tracing::error;
+
+use super::ws::{WsAction, run_socket};
 
 pub fn router() -> Router<Hydrant> {
     Router::new().route("/", get(handle_stream))
@@ -27,59 +28,41 @@ pub async fn handle_stream(
     ws.on_upgrade(move |socket| handle_socket(socket, hydrant, query))
 }
 
-async fn handle_socket(mut socket: WebSocket, hydrant: Hydrant, query: StreamQuery) {
+async fn handle_socket(socket: WebSocket, hydrant: Hydrant, query: StreamQuery) {
     let send_timeout = hydrant.stream_send_timeout();
-    let mut stream = hydrant.subscribe(query.cursor);
-
-    while let Some(item) = stream.next().await {
-        let evt = match item {
-            Ok(evt) => evt,
+    let events = hydrant.subscribe(query.cursor);
+    run_socket(
+        socket,
+        events,
+        |item| match item {
+            Ok(evt) => match serde_json::to_string(&evt) {
+                Ok(json) => WsAction::Send(Message::text(json)),
+                Err(e) => {
+                    error!(err = %e, "failed to serialize event");
+                    WsAction::Skip
+                }
+            },
             Err(err) => {
                 let json = serde_json::json!({
                     "type": "error",
                     "error": err.code(),
                     "message": err.to_string(),
                 });
-                let _ = tokio::time::timeout(
-                    send_timeout,
-                    socket.send(Message::text(json.to_string())),
-                )
-                .await;
-                let _ =
-                    tokio::time::timeout(std::time::Duration::from_secs(1), socket.close()).await;
-                break;
+                WsAction::Close(Some(Message::text(json.to_string())))
             }
-        };
-
-        match serde_json::to_string(&evt) {
-            Ok(json) => {
-                match tokio::time::timeout(send_timeout, socket.send(Message::text(json))).await {
-                    Ok(Ok(())) => {}
-                    Ok(Err(_)) => break,
-                    Err(_) => {
-                        let err = serde_json::json!({
-                            "type": "error",
-                            "error": "ConsumerTooSlow",
-                            "message": format!(
-                                "stream socket send blocked for at least {} seconds",
-                                send_timeout.as_secs()
-                            ),
-                        });
-                        let _ = tokio::time::timeout(
-                            std::time::Duration::from_secs(1),
-                            socket.send(Message::text(err.to_string())),
-                        )
-                        .await;
-                        let _ =
-                            tokio::time::timeout(std::time::Duration::from_secs(1), socket.close())
-                                .await;
-                        break;
-                    }
-                }
-            }
-            Err(e) => {
-                error!(err = %e, "failed to serialize event");
-            }
-        }
-    }
+        },
+        send_timeout,
+        |timeout_dur| {
+            let json = serde_json::json!({
+                "type": "error",
+                "error": "ConsumerTooSlow",
+                "message": format!(
+                    "stream socket send blocked for at least {} seconds",
+                    timeout_dur.as_secs()
+                ),
+            });
+            Some(Message::text(json.to_string()))
+        },
+    )
+    .await;
 }
