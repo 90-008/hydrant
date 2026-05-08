@@ -1,7 +1,7 @@
 #!/usr/bin/env nu
 use common.nu *
 
-def run-auth-test [did: string, password: string, pds_url: string, relays: string, port: int] {
+def run-auth-test [binary: string, did: string, password: string, pds_url: string, relays: string, port: int] {
     let url = $"http://localhost:($port)"
     let ws_url = $"ws://localhost:($port)/stream"
     let db_path = (mktemp -d -t hydrant_auth_test.XXXXXX)
@@ -14,7 +14,6 @@ def run-auth-test [did: string, password: string, pds_url: string, relays: strin
 
     # 2. start hydrant
     print $"starting hydrant on port ($port) with relays: ($relays)..."
-    let binary = "target/debug/hydrant" # already built in main
     let instance = (with-env { HYDRANT_RELAY_HOSTS: $relays } {
         start-hydrant $binary $db_path $port
     })
@@ -180,18 +179,18 @@ def main [] {
     let pds_url = resolve-pds $did
 
     # ensure build
-    build-hydrant | ignore
+    let binary = build-hydrant
 
     let port = resolve-test-port 3005
 
     print "=== running single-relay test ==="
     let relay1 = "wss://relay.fire.hose.cam"
-    let success1 = run-auth-test $did $password $pds_url $relay1 $port
+    let success1 = run-auth-test $binary $did $password $pds_url $relay1 $port
 
     print ""
     print "=== running multi-relay test ==="
     let relay_multi = "wss://relay.fire.hose.cam,wss://relay3.fr.hose.cam,wss://relay1.us-west.bsky.network,wss://relay1.us-east.bsky.network"
-    let success2 = run-auth-test $did $password $pds_url $relay_multi $port
+    let success2 = run-auth-test $binary $did $password $pds_url $relay_multi $port
 
     if $success1 and $success2 {
         print ""

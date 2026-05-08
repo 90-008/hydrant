@@ -4,6 +4,7 @@
 # usage:
 #   nu tests/run_all.nu
 #   nu tests/run_all.nu --only [stream repos_api]
+use common.nu [build-hydrant-features]
 
 def get_free_ports [count: int] {
     mut chosen = []
@@ -53,10 +54,7 @@ def test-needs-relay-binary [name: string] {
 
 def main [--only: list<string> = [], --skip-creds] {
     print "building hydrant..."
-    # build default features
-    cargo build
-    # build backlinks
-    cargo build --features backlinks
+    let indexer_binary = build-hydrant-features "backlinks"
     print ""
 
     # discover all test scripts, excluding infrastructure files
@@ -84,7 +82,7 @@ def main [--only: list<string> = [], --skip-creds] {
     for test in ($tests | enumerate) {
         let p = {($test | get index) * 3 + $in}
         let name = ($test | get item)
-        let binary = if ($relay_tests | any {$in == $name}) { null } else { "target/x86_64-unknown-linux-gnu/debug/hydrant" }
+        let binary = if ($relay_tests | any {$in == $name}) { null } else { $indexer_binary }
         let entry = {
             name: $name,
             api: ($ports | get (0 | do $p)),
