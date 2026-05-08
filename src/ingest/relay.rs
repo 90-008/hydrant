@@ -14,7 +14,6 @@ use jacquard_common::xrpc::{XrpcError, XrpcExt};
 use jacquard_common::{CowStr, IntoStatic};
 use miette::{IntoDiagnostic, Result};
 use tokio::runtime::Handle;
-use tokio::sync::mpsc;
 use tracing::{debug, error, info, info_span, trace, warn};
 use url::Url;
 
@@ -28,7 +27,7 @@ use crate::ingest::validation::{
     CommitValidationError, SyncValidationError, ValidatedCommit, ValidatedSync, ValidationContext,
     ValidationOptions,
 };
-use crate::ingest::{BufferRx, IngestMessage};
+use crate::ingest::{BufferRx, BufferTx, IngestMessage};
 use crate::state::AppState;
 #[cfg(feature = "relay")]
 use crate::types::RelayBroadcast;
@@ -60,7 +59,7 @@ struct WorkerMessage {
 
 pub struct RelayWorker {
     state: Arc<AppState>,
-    rx: BufferRx,
+    rxs: Vec<BufferRx>,
     #[cfg(feature = "indexer")]
     hook: crate::ingest::indexer::IndexerTx,
     verify_signatures: bool,
@@ -72,128 +71,75 @@ pub struct RelayWorker {
 impl RelayWorker {
     pub fn new(
         state: Arc<AppState>,
-        rx: BufferRx,
         #[cfg(feature = "indexer")] hook: crate::ingest::indexer::IndexerTx,
         verify_signatures: bool,
         num_shards: usize,
         validation_opts: ValidationOptions,
-    ) -> Self {
-        Self {
-            state,
-            rx,
-            #[cfg(feature = "indexer")]
-            hook,
-            verify_signatures,
-            num_shards,
-            validation_opts: Arc::new(validation_opts),
-            http: reqwest::Client::new(),
-        }
+    ) -> (BufferTx, Self) {
+        let (tx, rxs) = BufferTx::channel(num_shards);
+        (
+            tx,
+            Self {
+                state,
+                rxs,
+                #[cfg(feature = "indexer")]
+                hook,
+                verify_signatures,
+                num_shards,
+                validation_opts: Arc::new(validation_opts),
+                http: reqwest::Client::new(),
+            },
+        )
     }
 
     pub fn run(self, handle: Handle) -> Result<()> {
-        use futures::{StreamExt, future::BoxFuture, stream::FuturesUnordered};
+        let (exit_tx, exit_rx) = std::sync::mpsc::channel();
 
-        let mut shards: Vec<mpsc::Sender<WorkerMessage>> = Vec::with_capacity(self.num_shards);
-
-        for i in 0..self.num_shards {
-            let (tx, rx) = mpsc::channel(64);
-            shards.push(tx);
-
-            let state = self.state.clone();
+        for (i, rx) in self.rxs.into_iter().enumerate() {
+            let state = Arc::clone(&self.state);
             #[cfg(feature = "indexer")]
             let hook = self.hook.clone();
             let verify = self.verify_signatures;
             let h = handle.clone();
             let opts = self.validation_opts.clone();
             let http = self.http.clone();
+            let exit_tx = exit_tx.clone();
 
             std::thread::Builder::new()
                 .name(format!("relay-shard-{i}"))
                 .spawn(move || {
-                    Self::shard(
-                        i,
-                        rx,
-                        state,
-                        #[cfg(feature = "indexer")]
-                        hook,
-                        verify,
-                        h,
-                        opts,
-                        http,
-                    );
+                    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        Self::shard(
+                            i,
+                            rx,
+                            state,
+                            #[cfg(feature = "indexer")]
+                            hook,
+                            verify,
+                            h,
+                            opts,
+                            http,
+                        );
+                    }));
+                    let _ = exit_tx.send((i, res));
                 })
                 .into_diagnostic()?;
         }
+        drop(exit_tx);
 
         info!(num = self.num_shards, "relay worker: started shards");
 
-        let num_shards = self.num_shards;
-        let mut rx = self.rx;
-
-        handle.block_on(async move {
-            let mut pending: FuturesUnordered<
-                BoxFuture<'_, Result<(), mpsc::error::SendError<WorkerMessage>>>,
-            > = FuturesUnordered::new();
-
-            loop {
-                tokio::select! {
-                    msg = rx.recv(), if pending.len() < num_shards => {
-                        let Some(msg) = msg else { break; };
-                        let IngestMessage::Firehose { url, is_pds, msg } = msg;
-
-                        if let SubscribeReposMessage::Info(inf) = msg {
-                            match inf.name {
-                                InfoName::OutdatedCursor => {}
-                                InfoName::Other(name) => {
-                                    let message = inf
-                                        .message
-                                        .unwrap_or(CowStr::Borrowed("<no message>"));
-                                    info!(name = %name, "relay sent info: {message}");
-                                }
-                            }
-                            continue;
-                        }
-
-                        let shard_idx = {
-                            let did = match &msg {
-                                SubscribeReposMessage::Commit(c) => &c.repo,
-                                SubscribeReposMessage::Identity(i) => &i.did,
-                                SubscribeReposMessage::Account(a) => &a.did,
-                                SubscribeReposMessage::Sync(s) => &s.did,
-                                _ => continue,
-                            };
-                            (util::hash(did) as usize) % num_shards
-                        };
-
-                        let worker_msg = WorkerMessage { firehose: url, is_pds, msg };
-                        match shards[shard_idx].try_send(worker_msg) {
-                            Ok(()) => {}
-                            Err(mpsc::error::TrySendError::Full(worker_msg)) => {
-                                pending.push(Box::pin(shards[shard_idx].send(worker_msg)));
-                            }
-                            Err(mpsc::error::TrySendError::Closed(_)) => {
-                                error!(shard = shard_idx, "relay shard closed unexpectedly");
-                                break;
-                            }
-                        }
-                    }
-                    Some(result) = pending.next(), if !pending.is_empty() => {
-                        if let Err(e) = result {
-                            error!(err = %e, "relay worker: failed to send to shard, shard panicked?");
-                            break;
-                        }
-                    }
-                }
-            }
-        });
-
-        Err(miette::miette!("relay worker dispatcher shutting down"))
+        match exit_rx.recv() {
+            Ok((id, Ok(()))) => Err(miette::miette!("relay worker shard {id} shut down")),
+            Ok((id, Err(_))) => Err(miette::miette!("relay worker shard {id} panicked")),
+            Err(_) => Err(miette::miette!("relay worker shards shut down")),
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
     fn shard(
         id: usize,
-        mut rx: mpsc::Receiver<WorkerMessage>,
+        mut rx: BufferRx,
         state: Arc<AppState>,
         #[cfg(feature = "indexer")] hook: crate::ingest::indexer::IndexerTx,
         verify_signatures: bool,
@@ -225,6 +171,24 @@ impl RelayWorker {
         };
 
         while let Some(msg) = rx.blocking_recv() {
+            let IngestMessage::Firehose { url, is_pds, msg } = msg;
+            if let SubscribeReposMessage::Info(inf) = msg {
+                match inf.name {
+                    InfoName::OutdatedCursor => {}
+                    InfoName::Other(name) => {
+                        let message = inf.message.unwrap_or(CowStr::Borrowed("<no message>"));
+                        info!(name = %name, "relay sent info: {message}");
+                    }
+                }
+                continue;
+            }
+
+            let msg = WorkerMessage {
+                is_pds,
+                firehose: url,
+                msg,
+            };
+
             ctx.count_deltas = CountDeltas::default();
             let (did, seq) = match &msg.msg {
                 SubscribeReposMessage::Commit(c) => (c.repo.clone(), c.seq),

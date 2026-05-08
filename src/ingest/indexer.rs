@@ -1,5 +1,6 @@
 use super::*;
 use crate::db::{self, CountDeltas, keys, ser_repo_meta};
+use crate::ingest::mailbox::{ShardedMessage, ShardedReceiver, ShardedSender};
 use crate::ingest::stream::{Account, Commit, Identity};
 use crate::ingest::validation;
 use crate::resolver::{NoSigningKeyError, ResolverError};
@@ -18,7 +19,6 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering::SeqCst;
 use thiserror::Error;
 use tokio::runtime::Handle as TokioHandle;
-use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 #[cfg(feature = "indexer_stream")]
 use {
@@ -80,8 +80,46 @@ pub enum IndexerMessage {
     BackfillFinished(Did<'static>),
 }
 
-pub type IndexerTx = mpsc::Sender<IndexerMessage>;
-pub type IndexerRx = mpsc::Receiver<IndexerMessage>;
+#[derive(Clone, Debug)]
+pub struct IndexerTx {
+    inner: ShardedSender<IndexerMessage>,
+}
+
+pub type IndexerRx = ShardedReceiver<IndexerMessage>;
+
+impl IndexerTx {
+    pub async fn send(
+        &self,
+        msg: IndexerMessage,
+    ) -> Result<(), tokio::sync::mpsc::error::SendError<IndexerMessage>> {
+        self.inner.send(msg).await
+    }
+
+    pub fn blocking_send(
+        &self,
+        msg: IndexerMessage,
+    ) -> Result<(), tokio::sync::mpsc::error::SendError<IndexerMessage>> {
+        self.inner.blocking_send(msg)
+    }
+}
+
+impl ShardedMessage for IndexerMessage {
+    fn shard_idx(&self, num_shards: usize) -> usize {
+        // keep commit, new-repo, and backfill-finished messages for a did on one ordered path.
+        let did = match self {
+            IndexerMessage::Event(e) => match &e.data {
+                IndexerEventData::Commit(m) => &m.commit.repo,
+                IndexerEventData::Identity(m) => &m.identity.did,
+                IndexerEventData::Account(m) => &m.account.did,
+                IndexerEventData::Sync(did) => did,
+            },
+            IndexerMessage::NewRepo(did) => did,
+            IndexerMessage::BackfillFinished(did) => did,
+        };
+
+        (util::hash(did) as usize) % num_shards
+    }
+}
 
 #[derive(Debug, Diagnostic, Error)]
 enum IngestError {
@@ -120,8 +158,7 @@ enum RepoProcessResult<'s, 'c> {
 
 pub struct FirehoseWorker {
     state: Arc<AppState>,
-    rx: IndexerRx,
-    num_shards: usize,
+    rxs: Vec<IndexerRx>,
 }
 
 struct WorkerContext<'a> {
@@ -135,93 +172,42 @@ struct WorkerContext<'a> {
 }
 
 impl FirehoseWorker {
-    pub fn new(state: Arc<AppState>, rx: IndexerRx, num_shards: usize) -> Self {
-        Self {
-            state,
-            rx,
-            num_shards,
-        }
+    pub fn new(state: Arc<AppState>, num_shards: usize) -> (IndexerTx, Self) {
+        let (inner, rxs) = ShardedSender::channel(num_shards);
+        (IndexerTx { inner }, Self { state, rxs })
     }
 
     pub fn run(self, handle: TokioHandle) -> Result<()> {
-        use futures::{StreamExt, future::BoxFuture, stream::FuturesUnordered};
+        let num_shards = self.rxs.len();
+        let (exit_tx, exit_rx) = std::sync::mpsc::channel();
 
-        let mut shards: Vec<mpsc::Sender<IndexerMessage>> = Vec::with_capacity(self.num_shards);
-
-        for i in 0..self.num_shards {
-            let (tx, rx) = mpsc::channel(64);
-            shards.push(tx);
-
-            let state = self.state.clone();
+        for (i, rx) in self.rxs.into_iter().enumerate() {
+            let state = Arc::clone(&self.state);
             let handle = handle.clone();
+            let exit_tx = exit_tx.clone();
             std::thread::Builder::new()
                 .name(format!("ingest-shard-{i}"))
                 .spawn(move || {
-                    Self::shard(i, rx, state, handle);
+                    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        Self::shard(i, rx, state, handle);
+                    }));
+                    let _ = exit_tx.send((i, res));
                 })
                 .into_diagnostic()?;
         }
+        drop(exit_tx);
 
-        info!(num = self.num_shards, "started shards");
+        info!(num = num_shards, "started shards");
 
-        let num_shards = self.num_shards;
-        let mut rx = self.rx;
-
-        handle.block_on(async move {
-            let mut pending: FuturesUnordered<
-                BoxFuture<'_, Result<(), mpsc::error::SendError<IndexerMessage>>>,
-            > = FuturesUnordered::new();
-
-            loop {
-                tokio::select! {
-                    msg = rx.recv(), if pending.len() < num_shards => {
-                        let Some(msg) = msg else { break; };
-                        let shard_idx = {
-                            let did = match &msg {
-                                IndexerMessage::Event(e) => match &e.data {
-                                    IndexerEventData::Commit(m) => &m.commit.repo,
-                                    IndexerEventData::Identity(m) => &m.identity.did,
-                                    IndexerEventData::Account(m) => &m.account.did,
-                                    IndexerEventData::Sync(did) => did,
-                                },
-                                IndexerMessage::NewRepo(did) => did,
-                                IndexerMessage::BackfillFinished(did) => did,
-                            };
-                            (util::hash(did) as usize) % num_shards
-                        };
-                        match shards[shard_idx].try_send(msg) {
-                            Ok(()) => {}
-                            Err(mpsc::error::TrySendError::Full(msg)) => {
-                                pending.push(Box::pin(shards[shard_idx].send(msg)));
-                            }
-                            Err(mpsc::error::TrySendError::Closed(_)) => {
-                                error!(shard = shard_idx, "shard closed unexpectedly");
-                                break;
-                            }
-                        }
-                    }
-                    Some(result) = pending.next(), if !pending.is_empty() => {
-                        if let Err(e) = result {
-                            error!(err = %e, "failed to send to shard, shard panicked?");
-                            break;
-                        }
-                    }
-                }
-            }
-        });
-
-        Err(miette::miette!(
-            "firehose worker dispatcher shutting down, shard died?"
-        ))
+        match exit_rx.recv() {
+            Ok((id, Ok(()))) => Err(miette::miette!("firehose worker shard {id} shut down")),
+            Ok((id, Err(_))) => Err(miette::miette!("firehose worker shard {id} panicked")),
+            Err(_) => Err(miette::miette!("firehose worker shards shut down")),
+        }
     }
 
     #[inline(always)]
-    fn shard(
-        id: usize,
-        mut rx: mpsc::Receiver<IndexerMessage>,
-        state: Arc<AppState>,
-        handle: TokioHandle,
-    ) {
+    fn shard(id: usize, mut rx: IndexerRx, state: Arc<AppState>, handle: TokioHandle) {
         let _guard = handle.enter();
         debug!(shard = id, "shard started");
 

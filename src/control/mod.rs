@@ -283,13 +283,23 @@ impl Hydrant {
         }
 
         let fut = async move {
-            // raw firehose events from pds/relay to RelayWorker
-            let (buffer_tx, buffer_rx) = mpsc::channel::<crate::ingest::IngestMessage>(500);
-
-            // validated IndexerMessages from RelayWorker/backfill to FirehoseWorker
+            // validated IndexerMessages from RelayWorker/backfill to FirehoseWorker.
             #[cfg(feature = "indexer")]
-            let (indexer_tx, indexer_rx) =
-                mpsc::channel::<crate::ingest::indexer::IndexerMessage>(500);
+            let (indexer_tx, firehose_worker) =
+                FirehoseWorker::new(state.clone(), config.firehose_workers);
+
+            // raw firehose events from pds/relay to RelayWorker.
+            let (buffer_tx, relay_worker) = crate::ingest::relay::RelayWorker::new(
+                state.clone(),
+                #[cfg(feature = "indexer")]
+                indexer_tx.clone(),
+                matches!(config.verify_signatures, SignatureVerification::Full),
+                config.firehose_workers,
+                crate::ingest::validation::ValidationOptions {
+                    verify_mst: config.verify_mst,
+                    rev_clock_skew_secs: config.rev_clock_skew_secs,
+                },
+            );
 
             // 5. spawn the backfill worker (not used in relay mode)
             #[cfg(feature = "indexer")]
@@ -673,28 +683,8 @@ impl Hydrant {
 
             // 12. spawn the relay worker
             let relay_worker = std::thread::spawn({
-                let state = state.clone();
                 let handle = tokio::runtime::Handle::current();
-                let config = config.clone();
-
-                #[cfg(feature = "indexer")]
-                let hook = indexer_tx.clone();
-
-                move || {
-                    crate::ingest::relay::RelayWorker::new(
-                        state,
-                        buffer_rx,
-                        #[cfg(feature = "indexer")]
-                        hook,
-                        matches!(config.verify_signatures, SignatureVerification::Full),
-                        config.firehose_workers,
-                        crate::ingest::validation::ValidationOptions {
-                            verify_mst: config.verify_mst,
-                            rev_clock_skew_secs: config.rev_clock_skew_secs,
-                        },
-                    )
-                    .run(handle)
-                }
+                move || relay_worker.run(handle)
             });
 
             let tx = Arc::clone(&fatal_tx);
@@ -713,10 +703,8 @@ impl Hydrant {
             // 13. spawn the firehose worker (if enabled)
             #[cfg(feature = "indexer")]
             let firehose_worker = std::thread::spawn({
-                let state = state.clone();
                 let handle = tokio::runtime::Handle::current();
-                let config = config.clone();
-                move || FirehoseWorker::new(state, indexer_rx, config.firehose_workers).run(handle)
+                move || firehose_worker.run(handle)
             });
 
             #[cfg(feature = "indexer")]
