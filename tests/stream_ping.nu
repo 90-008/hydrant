@@ -4,7 +4,7 @@ use common.nu *
 def main [] {
     let port = resolve-test-port 3010
     let url = $"http://localhost:($port)"
-    let ws_url = $"ws://localhost:($port)/stream"
+    let ws_url = $"ws://127.0.0.1:($port)/stream"
     let db_path = (mktemp -d -t hydrant_stream_ping_test.XXXXXX)
 
     print "testing ping/pong handling on /stream..."

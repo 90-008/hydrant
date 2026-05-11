@@ -88,7 +88,20 @@ export def deactivate-account [pds_url: string, jwt: string] {
 }
 
 export def activate-account [pds_url: string, jwt: string] {
-    curl -X POST -H "Content-Type: application/json" -H $"Authorization: Bearer ($jwt)" $"($pds_url)/xrpc/com.atproto.server.activateAccount"
+    mut last_message = ""
+    for attempt in 1..5 {
+        let result = (curl --fail-with-body --silent --show-error --max-time 20 -X POST -H "Content-Type: application/json" -H $"Authorization: Bearer ($jwt)" $"($pds_url)/xrpc/com.atproto.server.activateAccount" | complete)
+        if $result.exit_code == 0 {
+            return $result.stdout
+        }
+
+        $last_message = $"($result.stdout)\n($result.stderr)" | str trim
+        if $attempt < 5 {
+            sleep 1sec
+        }
+    }
+
+    error make {msg: $"activateAccount failed: ($last_message)"}
 }
 
 # extract the hydrant executable path from cargo's json build output
@@ -173,14 +186,15 @@ export def wait-for-api [url: string] {
 # poll stats until backfill is complete or fails
 export def wait-for-backfill [url: string] {
     print "waiting for backfill to complete..."
-    for i in 1..120 {
+    let attempts = 240
+    for i in 1..$attempts {
         let stats = (http get $"($url)/stats").counts
         let pending = ($stats.pending | into int)
         let records = ($stats.records | into int)
         let repos = ($stats.repos | into int)
         let resync = ($stats.resync | into int)
 
-        print $"[($i)/120] pending: ($pending), records: ($records), repos: ($repos), resync: ($resync)"
+        print $"[($i)/($attempts)] pending: ($pending), records: ($records), repos: ($repos), resync: ($resync)"
 
         if $resync > 0 {
             print "resync state detected (failure or gone)!"
@@ -193,7 +207,7 @@ export def wait-for-backfill [url: string] {
             return true
         }
 
-        sleep 2sec
+        sleep 1sec
     }
     false
 }

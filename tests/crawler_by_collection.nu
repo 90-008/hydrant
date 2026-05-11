@@ -2,7 +2,7 @@
 # tests that the collection-index crawler (listReposByCollection) correctly discovers
 # and backfills repos from a lightrail-style index server.
 #
-# usage: nu tests/collection_index_test.nu
+# usage: nu tests/crawler_by_collection.nu
 #
 # requires network access to lightrail.microcosm.blue.
 use common.nu *
@@ -10,7 +10,7 @@ use common.nu *
 def main [] {
     let port = resolve-test-port 3015
     let url = $"http://localhost:($port)"
-    let db_path = (mktemp -d -t hydrant_collection_index_test.XXXXXX)
+    let db_path = (mktemp -d -t hydrant_crawler_by_collection.XXXXXX)
     let collection = "app.bsky.graph.starterpack"
     let index_url = "https://lightrail.microcosm.blue"
 

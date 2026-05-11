@@ -164,8 +164,8 @@ def check-car [hydrant_url: string, pds_url: string, did: string] {
 }
 
 def main [] {
-    let did = "did:plc:dfl62fgb7wtjj3fcbb72naae"
-    let pds = "https://zwsp.xyz"
+    let did = ($env | get --optional REPO_SYNC_INTEGRITY_DID | default "did:plc:ewvi7nxzyoun6zhxrhs64oiz")
+    let pds = ($env | get --optional REPO_SYNC_INTEGRITY_PDS | default (resolve-pds $did))
     let port = resolve-test-port 3001
     let url = $"http://localhost:($port)"
     let debug_port = resolve-test-debug-port ($port + 1)
@@ -176,7 +176,9 @@ def main [] {
     print $"database path: ($db_path)"
 
     let binary = build-hydrant
-    let instance = start-hydrant $binary $db_path $port
+    let instance = (with-env { HYDRANT_ENABLE_CRAWLER: "false", HYDRANT_ENABLE_FIREHOSE: "false" } {
+        start-hydrant $binary $db_path $port
+    })
 
     mut success = false
 

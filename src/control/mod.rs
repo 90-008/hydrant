@@ -457,6 +457,7 @@ impl Hydrant {
                         config.verify_signatures,
                         SignatureVerification::Full
                     ),
+                    max_failures: config.firehose_max_failures,
                 })
                 .ok()
                 .expect("firehose shared already set");

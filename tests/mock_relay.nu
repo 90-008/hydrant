@@ -7,14 +7,7 @@
     # check path
     if ($req.path | str starts-with "/xrpc/com.atproto.sync.listRepos") {
         
-        # parse query params if any
-        let query_string = ($req.path | split row "?" | get 1? | default "")
-        let params = if ($query_string | is-empty) {
-            []
-        } else {
-            ($query_string | split row "&" | each { |it| $it | split row "=" })
-        }
-        let cursor = ($params | where { |x| $x.0 == "cursor" } | get 0?.1?)
+        let cursor = ($req.query | get --optional cursor)
 
         # define some mock repos
         let all_repos = [
@@ -26,12 +19,18 @@
         ]
 
         let repos = if ($cursor == "50") {
-             []
+             [
+                { did: "did:web:mock6.com", head: "bafyreidf747c4x3lps3k4n357l3a3r57k3k465743k573k465743k5", rev: "3j6s746574657" }
+             ]
+        } else if ($cursor == "100") {
+            []
         } else {
              $all_repos
         }
 
         let next_cursor = if ($cursor == "50") {
+             "100"
+        } else if ($cursor == "100") {
              null
         } else {
              "50"

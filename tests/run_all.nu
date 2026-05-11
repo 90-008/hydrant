@@ -3,10 +3,14 @@
 #
 # usage:
 #   nu tests/run_all.nu
-#   nu tests/run_all.nu --only [stream repos_api]
-use common.nu [build-hydrant-features]
+#   nu tests/run_all.nu --only [stream_live_backfill api_repos]
+use common.nu [build-hydrant-features build-hydrant-relay]
 
 def get_free_ports [count: int] {
+    if $count == 0 {
+        return []
+    }
+
     mut chosen = []
     loop {
         let p = port
@@ -42,7 +46,19 @@ def run-test [] {
     }
 }
 
+def snapshot-binary [binary: string, label: string] {
+    let dir = (mktemp -d -t $"hydrant_($label)_binary.XXXXXX")
+    let out = $"($dir)/hydrant"
+    cp $binary $out
+    $out
+}
+
 def test-needs-relay-binary [name: string] {
+    let relay_binary_tests = ["relay_subscribe_repos_ping", "relay_ttl_prunes_events"]
+    if ($relay_binary_tests | any {$in == $name}) {
+        return true
+    }
+
     # tests that build a relay-only binary must run last (and serially) to avoid racing on
     # `target/` artifacts while other tests are executing.
     try {
@@ -53,14 +69,16 @@ def test-needs-relay-binary [name: string] {
 }
 
 def main [--only: list<string> = [], --skip-creds] {
-    print "building hydrant..."
-    let indexer_binary = build-hydrant-features "backlinks"
-    print ""
-
     # discover all test scripts, excluding infrastructure files
     mut excluded = ["common", "mock_relay", "mock_pds", "run_all"]
     if $skip_creds {
-        $excluded = ($excluded | append ["authenticated_stream", "count_tracking", "repo_sync_integrity"])
+        $excluded = ($excluded | append [
+            "authenticated_stream_multi_relay",
+            "authenticated_stream_single_relay",
+            "repo_count_resync",
+            "repo_sync_integrity",
+            "signal_filter"
+        ])
     }
     let discovered = (
         ls tests/*.nu
@@ -74,15 +92,41 @@ def main [--only: list<string> = [], --skip-creds] {
     } else {
         $discovered | where {|t| $only | any {$in == $t}}
     }
-    let ports = get_free_ports (($tests | length) * 3)
+
+    if ($tests | is-empty) {
+        print "running 0 tests"
+        return
+    }
 
     let relay_tests = $tests | where {|t| test-needs-relay-binary $t }
+    let indexer_tests = $tests | where {|t| not ($relay_tests | any {$in == $t}) }
+
+    mut indexer_binary = null
+    mut relay_binary = null
+
+    if not ($indexer_tests | is-empty) {
+        let built = build-hydrant-features "backlinks"
+        $indexer_binary = if not ($relay_tests | is-empty) {
+            snapshot-binary $built "indexer"
+        } else {
+            $built
+        }
+    }
+
+    if not ($relay_tests | is-empty) {
+        let built = build-hydrant-relay
+        $relay_binary = snapshot-binary $built "relay"
+    }
+
+    print ""
+
+    let ports = get_free_ports (($tests | length) * 3)
 
     mut assigned = []
     for test in ($tests | enumerate) {
         let p = {($test | get index) * 3 + $in}
         let name = ($test | get item)
-        let binary = if ($relay_tests | any {$in == $name}) { null } else { $indexer_binary }
+        let binary = if ($relay_tests | any {$in == $name}) { $relay_binary } else { $indexer_binary }
         let entry = {
             name: $name,
             api: ($ports | get (0 | do $p)),
@@ -93,28 +137,23 @@ def main [--only: list<string> = [], --skip-creds] {
         $assigned = ($assigned | append $entry)
     }
 
-    let relay_assigned = $assigned | where {|t| $t.binary == null }
-    let parallel_assigned = $assigned | where {|t| $t.binary != null }
-
     let groups = {
-        "authenticated_stream": "event_dependent",
-        "count_tracking": "event_dependent",
+        "authenticated_stream_multi_relay": "event_dependent",
+        "authenticated_stream_single_relay": "event_dependent",
+        "repo_count_resync": "event_dependent",
         "signal_filter": "event_dependent",
     }
-    let grouped = $parallel_assigned | group-by {
+    let grouped = $assigned | group-by {
         let name = $in.name
         $groups | get -o $name | default $name
     }
 
+    let relay_assigned = $assigned | where {|t| $relay_tests | any {$in == $t.name} }
+
     print $"running ($assigned | length) tests...\n"
-    if not ($relay_assigned | is-empty) {
-        print $"note: relay-binary tests will run last and not in parallel: (($relay_assigned | get name) | str join ', ')\n"
-    }
 
     let run_group = {each {timeit -o {run-test} | {time: $in.time, ...$in.output}}};
-    let parallel_results = $grouped | values | par-each {do $run_group} | flatten
-    let relay_results = if ($relay_assigned | is-empty) { [] } else { $relay_assigned | do $run_group }
-    let results = $parallel_results | append $relay_results
+    let results = $grouped | values | par-each {do $run_group} | flatten
 
     print "\n=== results ===\n"
     for r in $results {

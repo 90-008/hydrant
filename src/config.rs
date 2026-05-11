@@ -312,6 +312,9 @@ pub struct Config {
     /// number of concurrent workers processing firehose events.
     /// set via `HYDRANT_FIREHOSE_WORKERS`.
     pub firehose_workers: usize,
+    /// number of consecutive firehose connection failures before a PDS is marked offline.
+    /// set via `HYDRANT_FIREHOSE_MAX_FAILURES`.
+    pub firehose_max_failures: usize,
     /// how often the firehose cursor is persisted to disk.
     /// set via `HYDRANT_CURSOR_SAVE_INTERVAL` (humantime duration, e.g. `3sec`).
     pub cursor_save_interval: Duration,
@@ -499,6 +502,7 @@ impl Default for Config {
             plc_urls: vec![Url::parse("https://plc.wtf").unwrap()],
             enable_firehose: true,
             firehose_workers: 8,
+            firehose_max_failures: 15,
             cursor_save_interval: Duration::from_secs(3),
             repo_fetch_timeout: Duration::from_secs(300),
             backfill_concurrency_limit: 16,
@@ -645,6 +649,7 @@ impl Config {
             defaults.backfill_concurrency_limit
         );
         let firehose_workers = cfg!("FIREHOSE_WORKERS", defaults.firehose_workers);
+        let firehose_max_failures = cfg!("FIREHOSE_MAX_FAILURES", defaults.firehose_max_failures);
 
         let db_worker_threads = cfg!("DB_WORKER_THREADS", defaults.db_worker_threads);
         let db_max_journaling_size_mb = cfg!(
@@ -827,6 +832,7 @@ impl Config {
             plc_urls,
             enable_firehose,
             firehose_workers,
+            firehose_max_failures,
             cursor_save_interval,
             repo_fetch_timeout,
             backfill_concurrency_limit,
@@ -911,6 +917,7 @@ impl fmt::Display for Config {
         config_line!(f, "data compression", self.data_compression)?;
         config_line!(f, "journal compression", self.journal_compression)?;
         config_line!(f, "firehose workers", self.firehose_workers)?;
+        config_line!(f, "firehose max failures", self.firehose_max_failures)?;
         config_line!(f, "db worker threads", self.db_worker_threads)?;
         config_line!(
             f,

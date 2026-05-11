@@ -109,19 +109,31 @@ Hydrant uses multiple `fjall` keyspaces:
 ## Safe commands
 
 ### Testing
-- `nu tests/run_all.nu` - Runs all tests in parallel with automatically assigned free ports. Pass `--skip-creds` to skip tests requiring `.env` credentials, or `--only=[<name>...]` to run a subset.
-- `nu tests/repo_sync_integrity.nu` - Performs a backfill against a real PDS, and verifies record integrity compared to hydrant.
-- `nu tests/verify_crawler.nu` - Verifies full-network crawler functionality using a mock relay.
-- `nu tests/throttling.nu` - Verifies crawler throttling logic when pending queue is full.
-- `nu tests/stream.nu` - Tests WebSocket streaming functionality. Verifies both live event streaming during backfill and historical replay with cursor.
-- `nu tests/authenticated_stream.nu` - Tests authenticated event streaming. Verifies that create, update, and delete actions on a real account are correctly streamed by Hydrant in the correct order. Requires `TEST_REPO` and `TEST_PASSWORD` in `.env`.
+- `nu tests/run_all.nu` - Runs all tests in parallel with automatically assigned free ports. Pass `--skip-creds` to skip tests requiring `.env` credentials or external account fixtures, or `--only=[<name>...]` to run a subset.
+- `nu tests/api_crawler_sources.nu` - Tests `/crawler/sources` CRUD plus dynamic/configured source restart behavior.
+- `nu tests/api_firehose_sources.nu` - Tests `/firehose/sources` CRUD behavior.
+- `nu tests/api_pds_tiers.nu` - Tests PDS tier APIs, tier persistence, and custom rate tiers.
+- `nu tests/api_pds_banned.nu` - Tests PDS ban APIs and ban persistence.
+- `nu tests/api_repos.nu` - Tests the `/repos` API endpoints including pagination and validation errors.
+- `nu tests/crawler_full_network.nu` - Verifies full-network crawler discovery and cursor persistence using a mock relay.
+- `nu tests/crawler_pending_throttling.nu` - Verifies crawler throttling and resumption when pending queue limits are hit.
+- `nu tests/crawler_by_collection.nu` - Tests by-collection crawling via `listReposByCollection`.
+- `nu tests/stream_live_backfill.nu` - Tests live `/stream` events while a repo backfill is running.
+- `nu tests/stream_cursor_replay.nu` - Tests `/stream?cursor=0` historical event replay.
+- `nu tests/stream_ping.nu` - Tests ping/pong handling on `/stream`.
+- `nu tests/authenticated_stream_single_relay.nu` - Tests authenticated event streaming through one relay. Requires `TEST_REPO` and `TEST_PASSWORD` in `.env`.
+- `nu tests/authenticated_stream_multi_relay.nu` - Tests authenticated event streaming through multiple relays. Requires `TEST_REPO` and `TEST_PASSWORD` in `.env`.
+- `nu tests/relay_subscribe_repos_ping.nu` - Tests ping/pong handling on relay-mode `subscribeRepos`.
+- `nu tests/repo_count_resync.nu` - Verifies count repair across forced resync after stale create/delete events. Requires `TEST_REPO` and `TEST_PASSWORD` in `.env`.
+- `nu tests/repo_sync_integrity.nu` - Performs a backfill against a real PDS, and verifies record integrity compared to hydrant. Defaults to `atproto.com`'s public repo; set `REPO_SYNC_INTEGRITY_DID` and optionally `REPO_SYNC_INTEGRITY_PDS` to test another repo.
 - `nu tests/debug_endpoints.nu` - Tests debug/introspection endpoints (`/debug/iter`, `/debug/get`) and verifies DB content and serialization.
-- `nu tests/api.nu` - Tests management API endpoints (filter, repos, ingestion, sources).
-- `nu tests/repos_api.nu` - Tests the `/repos` API endpoints including pagination and single-repo lookup.
 - `nu tests/signal_filter.nu` - Verifies signal-based filtered indexing.
-- `nu tests/by_collection.nu` - Tests by-collection crawling via `listReposByCollection`.
-- `nu tests/backlinks.nu` - Tests backlinks indexing and XRPC query endpoints (requires `backlinks` feature).
-- `nu tests/ephemeral_gc.nu` - Tests ephemeral mode TTL expiration and event watermark cleanup.
+- `nu tests/backlinks.nu` - Tests backlinks indexing and XRPC query endpoints (requires `backlinks` feature). Defaults to `support.bsky.team`'s public repo; set `BACKLINKS_TEST_DID` to test another repo.
+- `nu tests/ephemeral_ttl_noop.nu` - Tests that a TTL tick leaves recent index events intact.
+- `nu tests/ephemeral_ttl_prunes_events.nu` - Tests TTL pruning for ephemeral index events.
+- `nu tests/relay_ttl_prunes_events.nu` - Tests TTL pruning for relay-mode events.
+- `nu tests/pds_host_status_transitions.nu` - Tests PDS host status transitions through offline, active, throttled, and active.
+- `nu tests/pds_tier_rule_status.nu` - Tests glob tier rules in PDS host status calculation.
 
 ## Rust code style
 

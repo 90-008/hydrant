@@ -1,6 +1,10 @@
 #!/usr/bin/env nu
 use common.nu *
 
+def log-contains [path: string, needle: string] {
+    ($path | path exists) and ((open $path | str replace --all "\n" " ") | str contains $needle)
+}
+
 def main [] {
     # 1. ensure http-nu is installed
     if (which http-nu | is-empty) {
@@ -38,8 +42,8 @@ def main [] {
             HYDRANT_DATABASE_PATH: ($db_path),
             HYDRANT_FULL_NETWORK: "true",
             HYDRANT_RELAY_HOST: ($mock_url),
-            HYDRANT_DISABLE_FIREHOSE: "true",
-            HYDRANT_DISABLE_BACKFILL: "true", # disable backfill so pending count stays up
+            HYDRANT_ENABLE_FIREHOSE: "false",
+            HYDRANT_ENABLE_CRAWLER: "false",
             HYDRANT_API_BIND: $"127.0.0.1:($port)",
             HYDRANT_LOG_LEVEL: "debug",
             RUST_LOG: "debug",
@@ -57,64 +61,76 @@ def main [] {
         if (wait-for-api $url) {
             print "hydrant api is up."
 
-            # wait for crawler to run and hit limit
+            print "pausing backfill..."
+            http patch -t application/json $"($url)/ingestion" {
+                backfill: false,
+                firehose: false,
+            } | ignore
+
+            print "enabling crawler..."
+            http patch -t application/json $"($url)/ingestion" {
+                crawler: true
+            } | ignore
+
             print "waiting for crawler to hit throttling limit..."
-            
-            # retry check for 30s
-            for i in 1..30 {
+
+            mut discovered = false
+            for i in 1..40 {
                 let stats = (http get $"($url)/stats").counts
                 let pending = ($stats.pending | into int)
-                
-                # we expect 5 repos from the mock, but max pending is 2. 
-                # wait, the crawler fetches a page (5 repos) THEN adds to DB.
-                # so pending will jump to 5.
-                # then next loop, it checks pending > 2.
-                # so pending should be 5.
-                
-                print $"[($i)/30] pending: ($pending)"
-                
+                print $"[($i)/40] pending: ($pending)"
+
                 if $pending >= 5 {
                     print "crawler discovered repos."
+                    $discovered = true
                     break
                 }
-                
-                sleep 1sec
+
+                sleep 250ms
             }
-            
-            # now check logs for throttling message
-            print "checking logs for throttling message..."
-            
-            let logs = (open $log_file | str replace --all "\n" " ")
-            if ($logs | str contains "throttling: above max pending") {
-                print "CONFIRMED: crawler is throttling!"
-                
-                # now testing resumption
-                print "testing resumption by removing repos..."
-                
-                # remove 4 repos to drop pending (5) to 1 (<= resume limit 1)
-                # mock repos are did:web:mock1.com ... mock5.com
-                curl -s -X DELETE -H "Content-Type: application/json" -d '[
-                    {"did": "did:web:mock1.com"},
-                    {"did": "did:web:mock2.com"},
-                    {"did": "did:web:mock3.com"},
-                    {"did": "did:web:mock4.com"}
-                ]' $"($url)/repos"
-                
-                print "waiting for crawler to wake up..."
-                sleep 1sec
-                
-                # check logs for resumption message
-                let logs_after = (open $log_file | str replace --all "\n" " ")
-                if ($logs_after | str contains "throttling released") {
-                     print "CONFIRMED: crawler resumed!"
-                     $success = true
-                } else {
-                     print "FAILED: resumption message not found in logs"
-                     $success = false
-                }
-                
+
+            if not $discovered {
+                print "FAILED: crawler did not enqueue mock repos"
             } else {
-                print "FAILED: throttling message not found in logs"
+                print "checking logs for throttling message..."
+
+                mut throttled = false
+                for i in 1..12 {
+                    if (log-contains $log_file "throttling: above max pending") {
+                        $throttled = true
+                        break
+                    }
+                    sleep 500ms
+                }
+
+                if $throttled {
+                    print "CONFIRMED: crawler is throttling!"
+
+                    print "testing resumption by letting backfill drain the queue..."
+                    http patch -t application/json $"($url)/ingestion" {
+                        backfill: true
+                    } | ignore
+
+                    print "waiting for crawler to release throttling..."
+                    mut released = false
+                    for i in 1..12 {
+                        if (log-contains $log_file "throttling released") {
+                            $released = true
+                            break
+                        }
+                        sleep 500ms
+                    }
+
+                    if $released {
+                        print "CONFIRMED: crawler resumed!"
+                        $success = true
+                    } else {
+                        print "FAILED: resumption message not found in logs"
+                        $success = false
+                    }
+                } else {
+                    print "FAILED: throttling message not found in logs"
+                }
             }
 
         } else {

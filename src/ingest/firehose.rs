@@ -19,7 +19,6 @@ use tracing::{Span, debug, error, info, trace, warn};
 use url::Url;
 
 // these match ref relay
-const MAX_FAILURES: usize = 15;
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
 
 trait AddJitter: rand::Rng {
@@ -40,6 +39,7 @@ pub struct FirehoseIngestor {
     enabled: watch::Receiver<bool>,
     _verify_signatures: bool,
     throttle: ThrottleHandle,
+    max_failures: usize,
 }
 
 impl FirehoseIngestor {
@@ -51,6 +51,7 @@ impl FirehoseIngestor {
         filter: FilterHandle,
         enabled: watch::Receiver<bool>,
         verify_signatures: bool,
+        max_failures: usize,
     ) -> Self {
         let throttle = state.throttler.get_handle(&relay_host).await;
         Self {
@@ -62,6 +63,7 @@ impl FirehoseIngestor {
             enabled,
             _verify_signatures: verify_signatures,
             throttle,
+            max_failures,
         }
     }
 
@@ -253,7 +255,7 @@ impl FirehoseIngestor {
             0.max(until - chrono::Utc::now().timestamp()) as u64
         });
         let failures = self.throttle.consecutive_failures();
-        if failures >= MAX_FAILURES {
+        if failures >= self.max_failures {
             warn!(failures, "too many consecutive failures, giving up on host");
             if self.is_pds
                 && let Err(e) = self.set_host_status(HostStatus::Offline)

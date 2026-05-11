@@ -9,7 +9,7 @@
 #   5. reverse=true returns the same set as forward, with inverted order verified when
 #      a subject with 2+ backlinks is found
 #
-# usage: nu tests/backlinks_test.nu
+# usage: nu tests/backlinks.nu
 use common.nu *
 
 # paginate through all backlinks for subject+source using limit=2, return all entries
@@ -179,15 +179,17 @@ def check-reverse-ordering [url: string, subject: string, expected_count: int] {
 }
 
 def main [] {
-    let did = "did:plc:dfl62fgb7wtjj3fcbb72naae"
+    let did = ($env | get --optional BACKLINKS_TEST_DID | default "did:plc:oc6vwdlmk2kqyida5i74d3p5")
     let port = resolve-test-port 3020
     let url = $"http://localhost:($port)"
-    let db_path = (mktemp -d -t hydrant_backlinks_test.XXXXXX)
+    let db_path = (mktemp -d -t hydrant_backlinks.XXXXXX)
 
     print $"database path: ($db_path)"
 
     let binary = (build-hydrant-features "backlinks")
-    let instance = (start-hydrant $binary $db_path $port)
+    let instance = (with-env { HYDRANT_ENABLE_CRAWLER: "false", HYDRANT_ENABLE_FIREHOSE: "false" } {
+        start-hydrant $binary $db_path $port
+    })
 
     if not (wait-for-api $url) {
         print "ERROR: hydrant failed to start"

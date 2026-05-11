@@ -4,7 +4,7 @@ use common.nu *
 def main [] {
     let port = resolve-test-port 3011
     let url = $"http://localhost:($port)"
-    let ws_url = $"ws://localhost:($port)/xrpc/com.atproto.sync.subscribeRepos"
+    let ws_url = $"ws://127.0.0.1:($port)/xrpc/com.atproto.sync.subscribeRepos"
     let db_path = (mktemp -d -t hydrant_subscribe_repos_ping_test.XXXXXX)
 
     print "testing ping/pong handling on /xrpc/com.atproto.sync.subscribeRepos..."

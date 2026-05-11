@@ -72,16 +72,19 @@ def main [] {
             let rkey = ($create_res.uri | split row "/" | last)
             print $"created: ($create_res.uri)"
 
-            # give hydrant time to receive and process the firehose event and backfill
-            sleep 10sec
-
-            # verify the record was indexed
-            print "checking indexed record..."
-            let result = (try {
-                http get $"($url)/xrpc/com.atproto.repo.getRecord?repo=($did)&collection=($collection)&rkey=($rkey)"
-            } catch {
-                null
-            })
+            print "waiting for record to be indexed..."
+            mut result = null
+            for i in 1..15 {
+                $result = (try {
+                    http get $"($url)/xrpc/com.atproto.repo.getRecord?repo=($did)&collection=($collection)&rkey=($rkey)"
+                } catch {
+                    null
+                })
+                if not ($result | is-empty) {
+                    break
+                }
+                sleep 1sec
+            }
 
             if ($result | is-empty) {
                 print "FAILED: record not found in hydrant index"

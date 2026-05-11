@@ -77,9 +77,9 @@ def main [] {
     let debug_port = resolve-test-debug-port ($port + 1)
     let url = $"http://localhost:($port)"
     let debug_url = $"http://localhost:($debug_port)"
-    let db_path = (mktemp -d -t hydrant_count_tracking.XXXXXX)
+    let db_path = (mktemp -d -t hydrant_repo_count_resync.XXXXXX)
 
-    print $"testing count tracking for ($did)..."
+    print $"testing count repair through resync for ($did)..."
     print $"database path: ($db_path)"
 
     let session = authenticate $pds_url $did $password
@@ -120,7 +120,6 @@ def main [] {
 
         let stale = create-record $pds_url $jwt $did $collection (record-data "hydrant count stale create")
         $stale_rkey = ($stale.uri | split row "/" | last)
-        sleep 2sec
 
         let stale_before_resync = (count-state $url $debug_url $did $collection)
         assert-count-state "stale before resync" $stale_before_resync $baseline.api $baseline.records
@@ -135,7 +134,6 @@ def main [] {
         assert-count-state "after create resync" $after_create ($baseline.api + 1) ($baseline.records + 1)
 
         delete-record $pds_url $jwt $did $collection $stale_rkey
-        sleep 2sec
 
         let stale_before_delete_resync = (count-state $url $debug_url $did $collection)
         assert-count-state "stale before delete resync" $stale_before_delete_resync ($baseline.api + 1) ($baseline.records + 1)

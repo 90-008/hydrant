@@ -28,6 +28,7 @@ impl Drop for FirehoseIngestorHandle {
 pub(super) struct FirehoseShared {
     pub(super) buffer_tx: BufferTx,
     pub(super) verify_signatures: bool,
+    pub(super) max_failures: usize,
 }
 
 /// a snapshot of a single firehose relay's runtime state.
@@ -90,6 +91,7 @@ impl FirehoseHandle {
             state.filter.clone(),
             enabled,
             shared.verify_signatures,
+            shared.max_failures,
         )
         .await;
 
