@@ -410,6 +410,8 @@ impl RelayWorker {
             return Ok(());
         }
         repo_state.advance_message_time(event_ms);
+        let was_active = repo_state.active;
+        let was_pds_host = Self::pds_host(repo_state.pds.as_deref());
 
         #[cfg(feature = "indexer")]
         let (was_handle, was_signing_key) = (
@@ -436,6 +438,14 @@ impl RelayWorker {
         if is_pds && repo_state.handle != identity.handle {
             identity.handle = None;
         }
+
+        Self::update_pds_account_count(
+            ctx,
+            was_active,
+            was_pds_host.as_deref(),
+            repo_state.active,
+            Self::pds_host(repo_state.pds.as_deref()).as_deref(),
+        );
 
         let repo_key = keys::repo_key(&identity.did);
 
@@ -476,7 +486,7 @@ impl RelayWorker {
         repo_state: &mut RepoState,
         firehose: &Url,
         #[allow(unused_mut)] mut account: Account<'static>,
-        is_pds: bool,
+        _is_pds: bool,
     ) -> Result<()> {
         let event_ms = account.time.0.timestamp_millis();
         if repo_state.last_message_time.is_some_and(|t| event_ms <= t) {
@@ -488,6 +498,7 @@ impl RelayWorker {
 
         // always capture was_active for count tracking, not just in indexer mode
         let was_active = repo_state.active;
+        let was_pds_host = Self::pds_host(repo_state.pds.as_deref());
         #[cfg(feature = "indexer")]
         let was_status = repo_state.status.clone();
 
@@ -517,24 +528,13 @@ impl RelayWorker {
             };
         }
 
-        // update per-PDS active account count on transitions
-        if is_pds && let Some(host) = firehose.host_str() {
-            let count_key = pds_account_count_key(host);
-            let delta = if !was_active && repo_state.active {
-                1
-            } else if was_active && !repo_state.active {
-                -1
-            } else {
-                0
-            };
-
-            if delta != 0 {
-                ctx.count_deltas.add(&count_key, delta);
-                let count = ctx.count_deltas.projected_count(&ctx.state.db, &count_key);
-                ctx.state
-                    .apply_host_limit_status(&mut ctx.batch, host, count);
-            }
-        }
+        Self::update_pds_account_count(
+            ctx,
+            was_active,
+            was_pds_host.as_deref(),
+            repo_state.active,
+            Self::pds_host(repo_state.pds.as_deref()).as_deref(),
+        );
 
         let repo_key = keys::repo_key(&account.did);
 
@@ -572,6 +572,39 @@ impl RelayWorker {
         );
 
         Ok(())
+    }
+
+    fn pds_host(pds: Option<&str>) -> Option<SmolStr> {
+        pds.and_then(|pds| Url::parse(pds).ok())
+            .and_then(|url| url.host_str().map(SmolStr::new))
+    }
+
+    fn update_pds_account_count(
+        ctx: &mut WorkerContext,
+        old_active: bool,
+        old_host: Option<&str>,
+        new_active: bool,
+        new_host: Option<&str>,
+    ) {
+        if old_active && old_host == new_host && new_active {
+            return;
+        }
+
+        let mut update_host = |host: &str, delta| {
+            let count_key = pds_account_count_key(host);
+            ctx.count_deltas.add(&count_key, delta);
+            let count = ctx.count_deltas.projected_count(&ctx.state.db, &count_key);
+            ctx.state
+                .apply_host_limit_status(&mut ctx.batch, host, count);
+        };
+
+        if old_active && let Some(host) = old_host {
+            update_host(host, -1);
+        }
+
+        if new_active && let Some(host) = new_host {
+            update_host(host, 1);
+        }
     }
 }
 
@@ -870,6 +903,13 @@ impl WorkerContext<'_> {
             .unwrap_or_else(RepoState::backfilling);
 
         repo_state.update_from_doc(doc);
+        RelayWorker::update_pds_account_count(
+            self,
+            false,
+            None,
+            repo_state.active,
+            RelayWorker::pds_host(repo_state.pds.as_deref()).as_deref(),
+        );
 
         self.batch.insert(
             &db.repos,
@@ -886,14 +926,6 @@ impl WorkerContext<'_> {
         }
 
         self.count_deltas.add("repos", 1);
-
-        // track initial active state for per-PDS rate limiting
-        if msg.is_pds
-            && repo_state.active
-            && let Some(host) = msg.firehose.host_str()
-        {
-            self.count_deltas.add(&pds_account_count_key(host), 1);
-        }
 
         Ok(Some(repo_state))
     }

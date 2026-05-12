@@ -1226,4 +1226,91 @@ mod tests {
 
         Ok(())
     }
+
+    #[test]
+    fn pds_account_count_migration_rebuilds_from_active_repos() -> Result<()> {
+        use jacquard_common::CowStr;
+        use jacquard_common::types::string::Did;
+
+        let tmp = tempfile::tempdir().into_diagnostic()?;
+        let cfg = test_config(tmp.path());
+
+        {
+            let db = Db::open(&cfg)?;
+            let mut batch = db.inner.batch();
+
+            let mut insert_repo = |did_str: &str, pds: &'static str, active: bool| -> Result<()> {
+                let did = Did::new(did_str).into_diagnostic()?;
+                let mut state = RepoState::backfilling();
+                state.active = active;
+                state.pds = Some(CowStr::Borrowed(pds));
+                batch.insert(&db.repos, keys::repo_key(&did), ser_repo_state(&state)?);
+                Ok(())
+            };
+
+            insert_repo("did:web:one.test", "https://pds.example/", true)?;
+            insert_repo("did:web:two.test", "https://pds.example/", true)?;
+            insert_repo("did:web:inactive.test", "https://pds.example/", false)?;
+            insert_repo("did:web:other.test", "https://other.example/", true)?;
+
+            set_ks_count(
+                &mut batch,
+                &db,
+                &keys::pds_account_count_key("pds.example"),
+                100,
+            );
+            set_ks_count(
+                &mut batch,
+                &db,
+                &keys::pds_account_count_key("other.example"),
+                42,
+            );
+            set_ks_count(
+                &mut batch,
+                &db,
+                &keys::pds_account_count_key("orphan.example"),
+                7,
+            );
+            batch.insert(
+                &db.counts,
+                keys::count_delta_key(1, &keys::pds_account_count_key("pds.example")),
+                5_i64.to_be_bytes(),
+            );
+            batch.insert(
+                &db.counts,
+                keys::count_delta_key(2, "repos"),
+                1_i64.to_be_bytes(),
+            );
+            batch.insert(&db.counts, keys::VERSIONING_KEY, 5_u64.to_be_bytes());
+            batch.commit().into_diagnostic()?;
+            db.persist()?;
+        }
+
+        let db = Db::open(&cfg)?;
+        assert_eq!(
+            db.get_count_sync(&keys::pds_account_count_key("pds.example")),
+            2
+        );
+        assert_eq!(
+            db.get_count_sync(&keys::pds_account_count_key("other.example")),
+            1
+        );
+        assert_eq!(
+            db.get_count_sync(&keys::pds_account_count_key("orphan.example")),
+            0
+        );
+        assert_eq!(db.get_count_sync("repos"), 1);
+
+        let mut pds_delta_count = 0;
+        for guard in db.counts.prefix(keys::COUNT_DELTA_PREFIX) {
+            let key = guard.key().into_diagnostic()?;
+            let (_, name) = keys::parse_count_delta_key(&key)?;
+            if name.starts_with("p|") {
+                pds_delta_count += 1;
+            }
+        }
+        assert_eq!(pds_delta_count, 0);
+
+        Ok(())
+    }
 }

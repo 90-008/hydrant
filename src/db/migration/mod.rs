@@ -9,6 +9,7 @@ mod v2;
 mod v3;
 mod v4;
 mod v5;
+mod v6;
 
 type MigrationFn = fn(&Db, &mut OwnedWriteBatch) -> Result<()>;
 
@@ -19,6 +20,7 @@ const MIGRATIONS: &[(&str, MigrationFn)] = &[
     ("firehose_source_is_pds", v3::firehose_source_is_pds),
     ("repo_state_active", v4::repo_state_active),
     ("pds_meta_layout", v5::pds_meta_layout),
+    ("rebuild_pds_account_counts", v6::rebuild_pds_account_counts),
 ];
 
 fn read_version(db: &Db) -> Result<u64> {

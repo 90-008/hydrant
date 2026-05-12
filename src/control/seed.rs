@@ -9,7 +9,7 @@ use tracing::{info, warn};
 use url::Url;
 
 use super::firehose::FirehoseHandle;
-use crate::db::{self, CountDeltas, keys};
+use crate::db::{self, keys};
 use crate::state::AppState;
 
 const MAX_CONCURRENT_SEEDS: usize = 4;
@@ -130,32 +130,6 @@ async fn seed_one(
             // skip sources that are already running
             if firehose.tasks.contains_async(&wss_url).await {
                 continue;
-            }
-
-            // initialise account count for hosts we haven't seen before
-            if let Some(count) = host.account_count.filter(|&c| c > 0) {
-                let count_key = keys::pds_account_count_key(host.hostname.as_ref());
-                let current = state.db.get_count(&count_key).await;
-                if current == 0 {
-                    let state = state.clone();
-                    let count_key = count_key.clone();
-                    let result = tokio::task::spawn_blocking(move || -> miette::Result<()> {
-                        let mut batch = state.db.inner.batch();
-                        let mut count_deltas = CountDeltas::default();
-                        count_deltas.add(&count_key, count);
-                        let reservation = state.db.stage_count_deltas(&mut batch, &count_deltas);
-                        batch.commit().into_diagnostic()?;
-                        state.db.apply_count_deltas(&count_deltas);
-                        drop(reservation);
-                        Ok(())
-                    })
-                    .await
-                    .into_diagnostic()
-                    .flatten();
-                    if let Err(e) = result {
-                        warn!(hostname = %host.hostname, err = %e, "failed to seed host account count");
-                    }
-                }
             }
 
             match firehose.add_source(wss_url, true).await {
