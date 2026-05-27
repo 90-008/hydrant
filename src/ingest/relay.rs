@@ -48,7 +48,10 @@ struct WorkerContext<'a> {
     #[cfg(feature = "relay")]
     pending_broadcasts: Vec<RelayBroadcast>,
     #[cfg(all(feature = "relay", feature = "jetstream"))]
-    pending_jetstream_events: Vec<crate::types::StoredJetstreamEvent<'static>>,
+    pending_jetstream_events: Vec<(
+        crate::types::StoredJetstreamEvent<'static>,
+        Option<crate::jetstream::JetstreamEphemeral>,
+    )>,
     #[cfg(feature = "indexer")]
     pending_hook_messages: Vec<crate::ingest::indexer::IndexerMessage>,
     #[cfg(feature = "indexer")]
@@ -226,8 +229,9 @@ impl RelayWorker {
             let res = {
                 let _lock = ctx.state.db.jetstream_lock.lock();
                 let mut stage_res = Ok(());
-                for event in ctx.pending_jetstream_events.drain(..) {
-                    match crate::jetstream::stage_event(&mut batch, &ctx.state.db, event) {
+                for (event, ephemeral) in ctx.pending_jetstream_events.drain(..) {
+                    match crate::jetstream::stage_event(&mut batch, &ctx.state.db, event, ephemeral)
+                    {
                         Ok(broadcast) => jetstream_broadcasts.push(broadcast),
                         Err(e) => {
                             stage_res = Err(e);
@@ -383,15 +387,32 @@ impl RelayWorker {
                 encode_frame("#commit", &commit)
             })?;
             #[cfg(feature = "jetstream")]
-            for (op_index, collection) in jetstream_ops {
-                // todo: build live jetstream frames from this decoded commit and use stored frames only for replay.
-                ctx.pending_jetstream_events
-                    .push(StoredJetstreamEvent::RelayCommit {
-                        did: jetstream_did.clone(),
-                        collection,
-                        relay_seq,
-                        op_index,
+            {
+                let parsed_car = tokio::runtime::Handle::current()
+                    .block_on(jacquard_repo::car::reader::parse_car_bytes(
+                        commit.blocks.as_ref(),
+                    ))
+                    .ok();
+                for (op_index, collection) in jetstream_ops {
+                    let ephemeral = parsed_car.as_ref().and_then(|car| {
+                        crate::jetstream::build_ephemeral_from_relay(
+                            &commit,
+                            op_index,
+                            collection.as_str(),
+                            true,
+                            car,
+                        )
                     });
+                    ctx.pending_jetstream_events.push((
+                        StoredJetstreamEvent::RelayCommit {
+                            did: jetstream_did.clone(),
+                            collection,
+                            relay_seq: _relay_seq,
+                            op_index,
+                        },
+                        ephemeral,
+                    ));
+                }
             }
         }
 
@@ -530,11 +551,13 @@ impl RelayWorker {
                 encode_frame("#identity", &identity)
             })?;
             #[cfg(feature = "jetstream")]
-            ctx.pending_jetstream_events
-                .push(StoredJetstreamEvent::RelayIdentity {
+            ctx.pending_jetstream_events.push((
+                StoredJetstreamEvent::RelayIdentity {
                     did: TrimmedDid::from(&identity.did).into_static(),
-                    relay_seq,
-                });
+                    relay_seq: _relay_seq,
+                },
+                None,
+            ));
         }
 
         ctx.batch.insert(
@@ -628,11 +651,13 @@ impl RelayWorker {
                 encode_frame("#account", &account)
             })?;
             #[cfg(feature = "jetstream")]
-            ctx.pending_jetstream_events
-                .push(StoredJetstreamEvent::RelayAccount {
+            ctx.pending_jetstream_events.push((
+                StoredJetstreamEvent::RelayAccount {
                     did: TrimmedDid::from(&account.did).into_static(),
-                    relay_seq,
-                });
+                    relay_seq: _relay_seq,
+                },
+                None,
+            ));
         }
 
         repo_state.touch();

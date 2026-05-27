@@ -893,6 +893,7 @@ fn read_jetstream_replay_chunk(
             id,
             time_us: time_us as i64,
             event: event.into_static(),
+            ephemeral: None,
         });
     }
 
@@ -905,17 +906,17 @@ fn read_jetstream_replay_chunk(
 
 #[cfg(feature = "jetstream")]
 #[derive(serde::Serialize)]
-struct JetstreamEvent<'a> {
-    did: &'a str,
-    time_us: i64,
+pub(crate) struct JetstreamEvent<'a> {
+    pub(crate) did: &'a str,
+    pub(crate) time_us: i64,
     #[serde(flatten)]
-    payload: JetstreamPayload<'a>,
+    pub(crate) payload: JetstreamPayload<'a>,
 }
 
 #[cfg(feature = "jetstream")]
 #[derive(serde::Serialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
-enum JetstreamPayload<'a> {
+pub(crate) enum JetstreamPayload<'a> {
     Commit {
         commit: JetstreamCommit<'a>,
     },
@@ -931,37 +932,37 @@ enum JetstreamPayload<'a> {
 
 #[cfg(feature = "jetstream")]
 #[derive(serde::Serialize)]
-struct JetstreamCommit<'a> {
-    rev: &'a str,
-    operation: &'a str,
-    collection: &'a str,
-    rkey: &'a str,
+pub(crate) struct JetstreamCommit<'a> {
+    pub(crate) rev: &'a str,
+    pub(crate) operation: &'a str,
+    pub(crate) collection: &'a str,
+    pub(crate) rkey: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
-    record: Option<&'a serde_json::Value>,
+    pub(crate) record: Option<&'a serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    cid: Option<String>,
-    live: bool,
+    pub(crate) cid: Option<String>,
+    pub(crate) live: bool,
 }
 
 #[cfg(feature = "jetstream")]
 #[derive(serde::Serialize)]
-struct JetstreamIdentity<'a> {
-    did: String,
-    seq: i64,
-    time: &'a crate::ingest::stream::Datetime,
+pub(crate) struct JetstreamIdentity<'a> {
+    pub(crate) did: String,
+    pub(crate) seq: i64,
+    pub(crate) time: &'a crate::ingest::stream::Datetime,
     #[serde(skip_serializing_if = "Option::is_none")]
-    handle: Option<String>,
+    pub(crate) handle: Option<String>,
 }
 
 #[cfg(feature = "jetstream")]
 #[derive(serde::Serialize)]
-struct JetstreamAccount<'a> {
-    active: bool,
-    did: String,
-    seq: i64,
-    time: &'a crate::ingest::stream::Datetime,
+pub(crate) struct JetstreamAccount<'a> {
+    pub(crate) active: bool,
+    pub(crate) did: String,
+    pub(crate) seq: i64,
+    pub(crate) time: &'a crate::ingest::stream::Datetime,
     #[serde(skip_serializing_if = "Option::is_none")]
-    status: Option<String>,
+    pub(crate) status: Option<String>,
 }
 
 #[cfg(feature = "jetstream")]
@@ -972,6 +973,11 @@ fn jetstream_event_to_bytes(
 ) -> Option<Bytes> {
     if !filter.wants(&event.event) {
         return None;
+    }
+
+    // live tailing: use pre-serialized ephemeral bytes to avoid db reads.
+    if let Some(bytes) = event.ephemeral {
+        return Some(bytes);
     }
 
     match &event.event {

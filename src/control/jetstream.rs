@@ -248,7 +248,9 @@ mod tests {
         let wanted = opts.wanted_collections.unwrap();
 
         assert!(wanted.prefixes.iter().any(|prefix| prefix == "app.bsky."));
-        assert!(JetstreamSubscriberOptions::parse(&["app.bsky.feed.po*".into()], &[], 0, &[]).is_err());
+        assert!(
+            JetstreamSubscriberOptions::parse(&["app.bsky.feed.po*".into()], &[], 0, &[]).is_err()
+        );
     }
 
     #[test]

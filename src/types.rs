@@ -502,6 +502,9 @@ pub(crate) struct JetstreamBroadcast {
     pub id: u64,
     pub time_us: i64,
     pub event: StoredJetstreamEvent<'static>,
+    /// pre-serialized json bytes for live tailing.
+    /// replay events read from the database instead.
+    pub ephemeral: Option<bytes::Bytes>,
 }
 
 #[cfg(feature = "jetstream")]

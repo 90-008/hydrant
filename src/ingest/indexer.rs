@@ -559,6 +559,7 @@ impl FirehoseWorker {
                     seq: identity.seq,
                     time: identity.time.clone(),
                 },
+                None,
             )?);
 
             if changed {
@@ -600,6 +601,7 @@ impl FirehoseWorker {
                 seq: account.seq,
                 time: account.time.clone(),
             },
+            None,
         )?);
 
         if is_inactive {

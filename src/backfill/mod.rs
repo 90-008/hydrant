@@ -711,7 +711,7 @@ async fn process_did(
                                 event_id,
                                 live: false,
                             };
-                            crate::jetstream::stage_event(&mut batch, &app_state.db, jetstream)?;
+                            crate::jetstream::stage_event(&mut batch, &app_state.db, jetstream, None)?;
                         }
                     }
 
@@ -765,7 +765,7 @@ async fn process_did(
                             event_id,
                             live: false,
                         };
-                        crate::jetstream::stage_event(&mut batch, &app_state.db, jetstream)?;
+                        crate::jetstream::stage_event(&mut batch, &app_state.db, jetstream, None)?;
                     }
                 }
 
