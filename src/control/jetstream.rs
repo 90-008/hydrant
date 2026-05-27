@@ -62,6 +62,7 @@ pub struct JetstreamSubscriberOptions {
     wanted_collections: Option<WantedCollections>,
     wanted_dids: Arc<HashSet<Vec<u8>>>,
     max_message_size_bytes: u32,
+    wanted_event_types: Option<WantedEventTypes>,
 }
 
 #[derive(Clone)]
@@ -70,18 +71,27 @@ struct WantedCollections {
     full_paths: HashSet<SmolStr>,
 }
 
+#[derive(Clone)]
+struct WantedEventTypes {
+    live: bool,
+    historical: bool,
+}
+
 impl JetstreamSubscriberOptions {
     pub fn parse(
         wanted_collections: &[String],
         wanted_dids: &[String],
         max_message_size_bytes: u32,
+        wanted_event_types: &[String],
     ) -> std::result::Result<Self, String> {
         let wanted_collections = parse_wanted_collections(wanted_collections)?;
         let wanted_dids = parse_wanted_dids(wanted_dids)?;
+        let wanted_event_types = parse_wanted_event_types(wanted_event_types)?;
         Ok(Self {
             wanted_collections,
             wanted_dids: Arc::new(wanted_dids),
             max_message_size_bytes,
+            wanted_event_types,
         })
     }
 
@@ -90,6 +100,16 @@ impl JetstreamSubscriberOptions {
     }
 
     pub(crate) fn wants(&self, event: &StoredJetstreamEvent<'_>) -> bool {
+        if let Some(wanted) = &self.wanted_event_types {
+            let is_live = event.is_live();
+            if is_live && !wanted.live {
+                return false;
+            }
+            if !is_live && !wanted.historical {
+                return false;
+            }
+        }
+
         if !self.wanted_dids.is_empty() {
             let mut did = Vec::with_capacity(event.did().len());
             event.did().write_to_vec(&mut did);
@@ -180,6 +200,24 @@ fn validate_collection_prefix(prefix: &str) -> std::result::Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
+fn parse_wanted_event_types(
+    provided: &[String],
+) -> std::result::Result<Option<WantedEventTypes>, String> {
+    if provided.is_empty() {
+        return Ok(None);
+    }
+    let mut live = false;
+    let mut historical = false;
+    for ev in provided {
+        match ev.as_str() {
+            "live" => live = true,
+            "historical" => historical = true,
+            _ => return Err(format!("unknown wantedEventTypes value: {}", ev)),
+        }
+    }
+    Ok(Some(WantedEventTypes { live, historical }))
+}
+
 fn parse_wanted_dids(provided: &[String]) -> std::result::Result<HashSet<Vec<u8>>, String> {
     let mut wanted = HashSet::new();
     for did_raw in provided {
@@ -206,40 +244,46 @@ mod tests {
 
     #[test]
     fn collection_prefixes_accept_domain_prefixes() {
-        let opts = JetstreamSubscriberOptions::parse(&["app.bsky.*".into()], &[], 0).unwrap();
+        let opts = JetstreamSubscriberOptions::parse(&["app.bsky.*".into()], &[], 0, &[]).unwrap();
         let wanted = opts.wanted_collections.unwrap();
 
         assert!(wanted.prefixes.iter().any(|prefix| prefix == "app.bsky."));
-        assert!(JetstreamSubscriberOptions::parse(&["app.bsky.feed.po*".into()], &[], 0).is_err());
+        assert!(JetstreamSubscriberOptions::parse(&["app.bsky.feed.po*".into()], &[], 0, &[]).is_err());
     }
 
     #[test]
-    fn full_path_filter_matches_relay_commit_collection() {
+    fn full_path_filter_matches_commit_collection() {
         use crate::db::types::TrimmedDid;
         use crate::types::StoredJetstreamEvent;
         use jacquard_common::{CowStr, IntoStatic};
         use smol_str::ToSmolStr;
 
-        let opts = JetstreamSubscriberOptions::parse(&["app.bsky.feed.post".into()], &[], 0)
+        let opts = JetstreamSubscriberOptions::parse(&["app.bsky.feed.post".into()], &[], 0, &[])
             .expect("app.bsky.feed.post must be a valid collection");
 
         let did =
             TrimmedDid::from(&jacquard_common::types::string::Did::new("did:plc:abc123").unwrap())
                 .into_static();
 
-        let matching = StoredJetstreamEvent::RelayCommit {
+        let matching = StoredJetstreamEvent::Commit {
             did: did.clone(),
             collection: CowStr::Owned("app.bsky.feed.post".to_smolstr()),
-            relay_seq: 1,
-            op_index: 0,
+            event_id: 1,
+            live: true,
         };
-        let non_matching = StoredJetstreamEvent::RelayCommit {
+        let non_matching = StoredJetstreamEvent::Commit {
             did: did.clone(),
             collection: CowStr::Owned("app.bsky.actor.profile".to_smolstr()),
-            relay_seq: 2,
-            op_index: 0,
+            event_id: 2,
+            live: true,
         };
-        let account = StoredJetstreamEvent::RelayAccount { did, relay_seq: 3 };
+        let account = StoredJetstreamEvent::Account {
+            did,
+            active: true,
+            status: None,
+            seq: 1,
+            time: crate::ingest::stream::Datetime(chrono::Utc::now().into()),
+        };
 
         assert!(
             opts.wants(&matching),
@@ -259,7 +303,7 @@ mod tests {
     fn wanted_did_limit_counts_unique_dids() {
         let dids = vec!["did:plc:abc123".to_string(); 10_001];
 
-        let opts = JetstreamSubscriberOptions::parse(&[], &dids, 0).unwrap();
+        let opts = JetstreamSubscriberOptions::parse(&[], &dids, 0, &[]).unwrap();
 
         assert_eq!(opts.wanted_dids.len(), 1);
     }

@@ -384,6 +384,7 @@ pub fn apply_commit<'s>(
                     did: did_trimmed.clone().into_static(),
                     collection: collection.clone().into_static(),
                     event_id,
+                    live: true,
                 };
                 jetstream_events.push(crate::jetstream::stage_event(batch, db, jetstream)?);
             }

@@ -1,4 +1,3 @@
-use std::sync::Arc;
 use std::time::Duration;
 
 use axum::extract::{Query, State};
@@ -72,6 +71,12 @@ pub struct JetstreamQuery {
     compress: bool,
     #[serde(default, rename = "requireHello")]
     require_hello: bool,
+    #[serde(
+        default,
+        rename = "wantedEventTypes",
+        deserialize_with = "deserialize_string_or_seq"
+    )]
+    wanted_event_types: Vec<String>,
 }
 
 pub async fn handle_subscribe(
@@ -84,6 +89,7 @@ pub async fn handle_subscribe(
         &query.wanted_collections,
         &query.wanted_dids,
         parse_max_message_size(query.max_message_size_bytes),
+        &query.wanted_event_types,
     ) {
         Ok(options) => JetstreamFilter::new(options),
         Err(err) => return (StatusCode::BAD_REQUEST, err).into_response(),
@@ -241,6 +247,7 @@ fn handle_options_message(msg: Message, options: &JetstreamFilter) -> Result<boo
         &payload.wanted_collections,
         &payload.wanted_dids,
         parse_max_message_size(Some(payload.max_message_size_bytes)),
+        &payload.wanted_event_types,
     )?;
     options.update(next);
     Ok(true)
@@ -275,8 +282,14 @@ fn options_from_parts(
     wanted_collections: &[String],
     wanted_dids: &[String],
     max_message_size_bytes: u32,
+    wanted_event_types: &[String],
 ) -> Result<JetstreamSubscriberOptions, String> {
-    JetstreamSubscriberOptions::parse(wanted_collections, wanted_dids, max_message_size_bytes)
+    JetstreamSubscriberOptions::parse(
+        wanted_collections,
+        wanted_dids,
+        max_message_size_bytes,
+        wanted_event_types,
+    )
 }
 
 fn parse_max_message_size(value: Option<i64>) -> u32 {
@@ -312,4 +325,6 @@ struct SubscriberOptionsUpdatePayload {
     wanted_dids: Vec<String>,
     #[serde(default, rename = "maxMessageSizeBytes", alias = "maxSize")]
     max_message_size_bytes: i64,
+    #[serde(default, rename = "wantedEventTypes")]
+    wanted_event_types: Vec<String>,
 }

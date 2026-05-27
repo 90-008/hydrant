@@ -6,7 +6,7 @@
 #
 # Jetstream event format:
 #   {did, time_us, kind: "commit"|"identity"|"account", commit?|identity?|account?}
-#   commit:   {rev, operation, collection, rkey, record?, cid?}
+#   commit:   {rev, operation, collection, rkey, record?, cid?, live}
 #   identity: {did, seq, time, handle?}
 #   account:  {did, active, seq, time, status?}
 
@@ -43,7 +43,7 @@ def assert-no-error-events [events: list, label: string, ...pids: int] {
 }
 
 def assert-commit-structure [c: record, label: string, ...pids: int] {
-    for field in ["rev", "operation", "collection", "rkey"] {
+    for field in ["rev", "operation", "collection", "rkey", "live"] {
         if not ($field in $c) {
             fail $"($label): commit missing field ($field)" ...$pids
         }
@@ -109,6 +109,25 @@ def main [] {
     if not (wait-for-backfill $url) {
         fail "backfill timed out" $instance.pid
     }
+
+    # --- verify historical commits exist after backfill ---
+    print "--- verifying historical commits exist after backfill ---"
+    let hist_verify_file = $"($db_path)/hist_verify.txt"
+    # use cursor=0 to replay everything; we expect historical commits for our DID
+    let hist_verify_events = (collect-ws-json $"($ws_base)/subscribe?cursor=0" $hist_verify_file 10sec)
+    let hist_verify_commits = ($hist_verify_events | where { |e|
+        ($e | get -o kind | default "") == "commit" and ($e | get -o did | default "") == $did
+    })
+    print $"backfill historical commits for our DID: ($hist_verify_commits | length)"
+    if ($hist_verify_commits | is-empty) {
+        fail "expected historical commits for our DID after backfill, got none" $instance.pid
+    }
+    # all backfill commits must have live: false
+    let any_live_hist = ($hist_verify_commits | any { |e| ($e | get -o commit.live | default true) == true })
+    if $any_live_hist {
+        fail "backfill commits must have live=false" $instance.pid
+    }
+    print "historical commits verified (live=false)"
 
     # start live subscriber before creating records so we catch the events
     let live_file = $"($db_path)/live.txt"
@@ -255,6 +274,42 @@ def main [] {
         fail "wantedDids filter returned events for wrong DID" $instance.pid
     }
     print "wantedDids filter is correct"
+
+    # --- scenario: wantedEventTypes filter ---
+    print "--- scenario: wantedEventTypes filter ---"
+    let type_live_file = $"($db_path)/type_live_filter.txt"
+    let type_live_url = $"($ws_base)/subscribe?cursor=($cursor_us)&wantedEventTypes=live"
+    let type_live_events = (collect-ws-json $type_live_url $type_live_file 8sec)
+    print $"wantedEventTypes=live: ($type_live_events | length) events"
+
+    let type_hist_file = $"($db_path)/type_hist_filter.txt"
+    let type_hist_url = $"($ws_base)/subscribe?cursor=($cursor_us)&wantedEventTypes=historical"
+    let type_hist_events = (collect-ws-json $type_hist_url $type_hist_file 8sec)
+    print $"wantedEventTypes=historical: ($type_hist_events | length) events"
+
+    assert-no-error-events $type_live_events "wantedEventTypes=live filter" $instance.pid
+    assert-no-error-events $type_hist_events "wantedEventTypes=historical filter" $instance.pid
+
+    # verify live filter only returns live commits
+    let live_commits = ($type_live_events | where { |e| ($e | get -o kind | default "") == "commit" and ($e | get -o did | default "") == $did })
+    let any_non_live = ($live_commits | any { |e| ($e | get -o commit.live | default false) == false })
+    if $any_non_live {
+        fail "wantedEventTypes=live returned non-live commits" $instance.pid
+    }
+    print $"wantedEventTypes=live: ($live_commits | length) live commits for our DID"
+
+    # verify historical filter returns historical commits for our DID
+    let hist_commits = ($type_hist_events | where { |e| ($e | get -o kind | default "") == "commit" and ($e | get -o did | default "") == $did })
+    if ($hist_commits | is-empty) {
+        fail "wantedEventTypes=historical: expected historical commits for our DID, got none" $instance.pid
+    }
+    let any_live_hist = ($hist_commits | any { |e| ($e | get -o commit.live | default true) == true })
+    if $any_live_hist {
+        fail "wantedEventTypes=historical returned live commits" $instance.pid
+    }
+    print $"wantedEventTypes=historical: ($hist_commits | length) historical commits for our DID, all have live=false"
+
+    print "wantedEventTypes filter is correct"
 
     try { kill $instance.pid }
     print "=== jetstream /subscribe test PASSED ==="

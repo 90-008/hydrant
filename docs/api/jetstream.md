@@ -12,8 +12,9 @@ subscribe to the jetstream websocket stream.
 
 | param | type | description |
 | :--- | :--- | :--- |
-| `wantedCollections` | string \| seq | list of collection NSIDs to receive (e.g. `app.bsky.feed.post`). supports namespace wildcards (e.g. `app.bsky.feed.*`). |
-| `wantedDids` | string \| seq | list of DIDs to receive (e.g. `did:plc:abc123xyz`). |
+| `wantedCollections` | seq<string> | list of collection NSIDs to receive (e.g. `app.bsky.feed.post`). supports namespace wildcards (e.g. `app.bsky.feed.*`). |
+| `wantedDids` | seq<string> | list of DIDs to receive (e.g. `did:plc:abc123xyz`). |
+| `wantedEventTypes` | seq<string> | list of event types to receive: `live` or `historical`. if not specified, both are returned. |
 | `maxMessageSizeBytes` | integer | filters out events whose serialized JSON size exceeds this value. |
 | `cursor` | integer | unix microseconds timestamp (`time_us`) to replay historical events from. |
 | `compress` | boolean | if `true` (or if header `Socket-Encoding` contains `zstd`), compresses frames using zstd and sends them as binary websocket frames. |
@@ -21,7 +22,7 @@ subscribe to the jetstream websocket stream.
 
 ### in-stream options update
 
-clients can dynamically modify filtering criteria (`wantedCollections`, `wantedDids`, and `maxMessageSizeBytes`) without reconnecting by sending a text frame with the following JSON format:
+clients can dynamically modify filtering criteria (`wantedCollections`, `wantedDids`, `maxMessageSizeBytes`, and `wantedEventTypes`) without reconnecting by sending a text frame with the following JSON format:
 
 ```json
 {
@@ -29,7 +30,8 @@ clients can dynamically modify filtering criteria (`wantedCollections`, `wantedD
   "payload": {
     "wantedCollections": ["app.bsky.feed.post", "app.bsky.like.*"],
     "wantedDids": ["did:plc:abc123xyz"],
-    "maxMessageSizeBytes": 5000000
+    "maxMessageSizeBytes": 5000000,
+    "wantedEventTypes": ["live"]
   }
 }
 ```
@@ -106,5 +108,5 @@ fired when a repository's status changes (active, deactivated, or deleted):
 
 ### additional details
 
-- **live stream scope**: jetstream subscribers only receive live firehose events. historical backfill and sync replay events are processed with `live: false` internally, and are never staged in the jetstream keyspace or broadcasted.
+- **live stream scope**: jetstream subscribers receive both live firehose events (`live: true`) and historical backfill / sync replay events (`live: false`) by default. be aware that historical backfills will interleave with live events unless filtered using the `wantedEventTypes` query parameter.
 - **slow consumers**: if a socket's send buffer remains full for longer than the configured timeout, the server sends a `{"type":"error","error":"ConsumerTooSlow"}` message and drops the connection.

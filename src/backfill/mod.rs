@@ -702,6 +702,17 @@ async fn process_did(
                         };
                         let bytes = rmp_serde::to_vec(&evt).into_diagnostic()?;
                         batch.insert(&app_state.db.events, keys::event_key(event_id), bytes);
+
+                        #[cfg(feature = "jetstream")]
+                        {
+                            let jetstream = crate::types::StoredJetstreamEvent::Commit {
+                                did: TrimmedDid::from(&did).into_static(),
+                                collection: CowStr::Borrowed(collection).into_static(),
+                                event_id,
+                                live: false,
+                            };
+                            crate::jetstream::stage_event(&mut batch, &app_state.db, jetstream)?;
+                        }
                     }
 
                     count += 1;
@@ -745,6 +756,17 @@ async fn process_did(
                     };
                     let bytes = rmp_serde::to_vec(&evt).into_diagnostic()?;
                     batch.insert(&app_state.db.events, keys::event_key(event_id), bytes);
+
+                    #[cfg(feature = "jetstream")]
+                    {
+                        let jetstream = crate::types::StoredJetstreamEvent::Commit {
+                            did: TrimmedDid::from(&did).into_static(),
+                            collection: CowStr::Borrowed(&collection).into_static(),
+                            event_id,
+                            live: false,
+                        };
+                        crate::jetstream::stage_event(&mut batch, &app_state.db, jetstream)?;
+                    }
                 }
 
                 delta -= 1;

@@ -78,7 +78,7 @@ pub struct Db {
     pub(crate) next_jetstream_id: Arc<AtomicU64>,
     #[cfg(feature = "jetstream")]
     pub(crate) last_jetstream_time_us: Arc<AtomicI64>,
-    #[cfg(feature = "jetstream")]
+    #[cfg(all(feature = "jetstream", feature = "relay"))]
     pub(crate) jetstream_lock: Arc<parking_lot::Mutex<()>>,
     #[cfg(feature = "relay")]
     pub(crate) relay_events: Keyspace,
@@ -580,7 +580,7 @@ impl Db {
             next_jetstream_id: Arc::new(AtomicU64::new(0)),
             #[cfg(feature = "jetstream")]
             last_jetstream_time_us: Arc::new(AtomicI64::new(0)),
-            #[cfg(feature = "jetstream")]
+            #[cfg(all(feature = "jetstream", feature = "relay"))]
             jetstream_lock: Arc::new(parking_lot::Mutex::new(())),
             #[cfg(feature = "relay")]
             relay_events,

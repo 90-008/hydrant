@@ -34,7 +34,7 @@ use crate::state::AppState;
 #[cfg(feature = "relay")]
 use crate::types::RelayBroadcast;
 #[cfg(all(feature = "relay", feature = "jetstream"))]
-use crate::types::{JetstreamBroadcast, StoredJetstreamEvent};
+use crate::types::StoredJetstreamEvent;
 use crate::types::{RepoState, RepoStatus};
 use crate::util;
 use smol_str::{SmolStr, ToSmolStr};
@@ -378,7 +378,7 @@ impl RelayWorker {
             #[cfg(feature = "jetstream")]
             let jetstream_did = TrimmedDid::from(&commit.repo).into_static();
 
-            let relay_seq = ctx.queue_emit(|seq| {
+            let _relay_seq = ctx.queue_emit(|seq| {
                 commit.seq = seq;
                 encode_frame("#commit", &commit)
             })?;
@@ -525,7 +525,7 @@ impl RelayWorker {
         }
         #[cfg(feature = "relay")]
         {
-            let relay_seq = ctx.queue_emit(|seq| {
+            let _relay_seq = ctx.queue_emit(|seq| {
                 identity.seq = seq;
                 encode_frame("#identity", &identity)
             })?;
@@ -623,7 +623,7 @@ impl RelayWorker {
         }
         #[cfg(feature = "relay")]
         {
-            let relay_seq = ctx.queue_emit(|seq| {
+            let _relay_seq = ctx.queue_emit(|seq| {
                 account.seq = seq;
                 encode_frame("#account", &account)
             })?;

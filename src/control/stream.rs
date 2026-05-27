@@ -940,6 +940,7 @@ struct JetstreamCommit<'a> {
     record: Option<&'a serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     cid: Option<String>,
+    live: bool,
 }
 
 #[cfg(feature = "jetstream")]
@@ -975,7 +976,7 @@ fn jetstream_event_to_bytes(
 
     match &event.event {
         #[cfg(feature = "indexer_stream")]
-        StoredJetstreamEvent::Commit { event_id, .. } => {
+        StoredJetstreamEvent::Commit { event_id, live, .. } => {
             let bytes = state.db.events.get(keys::event_key(*event_id)).ok()??;
             let stored: StoredEvent = rmp_serde::from_slice(&bytes).ok()?;
             let evt = stored_to_event(state, *event_id, stored, None)?;
@@ -993,6 +994,7 @@ fn jetstream_event_to_bytes(
                         rkey: rec.rkey.as_str(),
                         record: rec.record.as_ref(),
                         cid: rec.cid.map(|cid| cid.to_string()),
+                        live: *live,
                     },
                 },
             };
@@ -1044,6 +1046,7 @@ fn jetstream_event_to_bytes(
                         rkey,
                         record: record_owned.as_ref(),
                         cid,
+                        live: true,
                     },
                 },
             };

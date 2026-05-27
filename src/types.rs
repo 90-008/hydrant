@@ -436,6 +436,12 @@ pub(crate) struct LiveRecordEvent {
     pub inline_block: Option<Bytes>,
 }
 
+#[inline]
+#[allow(dead_code)]
+pub(crate) fn default_true() -> bool {
+    true
+}
+
 #[cfg(feature = "jetstream")]
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(bound(deserialize = "'i: 'de"))]
@@ -447,6 +453,8 @@ pub(crate) enum StoredJetstreamEvent<'i> {
         #[serde(borrow)]
         collection: CowStr<'i>,
         event_id: u64,
+        #[serde(default = "crate::types::default_true")]
+        live: bool,
     },
     #[cfg(feature = "relay")]
     RelayCommit {
@@ -498,6 +506,14 @@ pub(crate) struct JetstreamBroadcast {
 
 #[cfg(feature = "jetstream")]
 impl<'i> StoredJetstreamEvent<'i> {
+    pub(crate) fn is_live(&self) -> bool {
+        match self {
+            #[cfg(feature = "indexer_stream")]
+            Self::Commit { live, .. } => *live,
+            _ => true,
+        }
+    }
+
     pub(crate) fn did(&self) -> &TrimmedDid<'i> {
         match self {
             #[cfg(feature = "indexer_stream")]
@@ -529,10 +545,12 @@ impl<'i> StoredJetstreamEvent<'i> {
                 did,
                 collection,
                 event_id,
+                live,
             } => StoredJetstreamEvent::Commit {
                 did: did.into_static(),
                 collection: collection.into_static(),
                 event_id,
+                live,
             },
             #[cfg(feature = "relay")]
             Self::RelayCommit {
