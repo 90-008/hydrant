@@ -112,6 +112,12 @@ fn deserialize_value(partition: &str, value: &[u8]) -> Value {
                 return serde_json::to_value(event).unwrap_or(Value::Null);
             }
         }
+        #[cfg(feature = "jetstream")]
+        "jetstream_events" => {
+            if let Ok(event) = rmp_serde::from_slice::<crate::types::StoredJetstreamEvent>(value) {
+                return serde_json::to_value(event).unwrap_or(Value::Null);
+            }
+        }
         "records" => {
             if let Ok(s) = String::from_utf8(value.to_vec()) {
                 match Cid::from_str(&s) {
@@ -288,6 +294,8 @@ fn get_keyspace_by_name(db: &crate::db::Db, name: &str) -> Result<fjall::Keyspac
         "resync" => Ok(db.resync.clone()),
         #[cfg(feature = "indexer_stream")]
         "events" => Ok(db.events.clone()),
+        #[cfg(feature = "jetstream")]
+        "jetstream_events" => Ok(db.jetstream_events.clone()),
         #[cfg(feature = "relay")]
         "relay_events" => Ok(db.relay_events.clone()),
         #[cfg(feature = "indexer")]
@@ -330,6 +338,8 @@ pub async fn handle_debug_ephemeral_ttl_tick(
         crate::db::ephemeral::ephemeral_ttl_tick(&state.db, &state.ephemeral_ttl)?;
         #[cfg(feature = "relay")]
         crate::db::ephemeral::relay_events_ttl_tick(&state.db, &state.ephemeral_ttl)?;
+        #[cfg(feature = "jetstream")]
+        crate::db::ephemeral::jetstream_events_ttl_tick(&state.db, &state.ephemeral_ttl)?;
         Ok(())
     })
     .await

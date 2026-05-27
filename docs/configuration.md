@@ -20,8 +20,8 @@ hydrant is configured via environment variables, all prefixed with `HYDRANT_` (e
 | :--- | :--- | :--- |
 | `FULL_NETWORK` | `false` (indexer), `true` (relay) | if `true`, discover and index all repos in the network |
 | `EPHEMERAL` | `false` (indexer), `true` (relay) | if enabled, no records are stored (in indexer mode). events are deleted after a certain duration (`EPHEMERAL_TTL`) |
-| `EPHEMERAL_TTL` | `60min`, `3d` (relay) | how long to keep events before deletion |
-| `ONLY_INDEX_LINKS` | `false` | indexer only. if enabled, record blocks are not stored, only the index (records, counts, events) is kept. `getRecord`, `listRecords`, and `getRepo` will return errors. the event stream still works but create/update events will not include record values |
+| `EPHEMERAL_TTL` | `60min`, `3d` (relay) | how long to keep events before deletion. when built with `jetstream`, retained Jetstream replay metadata is pruned on the same schedule |
+| `ONLY_INDEX_LINKS` | `false` | indexer only. if enabled, record blocks are not stored, only the index (records, counts, events) is kept. `getRecord`, `listRecords`, and `getRepo` will return errors. the event stream and Jetstream stream still work, but create/update events will not include record values |
 
 ## filter
 

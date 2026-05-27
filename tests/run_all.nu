@@ -4,7 +4,7 @@
 # usage:
 #   nu tests/run_all.nu
 #   nu tests/run_all.nu --only [stream_live_backfill api_repos]
-use common.nu [build-hydrant-features build-hydrant-relay]
+use common.nu [build-hydrant-features build-hydrant-relay build-hydrant-relay-jetstream]
 
 def get_free_ports [count: int] {
     if $count == 0 {
@@ -62,7 +62,17 @@ def test-needs-relay-binary [name: string] {
     # tests that build a relay-only binary must run last (and serially) to avoid racing on
     # `target/` artifacts while other tests are executing.
     try {
-        open --raw $"tests/($name).nu" | str contains "build-hydrant-relay"
+        let content = (open --raw $"tests/($name).nu")
+        # exclude relay-jetstream tests which use a different binary
+        ($content | str contains "build-hydrant-relay") and not ($content | str contains "build-hydrant-relay-jetstream")
+    } catch {
+        false
+    }
+}
+
+def test-needs-relay-jetstream-binary [name: string] {
+    try {
+        open --raw $"tests/($name).nu" | str contains "build-hydrant-relay-jetstream"
     } catch {
         false
     }
@@ -99,14 +109,19 @@ def main [--only: list<string> = [], --skip-creds] {
     }
 
     let relay_tests = $tests | where {|t| test-needs-relay-binary $t }
-    let indexer_tests = $tests | where {|t| not ($relay_tests | any {$in == $t}) }
+    let relay_jetstream_tests = $tests | where {|t| test-needs-relay-jetstream-binary $t }
+    let indexer_tests = $tests | where {|t|
+        not ($relay_tests | any {$in == $t}) and not ($relay_jetstream_tests | any {$in == $t})
+    }
 
     mut indexer_binary = null
     mut relay_binary = null
+    mut relay_jetstream_binary = null
 
+    let needs_snapshot = not ($relay_tests | is-empty) or not ($relay_jetstream_tests | is-empty)
     if not ($indexer_tests | is-empty) {
-        let built = build-hydrant-features "backlinks"
-        $indexer_binary = if not ($relay_tests | is-empty) {
+        let built = build-hydrant-features "backlinks,jetstream"
+        $indexer_binary = if $needs_snapshot {
             snapshot-binary $built "indexer"
         } else {
             $built
@@ -118,6 +133,11 @@ def main [--only: list<string> = [], --skip-creds] {
         $relay_binary = snapshot-binary $built "relay"
     }
 
+    if not ($relay_jetstream_tests | is-empty) {
+        let built = build-hydrant-relay-jetstream
+        $relay_jetstream_binary = snapshot-binary $built "relay_jetstream"
+    }
+
     print ""
 
     let ports = get_free_ports (($tests | length) * 3)
@@ -126,7 +146,13 @@ def main [--only: list<string> = [], --skip-creds] {
     for test in ($tests | enumerate) {
         let p = {($test | get index) * 3 + $in}
         let name = ($test | get item)
-        let binary = if ($relay_tests | any {$in == $name}) { $relay_binary } else { $indexer_binary }
+        let binary = if ($relay_tests | any {$in == $name}) {
+            $relay_binary
+        } else if ($relay_jetstream_tests | any {$in == $name}) {
+            $relay_jetstream_binary
+        } else {
+            $indexer_binary
+        }
         let entry = {
             name: $name,
             api: ($ports | get (0 | do $p)),

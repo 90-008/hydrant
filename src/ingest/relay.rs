@@ -18,6 +18,8 @@ use tracing::{debug, error, info, info_span, trace, warn};
 use url::Url;
 
 use crate::db::keys::pds_account_count_key;
+#[cfg(all(feature = "relay", feature = "jetstream"))]
+use crate::db::types::TrimmedDid;
 use crate::db::{self, CountDeltas, keys};
 use crate::ingest::stream::AccountStatus;
 #[cfg(feature = "relay")]
@@ -31,6 +33,8 @@ use crate::ingest::{BufferRx, BufferTx, IngestMessage};
 use crate::state::AppState;
 #[cfg(feature = "relay")]
 use crate::types::RelayBroadcast;
+#[cfg(all(feature = "relay", feature = "jetstream"))]
+use crate::types::{JetstreamBroadcast, StoredJetstreamEvent};
 use crate::types::{RepoState, RepoStatus};
 use crate::util;
 use smol_str::{SmolStr, ToSmolStr};
@@ -43,6 +47,8 @@ struct WorkerContext<'a> {
     count_deltas: CountDeltas,
     #[cfg(feature = "relay")]
     pending_broadcasts: Vec<RelayBroadcast>,
+    #[cfg(all(feature = "relay", feature = "jetstream"))]
+    pending_jetstream_events: Vec<crate::types::StoredJetstreamEvent<'static>>,
     #[cfg(feature = "indexer")]
     pending_hook_messages: Vec<crate::ingest::indexer::IndexerMessage>,
     #[cfg(feature = "indexer")]
@@ -162,6 +168,8 @@ impl RelayWorker {
             count_deltas: CountDeltas::default(),
             #[cfg(feature = "relay")]
             pending_broadcasts: Vec::with_capacity(2),
+            #[cfg(all(feature = "relay", feature = "jetstream"))]
+            pending_jetstream_events: Vec::with_capacity(2),
             #[cfg(feature = "indexer")]
             pending_hook_messages: Vec::with_capacity(2),
             #[cfg(feature = "indexer")]
@@ -210,7 +218,29 @@ impl RelayWorker {
                 .state
                 .db
                 .stage_count_deltas(&mut batch, &ctx.count_deltas);
+
+            #[cfg(all(feature = "relay", feature = "jetstream"))]
+            let mut jetstream_broadcasts = Vec::new();
+
+            #[cfg(all(feature = "relay", feature = "jetstream"))]
+            let res = {
+                let _lock = ctx.state.db.jetstream_lock.lock();
+                let mut stage_res = Ok(());
+                for event in ctx.pending_jetstream_events.drain(..) {
+                    match crate::jetstream::stage_event(&mut batch, &ctx.state.db, event) {
+                        Ok(broadcast) => jetstream_broadcasts.push(broadcast),
+                        Err(e) => {
+                            stage_res = Err(e);
+                            break;
+                        }
+                    }
+                }
+                stage_res.and_then(|_| batch.commit().into_diagnostic())
+            };
+
+            #[cfg(not(all(feature = "relay", feature = "jetstream")))]
             let res = batch.commit();
+
             if let Err(e) = res {
                 error!(shard = id, err = %e, "relay shard: failed to commit batch");
                 drop(reservation);
@@ -222,6 +252,10 @@ impl RelayWorker {
             #[cfg(feature = "relay")]
             for broadcast in ctx.pending_broadcasts.drain(..) {
                 let _ = state.db.relay_broadcast_tx.send(broadcast);
+            }
+            #[cfg(all(feature = "relay", feature = "jetstream"))]
+            for broadcast in jetstream_broadcasts {
+                let _ = state.db.jetstream_tx.send(broadcast);
             }
             #[cfg(feature = "indexer")]
             for msg in ctx.pending_hook_messages.drain(..) {
@@ -330,10 +364,35 @@ impl RelayWorker {
         }
         #[cfg(feature = "relay")]
         {
-            ctx.queue_emit(|seq| {
+            #[cfg(feature = "jetstream")]
+            let jetstream_ops = commit
+                .ops
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, op)| {
+                    matches!(op.action.as_str(), "create" | "update" | "delete")
+                        .then(|| split_collection(&op.path).map(|col| (idx as u32, col)))
+                        .flatten()
+                })
+                .collect::<Vec<_>>();
+            #[cfg(feature = "jetstream")]
+            let jetstream_did = TrimmedDid::from(&commit.repo).into_static();
+
+            let relay_seq = ctx.queue_emit(|seq| {
                 commit.seq = seq;
                 encode_frame("#commit", &commit)
             })?;
+            #[cfg(feature = "jetstream")]
+            for (op_index, collection) in jetstream_ops {
+                // todo: build live jetstream frames from this decoded commit and use stored frames only for replay.
+                ctx.pending_jetstream_events
+                    .push(StoredJetstreamEvent::RelayCommit {
+                        did: jetstream_did.clone(),
+                        collection,
+                        relay_seq,
+                        op_index,
+                    });
+            }
         }
 
         repo_state.root = Some(commit_obj.into());
@@ -466,10 +525,16 @@ impl RelayWorker {
         }
         #[cfg(feature = "relay")]
         {
-            ctx.queue_emit(|seq| {
+            let relay_seq = ctx.queue_emit(|seq| {
                 identity.seq = seq;
                 encode_frame("#identity", &identity)
             })?;
+            #[cfg(feature = "jetstream")]
+            ctx.pending_jetstream_events
+                .push(StoredJetstreamEvent::RelayIdentity {
+                    did: TrimmedDid::from(&identity.did).into_static(),
+                    relay_seq,
+                });
         }
 
         ctx.batch.insert(
@@ -484,7 +549,7 @@ impl RelayWorker {
     fn handle_account(
         ctx: &mut WorkerContext,
         repo_state: &mut RepoState,
-        firehose: &Url,
+        #[allow(unused_variables)] firehose: &Url,
         #[allow(unused_mut)] mut account: Account<'static>,
         _is_pds: bool,
     ) -> Result<()> {
@@ -558,10 +623,16 @@ impl RelayWorker {
         }
         #[cfg(feature = "relay")]
         {
-            ctx.queue_emit(|seq| {
+            let relay_seq = ctx.queue_emit(|seq| {
                 account.seq = seq;
                 encode_frame("#account", &account)
             })?;
+            #[cfg(feature = "jetstream")]
+            ctx.pending_jetstream_events
+                .push(StoredJetstreamEvent::RelayAccount {
+                    did: TrimmedDid::from(&account.did).into_static(),
+                    relay_seq,
+                });
         }
 
         repo_state.touch();
@@ -931,7 +1002,7 @@ impl WorkerContext<'_> {
     }
 
     #[cfg(feature = "relay")]
-    fn queue_emit(&mut self, make_frame: impl FnOnce(i64) -> Result<bytes::Bytes>) -> Result<()> {
+    fn queue_emit(&mut self, make_frame: impl FnOnce(i64) -> Result<bytes::Bytes>) -> Result<u64> {
         let db = &self.state.db;
         let seq = db.next_relay_seq.fetch_add(1, Ordering::SeqCst);
         let frame = make_frame(seq as i64)?;
@@ -940,8 +1011,14 @@ impl WorkerContext<'_> {
         self.pending_broadcasts
             .push(RelayBroadcast::Ephemeral(seq, frame));
         self.pending_broadcasts.push(RelayBroadcast::Persisted(seq));
-        Ok(())
+        Ok(seq)
     }
+}
+
+#[cfg(all(feature = "relay", feature = "jetstream"))]
+fn split_collection(path: &str) -> Option<CowStr<'static>> {
+    path.split_once('/')
+        .map(|(collection, _)| CowStr::Owned(collection.to_smolstr()))
 }
 
 /// outcome of a host authority check.

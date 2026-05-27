@@ -18,6 +18,10 @@ pub use indexer::*;
 mod relay;
 #[cfg(feature = "relay")]
 pub use relay::*;
+#[cfg(feature = "jetstream")]
+mod jetstream;
+#[cfg(feature = "jetstream")]
+pub use jetstream::*;
 
 pub use filter::{FilterControl, FilterPatch, FilterSnapshot};
 pub use firehose::{FirehoseHandle, FirehoseSourceInfo};
@@ -790,6 +794,11 @@ impl Hydrant {
             "relay_events",
             state.db.relay_events.approximate_len() as u64,
         );
+        #[cfg(feature = "jetstream")]
+        counts.insert(
+            "jetstream_events",
+            state.db.jetstream_events.approximate_len() as u64,
+        );
 
         let sizes = tokio::task::spawn_blocking(move || {
             let mut s = BTreeMap::new();
@@ -812,6 +821,8 @@ impl Hydrant {
 
             #[cfg(feature = "relay")]
             s.insert("relay_events", state.db.relay_events.disk_space());
+            #[cfg(feature = "jetstream")]
+            s.insert("jetstream_events", state.db.jetstream_events.disk_space());
 
             #[cfg(feature = "backlinks")]
             s.insert("backlinks", state.db.backlinks.disk_space());

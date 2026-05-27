@@ -13,6 +13,11 @@ use fjall::OwnedWriteBatch;
 use jacquard_common::IntoStatic;
 use jacquard_common::types::did::Did;
 
+#[cfg(feature = "jetstream")]
+use crate::{
+    db::types::TrimmedDid,
+    types::{JetstreamBroadcast, StoredJetstreamEvent},
+};
 use jacquard_repo::error::CommitError;
 use miette::{Diagnostic, IntoDiagnostic, Result};
 use std::sync::Arc;
@@ -169,6 +174,8 @@ struct WorkerContext<'a> {
     count_deltas: &'a mut CountDeltas,
     #[cfg(feature = "indexer_stream")]
     broadcast_events: &'a mut Vec<BroadcastEvent>,
+    #[cfg(feature = "jetstream")]
+    jetstream_events: &'a mut Vec<JetstreamBroadcast>,
 }
 
 impl FirehoseWorker {
@@ -213,11 +220,15 @@ impl FirehoseWorker {
 
         #[cfg(feature = "indexer_stream")]
         let mut broadcast_events = Vec::new();
+        #[cfg(feature = "jetstream")]
+        let mut jetstream_events = Vec::new();
 
         while let Some(msg) = rx.blocking_recv() {
             let batch = state.db.inner.batch();
             #[cfg(feature = "indexer_stream")]
             broadcast_events.clear();
+            #[cfg(feature = "jetstream")]
+            jetstream_events.clear();
 
             let mut added_blocks = 0;
             let mut records_delta = 0;
@@ -231,6 +242,8 @@ impl FirehoseWorker {
                 count_deltas: &mut count_deltas,
                 #[cfg(feature = "indexer_stream")]
                 broadcast_events: &mut broadcast_events,
+                #[cfg(feature = "jetstream")]
+                jetstream_events: &mut jetstream_events,
             };
 
             match msg {
@@ -424,6 +437,10 @@ impl FirehoseWorker {
             for evt in broadcast_events.drain(..) {
                 let _ = state.db.event_tx.send(evt);
             }
+            #[cfg(feature = "jetstream")]
+            for evt in jetstream_events.drain(..) {
+                let _ = state.db.jetstream_tx.send(evt);
+            }
 
             // state.db.inner.persist(fjall::PersistMode::Buffer).ok();
         }
@@ -515,6 +532,8 @@ impl FirehoseWorker {
                     .push(BroadcastEvent::Persisted(last_id));
             }
         }
+        #[cfg(feature = "jetstream")]
+        ctx.jetstream_events.extend(res.jetstream_events);
 
         Ok(RepoProcessResult::Ok(repo_state))
     }
@@ -530,6 +549,18 @@ impl FirehoseWorker {
         {
             let db = &ctx.state.db;
             let did = &identity.did;
+            #[cfg(feature = "jetstream")]
+            ctx.jetstream_events.push(crate::jetstream::stage_event(
+                &mut ctx.batch,
+                db,
+                StoredJetstreamEvent::Identity {
+                    did: TrimmedDid::from(did).into_static(),
+                    handle: identity.handle.clone().map(IntoStatic::into_static),
+                    seq: identity.seq,
+                    time: identity.time.clone(),
+                },
+            )?);
+
             if changed {
                 let evt = IdentityEvt {
                     did: did.clone().into_static(),
@@ -558,6 +589,18 @@ impl FirehoseWorker {
             active: account.active,
             status: account.status.as_ref().map(|s| s.to_cowstr().into_static()),
         };
+        #[cfg(feature = "jetstream")]
+        ctx.jetstream_events.push(crate::jetstream::stage_event(
+            &mut ctx.batch,
+            db,
+            StoredJetstreamEvent::Account {
+                did: TrimmedDid::from(did).into_static(),
+                active: account.active,
+                status: account.status.as_ref().map(|s| s.to_cowstr().into_static()),
+                seq: account.seq,
+                time: account.time.clone(),
+            },
+        )?);
 
         if is_inactive {
             use crate::ingest::stream::AccountStatus;

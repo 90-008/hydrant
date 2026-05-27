@@ -10,6 +10,7 @@ title: build features
 | `indexer_stream` | yes | enables the event stream for the indexer. requires indexer feature. |
 | `relay` | no | makes hydrant act as a relay. incompatible with the indexer feature. |
 | `backlinks` | no | enables the backlinks indexer and XRPC endpoints (`blue.microcosm.links.*`). requires indexer feature. |
+| `jetstream` | no | enables the jetstream-compatible `GET /subscribe` websocket stream for indexer, ephemeral indexer, and relay builds. requires `indexer_stream` or `relay`. hydrant stores live-event metadata only; replay is bounded by normal event ttl in ephemeral/relay mode. |
 
 to build with a specific feature:
 

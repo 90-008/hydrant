@@ -14,6 +14,8 @@ mod debug;
 mod filter;
 mod firehose;
 mod ingestion;
+#[cfg(feature = "jetstream")]
+mod jetstream;
 mod pds;
 mod repos;
 mod stats;
@@ -45,6 +47,8 @@ pub async fn serve(hydrant: Hydrant, binds: ApiBinds) -> miette::Result<()> {
         .route("/stats", get(stats::get_stats));
     #[cfg(feature = "indexer_stream")]
     let app = app.nest("/stream", stream::router());
+    #[cfg(feature = "jetstream")]
+    let app = app.route("/subscribe", get(jetstream::handle_subscribe));
     let app = app
         .merge(xrpc::router(blocks_available))
         .merge(filter::router())

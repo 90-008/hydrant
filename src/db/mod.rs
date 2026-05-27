@@ -4,6 +4,8 @@ use crate::types::{RepoMetadata, RepoState};
 
 #[cfg(feature = "indexer_stream")]
 use crate::types::BroadcastEvent;
+#[cfg(feature = "jetstream")]
+use crate::types::JetstreamBroadcast;
 #[cfg(feature = "relay")]
 use crate::types::RelayBroadcast;
 
@@ -18,6 +20,8 @@ use smol_str::SmolStr;
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
+#[cfg(feature = "jetstream")]
+use std::sync::atomic::AtomicI64;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use url::Url;
@@ -60,12 +64,22 @@ pub struct Db {
     pub resync_buffer: Keyspace,
     #[cfg(feature = "indexer_stream")]
     pub events: Keyspace,
+    #[cfg(feature = "jetstream")]
+    pub(crate) jetstream_events: Keyspace,
     #[cfg(feature = "backlinks")]
     pub backlinks: Keyspace,
     #[cfg(feature = "indexer_stream")]
     pub(crate) event_tx: broadcast::Sender<BroadcastEvent>,
     #[cfg(feature = "indexer_stream")]
     pub next_event_id: Arc<AtomicU64>,
+    #[cfg(feature = "jetstream")]
+    pub(crate) jetstream_tx: broadcast::Sender<JetstreamBroadcast>,
+    #[cfg(feature = "jetstream")]
+    pub(crate) next_jetstream_id: Arc<AtomicU64>,
+    #[cfg(feature = "jetstream")]
+    pub(crate) last_jetstream_time_us: Arc<AtomicI64>,
+    #[cfg(feature = "jetstream")]
+    pub(crate) jetstream_lock: Arc<parking_lot::Mutex<()>>,
     #[cfg(feature = "relay")]
     pub(crate) relay_events: Keyspace,
     #[cfg(feature = "relay")]
@@ -246,16 +260,15 @@ impl Db {
             }
             None
         };
-        let dicts = ["repos", "blocks", "events", "backlinks"].into_iter().fold(
-            std::collections::HashMap::new(),
-            |mut acc, name| {
+        let dicts = ["repos", "blocks", "events", "jetstream_events", "backlinks"]
+            .into_iter()
+            .fold(std::collections::HashMap::new(), |mut acc, name| {
                 let Some(dict) = load_dict(name) else {
                     return acc;
                 };
                 acc.insert(name, dict);
                 acc
-            },
-        );
+            });
         let get_compression = |name: &str, level: i32| match cfg.data_compression {
             Compression::Lz4 => CompressionType::Lz4,
             Compression::Zstd => dicts
@@ -433,6 +446,22 @@ impl Db {
                 // ids are int, we can prefix truncate a lot
                 .data_block_restart_interval_policy(RestartIntervalPolicy::new([64, 128])),
         )?;
+
+        #[cfg(feature = "jetstream")]
+        let jetstream_events = open_ks(
+            "jetstream_events",
+            opts()
+                // time-ordered append-only stream metadata, only iterated for replay.
+                .expect_point_read_hits(true)
+                .max_memtable_size(mb(cfg.db_events_memtable_size_mb))
+                .data_block_size_policy(BlockSizePolicy::new([kb(16), kb(64), kb(128)]))
+                .data_block_compression_policy(CompressionPolicy::new([
+                    CompressionType::None,
+                    get_compression("jetstream_events", 3),
+                    get_compression("jetstream_events", 5),
+                ]))
+                .data_block_restart_interval_policy(RestartIntervalPolicy::new([64, 128])),
+        )?;
         let counts = open_ks(
             "counts",
             opts()
@@ -512,6 +541,9 @@ impl Db {
         #[cfg(feature = "relay")]
         let (relay_broadcast_tx, _) = broadcast::channel(10000);
 
+        #[cfg(feature = "jetstream")]
+        let (jetstream_tx, _) = broadcast::channel(10000);
+
         let this = Self {
             inner: db,
             path: cfg.database_path.clone(),
@@ -530,6 +562,8 @@ impl Db {
             resync_buffer,
             #[cfg(feature = "indexer_stream")]
             events,
+            #[cfg(feature = "jetstream")]
+            jetstream_events,
             counts,
             filter,
             crawler,
@@ -540,6 +574,14 @@ impl Db {
             counts_map: HashMap::new(),
             #[cfg(feature = "indexer_stream")]
             next_event_id: Arc::new(AtomicU64::new(0)),
+            #[cfg(feature = "jetstream")]
+            jetstream_tx,
+            #[cfg(feature = "jetstream")]
+            next_jetstream_id: Arc::new(AtomicU64::new(0)),
+            #[cfg(feature = "jetstream")]
+            last_jetstream_time_us: Arc::new(AtomicI64::new(0)),
+            #[cfg(feature = "jetstream")]
+            jetstream_lock: Arc::new(parking_lot::Mutex::new(())),
             #[cfg(feature = "relay")]
             relay_events,
             #[cfg(feature = "relay")]
@@ -587,6 +629,22 @@ impl Db {
                 .store(last_id + 1, std::sync::atomic::Ordering::Relaxed);
         }
 
+        #[cfg(feature = "jetstream")]
+        {
+            let mut last_id = 0;
+            let mut last_time_us = 0;
+            if let Some(guard) = this.jetstream_events.iter().next_back() {
+                let k = guard.key().into_diagnostic()?;
+                let (time_us, id) = keys::parse_jetstream_event_key(&k)?;
+                last_id = id;
+                last_time_us = time_us;
+            }
+            this.next_jetstream_id
+                .store(last_id + 1, std::sync::atomic::Ordering::Relaxed);
+            this.last_jetstream_time_us
+                .store(last_time_us as i64, std::sync::atomic::Ordering::Relaxed);
+        }
+
         // load counts into memory
         for guard in this.counts.prefix(keys::COUNT_KS_PREFIX) {
             let (k, v) = guard.into_inner().into_diagnostic()?;
@@ -628,6 +686,8 @@ impl Db {
             "blocks" => &self.blocks,
             #[cfg(feature = "indexer_stream")]
             "events" => &self.events,
+            #[cfg(feature = "jetstream")]
+            "jetstream_events" => &self.jetstream_events,
             "repos" => &self.repos,
             #[cfg(feature = "backlinks")]
             "backlinks" => &self.backlinks,
@@ -637,6 +697,7 @@ impl Db {
         let dict_size = match ks_name {
             "blocks" => kb(128),
             "events" => kb(64),
+            "jetstream_events" => kb(64),
             "repos" => kb(64),
             "backlinks" => kb(64),
             _ => kb(32),
@@ -747,6 +808,9 @@ impl Db {
         }
         #[cfg(feature = "indexer_stream")]
         tasks.push(compact(self.events.clone()));
+
+        #[cfg(feature = "jetstream")]
+        tasks.push(compact(self.jetstream_events.clone()));
 
         #[cfg(feature = "relay")]
         tasks.push(compact(self.relay_events.clone()));

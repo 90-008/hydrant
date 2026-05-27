@@ -26,6 +26,9 @@ use {
     std::sync::atomic::Ordering,
 };
 
+#[cfg(feature = "jetstream")]
+use crate::types::{JetstreamBroadcast, StoredJetstreamEvent};
+
 pub fn persist_to_resync_buffer(db: &Db, did: &Did, commit: &Commit) -> Result<()> {
     let key = keys::resync_buffer_key(did, DbTid::from(&commit.rev));
     let value = rmp_serde::to_vec_named(commit).into_diagnostic()?;
@@ -212,6 +215,8 @@ pub struct ApplyCommitResults<'s> {
     pub live_events: Vec<LiveRecordEvent>,
     #[cfg(feature = "indexer_stream")]
     pub last_event_id: Option<u64>,
+    #[cfg(feature = "jetstream")]
+    pub jetstream_events: Vec<JetstreamBroadcast>,
 }
 
 pub fn apply_commit<'s>(
@@ -245,6 +250,8 @@ pub fn apply_commit<'s>(
     let mut live_events = Vec::new();
     #[cfg(feature = "indexer_stream")]
     let mut last_event_id = None;
+    #[cfg(feature = "jetstream")]
+    let mut jetstream_events = Vec::new();
 
     for op in &commit.ops {
         let (collection, rkey) = parse_path(&op.path)?;
@@ -371,6 +378,16 @@ pub fn apply_commit<'s>(
             let bytes = rmp_serde::to_vec(&evt).into_diagnostic()?;
             batch.insert(&db.events, keys::event_key(event_id), bytes);
 
+            #[cfg(feature = "jetstream")]
+            {
+                let jetstream = StoredJetstreamEvent::Commit {
+                    did: did_trimmed.clone().into_static(),
+                    collection: collection.clone().into_static(),
+                    event_id,
+                };
+                jetstream_events.push(crate::jetstream::stage_event(batch, db, jetstream)?);
+            }
+
             if should_broadcast_live {
                 live_events.push(LiveRecordEvent {
                     id: event_id,
@@ -404,6 +421,8 @@ pub fn apply_commit<'s>(
         live_events,
         #[cfg(feature = "indexer_stream")]
         last_event_id,
+        #[cfg(feature = "jetstream")]
+        jetstream_events,
     })
 }
 

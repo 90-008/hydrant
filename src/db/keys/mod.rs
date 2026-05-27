@@ -56,6 +56,32 @@ pub fn event_key(seq: u64) -> [u8; 8] {
     seq.to_be_bytes()
 }
 
+#[cfg(feature = "jetstream")]
+pub fn jetstream_event_key(time_us: u64, id: u64) -> [u8; 16] {
+    let mut key = [0u8; 16];
+    key[..8].copy_from_slice(&time_us.to_be_bytes());
+    key[8..].copy_from_slice(&id.to_be_bytes());
+    key
+}
+
+#[cfg(feature = "jetstream")]
+pub fn parse_jetstream_event_key(key: &[u8]) -> miette::Result<(u64, u64)> {
+    if key.len() != 16 {
+        miette::bail!("jetstream event key is not 16 bytes");
+    }
+    let time_us = u64::from_be_bytes(
+        key[..8]
+            .try_into()
+            .map_err(|e| miette::miette!("invalid jetstream time bytes: {e}"))?,
+    );
+    let id = u64::from_be_bytes(
+        key[8..]
+            .try_into()
+            .map_err(|e| miette::miette!("invalid jetstream id bytes: {e}"))?,
+    );
+    Ok((time_us, id))
+}
+
 pub const COUNT_KS_PREFIX: &[u8] = &[b'k', SEP];
 
 // count keys for the counts keyspace

@@ -17,6 +17,10 @@ pub fn ephemeral_ttl_worker(state: Arc<crate::state::AppState>) {
         if let Err(e) = ephemeral_ttl_tick(&state.db, &state.ephemeral_ttl) {
             error!(err = %e, "ephemeral TTL tick failed");
         }
+        #[cfg(feature = "jetstream")]
+        if let Err(e) = jetstream_events_ttl_tick(&state.db, &state.ephemeral_ttl) {
+            error!(err = %e, "jetstream TTL tick failed");
+        }
     }
 }
 
@@ -27,6 +31,10 @@ pub fn relay_events_ttl_worker(state: Arc<crate::state::AppState>) {
         std::thread::sleep(Duration::from_secs(60));
         if let Err(e) = relay_events_ttl_tick(&state.db, &state.ephemeral_ttl) {
             error!(err = %e, "relay events TTL tick failed");
+        }
+        #[cfg(feature = "jetstream")]
+        if let Err(e) = jetstream_events_ttl_tick(&state.db, &state.ephemeral_ttl) {
+            error!(err = %e, "jetstream TTL tick failed");
         }
     }
 }
@@ -55,6 +63,40 @@ pub fn relay_events_ttl_tick(db: &Db, ttl: &Duration) -> miette::Result<()> {
         &db.relay_events,
         current_seq,
     )
+}
+
+#[cfg(feature = "jetstream")]
+pub fn jetstream_events_ttl_tick(db: &Db, ttl: &Duration) -> miette::Result<()> {
+    let now = chrono::Utc::now().timestamp() as u64;
+    let cutoff_ts = now.saturating_sub(ttl.as_secs());
+    let cutoff_us = cutoff_ts.saturating_mul(1_000_000);
+
+    db.jetstream_events
+        .rotate_memtable_and_wait()
+        .into_diagnostic()
+        .wrap_err("failed to rotate memtable before Jetstream TTL range drop")?;
+
+    let before_space = db.jetstream_events.disk_space();
+    let before_tables = db.jetstream_events.table_count();
+    db.jetstream_events
+        .drop_range(..keys::jetstream_event_key(cutoff_us, 0))
+        .into_diagnostic()
+        .wrap_err("failed Jetstream TTL range drop for old events")?;
+    let after_space = db.jetstream_events.disk_space();
+    let after_tables = db.jetstream_events.table_count();
+
+    info!(
+        cutoff_us,
+        reclaimed_bytes = before_space.saturating_sub(after_space),
+        dropped_tables = before_tables.saturating_sub(after_tables),
+        before_space,
+        after_space,
+        before_tables,
+        after_tables,
+        "dropped old Jetstream events for TTL"
+    );
+
+    Ok(())
 }
 
 #[cfg(any(feature = "indexer_stream", feature = "relay"))]
