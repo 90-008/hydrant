@@ -40,7 +40,7 @@ impl Hydrant {
     /// slow consumers receive [`RelayStreamError::ConsumerTooSlow`] before the stream terminates
     /// when possible.
     pub fn subscribe_repos(&self, cursor: Option<u64>) -> RelayEventStream {
-        let (tx, rx) = mpsc::channel(500);
+        let (tx, rx) = mpsc::channel(stream::STREAM_CHANNEL_CAPACITY);
         let state = self.state.clone();
         let runtime = tokio::runtime::Handle::current();
         let opts = stream::StreamOptions::from_config(&self.config);

@@ -78,7 +78,7 @@ impl Hydrant {
     /// the stream ends when the `EventStream` is dropped. slow consumers receive
     /// [`StreamError::ConsumerTooSlow`] before the stream terminates when possible.
     pub fn subscribe(&self, cursor: Option<u64>) -> EventStream {
-        let (tx, rx) = mpsc::channel(500);
+        let (tx, rx) = mpsc::channel(stream::STREAM_CHANNEL_CAPACITY);
         let state = self.state.clone();
         let runtime = tokio::runtime::Handle::current();
         let opts = stream::StreamOptions::from_config(&self.config);
@@ -96,5 +96,46 @@ impl Hydrant {
 
     pub(crate) fn stream_send_timeout(&self) -> std::time::Duration {
         self.config.stream_send_timeout
+    }
+
+    #[cfg(feature = "indexer_stream")]
+    #[doc(hidden)]
+    pub fn seed_events_for_bench(&self, count: usize) -> usize {
+        use crate::db::keys;
+        use crate::db::types::{DbAction, DbRkey, DbTid, TrimmedDid};
+        use crate::types::{StoredData, StoredEvent};
+        use jacquard_common::types::did::Did;
+        use jacquard_common::{CowStr, IntoStatic};
+        use std::sync::atomic::Ordering;
+
+        let db = &self.state.db;
+        let mut batch = db.inner.batch();
+        let mut total_bytes = 0usize;
+
+        let did_str = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let did = Did::new(did_str).expect("valid plc did");
+        let trimmed = TrimmedDid::from(&did).into_static();
+        let rev = DbTid::new_from_bytes([0u8; 8]);
+        let collection = CowStr::Borrowed("app.bsky.feed.post").into_static();
+
+        for i in 0..count {
+            let event_id = db.next_event_id.fetch_add(1, Ordering::SeqCst);
+            let rkey = DbRkey::Str(smol_str::format_smolstr!("r{i}"));
+            let evt = StoredEvent {
+                live: false,
+                did: trimmed.clone(),
+                rev,
+                collection: collection.clone(),
+                rkey,
+                action: DbAction::Create,
+                data: StoredData::Nothing,
+            };
+            let bytes = rmp_serde::to_vec(&evt).expect("msgpack serialization cannot fail");
+            total_bytes += bytes.len();
+            batch.insert(&db.events, keys::event_key(event_id), bytes);
+        }
+
+        batch.commit().expect("failed to commit events batch");
+        total_bytes
     }
 }

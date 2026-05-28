@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
 use std::fmt;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -38,13 +39,17 @@ use {
 #[cfg(all(feature = "relay", feature = "jetstream"))]
 use crate::ingest::stream::{SubscribeReposMessage, decode_frame};
 
-#[cfg(any(feature = "indexer_stream", feature = "relay"))]
+#[cfg(any(feature = "indexer_stream", feature = "relay", feature = "jetstream"))]
 const STREAM_SEND_RETRY_PAUSE: Duration = Duration::from_millis(10);
+
+pub(super) const STREAM_CHANNEL_CAPACITY: usize = 500;
 
 #[cfg(any(feature = "indexer_stream", feature = "relay"))]
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct StreamOptions {
-    replay_chunk_size: usize,
+    /// `None` = auto: use roughly half the output channel capacity, capped by
+    /// current available capacity. `Some(n)` = manual override.
+    replay_chunk_size: Option<NonZeroUsize>,
     replay_chunk_pause: Duration,
     pending_event_limit: usize,
     send_timeout: Duration,
@@ -54,7 +59,8 @@ pub(crate) struct StreamOptions {
 impl StreamOptions {
     pub(crate) fn from_config(config: &Config) -> Self {
         Self {
-            replay_chunk_size: config.stream_replay_chunk_size.max(1),
+            // 0 means auto; NonZeroUsize::new returns None for 0.
+            replay_chunk_size: NonZeroUsize::new(config.stream_replay_chunk_size),
             replay_chunk_pause: config.stream_replay_chunk_pause,
             pending_event_limit: config.stream_pending_event_limit.max(1),
             send_timeout: config.stream_send_timeout,
@@ -246,6 +252,7 @@ fn run_ordered_stream<B, O, E>(
 {
     let mut replay_gap_target = None;
     let mut pending = PendingLiveEvents::new(opts.pending_event_limit);
+    let mut replay_blocked_since: Option<Instant> = None;
 
     loop {
         if let Err(err) = drain_pending_broadcasts(&mut event_rx, &mut pending) {
@@ -275,7 +282,27 @@ fn run_ordered_stream<B, O, E>(
                 .and_then(|seq| seq.checked_sub(1))
                 .map(|before_pending| before_pending.min(target))
                 .unwrap_or(target);
-            let chunk = read_replay_chunk(current_seq, effective_target, opts.replay_chunk_size);
+
+            // skip the DB read entirely when the output channel is saturated.
+            // this mirrors the send_timeout semantics already enforced inside
+            // send_stream_event: a continuously-full channel will eventually
+            // trigger StreamTooSlow::send_timeout and close the stream.
+            let Some(chunk_size) = replay_chunk_size_for(&tx, opts.replay_chunk_size) else {
+                if let Err(err) = drain_pending_broadcasts(&mut event_rx, &mut pending) {
+                    send_stream_error(&tx, err.into());
+                    return;
+                }
+                if let Err(err) = note_replay_blocked(&mut replay_blocked_since, opts.send_timeout)
+                {
+                    send_stream_error(&tx, err.into());
+                    return;
+                }
+                std::thread::sleep(STREAM_SEND_RETRY_PAUSE);
+                continue;
+            };
+            clear_replay_blocked(&mut replay_blocked_since);
+
+            let chunk = read_replay_chunk(current_seq, effective_target, chunk_size);
             current_seq = chunk.last_seen_seq.or(current_seq);
 
             for event in chunk.events {
@@ -295,6 +322,7 @@ fn run_ordered_stream<B, O, E>(
                 }
                 replay_gap_target = Some(effective_target);
             } else if !opts.replay_chunk_pause.is_zero() {
+                // emergency compatibility knob; zero by default.
                 std::thread::sleep(opts.replay_chunk_pause);
             }
 
@@ -570,6 +598,59 @@ fn next_expected_seq(current_id: Option<u64>) -> u64 {
     current_id.map(|id| id.saturating_add(1)).unwrap_or(0)
 }
 
+/// Returns the chunk size to use for the next DB replay read, or `None` if the
+/// output channel has no remaining capacity and the read should be skipped.
+///
+/// - In auto mode (`configured = None`): target half of the channel's maximum
+///   capacity so the reader stays roughly half a window ahead.
+/// - In manual mode (`configured = Some(n)`): use `n`, but still cap to the
+///   channel's hard maximum to avoid over-reading.
+///
+/// In both modes the result is further capped to the current *available*
+/// capacity so we never read more events than the channel can immediately absorb.
+#[cfg(any(feature = "indexer_stream", feature = "relay", feature = "jetstream"))]
+fn replay_chunk_size_for<T>(
+    tx: &mpsc::Sender<T>,
+    configured: Option<NonZeroUsize>,
+) -> Option<usize> {
+    let available = tx.capacity();
+
+    if available == 0 {
+        return None;
+    }
+
+    let max_cap = tx.max_capacity().max(1);
+    let desired = configured
+        .map(NonZeroUsize::get)
+        .unwrap_or_else(|| (max_cap / 2).max(1))
+        .min(max_cap);
+
+    Some(desired.min(available).max(1))
+}
+
+/// Records the instant the replay loop first found the channel full. Returns
+/// `Err(StreamTooSlow)` if the channel has been continuously full for longer
+/// than `timeout`.
+#[cfg(any(feature = "indexer_stream", feature = "relay"))]
+fn note_replay_blocked(
+    blocked_since: &mut Option<Instant>,
+    timeout: Duration,
+) -> Result<(), StreamTooSlow> {
+    let started = blocked_since.get_or_insert_with(Instant::now);
+
+    if started.elapsed() >= timeout {
+        return Err(StreamTooSlow::send_timeout(timeout));
+    }
+
+    Ok(())
+}
+
+/// Resets the replay-blocked timer once the channel has capacity again.
+#[cfg(any(feature = "indexer_stream", feature = "relay"))]
+fn clear_replay_blocked(blocked_since: &mut Option<Instant>) {
+    *blocked_since = None;
+}
+
 #[cfg(feature = "relay")]
 pub(super) fn relay_stream_thread(
     state: Arc<AppState>,
@@ -802,7 +883,7 @@ fn send_jetstream_live_event(
                     send_stream_error(tx, StreamTooSlow::send_timeout(opts.send_timeout).into());
                     return Err(());
                 }
-                std::thread::sleep(Duration::from_millis(10));
+                std::thread::sleep(STREAM_SEND_RETRY_PAUSE);
             }
         }
     }
@@ -819,13 +900,25 @@ fn send_jetstream_replay_window(
     opts: StreamOptions,
 ) -> Option<Option<u64>> {
     let mut max_id_seen: Option<u64> = None;
+    let mut replay_blocked_since: Option<Instant> = None;
     loop {
         // drain live events without buffering so the broadcast receiver never
         // lags regardless of how many events arrive during the replay window.
         drain_jetstream_broadcast(event_rx);
 
-        let chunk =
-            read_jetstream_replay_chunk(state, &next_key, target_time_us, opts.replay_chunk_size);
+        // skip the DB read when the output channel is already saturated.
+        let Some(chunk_size) = replay_chunk_size_for(tx, opts.replay_chunk_size) else {
+            drain_jetstream_broadcast(event_rx);
+            if let Err(err) = note_replay_blocked(&mut replay_blocked_since, opts.send_timeout) {
+                send_stream_error(tx, err.into());
+                return None;
+            }
+            std::thread::sleep(STREAM_SEND_RETRY_PAUSE);
+            continue;
+        };
+        clear_replay_blocked(&mut replay_blocked_since);
+
+        let chunk = read_jetstream_replay_chunk(state, &next_key, target_time_us, chunk_size);
         for event in chunk.events {
             let event_id = event.id;
             next_key = keys::jetstream_event_key(event.time_us as u64, event_id.saturating_add(1))
@@ -843,6 +936,7 @@ fn send_jetstream_replay_window(
             return Some(max_id_seen);
         }
         if !opts.replay_chunk_pause.is_zero() {
+            // emergency compatibility knob; zero by default.
             std::thread::sleep(opts.replay_chunk_pause);
         }
     }
@@ -1190,10 +1284,14 @@ mod tests {
         }
     }
 
+    fn chunk_size(n: usize) -> Option<NonZeroUsize> {
+        NonZeroUsize::new(n)
+    }
+
     #[test]
     fn ordered_stream_replays_chunks_then_live_tail() {
         let opts = StreamOptions {
-            replay_chunk_size: 2,
+            replay_chunk_size: chunk_size(2),
             replay_chunk_pause: Duration::ZERO,
             pending_event_limit: 4,
             send_timeout: Duration::from_secs(1),
@@ -1248,8 +1346,11 @@ mod tests {
 
     #[test]
     fn ordered_stream_closes_when_output_queue_is_full() {
+        // channel capacity 1: one event is enqueued by replay_chunk_size_for,
+        // then the channel is full. send_stream_event's retry loop fires
+        // send_timeout immediately (Duration::ZERO) and the stream closes.
         let opts = StreamOptions {
-            replay_chunk_size: 2,
+            replay_chunk_size: chunk_size(2),
             replay_chunk_pause: Duration::ZERO,
             pending_event_limit: 4,
             send_timeout: Duration::ZERO,
@@ -1273,6 +1374,70 @@ mod tests {
                 TestBroadcast::Live(seq) => Some(seq),
             },
         );
+    }
+
+    // --- replay_chunk_size_for unit tests ---
+
+    #[test]
+    fn replay_chunk_auto_uses_half_max_capacity() {
+        let (tx, _rx) = mpsc::channel::<()>(500);
+        assert_eq!(replay_chunk_size_for(&tx, None), Some(250));
+    }
+
+    #[test]
+    fn replay_chunk_manual_is_respected() {
+        let (tx, _rx) = mpsc::channel::<()>(500);
+        assert_eq!(replay_chunk_size_for(&tx, chunk_size(64)), Some(64));
+    }
+
+    #[test]
+    fn replay_chunk_manual_is_capped_to_max_capacity() {
+        let (tx, _rx) = mpsc::channel::<()>(500);
+        // requesting more than the channel can ever hold is silently capped.
+        assert_eq!(replay_chunk_size_for(&tx, chunk_size(1000)), Some(500));
+    }
+
+    #[test]
+    fn replay_chunk_is_capped_to_current_available_capacity() {
+        let (tx, mut rx) = mpsc::channel::<()>(4);
+
+        // fill 3 of 4 slots — only 1 is free.
+        tx.try_send(()).unwrap();
+        tx.try_send(()).unwrap();
+        tx.try_send(()).unwrap();
+
+        // auto mode: half of 4 is 2, but only 1 slot is free.
+        assert_eq!(replay_chunk_size_for(&tx, None), Some(1));
+
+        let _ = rx.try_recv();
+    }
+
+    #[test]
+    fn replay_chunk_none_when_channel_full() {
+        let (tx, _rx) = mpsc::channel::<()>(2);
+
+        tx.try_send(()).unwrap();
+        tx.try_send(()).unwrap();
+
+        assert_eq!(replay_chunk_size_for(&tx, None), None);
+    }
+
+    #[test]
+    fn replay_chunk_manual_none_when_channel_full() {
+        let (tx, _rx) = mpsc::channel::<()>(2);
+
+        tx.try_send(()).unwrap();
+        tx.try_send(()).unwrap();
+
+        // even an explicit size of 1 returns None when the channel is full.
+        assert_eq!(replay_chunk_size_for(&tx, chunk_size(1)), None);
+    }
+
+    #[test]
+    fn replay_chunk_auto_min_one_for_small_channel() {
+        // channel of 1 — half rounds down to 0, should be floored to 1.
+        let (tx, _rx) = mpsc::channel::<()>(1);
+        assert_eq!(replay_chunk_size_for(&tx, None), Some(1));
     }
 }
 

@@ -71,6 +71,11 @@ ahash = "0.8.12"
 [dev-dependencies]
 tempfile = "3.26.0"
 
+[[bin]]
+name = "replay_bench"
+path = "src/bin/replay_bench.rs"
+required-features = ["indexer_stream"]
+
 [[example]]
 name = "statusphere"
 required-features = ["indexer_stream"]

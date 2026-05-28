@@ -139,7 +139,7 @@ impl Hydrant {
         cursor: Option<i64>,
         filter: JetstreamFilter,
     ) -> JetstreamEventStream {
-        let (tx, rx) = mpsc::channel(500);
+        let (tx, rx) = mpsc::channel(stream::STREAM_CHANNEL_CAPACITY);
         let state = self.state.clone();
         let runtime = tokio::runtime::Handle::current();
         let opts = stream::StreamOptions::from_config(&self.config);

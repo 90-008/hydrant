@@ -457,10 +457,22 @@ pub struct Config {
     /// set via `HYDRANT_DB_RECORDS_MEMTABLE_SIZE_MB`.
     pub db_records_memtable_size_mb: u64,
 
-    /// maximum number of persisted events read from the database per replay batch.
+    /// replay batch size.
+    ///
+    /// `0` (the default) means auto: use about half the subscriber channel capacity
+    /// (`STREAM_CHANNEL_CAPACITY / 2`), capped to the channel's current available
+    /// capacity. this prevents DB reads when the output buffer is already saturated.
+    ///
+    /// set to a non-zero value to fix the batch size manually.
+    ///
     /// set via `HYDRANT_STREAM_REPLAY_CHUNK_SIZE`.
     pub stream_replay_chunk_size: usize,
-    /// pause between replay batches, giving database maintenance work a chance to run.
+    /// optional pause between replay batches.
+    ///
+    /// normally zero. slow consumers are handled by bounded-channel backpressure
+    /// and `HYDRANT_STREAM_SEND_TIMEOUT`. only set this as an emergency knob if
+    /// you need to artificially throttle replay throughput.
+    ///
     /// set via `HYDRANT_STREAM_REPLAY_CHUNK_PAUSE` (humantime duration, e.g. `2ms`).
     pub stream_replay_chunk_pause: Duration,
     /// maximum number of live in-memory stream events buffered per subscriber while it catches up.
@@ -543,8 +555,8 @@ impl Default for Config {
             db_repos_memtable_size_mb: BASE_MEMTABLE_MB / 2,
             db_events_memtable_size_mb: BASE_MEMTABLE_MB,
             db_records_memtable_size_mb: BASE_MEMTABLE_MB / 3 * 2,
-            stream_replay_chunk_size: 64,
-            stream_replay_chunk_pause: Duration::from_millis(2),
+            stream_replay_chunk_size: 0,
+            stream_replay_chunk_pause: Duration::ZERO,
             stream_pending_event_limit: 4096,
             stream_send_timeout: Duration::from_secs(30),
         }
@@ -944,7 +956,12 @@ impl fmt::Display for Config {
             "db records memtable",
             format_args!("{} mb", self.db_records_memtable_size_mb)
         )?;
-        config_line!(f, "stream replay chunk", self.stream_replay_chunk_size)?;
+        let replay_chunk = if self.stream_replay_chunk_size == 0 {
+            "auto".to_owned()
+        } else {
+            self.stream_replay_chunk_size.to_string()
+        };
+        config_line!(f, "stream replay chunk", replay_chunk)?;
         config_line!(
             f,
             "stream replay pause",
