@@ -10,6 +10,8 @@ pub mod types;
 
 /// dependencies hydrant uses in it's public api
 pub mod deps {
+    #[cfg(feature = "user-keyspace")]
+    pub use fjall;
     pub use futures;
     pub use jacquard_common as jacquard;
     pub use rustls;

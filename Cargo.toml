@@ -11,6 +11,7 @@ relay = []
 indexer = []
 indexer_stream = ["indexer"]
 jetstream = ["dep:zstd"]
+user-keyspace = []
 
 [dependencies]
 tokio = { version = "1.0", features = ["full"] }
