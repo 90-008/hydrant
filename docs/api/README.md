@@ -17,6 +17,6 @@ hydrant's REST API is split into public endpoints (safe to expose) and managemen
 - [ingestion](ingestion.md): enable/disable crawler, firehose, backfill at runtime
 - [crawler](crawler.md): crawler source management
 - [firehose](firehose.md): firehose source management
-- [pds](pds.md): rate-limit tier assignments
+- [pds](pds.md): bans and rate-limit tier assignments
 - [repos](repos.md): explicit repository tracking, resyncing, untracking
 - [database](database.md): compression training, compaction

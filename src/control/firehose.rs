@@ -16,7 +16,6 @@ use crate::state::AppState;
 pub(super) struct FirehoseIngestorHandle {
     id: usize,
     cancel: CancellationToken,
-    pub(super) is_pds: bool,
 }
 
 impl Drop for FirehoseIngestorHandle {
@@ -37,6 +36,16 @@ pub struct FirehoseSourceInfo {
     pub url: Url,
     /// true when this is a direct PDS connection; enables host authority enforcement.
     pub is_pds: bool,
+    pub running: bool,
+    pub failing: bool,
+    pub throttled: bool,
+    pub consecutive_failures: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub throttled_until: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_in_secs: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host_status: Option<&'static str>,
 }
 
 /// runtime control over the firehose ingestor component.
@@ -130,11 +139,7 @@ impl FirehoseHandle {
             }
         });
 
-        let handle = FirehoseIngestorHandle {
-            id,
-            cancel,
-            is_pds: source.is_pds,
-        };
+        let handle = FirehoseIngestorHandle { id, cancel };
         self.tasks.upsert_async(source.url.clone(), handle).await;
 
         Ok(())
@@ -164,18 +169,34 @@ impl FirehoseHandle {
         self.tasks.contains_sync(url)
     }
 
-    /// list all currently active firehose sources.
+    /// list all known firehose sources, including offline ones pending retry.
     pub async fn list_sources(&self) -> Vec<FirehoseSourceInfo> {
-        let mut out = Vec::with_capacity(self.tasks.capacity());
-        self.tasks
-            .iter_async(|url, handle| {
+        let now = chrono::Utc::now().timestamp();
+        let meta = self.state.pds_meta.load();
+        let mut out = Vec::with_capacity(self.known_sources.capacity());
+        self.known_sources
+            .iter_async(|url, &is_pds| {
+                let running = self.tasks.contains_sync(url);
+                let throttle = self.state.throttler.snapshot(url);
+                let host_status = is_pds
+                    .then(|| url.host_str().map(|host| meta.status(host).as_str()))
+                    .flatten();
                 out.push(FirehoseSourceInfo {
                     url: url.clone(),
-                    is_pds: handle.is_pds,
+                    is_pds,
+                    running,
+                    failing: throttle.is_failing(),
+                    throttled: throttle.is_throttled(now),
+                    consecutive_failures: throttle.consecutive_failures,
+                    throttled_until: (throttle.throttled_until != 0)
+                        .then_some(throttle.throttled_until),
+                    retry_in_secs: throttle.retry_in_secs(now),
+                    host_status,
                 });
                 true
             })
             .await;
+        out.sort_unstable_by(|a, b| a.url.as_str().cmp(b.url.as_str()));
         out
     }
 

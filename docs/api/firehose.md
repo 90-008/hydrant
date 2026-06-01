@@ -4,9 +4,51 @@ title: firehose management
 
 ## GET /firehose/sources
 
-list all currently active firehose sources. returns a JSON array of `{ "url": string, "persisted": bool, "is_pds": bool }`.
+list all known firehose sources, including offline ones waiting for the retry loop. returns a JSON array of:
 
-`persisted: true` means the source was added via the API and is stored in the database; it will survive a restart. `persisted: false` means the source came from `RELAY_HOSTS` and is not written to the database. `is_pds: true` means the source is a direct PDS connection with host authority enforcement enabled.
+```json
+{
+  "url": "ws://127.0.0.1:9000/",
+  "is_pds": true,
+  "running": false,
+  "failing": true,
+  "throttled": true,
+  "consecutive_failures": 3,
+  "throttled_until": 1717240000,
+  "retry_in_secs": 42,
+  "host_status": "offline"
+}
+```
+
+`is_pds: true` means the source is a direct PDS connection with host authority enforcement enabled. `host_status` is only present for PDS sources.
+
+### query parameters
+
+all filters are exact-match and optional. multiple filters are combined with logical `AND`.
+
+| param | description |
+| :--- | :--- |
+| `host` | exact hostname from the source URL (e.g. `?host=localhost`) |
+| `url` | exact source URL |
+| `is_pds` | filter by direct-PDS vs relay source (`true` / `false`) |
+| `running` | filter by whether the ingestor task is currently running |
+| `failing` | filter by whether hydrant has recorded failures/backoff state for the source |
+| `throttled` | filter by whether the source is currently inside a retry backoff window |
+
+## GET /firehose/source
+
+fetch a single firehose source with the same runtime fields as `GET /firehose/sources`.
+
+### query parameters
+
+provide exactly one of:
+
+| param | description |
+| :--- | :--- |
+| `url` | exact source URL |
+| `host` | exact hostname from the source URL |
+
+returns `404` if no source matches. if `host` matches more than one source, returns `409 Conflict` and asks the caller to query by exact `url`.
 
 ## POST /firehose/sources
 

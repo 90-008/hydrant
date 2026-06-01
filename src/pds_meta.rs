@@ -29,6 +29,16 @@ impl From<HostStatus> for jacquard_api::com_atproto::sync::HostStatus<'static> {
 }
 
 impl HostStatus {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Idle => "idle",
+            Self::Offline => "offline",
+            Self::Throttled => "throttled",
+            Self::Banned => "banned",
+        }
+    }
+
     /// returns the new status to apply if the count dynamically crossed limits.
     pub fn check_limit_transition(
         self,

@@ -24,6 +24,27 @@ pub struct Throttler {
     states: Arc<HashMap<Url, Arc<State>>>,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ThrottleSnapshot {
+    pub consecutive_failures: usize,
+    pub throttled_until: i64,
+}
+
+impl ThrottleSnapshot {
+    pub fn is_failing(self) -> bool {
+        self.consecutive_failures != 0 || self.throttled_until != 0
+    }
+
+    pub fn is_throttled(self, now: i64) -> bool {
+        self.throttled_until != 0 && now < self.throttled_until
+    }
+
+    pub fn retry_in_secs(self, now: i64) -> Option<u64> {
+        self.is_throttled(now)
+            .then_some((self.throttled_until - now) as u64)
+    }
+}
+
 impl Throttler {
     pub fn new() -> Self {
         Self {
@@ -51,6 +72,15 @@ impl Throttler {
                     || v.consecutive_failures.load(Ordering::Acquire) != 0
             })
             .await;
+    }
+
+    pub fn snapshot(&self, url: &Url) -> ThrottleSnapshot {
+        self.states
+            .read_sync(url, |_, state| ThrottleSnapshot {
+                consecutive_failures: state.consecutive_failures.load(Ordering::Acquire),
+                throttled_until: state.throttled_until.load(Ordering::Acquire),
+            })
+            .unwrap_or_default()
     }
 }
 

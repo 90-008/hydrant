@@ -1,6 +1,6 @@
 use axum::{
     Json, Router,
-    extract::State,
+    extract::{Query, State},
     http::StatusCode,
     routing::{delete, get, post},
 };
@@ -11,14 +11,96 @@ use crate::control::{FirehoseSourceInfo, Hydrant};
 
 pub fn router() -> Router<Hydrant> {
     Router::new()
+        .route("/firehose/source", get(get_source))
         .route("/firehose/sources", get(list_sources))
         .route("/firehose/sources", post(add_source))
         .route("/firehose/sources", delete(remove_source))
         .route("/firehose/cursors", delete(reset_cursor))
 }
 
-pub async fn list_sources(State(hydrant): State<Hydrant>) -> Json<Vec<FirehoseSourceInfo>> {
-    Json(hydrant.firehose.list_sources().await)
+#[derive(Debug, Deserialize)]
+pub struct GetSourceQuery {
+    pub url: Option<String>,
+    pub host: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct ListSourcesQuery {
+    pub host: Option<String>,
+    pub url: Option<String>,
+    pub is_pds: Option<bool>,
+    pub running: Option<bool>,
+    pub failing: Option<bool>,
+    pub throttled: Option<bool>,
+}
+
+pub async fn get_source(
+    State(hydrant): State<Hydrant>,
+    Query(query): Query<GetSourceQuery>,
+) -> Result<Json<FirehoseSourceInfo>, (StatusCode, String)> {
+    let sources = hydrant.firehose.list_sources().await;
+    let source = match (query.url.as_deref(), query.host.as_deref()) {
+        (Some(url), None) => sources
+            .into_iter()
+            .find(|source| source.url.as_str() == url)
+            .ok_or_else(|| (StatusCode::NOT_FOUND, "source does not exist".to_string()))?,
+        (None, Some(host)) => {
+            let mut matches = sources
+                .into_iter()
+                .filter(|source| source.url.host_str() == Some(host));
+            let Some(source) = matches.next() else {
+                return Err((StatusCode::NOT_FOUND, "source does not exist".to_string()));
+            };
+            if matches.next().is_some() {
+                return Err((
+                    StatusCode::CONFLICT,
+                    "multiple sources match host; query by url".to_string(),
+                ));
+            }
+            source
+        }
+        (Some(_), Some(_)) => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "query by either url or host, not both".to_string(),
+            ));
+        }
+        (None, None) => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "missing query param: url or host".to_string(),
+            ));
+        }
+    };
+    Ok(Json(source))
+}
+
+pub async fn list_sources(
+    State(hydrant): State<Hydrant>,
+    Query(query): Query<ListSourcesQuery>,
+) -> Json<Vec<FirehoseSourceInfo>> {
+    let mut sources = hydrant.firehose.list_sources().await;
+    sources.retain(|source| {
+        query
+            .host
+            .as_deref()
+            .is_none_or(|host| source.url.host_str() == Some(host))
+            && query
+                .url
+                .as_deref()
+                .is_none_or(|url| source.url.as_str() == url)
+            && query.is_pds.is_none_or(|is_pds| source.is_pds == is_pds)
+            && query
+                .running
+                .is_none_or(|running| source.running == running)
+            && query
+                .failing
+                .is_none_or(|failing| source.failing == failing)
+            && query
+                .throttled
+                .is_none_or(|throttled| source.throttled == throttled)
+    });
+    Json(sources)
 }
 
 #[derive(Deserialize)]
