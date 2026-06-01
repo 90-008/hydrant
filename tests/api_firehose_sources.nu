@@ -101,6 +101,15 @@ def test-firehose-source-filters [url: string, pid: int, mock_port: int] {
         stop-mock-pds $mock_pds
         fail "expected failing source to expose retry_in_secs" $pid
     }
+    let failing_pds = ($failing.pds? | default null)
+    if $failing_pds == null {
+        stop-mock-pds $mock_pds
+        fail "expected failing source to include pds info" $pid
+    }
+    if ($failing_pds.host != $failing_host) or ($failing_pds.status != "offline") {
+        stop-mock-pds $mock_pds
+        fail "expected failing source pds info to reflect localhost offline state" $pid
+    }
 
     print "  GET /firehose/source?host=... resolves the single failing source..."
     let single_by_host = (http get $"($url)/firehose/source?host=($failing_host)")
@@ -108,12 +117,20 @@ def test-firehose-source-filters [url: string, pid: int, mock_port: int] {
         stop-mock-pds $mock_pds
         fail "expected /firehose/source?host=localhost to return the failing source" $pid
     }
+    if (($single_by_host.pds?.host? | default "") != $failing_host) or (($single_by_host.pds?.status? | default "") != "offline") {
+        stop-mock-pds $mock_pds
+        fail "expected /firehose/source?host=localhost to include pds metadata" $pid
+    }
 
     print "  GET /firehose/source?url=... resolves the live source..."
     let single_live = (http get $"($url)/firehose/source?url=($live_url)")
     if ($single_live.url != $live_url) or ($single_live.running != true) or ($single_live.failing != false) {
         stop-mock-pds $mock_pds
         fail "expected /firehose/source?url=... to return the live source" $pid
+    }
+    if (($single_live.pds?.host? | default "") != $live_host) or (($single_live.pds?.status? | default "") != "active") {
+        stop-mock-pds $mock_pds
+        fail "expected /firehose/source?url=... to include active pds metadata" $pid
     }
 
     print "  GET /firehose/source validates query shape..."

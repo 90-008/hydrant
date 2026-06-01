@@ -16,11 +16,17 @@ list all known firehose sources, including offline ones waiting for the retry lo
   "consecutive_failures": 3,
   "throttled_until": 1717240000,
   "retry_in_secs": 42,
-  "host_status": "offline"
+  "host_status": "offline",
+  "pds": {
+    "host": "127.0.0.1",
+    "seq": 0,
+    "account_count": 0,
+    "status": "offline"
+  }
 }
 ```
 
-`is_pds: true` means the source is a direct PDS connection with host authority enforcement enabled. `host_status` is only present for PDS sources.
+`is_pds: true` means the source is a direct PDS connection with host authority enforcement enabled. `host_status` and `pds` are only present for PDS sources.
 
 ### query parameters
 

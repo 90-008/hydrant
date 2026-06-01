@@ -32,6 +32,15 @@ pub(super) struct FirehoseShared {
 
 /// a snapshot of a single firehose relay's runtime state.
 #[derive(Debug, Clone, serde::Serialize)]
+pub struct FirehosePdsInfo {
+    pub host: String,
+    pub seq: i64,
+    pub account_count: u64,
+    pub status: &'static str,
+}
+
+/// a snapshot of a single firehose relay's runtime state.
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct FirehoseSourceInfo {
     pub url: Url,
     /// true when this is a direct PDS connection; enables host authority enforcement.
@@ -46,6 +55,8 @@ pub struct FirehoseSourceInfo {
     pub retry_in_secs: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub host_status: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pds: Option<FirehosePdsInfo>,
 }
 
 /// runtime control over the firehose ingestor component.
@@ -178,9 +189,8 @@ impl FirehoseHandle {
             .iter_async(|url, &is_pds| {
                 let running = self.tasks.contains_sync(url);
                 let throttle = self.state.throttler.snapshot(url);
-                let host_status = is_pds
-                    .then(|| url.host_str().map(|host| meta.status(host).as_str()))
-                    .flatten();
+                let pds = is_pds.then(|| self.pds_info(url, &meta)).flatten();
+                let host_status = pds.as_ref().map(|pds| pds.status);
                 out.push(FirehoseSourceInfo {
                     url: url.clone(),
                     is_pds,
@@ -192,12 +202,41 @@ impl FirehoseHandle {
                         .then_some(throttle.throttled_until),
                     retry_in_secs: throttle.retry_in_secs(now),
                     host_status,
+                    pds,
                 });
                 true
             })
             .await;
         out.sort_unstable_by(|a, b| a.url.as_str().cmp(b.url.as_str()));
         out
+    }
+
+    fn pds_info(&self, url: &Url, meta: &crate::pds_meta::PdsMeta) -> Option<FirehosePdsInfo> {
+        let host = url.host_str()?;
+        let seq = self
+            .state
+            .firehose_cursors
+            .peek_with(url, |_, cursor| cursor.load(Ordering::SeqCst))
+            .or_else(|| {
+                self.state
+                    .db
+                    .cursors
+                    .get(keys::firehose_cursor_key_from_url(url))
+                    .ok()
+                    .flatten()
+                    .and_then(|bytes| bytes.as_ref().try_into().ok().map(i64::from_be_bytes))
+            })
+            .unwrap_or(0);
+        let account_count = self
+            .state
+            .db
+            .get_count_sync(&keys::pds_account_count_key(host));
+        Some(FirehosePdsInfo {
+            host: host.to_string(),
+            seq,
+            account_count,
+            status: meta.status(host).as_str(),
+        })
     }
 
     /// add a new firehose source at runtime, persisting it to the database.
