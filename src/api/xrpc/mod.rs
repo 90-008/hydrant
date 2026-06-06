@@ -55,6 +55,8 @@ mod describe_repo;
 #[cfg(feature = "indexer")]
 mod get_record;
 #[cfg(feature = "indexer")]
+mod get_record_by_uri;
+#[cfg(feature = "indexer")]
 mod get_repo;
 #[cfg(feature = "indexer")]
 mod list_records;
@@ -96,6 +98,14 @@ pub fn router(
     #[cfg(feature = "indexer")]
     let r = if blocks_available {
         r.route(GetRecordRequest::PATH, get(get_record::handle))
+            .route(
+                get_record_by_uri::BlueMicrocosmGetRecordByUri::PATH,
+                get(get_record_by_uri::handle_blue_microcosm),
+            )
+            .route(
+                get_record_by_uri::BadExampleGetUriRecord::PATH,
+                get(get_record_by_uri::handle_bad_example),
+            )
             .route(ListRecordsRequest::PATH, get(list_records::handle))
             .route(GetRepoRequest::PATH, get(get_repo::handle))
     } else {
