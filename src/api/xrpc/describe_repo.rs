@@ -4,7 +4,6 @@ use futures::TryFutureExt;
 use jacquard_common::types::{did::Did, nsid::Nsid, string::Handle};
 use smol_str::SmolStr;
 
-use crate::control::repos::MiniDocError;
 use crate::db::types::DidKey;
 
 use super::*;
@@ -56,22 +55,14 @@ pub async fn handle(
     ExtractXrpc(req): ExtractXrpc<DescribeRepo>,
 ) -> XrpcResult<Json<DescribeRepoOutput<'static>>> {
     let nsid = DescribeRepoResponse::NSID;
+    let doc = super::resolve_mini_doc::resolve_mini_doc(&hydrant, &req.identifier, nsid);
     let did = hydrant
         .state
         .resolver
         .resolve_did(&req.identifier)
         .await
         .map_err(|e| internal_error(nsid, format!("can't resolve identifier: {e}")))?;
-
     let repo = hydrant.repos.get(&did);
-    let doc = repo.mini_doc().map_err(|e| match e {
-        MiniDocError::NotSynced => bad_request(nsid, "repo not synced"),
-        MiniDocError::RepoNotFound => bad_request(nsid, "repo not found"),
-        MiniDocError::CouldNotResolveIdentity => {
-            upstream_error(nsid, "identity could not be resolved")
-        }
-        MiniDocError::Other(e) => internal_error(nsid, e),
-    });
     let collections = repo.collections().map_err(|e| internal_error(nsid, e));
     let (doc, collections) = tokio::try_join!(doc, collections)?;
 

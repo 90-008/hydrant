@@ -58,6 +58,8 @@ mod get_record;
 mod get_repo;
 #[cfg(feature = "indexer")]
 mod list_records;
+#[cfg(feature = "indexer")]
+mod resolve_mini_doc;
 
 #[cfg(feature = "relay")]
 mod request_crawl;
@@ -78,6 +80,14 @@ pub fn router(
     let r = r
         .route(CountRecords::PATH, get(count_records::handle))
         .route(DescribeRepo::PATH, get(describe_repo::handle))
+        .route(
+            resolve_mini_doc::BadExampleResolveMiniDoc::PATH,
+            get(resolve_mini_doc::handle_bad_example),
+        )
+        .route(
+            resolve_mini_doc::BlueMicrocosmResolveMiniDoc::PATH,
+            get(resolve_mini_doc::handle_blue_microcosm),
+        )
         .route(
             AtprotoDescribeRepoRequest::PATH,
             get(com_atproto_describe_repo::handle),
