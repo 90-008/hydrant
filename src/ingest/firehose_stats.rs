@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::Duration;
@@ -9,6 +10,7 @@ use url::Url;
 #[derive(Default)]
 pub struct FirehoseStats {
     sources: scc::HashMap<Url, Arc<FirehoseSourceStats>>,
+    relay_worker: RelayWorkerStats,
 }
 
 impl FirehoseStats {
@@ -23,6 +25,14 @@ impl FirehoseStats {
 
     pub fn snapshot(&self, url: &Url) -> Option<FirehoseStatsSnapshot> {
         self.sources.read_sync(url, |_, stats| stats.snapshot())
+    }
+
+    pub fn relay_shard(&self, id: usize) -> Arc<RelayShardStats> {
+        self.relay_worker.shard(id)
+    }
+
+    pub fn relay_worker_snapshot(&self) -> RelayWorkerStatsSnapshot {
+        self.relay_worker.snapshot()
     }
 }
 
@@ -261,12 +271,187 @@ pub struct FirehoseMessageStats {
     pub info: u64,
 }
 
+#[derive(Default)]
+pub struct RelayWorkerStats {
+    shards: Mutex<BTreeMap<usize, Arc<RelayShardStats>>>,
+}
+
+impl RelayWorkerStats {
+    fn shard(&self, id: usize) -> Arc<RelayShardStats> {
+        let mut shards = self.shards.lock();
+        shards
+            .entry(id)
+            .or_insert_with(|| Arc::new(RelayShardStats::default()))
+            .clone()
+    }
+
+    fn snapshot(&self) -> RelayWorkerStatsSnapshot {
+        let shards = self
+            .shards
+            .lock()
+            .iter()
+            .map(|(&id, stats)| stats.snapshot(id))
+            .collect();
+        RelayWorkerStatsSnapshot { shards }
+    }
+}
+
+#[derive(Default)]
+pub struct RelayShardStats {
+    received_messages: AtomicU64,
+    info_messages: AtomicU64,
+    processed_messages: AtomicU64,
+    process_errors: AtomicU64,
+    commit_errors: AtomicU64,
+    process_message_micros: AtomicU64,
+    stage_counts_micros: AtomicU64,
+    stage_and_commit_micros: AtomicU64,
+    apply_counts_micros: AtomicU64,
+    broadcast_micros: AtomicU64,
+    cursor_micros: AtomicU64,
+    total_micros: AtomicU64,
+    max_process_message_micros: AtomicU64,
+    max_stage_and_commit_micros: AtomicU64,
+    max_total_micros: AtomicU64,
+    last_received_at: AtomicI64,
+    last_processed_at: AtomicI64,
+    last_error_at: AtomicI64,
+    last_seq: AtomicI64,
+    max_seq: AtomicI64,
+}
+
+impl RelayShardStats {
+    pub fn record_received(&self, seq: i64) {
+        self.received_messages.fetch_add(1, Ordering::Relaxed);
+        self.last_received_at.store(now_ts(), Ordering::Relaxed);
+        self.last_seq.store(seq, Ordering::Relaxed);
+        self.max_seq.fetch_max(seq, Ordering::Relaxed);
+    }
+
+    pub fn record_info(&self) {
+        self.info_messages.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_process_error(&self) {
+        self.process_errors.fetch_add(1, Ordering::Relaxed);
+        self.last_error_at.store(now_ts(), Ordering::Relaxed);
+    }
+
+    pub fn record_commit_error(&self) {
+        self.commit_errors.fetch_add(1, Ordering::Relaxed);
+        self.last_error_at.store(now_ts(), Ordering::Relaxed);
+    }
+
+    pub fn record_processed(&self, timings: RelayShardTimings) {
+        self.processed_messages.fetch_add(1, Ordering::Relaxed);
+        self.last_processed_at.store(now_ts(), Ordering::Relaxed);
+        add_duration_with_max(
+            &self.process_message_micros,
+            &self.max_process_message_micros,
+            timings.process_message,
+        );
+        add_duration(&self.stage_counts_micros, timings.stage_counts);
+        add_duration_with_max(
+            &self.stage_and_commit_micros,
+            &self.max_stage_and_commit_micros,
+            timings.stage_and_commit,
+        );
+        add_duration(&self.apply_counts_micros, timings.apply_counts);
+        add_duration(&self.broadcast_micros, timings.broadcast);
+        add_duration(&self.cursor_micros, timings.cursor);
+        add_duration_with_max(&self.total_micros, &self.max_total_micros, timings.total);
+    }
+
+    fn snapshot(&self, id: usize) -> RelayShardStatsSnapshot {
+        RelayShardStatsSnapshot {
+            id,
+            received_messages: self.received_messages.load(Ordering::Relaxed),
+            info_messages: self.info_messages.load(Ordering::Relaxed),
+            processed_messages: self.processed_messages.load(Ordering::Relaxed),
+            process_errors: self.process_errors.load(Ordering::Relaxed),
+            commit_errors: self.commit_errors.load(Ordering::Relaxed),
+            process_message_micros: self.process_message_micros.load(Ordering::Relaxed),
+            stage_counts_micros: self.stage_counts_micros.load(Ordering::Relaxed),
+            stage_and_commit_micros: self.stage_and_commit_micros.load(Ordering::Relaxed),
+            apply_counts_micros: self.apply_counts_micros.load(Ordering::Relaxed),
+            broadcast_micros: self.broadcast_micros.load(Ordering::Relaxed),
+            cursor_micros: self.cursor_micros.load(Ordering::Relaxed),
+            total_micros: self.total_micros.load(Ordering::Relaxed),
+            max_process_message_micros: self.max_process_message_micros.load(Ordering::Relaxed),
+            max_stage_and_commit_micros: self.max_stage_and_commit_micros.load(Ordering::Relaxed),
+            max_total_micros: self.max_total_micros.load(Ordering::Relaxed),
+            last_received_at: nonzero_i64(&self.last_received_at),
+            last_processed_at: nonzero_i64(&self.last_processed_at),
+            last_error_at: nonzero_i64(&self.last_error_at),
+            last_seq: nonzero_i64(&self.last_seq),
+            max_seq: nonzero_i64(&self.max_seq),
+        }
+    }
+}
+
+#[derive(Default)]
+pub struct RelayShardTimings {
+    pub process_message: Duration,
+    pub stage_counts: Duration,
+    pub stage_and_commit: Duration,
+    pub apply_counts: Duration,
+    pub broadcast: Duration,
+    pub cursor: Duration,
+    pub total: Duration,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RelayWorkerStatsSnapshot {
+    pub shards: Vec<RelayShardStatsSnapshot>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RelayShardStatsSnapshot {
+    pub id: usize,
+    pub received_messages: u64,
+    pub info_messages: u64,
+    pub processed_messages: u64,
+    pub process_errors: u64,
+    pub commit_errors: u64,
+    pub process_message_micros: u64,
+    pub stage_counts_micros: u64,
+    pub stage_and_commit_micros: u64,
+    pub apply_counts_micros: u64,
+    pub broadcast_micros: u64,
+    pub cursor_micros: u64,
+    pub total_micros: u64,
+    pub max_process_message_micros: u64,
+    pub max_stage_and_commit_micros: u64,
+    pub max_total_micros: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_received_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_processed_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_seq: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_seq: Option<i64>,
+}
+
 fn now_ts() -> i64 {
     chrono::Utc::now().timestamp()
 }
 
 fn duration_micros(duration: Duration) -> u64 {
     duration.as_micros().try_into().unwrap_or(u64::MAX)
+}
+
+fn add_duration(total: &AtomicU64, duration: Duration) {
+    let micros = duration_micros(duration);
+    total.fetch_add(micros, Ordering::Relaxed);
+}
+
+fn add_duration_with_max(total: &AtomicU64, max: &AtomicU64, duration: Duration) {
+    let micros = duration_micros(duration);
+    total.fetch_add(micros, Ordering::Relaxed);
+    max.fetch_max(micros, Ordering::Relaxed);
 }
 
 fn nonzero_i64(atomic: &AtomicI64) -> Option<i64> {
@@ -299,5 +484,37 @@ mod tests {
         assert_eq!(snapshot.last_seq, Some(101));
         assert_eq!(snapshot.max_seq, Some(101));
         assert_eq!(snapshot.message_kinds.commit, 1);
+    }
+
+    #[test]
+    fn snapshot_records_relay_worker_progress() {
+        let stats = RelayShardStats::default();
+
+        stats.record_received(200);
+        stats.record_process_error();
+        stats.record_processed(RelayShardTimings {
+            process_message: Duration::from_micros(10),
+            stage_counts: Duration::from_micros(20),
+            stage_and_commit: Duration::from_micros(30),
+            apply_counts: Duration::from_micros(40),
+            broadcast: Duration::from_micros(50),
+            cursor: Duration::from_micros(60),
+            total: Duration::from_micros(210),
+        });
+
+        let snapshot = stats.snapshot(3);
+        assert_eq!(snapshot.id, 3);
+        assert_eq!(snapshot.received_messages, 1);
+        assert_eq!(snapshot.processed_messages, 1);
+        assert_eq!(snapshot.process_errors, 1);
+        assert_eq!(snapshot.last_seq, Some(200));
+        assert_eq!(snapshot.max_seq, Some(200));
+        assert_eq!(snapshot.process_message_micros, 10);
+        assert_eq!(snapshot.stage_counts_micros, 20);
+        assert_eq!(snapshot.stage_and_commit_micros, 30);
+        assert_eq!(snapshot.apply_counts_micros, 40);
+        assert_eq!(snapshot.broadcast_micros, 50);
+        assert_eq!(snapshot.cursor_micros, 60);
+        assert_eq!(snapshot.total_micros, 210);
     }
 }

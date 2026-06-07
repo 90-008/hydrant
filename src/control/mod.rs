@@ -24,6 +24,8 @@ mod jetstream;
 pub use jetstream::*;
 
 pub use filter::{FilterControl, FilterPatch, FilterSnapshot};
+#[cfg(feature = "firehose-diagnostics")]
+pub use firehose::FirehoseDiagnosticsInfo;
 pub use firehose::{FirehoseHandle, FirehoseSourceInfo};
 pub use pds::{PdsControl, PdsTierAssignment, PdsTierDefinition};
 pub use repos::{ListedRecord, Record, RecordList, RepoHandle, RepoInfo, ReposControl};

@@ -11,7 +11,7 @@ use url::Url;
 use crate::config::FirehoseSource;
 use crate::db::{self, keys};
 #[cfg(feature = "firehose-diagnostics")]
-use crate::ingest::firehose_stats::FirehoseStatsSnapshot;
+use crate::ingest::firehose_stats::{FirehoseStatsSnapshot, RelayWorkerStatsSnapshot};
 use crate::ingest::{BufferTx, firehose::FirehoseIngestor};
 use crate::state::AppState;
 
@@ -72,6 +72,13 @@ pub struct FirehoseSourceInfo {
     pub host_status: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pds: Option<FirehosePdsInfo>,
+}
+
+/// feature-gated runtime diagnostics for firehose ingestion internals.
+#[cfg(feature = "firehose-diagnostics")]
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct FirehoseDiagnosticsInfo {
+    pub relay_worker: RelayWorkerStatsSnapshot,
 }
 
 /// runtime control over the firehose ingestor component.
@@ -250,6 +257,13 @@ impl FirehoseHandle {
             .await;
         out.sort_unstable_by(|a, b| a.url.as_str().cmp(b.url.as_str()));
         out
+    }
+
+    #[cfg(feature = "firehose-diagnostics")]
+    pub fn diagnostics(&self) -> FirehoseDiagnosticsInfo {
+        FirehoseDiagnosticsInfo {
+            relay_worker: self.state.firehose_stats.relay_worker_snapshot(),
+        }
     }
 
     fn pds_info(&self, url: &Url, meta: &crate::pds_meta::PdsMeta) -> Option<FirehosePdsInfo> {

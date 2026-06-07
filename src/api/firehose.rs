@@ -10,12 +10,17 @@ use url::Url;
 use crate::control::{FirehoseSourceInfo, Hydrant};
 
 pub fn router() -> Router<Hydrant> {
-    Router::new()
+    let router = Router::new()
         .route("/firehose/source", get(get_source))
         .route("/firehose/sources", get(list_sources))
         .route("/firehose/sources", post(add_source))
         .route("/firehose/sources", delete(remove_source))
-        .route("/firehose/cursors", delete(reset_cursor))
+        .route("/firehose/cursors", delete(reset_cursor));
+
+    #[cfg(feature = "firehose-diagnostics")]
+    let router = router.route("/firehose/diagnostics", get(get_diagnostics));
+
+    router
 }
 
 #[derive(Debug, Deserialize)]
@@ -101,6 +106,13 @@ pub async fn list_sources(
                 .is_none_or(|throttled| source.throttled == throttled)
     });
     Json(sources)
+}
+
+#[cfg(feature = "firehose-diagnostics")]
+pub async fn get_diagnostics(
+    State(hydrant): State<Hydrant>,
+) -> Json<crate::control::FirehoseDiagnosticsInfo> {
+    Json(hydrant.firehose.diagnostics())
 }
 
 #[derive(Deserialize)]

@@ -86,6 +86,43 @@ all filters are exact-match and optional. multiple filters are combined with log
 | `failing` | filter by whether hydrant has recorded failures/backoff state for the source |
 | `throttled` | filter by whether the source is currently inside a retry backoff window |
 
+## GET /firehose/diagnostics
+
+available only in builds compiled with the `firehose-diagnostics` feature. returns process-local diagnostics for firehose internals:
+
+```json
+{
+  "relay_worker": {
+    "shards": [
+      {
+        "id": 0,
+        "received_messages": 1000,
+        "info_messages": 0,
+        "processed_messages": 999,
+        "process_errors": 0,
+        "commit_errors": 0,
+        "process_message_micros": 100000,
+        "stage_counts_micros": 20000,
+        "stage_and_commit_micros": 900000,
+        "apply_counts_micros": 30000,
+        "broadcast_micros": 20000,
+        "cursor_micros": 1000,
+        "total_micros": 1100000,
+        "max_process_message_micros": 1000,
+        "max_stage_and_commit_micros": 10000,
+        "max_total_micros": 12000,
+        "last_received_at": 1717239958,
+        "last_processed_at": 1717239958,
+        "last_seq": 1322,
+        "max_seq": 1322
+      }
+    ]
+  }
+}
+```
+
+poll this endpoint together with `/firehose/sources`. if source `send_wait_micros` is rising while relay-worker `stage_and_commit_micros` or `process_message_micros` dominates, the bottleneck is downstream of websocket reading rather than source connectivity.
+
 ## GET /firehose/source
 
 fetch a single firehose source with the same runtime fields as `GET /firehose/sources`.
