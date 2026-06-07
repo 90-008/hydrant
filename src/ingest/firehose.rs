@@ -119,6 +119,17 @@ fn classify_websocket_error(err: &tokio_websockets::Error) -> FirehoseFailure {
     }
 }
 
+#[cfg(feature = "firehose-diagnostics")]
+fn message_stats(msg: &SubscribeReposMessage<'_>) -> (&'static str, Option<i64>) {
+    match msg {
+        SubscribeReposMessage::Commit(commit) => ("commit", Some(commit.seq)),
+        SubscribeReposMessage::Sync(sync) => ("sync", Some(sync.seq)),
+        SubscribeReposMessage::Identity(identity) => ("identity", Some(identity.seq)),
+        SubscribeReposMessage::Account(account) => ("account", Some(account.seq)),
+        SubscribeReposMessage::Info(_) => ("info", None),
+    }
+}
+
 trait AddJitter: rand::Rng {
     fn add_jitter(&mut self, timeout: Duration) -> Duration {
         let timeout_secs = timeout.as_secs_f32();
@@ -138,6 +149,8 @@ pub struct FirehoseIngestor {
     _verify_signatures: bool,
     throttle: ThrottleHandle,
     max_failures: usize,
+    #[cfg(feature = "firehose-diagnostics")]
+    stats: Arc<crate::ingest::firehose_stats::FirehoseSourceStats>,
 }
 
 impl FirehoseIngestor {
@@ -152,6 +165,8 @@ impl FirehoseIngestor {
         max_failures: usize,
     ) -> Self {
         let throttle = state.throttler.get_handle(&relay_host).await;
+        #[cfg(feature = "firehose-diagnostics")]
+        let stats = state.firehose_stats.handle(&relay_host).await;
         Self {
             state,
             buffer_tx,
@@ -162,6 +177,8 @@ impl FirehoseIngestor {
             _verify_signatures: verify_signatures,
             throttle,
             max_failures,
+            #[cfg(feature = "firehose-diagnostics")]
+            stats,
         }
     }
 
@@ -191,6 +208,8 @@ impl FirehoseIngestor {
                 Some(c) => info!(cursor = %c, "resuming from cursor"),
                 None => info!("no cursor found, live tailing"),
             }
+            #[cfg(feature = "firehose-diagnostics")]
+            self.stats.record_connect_attempt(start_cursor);
 
             let host_status = self.is_pds.then(|| {
                 let meta = self.state.pds_meta.load();
@@ -210,6 +229,8 @@ impl FirehoseIngestor {
                     Ok(s) => s,
                     Err(e) => {
                         let failure = classify_firehose_error(&e);
+                        #[cfg(feature = "firehose-diagnostics")]
+                        self.stats.record_connect_error(failure.kind);
                         let secs = match self.on_failure(&failure).await {
                             Some(secs) => secs,
                             None => {
@@ -244,6 +265,8 @@ impl FirehoseIngestor {
                 elapsed_ms = connect_started.elapsed().as_millis(),
                 "firehose connected"
             );
+            #[cfg(feature = "firehose-diagnostics")]
+            self.stats.record_connected(connect_started.elapsed());
             let mut marked_active = false;
             let active_sleep_secs = if cfg!(debug_assertions) { 1 } else { 60 };
             let mut active_sleep =
@@ -256,8 +279,15 @@ impl FirehoseIngestor {
                             Ok(b) => b,
                             Err(e) => break Err(e),
                         };
+                        #[cfg(feature = "firehose-diagnostics")]
+                        self.stats.record_frame(bytes.len());
                         match decode_frame(&bytes) {
                             Ok(msg) => {
+                                #[cfg(feature = "firehose-diagnostics")]
+                                {
+                                    let (kind, seq) = message_stats(&msg);
+                                    self.stats.record_decoded(kind, seq);
+                                }
                                 if self.is_pds {
                                     let tier = {
                                         let meta = self.state.pds_meta.load();
@@ -269,8 +299,13 @@ impl FirehoseIngestor {
                                         self.state.tier_policy.resolve(host, override_name)
                                     };
                                     let accounts = self.state.db.get_count(&count_key).await;
+                                    #[cfg(feature = "firehose-diagnostics")]
+                                    let throttle_started = Instant::now();
                                     tokio::select! {
-                                        _ = self.throttle.wait_for_allow(accounts, &tier) => {}
+                                        _ = self.throttle.wait_for_allow(accounts, &tier) => {
+                                            #[cfg(feature = "firehose-diagnostics")]
+                                            self.stats.record_throttle_wait(throttle_started.elapsed());
+                                        }
                                         _ = self.enabled.changed() => {
                                             if !*self.enabled.borrow() {
                                                 info!("firehose disabled, disconnecting");
@@ -342,10 +377,14 @@ impl FirehoseIngestor {
             match res {
                 Ok(()) => {}
                 Err(FirehoseError::StreamClosed { code: 1001, reason }) => {
+                    #[cfg(feature = "firehose-diagnostics")]
+                    self.stats.record_stream_error("stream_closed");
                     debug!(reason = %reason, "host gone away");
                     tokio::time::sleep(Duration::from_secs(1)).await;
                 }
                 Err(FirehoseError::FutureCursor) => {
+                    #[cfg(feature = "firehose-diagnostics")]
+                    self.stats.record_stream_error("future_cursor");
                     if self.is_pds
                         && let Err(e) = self.set_host_status(HostStatus::Idle)
                     {
@@ -363,6 +402,8 @@ impl FirehoseIngestor {
                         .map_or(Cow::Borrowed("<no message>"), Cow::Borrowed);
                     let failure =
                         FirehoseFailure::new("relay_error", format!("{error}: {message}"));
+                    #[cfg(feature = "firehose-diagnostics")]
+                    self.stats.record_stream_error(failure.kind);
                     error!(err = %error, "relay sent error: {message}");
                     let secs = match self.on_failure(&failure).await {
                         Some(secs) => secs,
@@ -391,6 +432,8 @@ impl FirehoseIngestor {
                 }
                 Err(e) => {
                     let failure = classify_firehose_error(&e);
+                    #[cfg(feature = "firehose-diagnostics")]
+                    self.stats.record_stream_error(failure.kind);
                     let secs = match self.on_failure(&failure).await {
                         Some(secs) => secs,
                         None => {
@@ -487,26 +530,44 @@ impl FirehoseIngestor {
             _ => return,
         };
 
+        #[cfg(feature = "firehose-diagnostics")]
+        let should_process_started = Instant::now();
         let process = self
             .should_process(did)
             .await
             .inspect_err(|e| error!(did = %did, err = %e, "failed to check if we should process"))
             .unwrap_or(false);
+        #[cfg(feature = "firehose-diagnostics")]
+        self.stats
+            .record_should_process(should_process_started.elapsed());
         if !process {
+            #[cfg(feature = "firehose-diagnostics")]
+            self.stats.record_skipped();
             trace!(did = %did, "skipping: not in filter");
             return;
         }
         trace!(did = %did, "forwarding message to ingest buffer");
 
-        if let Err(e) = self
+        #[cfg(feature = "firehose-diagnostics")]
+        let send_started = Instant::now();
+        let res = self
             .buffer_tx
             .send(IngestMessage::Firehose {
                 url: self.relay_host.clone(),
                 is_pds: self.is_pds,
                 msg: msg.into_static(),
             })
-            .await
+            .await;
+        #[cfg(feature = "firehose-diagnostics")]
         {
+            let elapsed = send_started.elapsed();
+            if res.is_ok() {
+                self.stats.record_forwarded(elapsed);
+            } else {
+                self.stats.record_forward_error(elapsed);
+            }
+        }
+        if let Err(e) = res {
             error!(err = %e, "failed to send message to buffer processor");
         }
     }

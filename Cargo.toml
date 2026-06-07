@@ -12,6 +12,7 @@ indexer = []
 indexer_stream = ["indexer"]
 jetstream = ["dep:zstd"]
 user-keyspace = []
+firehose-diagnostics = []
 
 [dependencies]
 tokio = { version = "1.0", features = ["full"] }

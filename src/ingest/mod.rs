@@ -1,4 +1,6 @@
 pub mod firehose;
+#[cfg(feature = "firehose-diagnostics")]
+pub mod firehose_stats;
 #[cfg(feature = "indexer")]
 pub mod indexer;
 mod mailbox;

@@ -21,6 +21,42 @@ list all known firehose sources, including offline ones waiting for the retry lo
     "kind": "tcp_refused",
     "detail": "connection refused"
   },
+  "stats": {
+    "connection_attempts": 2,
+    "successful_connections": 1,
+    "connect_errors": 1,
+    "stream_errors": 0,
+    "frames_read": 1200,
+    "bytes_read": 22000000,
+    "messages_decoded": 1200,
+    "messages_forwarded": 1198,
+    "messages_skipped": 2,
+    "forward_errors": 0,
+    "throttle_waits": 0,
+    "throttle_wait_micros": 0,
+    "should_process_micros": 8800,
+    "send_waits": 1198,
+    "send_wait_micros": 64000,
+    "connect_elapsed_micros": 410000,
+    "max_send_wait_micros": 9000,
+    "max_should_process_micros": 1200,
+    "max_throttle_wait_micros": 0,
+    "last_connect_attempt_at": 1717239900,
+    "last_connected_at": 1717239901,
+    "last_frame_at": 1717239958,
+    "last_decoded_at": 1717239958,
+    "last_forwarded_at": 1717239958,
+    "last_start_cursor": 123,
+    "last_seq": 1322,
+    "max_seq": 1322,
+    "message_kinds": {
+      "commit": 1197,
+      "sync": 0,
+      "identity": 0,
+      "account": 3,
+      "info": 0
+    }
+  },
   "host_status": "offline",
   "pds": {
     "host": "127.0.0.1",
@@ -34,6 +70,8 @@ list all known firehose sources, including offline ones waiting for the retry lo
 `is_pds: true` means the source is a direct PDS connection with host authority enforcement enabled. `host_status` and `pds` are only present for PDS sources.
 
 `last_failure` is present while hydrant has recorded failure/backoff state for a source. `kind` is a compact category such as `dns`, `tcp_refused`, `tcp_timeout`, `tls`, `http_upgrade`, `websocket`, `decode`, `relay_error`, or `config`; `detail` contains the underlying error text.
+
+`stats` is present only in builds compiled with the `firehose-diagnostics` feature. these counters are in-memory process diagnostics intended for polling and diffing. compare `last_seq`/`max_seq`, `frames_read`, `messages_forwarded`, `send_wait_micros`, `max_send_wait_micros`, and `stream_errors` across samples to distinguish source lag, reconnect churn, filtering, and worker-channel backpressure.
 
 ### query parameters
 

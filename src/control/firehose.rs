@@ -10,6 +10,8 @@ use url::Url;
 
 use crate::config::FirehoseSource;
 use crate::db::{self, keys};
+#[cfg(feature = "firehose-diagnostics")]
+use crate::ingest::firehose_stats::FirehoseStatsSnapshot;
 use crate::ingest::{BufferTx, firehose::FirehoseIngestor};
 use crate::state::AppState;
 
@@ -63,6 +65,9 @@ pub struct FirehoseSourceInfo {
     pub retry_in_secs: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_failure: Option<FirehoseFailureInfo>,
+    #[cfg(feature = "firehose-diagnostics")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stats: Option<FirehoseStatsSnapshot>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub host_status: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -213,6 +218,8 @@ impl FirehoseHandle {
                 let throttle = self.state.throttler.snapshot(url);
                 let pds = is_pds.then(|| self.pds_info(url, &meta)).flatten();
                 let host_status = pds.as_ref().map(|pds| pds.status);
+                #[cfg(feature = "firehose-diagnostics")]
+                let stats = self.state.firehose_stats.snapshot(url);
                 let last_failure =
                     throttle
                         .last_failure
@@ -233,6 +240,8 @@ impl FirehoseHandle {
                         .then_some(throttle.throttled_until),
                     retry_in_secs: throttle.retry_in_secs(now),
                     last_failure,
+                    #[cfg(feature = "firehose-diagnostics")]
+                    stats,
                     host_status,
                     pds,
                 });
