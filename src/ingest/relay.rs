@@ -23,6 +23,10 @@ use crate::db::keys::pds_account_count_key;
 #[cfg(all(feature = "relay", feature = "jetstream"))]
 use crate::db::types::TrimmedDid;
 use crate::db::{self, CountDeltas, keys};
+#[cfg(feature = "firehose-diagnostics")]
+use crate::ingest::firehose_stats::{
+    HostAuthorityStatsOutcome, RelayMessageKind, RepoStateLoadOutcome, ValidationStatsOutcome,
+};
 use crate::ingest::stream::AccountStatus;
 #[cfg(feature = "relay")]
 use crate::ingest::stream::encode_frame;
@@ -63,10 +67,46 @@ fn map_repo_status_probe(output: Option<GetRepoStatusOutput<'_>>) -> Option<Repo
     Some(repo_state)
 }
 
+#[cfg(feature = "firehose-diagnostics")]
+fn relay_message_kind(msg: &SubscribeReposMessage<'_>) -> Option<RelayMessageKind> {
+    match msg {
+        SubscribeReposMessage::Commit(_) => Some(RelayMessageKind::Commit),
+        SubscribeReposMessage::Sync(_) => Some(RelayMessageKind::Sync),
+        SubscribeReposMessage::Identity(_) => Some(RelayMessageKind::Identity),
+        SubscribeReposMessage::Account(_) => Some(RelayMessageKind::Account),
+        SubscribeReposMessage::Info(_) => None,
+    }
+}
+
+#[cfg(feature = "firehose-diagnostics")]
+fn commit_validation_outcome(
+    res: &std::result::Result<ValidatedCommit<'_>, CommitValidationError>,
+) -> ValidationStatsOutcome {
+    match res {
+        Ok(_) => ValidationStatsOutcome::Accepted,
+        Err(CommitValidationError::StaleRev) => ValidationStatsOutcome::Stale,
+        Err(CommitValidationError::SigFailure) => ValidationStatsOutcome::SigFailure,
+        Err(_) => ValidationStatsOutcome::Rejected,
+    }
+}
+
+#[cfg(feature = "firehose-diagnostics")]
+fn sync_validation_outcome(
+    res: &std::result::Result<ValidatedSync, SyncValidationError>,
+) -> ValidationStatsOutcome {
+    match res {
+        Ok(_) => ValidationStatsOutcome::Accepted,
+        Err(SyncValidationError::SigFailure) => ValidationStatsOutcome::SigFailure,
+        Err(_) => ValidationStatsOutcome::Rejected,
+    }
+}
+
 struct WorkerContext<'a> {
     verify_signatures: bool,
     state: &'a AppState,
     vctx: ValidationContext<'a>,
+    #[cfg(feature = "firehose-diagnostics")]
+    stats: Arc<crate::ingest::firehose_stats::RelayShardStats>,
     batch: OwnedWriteBatch,
     count_deltas: CountDeltas,
     #[cfg(feature = "relay")]
@@ -193,6 +233,8 @@ impl RelayWorker {
             vctx: ValidationContext {
                 opts: &validation_opts,
             },
+            #[cfg(feature = "firehose-diagnostics")]
+            stats: shard_stats.clone(),
             batch: state.db.inner.batch(),
             count_deltas: CountDeltas::default(),
             #[cfg(feature = "relay")]
@@ -346,7 +388,17 @@ impl RelayWorker {
     }
 
     fn process_message(ctx: &mut WorkerContext, msg: WorkerMessage) -> Result<()> {
-        let Some(mut repo_state) = ctx.load_repo_state(&msg)? else {
+        #[cfg(feature = "firehose-diagnostics")]
+        if let Some(kind) = relay_message_kind(&msg.msg) {
+            ctx.stats.record_message_kind(kind);
+        }
+
+        #[cfg(feature = "firehose-diagnostics")]
+        let load_started = Instant::now();
+        let repo_state_result = ctx.load_repo_state(&msg);
+        #[cfg(feature = "firehose-diagnostics")]
+        ctx.stats.record_repo_state_load(load_started.elapsed());
+        let Some(mut repo_state) = repo_state_result? else {
             return Ok(());
         };
         let did = msg.msg.did().expect("already checked for did");
@@ -354,7 +406,20 @@ impl RelayWorker {
         if let Some(host) = msg.firehose.host_str()
             && msg.is_pds
         {
-            let outcome = ctx.check_host_authority(did, &mut repo_state, host)?;
+            #[cfg(feature = "firehose-diagnostics")]
+            let authority_started = Instant::now();
+            let outcome_result = ctx.check_host_authority(did, &mut repo_state, host);
+            #[cfg(feature = "firehose-diagnostics")]
+            ctx.stats.record_host_authority(
+                authority_started.elapsed(),
+                match &outcome_result {
+                    Ok(AuthorityOutcome::Authorized) => HostAuthorityStatsOutcome::Authorized,
+                    Ok(AuthorityOutcome::WasStale) => HostAuthorityStatsOutcome::WasStale,
+                    Ok(AuthorityOutcome::WrongHost { .. }) => HostAuthorityStatsOutcome::WrongHost,
+                    Err(_) => HostAuthorityStatsOutcome::Error,
+                },
+            );
+            let outcome = outcome_result?;
             if let AuthorityOutcome::WrongHost { expected } = outcome {
                 if !ctx.inc_error(host) {
                     warn!(got = host, expected = %expected, "message rejected: wrong host");
@@ -367,19 +432,50 @@ impl RelayWorker {
         match msg.msg {
             SubscribeReposMessage::Commit(commit) => {
                 trace!("processing commit");
-                Self::handle_commit(ctx, &mut repo_state, &msg.firehose, *commit)
+                #[cfg(feature = "firehose-diagnostics")]
+                let started = Instant::now();
+                let result = Self::handle_commit(ctx, &mut repo_state, &msg.firehose, *commit);
+                #[cfg(feature = "firehose-diagnostics")]
+                ctx.stats
+                    .record_handle_message(RelayMessageKind::Commit, started.elapsed());
+                result
             }
             SubscribeReposMessage::Sync(sync) => {
                 debug!("processing sync");
-                Self::handle_sync(ctx, &mut repo_state, &msg.firehose, *sync)
+                #[cfg(feature = "firehose-diagnostics")]
+                let started = Instant::now();
+                let result = Self::handle_sync(ctx, &mut repo_state, &msg.firehose, *sync);
+                #[cfg(feature = "firehose-diagnostics")]
+                ctx.stats
+                    .record_handle_message(RelayMessageKind::Sync, started.elapsed());
+                result
             }
             SubscribeReposMessage::Identity(identity) => {
                 debug!("processing identity");
-                Self::handle_identity(ctx, &mut repo_state, &msg.firehose, *identity, msg.is_pds)
+                #[cfg(feature = "firehose-diagnostics")]
+                let started = Instant::now();
+                let result = Self::handle_identity(
+                    ctx,
+                    &mut repo_state,
+                    &msg.firehose,
+                    *identity,
+                    msg.is_pds,
+                );
+                #[cfg(feature = "firehose-diagnostics")]
+                ctx.stats
+                    .record_handle_message(RelayMessageKind::Identity, started.elapsed());
+                result
             }
             SubscribeReposMessage::Account(account) => {
                 debug!("processing account");
-                Self::handle_account(ctx, &mut repo_state, &msg.firehose, *account, msg.is_pds)
+                #[cfg(feature = "firehose-diagnostics")]
+                let started = Instant::now();
+                let result =
+                    Self::handle_account(ctx, &mut repo_state, &msg.firehose, *account, msg.is_pds);
+                #[cfg(feature = "firehose-diagnostics")]
+                ctx.stats
+                    .record_handle_message(RelayMessageKind::Account, started.elapsed());
+                result
             }
             _ => Ok(()),
         }
@@ -571,7 +667,11 @@ impl RelayWorker {
         // or if there is no handle specified
         if is_pds || identity.handle.is_none() {
             ctx.state.resolver.invalidate_sync(&identity.did);
+            #[cfg(feature = "firehose-diagnostics")]
+            let resolve_started = Instant::now();
             let doc = Handle::current().block_on(ctx.state.resolver.resolve_doc(&identity.did));
+            #[cfg(feature = "firehose-diagnostics")]
+            ctx.stats.record_resolve_doc(resolve_started.elapsed());
             match doc {
                 Ok(doc) => {
                     repo_state.update_from_doc(doc);
@@ -816,20 +916,32 @@ impl WorkerContext<'_> {
     }
 
     fn refresh_doc(&mut self, did: &Did, repo_state: &mut RepoState) -> Result<()> {
-        let db = &self.state.db;
-        self.state.resolver.invalidate_sync(did);
-        let doc = Handle::current()
-            .block_on(self.state.resolver.resolve_doc(did))
-            .map_err(|e| miette::miette!("{e}"))?;
-        repo_state.update_from_doc(doc);
-        repo_state.touch();
+        #[cfg(feature = "firehose-diagnostics")]
+        let refresh_started = Instant::now();
+        let result = (|| {
+            let db = &self.state.db;
+            self.state.resolver.invalidate_sync(did);
+            #[cfg(feature = "firehose-diagnostics")]
+            let resolve_started = Instant::now();
+            let doc = Handle::current()
+                .block_on(self.state.resolver.resolve_doc(did))
+                .map_err(|e| miette::miette!("{e}"));
+            #[cfg(feature = "firehose-diagnostics")]
+            self.stats.record_resolve_doc(resolve_started.elapsed());
+            let doc = doc?;
+            repo_state.update_from_doc(doc);
+            repo_state.touch();
 
-        self.batch.insert(
-            &db.repos,
-            keys::repo_key(did),
-            db::ser_repo_state(repo_state)?,
-        );
-        Ok(())
+            self.batch.insert(
+                &db.repos,
+                keys::repo_key(did),
+                db::ser_repo_state(repo_state)?,
+            );
+            Ok(())
+        })();
+        #[cfg(feature = "firehose-diagnostics")]
+        self.stats.record_refresh_doc(refresh_started.elapsed());
+        result
     }
 
     fn validate_commit<'c>(
@@ -839,7 +951,15 @@ impl WorkerContext<'_> {
     ) -> Result<Option<ValidatedCommit<'c>>> {
         let did = &commit.repo;
         let key = self.fetch_key(did)?;
-        match self.vctx.validate_commit(commit, repo_state, key.as_ref()) {
+        #[cfg(feature = "firehose-diagnostics")]
+        let validate_started = Instant::now();
+        let validation = self.vctx.validate_commit(commit, repo_state, key.as_ref());
+        #[cfg(feature = "firehose-diagnostics")]
+        self.stats.record_validate_commit(
+            validate_started.elapsed(),
+            commit_validation_outcome(&validation),
+        );
+        match validation {
             Ok(v) => return Ok(Some(v)),
             Err(CommitValidationError::StaleRev) => {
                 trace!("skipping replayed commit");
@@ -854,7 +974,15 @@ impl WorkerContext<'_> {
 
         self.refresh_doc(did, repo_state)?;
         let key = self.fetch_key(did)?;
-        match self.vctx.validate_commit(commit, repo_state, key.as_ref()) {
+        #[cfg(feature = "firehose-diagnostics")]
+        let validate_started = Instant::now();
+        let validation = self.vctx.validate_commit(commit, repo_state, key.as_ref());
+        #[cfg(feature = "firehose-diagnostics")]
+        self.stats.record_validate_commit(
+            validate_started.elapsed(),
+            commit_validation_outcome(&validation),
+        );
+        match validation {
             Ok(v) => Ok(Some(v)),
             Err(e) => {
                 debug!(err = %e, "commit rejected after key refresh");
@@ -870,7 +998,15 @@ impl WorkerContext<'_> {
     ) -> Result<Option<ValidatedSync>> {
         let did = &sync.did;
         let key = self.fetch_key(did)?;
-        match self.vctx.validate_sync(sync, key.as_ref()) {
+        #[cfg(feature = "firehose-diagnostics")]
+        let validate_started = Instant::now();
+        let validation = self.vctx.validate_sync(sync, key.as_ref());
+        #[cfg(feature = "firehose-diagnostics")]
+        self.stats.record_validate_sync(
+            validate_started.elapsed(),
+            sync_validation_outcome(&validation),
+        );
+        match validation {
             Ok(v) => return Ok(Some(v)),
             Err(SyncValidationError::SigFailure) => {}
             Err(e) => {
@@ -881,7 +1017,15 @@ impl WorkerContext<'_> {
 
         self.refresh_doc(did, repo_state)?;
         let key = self.fetch_key(did)?;
-        match self.vctx.validate_sync(sync, key.as_ref()) {
+        #[cfg(feature = "firehose-diagnostics")]
+        let validate_started = Instant::now();
+        let validation = self.vctx.validate_sync(sync, key.as_ref());
+        #[cfg(feature = "firehose-diagnostics")]
+        self.stats.record_validate_sync(
+            validate_started.elapsed(),
+            sync_validation_outcome(&validation),
+        );
+        match validation {
             Ok(v) => Ok(Some(v)),
             Err(e) => {
                 debug!(err = %e, "sync rejected after key refresh");
@@ -891,14 +1035,19 @@ impl WorkerContext<'_> {
     }
 
     fn fetch_key(&self, did: &Did) -> Result<Option<PublicKey<'static>>> {
-        if self.verify_signatures {
-            let key = Handle::current()
+        #[cfg(feature = "firehose-diagnostics")]
+        let started = Instant::now();
+        let result = if self.verify_signatures {
+            Handle::current()
                 .block_on(self.state.resolver.resolve_signing_key(did))
-                .map_err(|e| miette::miette!("{e}"))?;
-            Ok(Some(key))
+                .map(Some)
+                .map_err(|e| miette::miette!("{e}"))
         } else {
             Ok(None)
-        }
+        };
+        #[cfg(feature = "firehose-diagnostics")]
+        self.stats.record_fetch_key(started.elapsed());
+        result
     }
 
     /// maps an inactive account status to the corresponding `RepoStatus`.
@@ -973,6 +1122,9 @@ impl WorkerContext<'_> {
 
         if metadata.is_some_and(|m| !m.tracked) {
             trace!(did = %did, "ignoring message, repo is explicitly untracked");
+            #[cfg(feature = "firehose-diagnostics")]
+            self.stats
+                .record_repo_state_outcome(RepoStateLoadOutcome::Drop);
             return Ok(None);
         }
 
@@ -984,6 +1136,9 @@ impl WorkerContext<'_> {
             .transpose()?;
 
         if let Some(repo_state) = repo_state_opt {
+            #[cfg(feature = "firehose-diagnostics")]
+            self.stats
+                .record_repo_state_outcome(RepoStateLoadOutcome::Hit);
             return Ok(Some(repo_state));
         }
 
@@ -993,7 +1148,12 @@ impl WorkerContext<'_> {
             if filter.mode == crate::filter::FilterMode::Filter && !filter.signals.is_empty() {
                 let commit = match &msg.msg {
                     SubscribeReposMessage::Commit(c) => c,
-                    _ => return Ok(None),
+                    _ => {
+                        #[cfg(feature = "firehose-diagnostics")]
+                        self.stats
+                            .record_repo_state_outcome(RepoStateLoadOutcome::Drop);
+                        return Ok(None);
+                    }
                 };
                 let touches_signal = commit.ops.iter().any(|op| {
                     op.path
@@ -1011,24 +1171,37 @@ impl WorkerContext<'_> {
                 });
                 if !touches_signal {
                     trace!(did = %did, "dropping commit, no signal-matching ops");
+                    #[cfg(feature = "firehose-diagnostics")]
+                    self.stats
+                        .record_repo_state_outcome(RepoStateLoadOutcome::Drop);
                     return Ok(None);
                 }
             }
         }
 
         debug!(did = %did, "discovered new account from firehose, queueing backfill");
+        #[cfg(feature = "firehose-diagnostics")]
+        let new_account_started = Instant::now();
 
         // resolve doc to initialize repo state
         self.state.resolver.invalidate_sync(did);
+        #[cfg(feature = "firehose-diagnostics")]
+        let resolve_started = Instant::now();
         let doc = tokio::runtime::Handle::current()
             .block_on(self.state.resolver.resolve_doc(did))
-            .into_diagnostic()?;
+            .into_diagnostic();
+        #[cfg(feature = "firehose-diagnostics")]
+        self.stats.record_resolve_doc(resolve_started.elapsed());
+        let doc = doc?;
 
         // if it's a PDS, verify it's the authoritative one
         if msg.is_pds {
             let pds_host = doc.pds.host_str().map(|h| h.to_string());
             if pds_host.as_deref() != msg.firehose.host_str() {
                 warn!(did = %did, got = ?pds_host, expected = ?msg.firehose.host_str(), "message rejected: wrong host for new account");
+                #[cfg(feature = "firehose-diagnostics")]
+                self.stats
+                    .record_repo_state_outcome(RepoStateLoadOutcome::Drop);
                 return Ok(None);
             }
 
@@ -1036,14 +1209,22 @@ impl WorkerContext<'_> {
                 let count = self.state.db.get_count_sync(&pds_account_count_key(host));
                 if self.state.is_over_account_limit(host, count) {
                     warn!(did = %did, host, count, "account limit reached for host, dropping new account");
+                    #[cfg(feature = "firehose-diagnostics")]
+                    self.stats
+                        .record_repo_state_outcome(RepoStateLoadOutcome::Drop);
                     return Ok(None);
                 }
             }
         }
 
         // try to get upstream status
-        let mut repo_state = tokio::runtime::Handle::current()
-            .block_on(self.check_repo_status(did, &doc.pds))
+        #[cfg(feature = "firehose-diagnostics")]
+        let probe_started = Instant::now();
+        let repo_state =
+            tokio::runtime::Handle::current().block_on(self.check_repo_status(did, &doc.pds));
+        #[cfg(feature = "firehose-diagnostics")]
+        self.stats.record_repo_status_probe(probe_started.elapsed());
+        let mut repo_state = repo_state
             .ok()
             .flatten()
             .unwrap_or_else(RepoState::backfilling);
@@ -1073,20 +1254,34 @@ impl WorkerContext<'_> {
 
         self.count_deltas.add("repos", 1);
 
+        #[cfg(feature = "firehose-diagnostics")]
+        {
+            self.stats
+                .record_repo_state_outcome(RepoStateLoadOutcome::Miss);
+            self.stats.record_new_account(new_account_started.elapsed());
+        }
+
         Ok(Some(repo_state))
     }
 
     #[cfg(feature = "relay")]
     fn queue_emit(&mut self, make_frame: impl FnOnce(i64) -> Result<bytes::Bytes>) -> Result<u64> {
-        let db = &self.state.db;
-        let seq = db.next_relay_seq.fetch_add(1, Ordering::SeqCst);
-        let frame = make_frame(seq as i64)?;
-        self.batch
-            .insert(&db.relay_events, keys::relay_event_key(seq), frame.as_ref());
-        self.pending_broadcasts
-            .push(RelayBroadcast::Ephemeral(seq, frame));
-        self.pending_broadcasts.push(RelayBroadcast::Persisted(seq));
-        Ok(seq)
+        #[cfg(feature = "firehose-diagnostics")]
+        let started = Instant::now();
+        let result = (|| {
+            let db = &self.state.db;
+            let seq = db.next_relay_seq.fetch_add(1, Ordering::SeqCst);
+            let frame = make_frame(seq as i64)?;
+            self.batch
+                .insert(&db.relay_events, keys::relay_event_key(seq), frame.as_ref());
+            self.pending_broadcasts
+                .push(RelayBroadcast::Ephemeral(seq, frame));
+            self.pending_broadcasts.push(RelayBroadcast::Persisted(seq));
+            Ok(seq)
+        })();
+        #[cfg(feature = "firehose-diagnostics")]
+        self.stats.record_queue_emit(started.elapsed());
+        result
     }
 }
 
