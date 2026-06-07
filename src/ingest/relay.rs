@@ -6,7 +6,7 @@ use std::sync::atomic::Ordering;
 use fjall::OwnedWriteBatch;
 
 use jacquard_api::com_atproto::sync::get_repo_status::{
-    GetRepoStatus, GetRepoStatusError, GetRepoStatusOutputStatus,
+    GetRepoStatus, GetRepoStatusError, GetRepoStatusOutput, GetRepoStatusOutputStatus,
 };
 use jacquard_common::types::crypto::PublicKey;
 use jacquard_common::types::did::Did;
@@ -38,6 +38,28 @@ use crate::types::StoredJetstreamEvent;
 use crate::types::{RepoState, RepoStatus};
 use crate::util;
 use smol_str::{SmolStr, ToSmolStr};
+
+fn map_repo_status_probe(output: Option<GetRepoStatusOutput<'_>>) -> Option<RepoState<'static>> {
+    let output = output?;
+
+    let mut repo_state = RepoState::backfilling();
+    repo_state.active = output.active;
+    repo_state.status = match output.status {
+        Some(GetRepoStatusOutputStatus::Takendown) => RepoStatus::Takendown,
+        Some(GetRepoStatusOutputStatus::Suspended) => RepoStatus::Suspended,
+        Some(GetRepoStatusOutputStatus::Deactivated) => RepoStatus::Deactivated,
+        Some(GetRepoStatusOutputStatus::Deleted) => RepoStatus::Deleted,
+        Some(GetRepoStatusOutputStatus::Desynchronized) => RepoStatus::Desynchronized,
+        Some(GetRepoStatusOutputStatus::Throttled) => RepoStatus::Throttled,
+        Some(GetRepoStatusOutputStatus::Other(s)) => RepoStatus::Error(s.into()),
+        None => output
+            .active
+            .then_some(RepoStatus::Synced)
+            .unwrap_or_else(|| RepoStatus::Error("unknown".into())),
+    };
+
+    Some(repo_state)
+}
 
 struct WorkerContext<'a> {
     verify_signatures: bool,
@@ -485,11 +507,11 @@ impl RelayWorker {
         is_pds: bool,
     ) -> Result<()> {
         let event_ms = identity.time.0.timestamp_millis();
-        if repo_state.last_message_time.is_some_and(|t| event_ms <= t) {
+        if !repo_state.should_process_identity_time(event_ms) {
             debug!("skipping stale/duplicate identity event");
             return Ok(());
         }
-        repo_state.advance_message_time(event_ms);
+        repo_state.advance_identity_time(event_ms);
         let was_active = repo_state.active;
         let was_pds_host = Self::pds_host(repo_state.pds.as_deref());
 
@@ -577,12 +599,12 @@ impl RelayWorker {
         _is_pds: bool,
     ) -> Result<()> {
         let event_ms = account.time.0.timestamp_millis();
-        if repo_state.last_message_time.is_some_and(|t| event_ms <= t) {
+        if !repo_state.should_process_account_time(event_ms) {
             debug!("skipping stale/duplicate account event");
             return Ok(());
         }
 
-        repo_state.advance_message_time(event_ms);
+        repo_state.advance_account_time(event_ms);
 
         // always capture was_active for count tracking, not just in indexer mode
         let was_active = repo_state.active;
@@ -877,35 +899,17 @@ impl WorkerContext<'_> {
             Ok(r) => match r.into_output() {
                 Ok(o) => o,
                 Err(XrpcError::Xrpc(GetRepoStatusError::RepoNotFound(_))) => {
-                    // pds explicitly says it doesn't have this repo
-                    // we shouldnt really get here unless the pds is buggy?
-                    // or somehow the repo gets gon right after we receive the event
-                    let mut repo_state = RepoState::backfilling();
-                    repo_state.active = false;
-                    repo_state.status = RepoStatus::Error("not_found".into());
-                    return Ok(Some(repo_state));
+                    // treat probe-time 404s like any other transient probe failure.
+                    // we already have a live event from the authoritative host, so
+                    // inserting an inactive placeholder here can wedge the repo until
+                    // a later account event arrives.
+                    return Ok(map_repo_status_probe(None));
                 }
                 Err(_) => return Ok(None),
             },
         };
 
-        let mut repo_state = RepoState::backfilling();
-        repo_state.active = output.active;
-        repo_state.status = match output.status {
-            Some(GetRepoStatusOutputStatus::Takendown) => RepoStatus::Takendown,
-            Some(GetRepoStatusOutputStatus::Suspended) => RepoStatus::Suspended,
-            Some(GetRepoStatusOutputStatus::Deactivated) => RepoStatus::Deactivated,
-            Some(GetRepoStatusOutputStatus::Deleted) => RepoStatus::Deleted,
-            Some(GetRepoStatusOutputStatus::Desynchronized) => RepoStatus::Desynchronized,
-            Some(GetRepoStatusOutputStatus::Throttled) => RepoStatus::Throttled,
-            Some(GetRepoStatusOutputStatus::Other(s)) => RepoStatus::Error(s.into()),
-            None => output
-                .active
-                .then_some(RepoStatus::Synced)
-                .unwrap_or_else(|| RepoStatus::Error("unknown".into())),
-        };
-
-        Ok(Some(repo_state))
+        Ok(map_repo_status_probe(Some(output)))
     }
 
     fn load_repo_state(&mut self, msg: &WorkerMessage) -> Result<Option<RepoState<'static>>> {
@@ -1054,4 +1058,44 @@ enum AuthorityOutcome {
     WasStale,
     /// host did not match even after doc resolution.
     WrongHost { expected: SmolStr },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_repo_status_probe_falls_back_to_live_discovery() {
+        assert!(map_repo_status_probe(None).is_none());
+    }
+
+    #[test]
+    fn active_repo_status_probe_maps_to_synced_repo_state() {
+        let repo_state = map_repo_status_probe(Some(GetRepoStatusOutput {
+            did: Did::new("did:plc:testrepo").expect("valid did"),
+            active: true,
+            status: None,
+            rev: None,
+            extra_data: None,
+        }))
+        .expect("probe should map");
+
+        assert!(repo_state.active);
+        assert_eq!(repo_state.status, RepoStatus::Synced);
+    }
+
+    #[test]
+    fn throttled_repo_status_probe_preserves_host_status() {
+        let repo_state = map_repo_status_probe(Some(GetRepoStatusOutput {
+            did: Did::new("did:plc:testrepo").expect("valid did"),
+            active: true,
+            status: Some(GetRepoStatusOutputStatus::Throttled),
+            rev: None,
+            extra_data: None,
+        }))
+        .expect("probe should map");
+
+        assert!(repo_state.active);
+        assert_eq!(repo_state.status, RepoStatus::Throttled);
+    }
 }

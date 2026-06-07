@@ -21,6 +21,18 @@ use crate::db::types::{DbAction, DbRkey};
 use crate::ingest::stream::Datetime;
 use crate::resolver::MiniDoc;
 
+// on-disk schema snapshots for stored types.
+//
+// rules:
+// - versioned modules (`v2`, `v4`, `v7`, ...) are wire-format snapshots, not
+//   convenience namespaces
+// - once a version is referenced by a shipped migration, do not change its
+//   serialized shape again
+// - when a stored type changes, add a new versioned module and export the
+//   newest version for live code via `pub(crate) use vN::*`
+// - migrations should explicitly read the previous version and write the new one
+// - for example, if `RepoState` changes shape again, add `v8::RepoState`,
+//   keep `v7::RepoState` frozen, export `v8`, and migrate `v7 -> v8`
 pub(crate) mod v2 {
     use super::*;
 
@@ -107,9 +119,6 @@ pub(crate) mod v4 {
         pub active: bool,
         pub status: RepoStatus,
         pub root: Option<Commit>,
-        /// ms since epoch of the last firehose message we processed for this repo.
-        /// used to deduplicate identity / account events that can arrive from multiple relays at
-        /// different wall-clock times but represent the same underlying PDS event.
         pub last_message_time: Option<i64>,
         /// this is when we *ingested* any last updates
         pub last_updated_at: i64, // unix timestamp
@@ -130,7 +139,45 @@ pub(crate) mod v4 {
     }
 }
 
-pub(crate) use v4::*;
+pub(crate) mod v7 {
+    use super::*;
+    pub(crate) use v4::{Commit, RepoMetadata, RepoStatus};
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(bound(deserialize = "'i: 'de"))]
+    pub(crate) struct RepoState<'i> {
+        /// whether the upstream considers this account active.
+        /// services should use the `active` flag to control overall account visibility
+        pub active: bool,
+        pub status: RepoStatus,
+        pub root: Option<Commit>,
+        /// ms since epoch of the last firehose message we processed for this repo.
+        /// used to deduplicate identity / account events that can arrive from multiple relays at
+        /// different wall-clock times but represent the same underlying PDS event.
+        pub last_message_time: Option<i64>,
+        /// high-water mark for identity events only.
+        ///
+        /// sharing a single clock with commit/sync/account events can suppress valid identity
+        /// updates when those event classes arrive out of order but with overlapping timestamps.
+        pub last_identity_time: Option<i64>,
+        /// high-water mark for account events only.
+        ///
+        /// sharing a single clock with commit/sync/identity events can suppress valid account
+        /// status transitions when those event classes arrive out of order but with overlapping
+        /// timestamps.
+        pub last_account_time: Option<i64>,
+        /// this is when we *ingested* any last updates
+        pub last_updated_at: i64, // unix timestamp
+        #[serde(borrow)]
+        pub signing_key: Option<DidKey<'i>>,
+        #[serde(borrow)]
+        pub pds: Option<CowStr<'i>>,
+        #[serde(borrow)]
+        pub handle: Option<Handle<'i>>,
+    }
+}
+
+pub(crate) use v7::*;
 
 impl<'c> From<AtpCommit<'c>> for Commit {
     fn from(value: AtpCommit<'c>) -> Self {
@@ -246,12 +293,32 @@ impl<'i> RepoState<'i> {
             pds: None,
             signing_key: None,
             last_message_time: None,
+            last_identity_time: None,
+            last_account_time: None,
         }
     }
 
     // advances the high-water mark to event_ms if it's newer than what we've seen
     pub fn advance_message_time(&mut self, event_ms: i64) {
         self.last_message_time = Some(event_ms.max(self.last_message_time.unwrap_or(0)));
+    }
+
+    pub fn should_process_identity_time(&self, event_ms: i64) -> bool {
+        self.last_identity_time.is_none_or(|t| event_ms > t)
+    }
+
+    pub fn advance_identity_time(&mut self, event_ms: i64) {
+        self.last_identity_time = Some(event_ms.max(self.last_identity_time.unwrap_or(0)));
+        self.advance_message_time(event_ms);
+    }
+
+    pub fn should_process_account_time(&self, event_ms: i64) -> bool {
+        self.last_account_time.is_none_or(|t| event_ms > t)
+    }
+
+    pub fn advance_account_time(&mut self, event_ms: i64) {
+        self.last_account_time = Some(event_ms.max(self.last_account_time.unwrap_or(0)));
+        self.advance_message_time(event_ms);
     }
 
     // updates last_updated_at to now
@@ -284,6 +351,8 @@ impl<'i> IntoStatic for RepoState<'i> {
             pds: self.pds.map(IntoStatic::into_static),
             signing_key: self.signing_key.map(IntoStatic::into_static),
             last_message_time: self.last_message_time,
+            last_identity_time: self.last_identity_time,
+            last_account_time: self.last_account_time,
         }
     }
 }
@@ -611,4 +680,63 @@ pub(crate) enum RelayBroadcast {
     Persisted(#[allow(dead_code)] u64),
     #[allow(dead_code)]
     Ephemeral(u64, bytes::Bytes),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use miette::IntoDiagnostic;
+
+    #[test]
+    fn identity_dedupe_does_not_depend_on_commit_clock() {
+        let mut state = RepoState::backfilling();
+
+        state.advance_message_time(2_000);
+
+        assert!(state.should_process_identity_time(1_500));
+        state.advance_identity_time(1_500);
+        assert_eq!(state.last_message_time, Some(2_000));
+        assert_eq!(state.last_identity_time, Some(1_500));
+
+        assert!(!state.should_process_identity_time(1_500));
+        assert!(!state.should_process_identity_time(1_499));
+        assert!(state.should_process_identity_time(1_501));
+    }
+
+    #[test]
+    fn account_dedupe_does_not_depend_on_commit_clock() {
+        let mut state = RepoState::backfilling();
+
+        state.advance_message_time(3_000);
+
+        assert!(state.should_process_account_time(2_500));
+        state.advance_account_time(2_500);
+        assert_eq!(state.last_message_time, Some(3_000));
+        assert_eq!(state.last_account_time, Some(2_500));
+
+        assert!(!state.should_process_account_time(2_500));
+        assert!(!state.should_process_account_time(2_499));
+        assert!(state.should_process_account_time(2_501));
+    }
+
+    #[test]
+    fn into_static_preserves_per_event_clocks() -> miette::Result<()> {
+        let mut state = RepoState::backfilling();
+        state.last_message_time = Some(10);
+        state.last_identity_time = Some(20);
+        state.last_account_time = Some(30);
+        state.handle = Some(Handle::new("alice.test").into_diagnostic()?);
+        state.pds = Some(CowStr::Borrowed("https://pds.example"));
+        state.signing_key = Some(DidKey::from_did_key(
+            "did:key:zQ3shokFTS3brHcDQrn82RUDfCZESWL1ZdCEJwekUDPQiYBme",
+        )?);
+
+        let static_state = state.into_static();
+
+        assert_eq!(static_state.last_message_time, Some(10));
+        assert_eq!(static_state.last_identity_time, Some(20));
+        assert_eq!(static_state.last_account_time, Some(30));
+
+        Ok(())
+    }
 }

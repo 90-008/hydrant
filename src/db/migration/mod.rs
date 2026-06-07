@@ -10,9 +10,24 @@ mod v3;
 mod v4;
 mod v5;
 mod v6;
+mod v7;
 
 type MigrationFn = fn(&Db, &mut OwnedWriteBatch) -> Result<()>;
 
+/// ordered list of schema migrations.
+///
+/// invariants:
+/// - migration `vN` upgrades on-disk data from schema version `N-1` to `N`
+/// - once a migration ships, its input/output wire types are frozen
+/// - never "fix up" an older migration to match a newer live type; add a new
+///   schema version and a new migration instead
+/// - if a stored type changes shape, define a new versioned type in
+///   `src/types.rs`, export the newest one for live code, and have the new
+///   migration explicitly deserialize the previous version and write the new one
+///
+/// example: if `RepoState` changes again after `types::v7::RepoState`, add a new
+/// `types::v8::RepoState`, keep `v7` frozen, and add a migration that rewrites
+/// `v7 -> v8`.
 /// ordered list of migrations. migration at index `i` upgrades the schema from version `i` to `i+1`.
 const MIGRATIONS: &[(&str, MigrationFn)] = &[
     ("stable_firehose_cursors", v1::stable_firehose_cursors),
@@ -21,6 +36,7 @@ const MIGRATIONS: &[(&str, MigrationFn)] = &[
     ("repo_state_active", v4::repo_state_active),
     ("pds_meta_layout", v5::pds_meta_layout),
     ("rebuild_pds_account_counts", v6::rebuild_pds_account_counts),
+    ("repo_state_event_clocks", v7::repo_state_event_clocks),
 ];
 
 fn read_version(db: &Db) -> Result<u64> {

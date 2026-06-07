@@ -101,6 +101,15 @@ def test-firehose-source-filters [url: string, pid: int, mock_port: int] {
         stop-mock-pds $mock_pds
         fail "expected failing source to expose retry_in_secs" $pid
     }
+    let last_failure = ($failing.last_failure? | default null)
+    if $last_failure == null {
+        stop-mock-pds $mock_pds
+        fail "expected failing source to expose last_failure" $pid
+    }
+    if (($last_failure.kind? | default "") == "") or (($last_failure.detail? | default "") == "") or (($last_failure.at? | default 0 | into int) <= 0) {
+        stop-mock-pds $mock_pds
+        fail "expected last_failure to include kind, detail, and timestamp" $pid
+    }
     let failing_pds = ($failing.pds? | default null)
     if $failing_pds == null {
         stop-mock-pds $mock_pds

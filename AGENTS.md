@@ -89,6 +89,7 @@ See `examples/statusphere.rs` for a usage example.
 - **Cursors**: Store cursors as big-endian bytes (`u64`/`i64`).
 - **Compression**: Configurable via `HYDRANT_DATA_COMPRESSION` (`lz4`, `zstd`, `none`). Per-keyspace zstd dictionaries can be trained via `POST /db/train` and are stored as `dict_{keyspace}.bin` in the database directory.
 - **Keyspaces**: Use the `keys.rs` module to maintain consistent composite key formats.
+- **Schema evolution**: Treat versioned wire types in `src/types.rs` as frozen snapshots once shipped. If a stored type changes shape, add a new versioned type, export the newest version for live code, and add a forward migration that explicitly deserializes the previous version and writes the new one. Do not modify older migration input/output types in place. For example, if `RepoState` changes after `v7`, add `v8::RepoState` and a `v7 -> v8` migration instead of mutating `v7`.
 
 ## Database schema (keyspaces)
 

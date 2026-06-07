@@ -1,7 +1,8 @@
 use std::collections::BTreeMap;
 
 use crate::db::keys::{self, COUNT_KS_PREFIX};
-use crate::db::{Db, deser_repo_state, set_ks_count};
+use crate::db::{Db, set_ks_count};
+use crate::types::v4;
 use fjall::OwnedWriteBatch;
 use miette::{Context, IntoDiagnostic, Result};
 use smol_str::SmolStr;
@@ -12,7 +13,9 @@ pub(crate) fn rebuild_pds_account_counts(db: &Db, batch: &mut OwnedWriteBatch) -
 
     for guard in db.repos.iter() {
         let (_, value) = guard.into_inner().into_diagnostic()?;
-        let state = deser_repo_state(value.as_ref())?;
+        let state: v4::RepoState = rmp_serde::from_slice(value.as_ref())
+            .into_diagnostic()
+            .wrap_err("invalid v5 repo state")?;
         if !state.active {
             continue;
         }

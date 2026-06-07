@@ -1305,10 +1305,18 @@ mod tests {
 
             let mut insert_repo = |did_str: &str, pds: &'static str, active: bool| -> Result<()> {
                 let did = Did::new(did_str).into_diagnostic()?;
-                let mut state = RepoState::backfilling();
-                state.active = active;
-                state.pds = Some(CowStr::Borrowed(pds));
-                batch.insert(&db.repos, keys::repo_key(&did), ser_repo_state(&state)?);
+                let state = crate::types::v4::RepoState {
+                    active,
+                    status: crate::types::v4::RepoStatus::Synced,
+                    root: None,
+                    last_message_time: None,
+                    last_updated_at: 0,
+                    signing_key: None,
+                    pds: Some(CowStr::Borrowed(pds)),
+                    handle: None,
+                };
+                let bytes = rmp_serde::to_vec(&state).into_diagnostic()?;
+                batch.insert(&db.repos, keys::repo_key(&did), bytes);
                 Ok(())
             };
 

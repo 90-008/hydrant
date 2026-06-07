@@ -11,15 +11,113 @@ use miette::{IntoDiagnostic, Result};
 use rand::RngExt;
 use rand::rngs::SmallRng;
 use std::borrow::Cow;
+use std::io::ErrorKind;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::watch;
 use tracing::{Span, debug, error, info, trace, warn};
 use url::Url;
 
 // these match ref relay
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
+
+#[derive(Debug, Clone)]
+struct FirehoseFailure {
+    kind: &'static str,
+    detail: String,
+}
+
+impl FirehoseFailure {
+    fn new(kind: &'static str, detail: impl Into<String>) -> Self {
+        Self {
+            kind,
+            detail: detail.into(),
+        }
+    }
+}
+
+fn classify_firehose_error(err: &FirehoseError) -> FirehoseFailure {
+    match err {
+        FirehoseError::WebSocket(err) => classify_websocket_error(err),
+        FirehoseError::UnknownScheme(scheme) => {
+            FirehoseFailure::new("config", format!("unsupported URL scheme `{scheme}`"))
+        }
+        FirehoseError::InvalidUri(err) => {
+            FirehoseFailure::new("config", format!("invalid websocket URI: {err}"))
+        }
+        FirehoseError::Decode(err) => {
+            FirehoseFailure::new("decode", format!("failed to decode firehose frame: {err}"))
+        }
+        FirehoseError::EmptyFrame => FirehoseFailure::new("protocol", "received empty frame"),
+        FirehoseError::RelayError { error, message } => FirehoseFailure::new(
+            "relay_error",
+            message
+                .as_deref()
+                .map(|message| format!("{error}: {message}"))
+                .unwrap_or_else(|| error.clone()),
+        ),
+        FirehoseError::UnknownOp(op) => {
+            FirehoseFailure::new("protocol", format!("unknown frame op {op}"))
+        }
+        FirehoseError::MissingType => FirehoseFailure::new("protocol", "missing frame type header"),
+        FirehoseError::UnknownType(ty) => {
+            FirehoseFailure::new("protocol", format!("unknown frame type `{ty}`"))
+        }
+        FirehoseError::Cbor(err) => {
+            FirehoseFailure::new("decode", format!("cbor decode error: {err}"))
+        }
+        FirehoseError::StreamClosed { code, reason } => {
+            FirehoseFailure::new("stream_closed", format!("close code {code}: {reason}"))
+        }
+        FirehoseError::TcpDropped => FirehoseFailure::new("tcp_dropped", "tcp layer dropped"),
+        FirehoseError::FutureCursor => FirehoseFailure::new("cursor", "future cursor"),
+    }
+}
+
+fn classify_websocket_error(err: &tokio_websockets::Error) -> FirehoseFailure {
+    match err {
+        tokio_websockets::Error::CannotResolveHost => {
+            FirehoseFailure::new("dns", "host could not be resolved")
+        }
+        tokio_websockets::Error::Io(err) => {
+            let kind = match err.kind() {
+                ErrorKind::ConnectionRefused => "tcp_refused",
+                ErrorKind::ConnectionReset => "tcp_reset",
+                ErrorKind::ConnectionAborted => "tcp_aborted",
+                ErrorKind::TimedOut => "tcp_timeout",
+                ErrorKind::UnexpectedEof => "tcp_eof",
+                ErrorKind::AddrInUse => "tcp_addr_in_use",
+                ErrorKind::AddrNotAvailable => "tcp_addr_not_available",
+                ErrorKind::PermissionDenied => "tcp_permission",
+                _ => "io",
+            };
+            FirehoseFailure::new(kind, format!("{err}"))
+        }
+        tokio_websockets::Error::InvalidDNSName(_) => {
+            FirehoseFailure::new("tls_invalid_dns_name", format!("{err}"))
+        }
+        tokio_websockets::Error::Rustls(_) => FirehoseFailure::new("tls", format!("{err}")),
+        tokio_websockets::Error::Upgrade(upgrade) => {
+            let kind = match upgrade {
+                tokio_websockets::upgrade::Error::DidNotSwitchProtocols(_) => "http_upgrade",
+                _ => "websocket_upgrade",
+            };
+            FirehoseFailure::new(kind, format!("{upgrade}"))
+        }
+        tokio_websockets::Error::UnsupportedScheme => {
+            FirehoseFailure::new("config", "unsupported websocket URL scheme")
+        }
+        tokio_websockets::Error::Protocol(err) => {
+            FirehoseFailure::new("websocket_protocol", format!("{err}"))
+        }
+        tokio_websockets::Error::PayloadTooLong { len, max_len } => FirehoseFailure::new(
+            "websocket_payload",
+            format!("payload length {len} > {max_len}"),
+        ),
+        _ => FirehoseFailure::new("websocket", format!("{err}")),
+    }
+}
 
 trait AddJitter: rand::Rng {
     fn add_jitter(&mut self, timeout: Duration) -> Duration {
@@ -94,23 +192,58 @@ impl FirehoseIngestor {
                 None => info!("no cursor found, live tailing"),
             }
 
-            let mut stream = match FirehoseStream::connect(self.relay_host.clone(), start_cursor)
-                .await
-            {
-                Ok(s) => s,
-                Err(e) => {
-                    let Some(secs) = self.on_failure().await else {
-                        break Ok(());
-                    };
-                    let timeout = rng.add_jitter(Duration::from_secs(secs).min(MAX_BACKOFF));
-                    let fmt = humantime::format_duration(timeout);
-                    error!(err = %e, in = %fmt, "failed to connect to firehose, retrying later");
-                    tokio::time::sleep(timeout).await;
-                    continue;
-                }
-            };
+            let host_status = self.is_pds.then(|| {
+                let meta = self.state.pds_meta.load();
+                meta.status(host).as_str()
+            });
+            debug!(
+                is_pds = self.is_pds,
+                cursor = ?start_cursor,
+                host_status = ?host_status,
+                consecutive_failures = self.throttle.consecutive_failures(),
+                throttled_until = self.throttle.throttled_until(),
+                "connecting to firehose"
+            );
+            let connect_started = Instant::now();
+            let mut stream =
+                match FirehoseStream::connect(self.relay_host.clone(), start_cursor).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        let failure = classify_firehose_error(&e);
+                        let secs = match self.on_failure(&failure).await {
+                            Some(secs) => secs,
+                            None => {
+                                error!(
+                                    err = %e,
+                                    failure_kind = failure.kind,
+                                    failure = %failure.detail,
+                                    failures = self.throttle.consecutive_failures(),
+                                    max_failures = self.max_failures,
+                                    "failed to connect to firehose, giving up"
+                                );
+                                break Ok(());
+                            }
+                        };
+                        let timeout = rng.add_jitter(Duration::from_secs(secs).min(MAX_BACKOFF));
+                        let fmt = humantime::format_duration(timeout);
+                        error!(
+                            err = %e,
+                            failure_kind = failure.kind,
+                            failure = %failure.detail,
+                            failures = self.throttle.consecutive_failures(),
+                            max_failures = self.max_failures,
+                            in = %fmt,
+                            "failed to connect to firehose, retrying later"
+                        );
+                        tokio::time::sleep(timeout).await;
+                        continue;
+                    }
+                };
 
-            info!("firehose connected");
+            info!(
+                elapsed_ms = connect_started.elapsed().as_millis(),
+                "firehose connected"
+            );
             let mut marked_active = false;
             let active_sleep_secs = if cfg!(debug_assertions) { 1 } else { 60 };
             let mut active_sleep =
@@ -218,29 +351,71 @@ impl FirehoseIngestor {
                     {
                         error!(err = %e, "failed to update host status to idle");
                     }
-                    debug!("outdated cursor, backing off");
-                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    if let Err(e) = self.clear_stale_cursor() {
+                        error!(err = %e, "failed to clear outdated cursor");
+                    }
+                    warn!("outdated cursor, cleared stored cursor and retrying from live tail");
+                    tokio::time::sleep(Duration::from_secs(1)).await;
                 }
                 Err(FirehoseError::RelayError { error, message }) => {
                     let message = message
                         .as_deref()
                         .map_or(Cow::Borrowed("<no message>"), Cow::Borrowed);
+                    let failure =
+                        FirehoseFailure::new("relay_error", format!("{error}: {message}"));
                     error!(err = %error, "relay sent error: {message}");
-                    let Some(secs) = self.on_failure().await else {
-                        break Ok(());
+                    let secs = match self.on_failure(&failure).await {
+                        Some(secs) => secs,
+                        None => {
+                            error!(
+                                failure_kind = failure.kind,
+                                failure = %failure.detail,
+                                failures = self.throttle.consecutive_failures(),
+                                max_failures = self.max_failures,
+                                "firehose disconnected, giving up"
+                            );
+                            break Ok(());
+                        }
                     };
                     let timeout = rng.add_jitter(Duration::from_secs(secs).min(MAX_BACKOFF));
                     let fmt = humantime::format_duration(timeout);
-                    error!(in = %fmt, "firehose disconnected, reconnecting later");
+                    error!(
+                        failure_kind = failure.kind,
+                        failure = %failure.detail,
+                        failures = self.throttle.consecutive_failures(),
+                        max_failures = self.max_failures,
+                        in = %fmt,
+                        "firehose disconnected, reconnecting later"
+                    );
                     tokio::time::sleep(timeout).await;
                 }
                 Err(e) => {
-                    let Some(secs) = self.on_failure().await else {
-                        break Ok(());
+                    let failure = classify_firehose_error(&e);
+                    let secs = match self.on_failure(&failure).await {
+                        Some(secs) => secs,
+                        None => {
+                            error!(
+                                err = %e,
+                                failure_kind = failure.kind,
+                                failure = %failure.detail,
+                                failures = self.throttle.consecutive_failures(),
+                                max_failures = self.max_failures,
+                                "firehose stream error, giving up"
+                            );
+                            break Ok(());
+                        }
                     };
                     let timeout = rng.add_jitter(Duration::from_secs(secs).min(MAX_BACKOFF));
                     let fmt = humantime::format_duration(timeout);
-                    error!(err = %e, in = %fmt, "firehose stream error, reconnecting later");
+                    error!(
+                        err = %e,
+                        failure_kind = failure.kind,
+                        failure = %failure.detail,
+                        failures = self.throttle.consecutive_failures(),
+                        max_failures = self.max_failures,
+                        in = %fmt,
+                        "firehose stream error, reconnecting later"
+                    );
                     tokio::time::sleep(timeout).await;
                 }
             }
@@ -249,14 +424,23 @@ impl FirehoseIngestor {
 
     /// record a failure and return the backoff duration in seconds,
     /// or `None` if the failure threshold was reached and the subscriber should stop
-    async fn on_failure(&self) -> Option<u64> {
-        let secs = self.throttle.record_failure().unwrap_or_else(|| {
-            let until = self.throttle.throttled_until();
-            0.max(until - chrono::Utc::now().timestamp()) as u64
-        });
+    async fn on_failure(&self, failure: &FirehoseFailure) -> Option<u64> {
+        let secs = self
+            .throttle
+            .record_failure_detail(failure.kind, failure.detail.clone())
+            .unwrap_or_else(|| {
+                let until = self.throttle.throttled_until();
+                0.max(until - chrono::Utc::now().timestamp()) as u64
+            });
         let failures = self.throttle.consecutive_failures();
         if failures >= self.max_failures {
-            warn!(failures, "too many consecutive failures, giving up on host");
+            warn!(
+                failures,
+                max_failures = self.max_failures,
+                failure_kind = failure.kind,
+                failure = %failure.detail,
+                "too many consecutive failures, giving up on host"
+            );
             if self.is_pds
                 && let Err(e) = self.set_host_status(HostStatus::Offline)
             {
@@ -280,6 +464,17 @@ impl FirehoseIngestor {
 
         crate::pds_meta::PdsMeta::update_host(&self.state.pds_meta, host, |h| h.status = status);
 
+        Ok(())
+    }
+
+    fn clear_stale_cursor(&self) -> Result<()> {
+        let key = crate::db::keys::firehose_cursor_key_from_url(&self.relay_host);
+        self.state.db.cursors.remove(key).into_diagnostic()?;
+        self.state
+            .firehose_cursors
+            .peek_with(&self.relay_host, |_, cursor| {
+                cursor.store(0, Ordering::SeqCst)
+            });
         Ok(())
     }
 
@@ -365,5 +560,56 @@ impl FirehoseIngestor {
         .await
         .into_diagnostic()
         .flatten()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+    use std::sync::atomic::AtomicI64;
+
+    #[tokio::test]
+    async fn clear_stale_cursor_resets_db_and_memory() -> Result<()> {
+        let tmp = tempfile::tempdir().into_diagnostic()?;
+        let cfg = Config {
+            database_path: tmp.path().to_path_buf(),
+            ..Default::default()
+        };
+        let state = Arc::new(AppState::new(&cfg)?);
+        let relay_host = Url::parse("wss://example.com/").into_diagnostic()?;
+
+        crate::db::set_firehose_cursor(&state.db, &relay_host, 1234)?;
+        let _ = state
+            .firehose_cursors
+            .insert_async(relay_host.clone(), AtomicI64::new(1234))
+            .await;
+
+        let ingestor = FirehoseIngestor::new(
+            state.clone(),
+            BufferTx::channel(1).0,
+            relay_host.clone(),
+            true,
+            state.filter.clone(),
+            state.firehose_enabled.subscribe(),
+            false,
+            1,
+        )
+        .await;
+
+        ingestor.clear_stale_cursor()?;
+
+        assert!(
+            crate::db::get_firehose_cursor(&state.db, &relay_host)
+                .await?
+                .is_none()
+        );
+        let in_memory = state
+            .firehose_cursors
+            .peek_with(&relay_host, |_, cursor| cursor.load(Ordering::SeqCst))
+            .unwrap_or(-1);
+        assert_eq!(in_memory, 0);
+
+        Ok(())
     }
 }

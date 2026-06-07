@@ -24,25 +24,33 @@ pub struct Throttler {
     states: Arc<HashMap<Url, Arc<State>>>,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct ThrottleSnapshot {
     pub consecutive_failures: usize,
     pub throttled_until: i64,
+    pub last_failure: Option<FailureSnapshot>,
 }
 
 impl ThrottleSnapshot {
-    pub fn is_failing(self) -> bool {
+    pub fn is_failing(&self) -> bool {
         self.consecutive_failures != 0 || self.throttled_until != 0
     }
 
-    pub fn is_throttled(self, now: i64) -> bool {
+    pub fn is_throttled(&self, now: i64) -> bool {
         self.throttled_until != 0 && now < self.throttled_until
     }
 
-    pub fn retry_in_secs(self, now: i64) -> Option<u64> {
+    pub fn retry_in_secs(&self, now: i64) -> Option<u64> {
         self.is_throttled(now)
             .then_some((self.throttled_until - now) as u64)
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct FailureSnapshot {
+    pub at: i64,
+    pub kind: String,
+    pub detail: String,
 }
 
 impl Throttler {
@@ -79,6 +87,7 @@ impl Throttler {
             .read_sync(url, |_, state| ThrottleSnapshot {
                 consecutive_failures: state.consecutive_failures.load(Ordering::Acquire),
                 throttled_until: state.throttled_until.load(Ordering::Acquire),
+                last_failure: state.last_failure.lock().clone(),
             })
             .unwrap_or_default()
     }
@@ -88,6 +97,7 @@ struct State {
     throttled_until: AtomicI64,
     consecutive_failures: AtomicUsize,
     consecutive_timeouts: AtomicUsize,
+    last_failure: Mutex<Option<FailureSnapshot>>,
     /// only fires on hard failures (timeout, TLS, bad gateway, etc).
     /// ratelimits do NOT fire this — they just store `throttled_until` and
     /// let tasks exit naturally, deferring to the background retry loop.
@@ -102,6 +112,7 @@ impl State {
             throttled_until: AtomicI64::new(0),
             consecutive_failures: AtomicUsize::new(0),
             consecutive_timeouts: AtomicUsize::new(0),
+            last_failure: Mutex::new(None),
             failure_notify: Notify::new(),
             semaphore: Semaphore::new(PER_PDS_CONCURRENCY),
             rate_limiter: RateLimiter::new(),
@@ -128,6 +139,7 @@ impl ThrottleHandle {
         self.state.consecutive_failures.store(0, Ordering::Release);
         self.state.consecutive_timeouts.store(0, Ordering::Release);
         self.state.throttled_until.store(0, Ordering::Release);
+        *self.state.last_failure.lock() = None;
     }
 
     /// called on a 429 response. `retry_after_secs` comes from the `Retry-After`
@@ -145,6 +157,23 @@ impl ThrottleHandle {
     /// always increments `consecutive_failures`. only sets a new `throttled_until`
     /// (and notifies waiters) if not already throttled.
     pub fn record_failure(&self) -> Option<u64> {
+        self.record_failure_inner()
+    }
+
+    pub fn record_failure_detail(
+        &self,
+        kind: impl Into<String>,
+        detail: impl Into<String>,
+    ) -> Option<u64> {
+        *self.state.last_failure.lock() = Some(FailureSnapshot {
+            at: chrono::Utc::now().timestamp(),
+            kind: kind.into(),
+            detail: detail.into(),
+        });
+        self.record_failure_inner()
+    }
+
+    fn record_failure_inner(&self) -> Option<u64> {
         let failures = self
             .state
             .consecutive_failures

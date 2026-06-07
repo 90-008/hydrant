@@ -5,7 +5,7 @@ use std::time::Duration;
 use miette::{IntoDiagnostic, Result};
 use rand::RngExt;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info};
+use tracing::{debug, error, info};
 use url::Url;
 
 use crate::config::FirehoseSource;
@@ -39,6 +39,14 @@ pub struct FirehosePdsInfo {
     pub status: &'static str,
 }
 
+/// details for the most recent recorded firehose source failure.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct FirehoseFailureInfo {
+    pub at: i64,
+    pub kind: String,
+    pub detail: String,
+}
+
 /// a snapshot of a single firehose relay's runtime state.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct FirehoseSourceInfo {
@@ -53,6 +61,8 @@ pub struct FirehoseSourceInfo {
     pub throttled_until: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub retry_in_secs: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_failure: Option<FirehoseFailureInfo>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub host_status: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -120,12 +130,24 @@ impl FirehoseHandle {
 
         tokio::spawn({
             let relay_url = source.url.clone();
+            let is_pds = source.is_pds;
             let tasks = self.tasks.clone();
             let token = cancel.clone();
             async move {
                 // jitter connection start so we dont cause thundering herd problems
                 if delay_startup {
-                    let jitter_ms = rand::rng().random_range(0u64..2000);
+                    let max_jitter_ms = if is_pds && !cfg!(debug_assertions) {
+                        60_000
+                    } else {
+                        2_000
+                    };
+                    let jitter_ms = rand::rng().random_range(0u64..max_jitter_ms);
+                    debug!(
+                        relay = %relay_url,
+                        is_pds,
+                        jitter_ms,
+                        "delaying firehose ingestor startup"
+                    );
                     tokio::select! {
                         _ = tokio::time::sleep(Duration::from_millis(jitter_ms)) => {}
                         _ = token.cancelled() => {
@@ -191,6 +213,15 @@ impl FirehoseHandle {
                 let throttle = self.state.throttler.snapshot(url);
                 let pds = is_pds.then(|| self.pds_info(url, &meta)).flatten();
                 let host_status = pds.as_ref().map(|pds| pds.status);
+                let last_failure =
+                    throttle
+                        .last_failure
+                        .clone()
+                        .map(|failure| FirehoseFailureInfo {
+                            at: failure.at,
+                            kind: failure.kind,
+                            detail: failure.detail,
+                        });
                 out.push(FirehoseSourceInfo {
                     url: url.clone(),
                     is_pds,
@@ -201,6 +232,7 @@ impl FirehoseHandle {
                     throttled_until: (throttle.throttled_until != 0)
                         .then_some(throttle.throttled_until),
                     retry_in_secs: throttle.retry_in_secs(now),
+                    last_failure,
                     host_status,
                     pds,
                 });
@@ -279,6 +311,70 @@ impl FirehoseHandle {
             .await?;
 
         Ok(())
+    }
+
+    /// add PDS sources discovered from a seed relay.
+    ///
+    /// seed pages can contain thousands of hosts. persist the whole page in one
+    /// batch and stagger startup so a fresh relay does not stampede DNS, TCP,
+    /// TLS, and remote PDS websocket endpoints at once.
+    pub(super) async fn add_seeded_sources(&self, urls: Vec<Url>) -> Result<usize> {
+        let shared = self
+            .shared
+            .get()
+            .ok_or_else(|| miette::miette!("firehose worker not started"))?;
+
+        let mut sources = Vec::with_capacity(urls.len());
+        for url in urls {
+            if self.is_source_known(&url) {
+                continue;
+            }
+            sources.push(FirehoseSource { url, is_pds: true });
+        }
+
+        if sources.is_empty() {
+            return Ok(0);
+        }
+
+        tokio::task::spawn_blocking({
+            let state = self.state.clone();
+            let sources = sources.clone();
+            move || {
+                let mut batch = state.db.inner.batch();
+                for source in &sources {
+                    let value = rmp_serde::to_vec(&db::FirehoseSourceMeta {
+                        is_pds: source.is_pds,
+                    })
+                    .map_err(|e| {
+                        miette::miette!("failed to serialize firehose source meta: {e}")
+                    })?;
+                    batch.insert(
+                        &state.db.crawler,
+                        keys::firehose_source_key(source.url.as_str()),
+                        &value,
+                    );
+                }
+                batch.commit().into_diagnostic()?;
+                state.db.persist()
+            }
+        })
+        .await
+        .into_diagnostic()??;
+
+        let mut added = 0usize;
+        for source in sources {
+            if self
+                .known_sources
+                .insert_async(source.url.clone(), true)
+                .await
+                .is_ok()
+            {
+                self.spawn_firehose_ingestor(&source, shared, true).await?;
+                added += 1;
+            }
+        }
+
+        Ok(added)
     }
 
     /// remove a firehose source at runtime.

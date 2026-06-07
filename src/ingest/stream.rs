@@ -26,6 +26,8 @@ pub enum FirehoseError {
     WebSocket(#[from] tokio_websockets::Error),
     #[error("unknown scheme: {0}")]
     UnknownScheme(String),
+    #[error("invalid websocket uri: {0}")]
+    InvalidUri(String),
     #[error("decode error: {0}")]
     Decode(#[from] DecodeError),
     #[error("empty frame")]
@@ -77,7 +79,7 @@ impl FirehoseStream {
         let uri: Uri = relay
             .as_str()
             .parse()
-            .map_err(|e| FirehoseError::Cbor(format!("invalid uri: {e}")))?;
+            .map_err(|e| FirehoseError::InvalidUri(format!("{e}")))?;
 
         let (ws, _) = ClientBuilder::from_uri(uri).connect().await?;
 

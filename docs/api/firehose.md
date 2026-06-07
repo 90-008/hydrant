@@ -16,6 +16,11 @@ list all known firehose sources, including offline ones waiting for the retry lo
   "consecutive_failures": 3,
   "throttled_until": 1717240000,
   "retry_in_secs": 42,
+  "last_failure": {
+    "at": 1717239958,
+    "kind": "tcp_refused",
+    "detail": "connection refused"
+  },
   "host_status": "offline",
   "pds": {
     "host": "127.0.0.1",
@@ -27,6 +32,8 @@ list all known firehose sources, including offline ones waiting for the retry lo
 ```
 
 `is_pds: true` means the source is a direct PDS connection with host authority enforcement enabled. `host_status` and `pds` are only present for PDS sources.
+
+`last_failure` is present while hydrant has recorded failure/backoff state for a source. `kind` is a compact category such as `dns`, `tcp_refused`, `tcp_timeout`, `tls`, `http_upgrade`, `websocket`, `decode`, `relay_error`, or `config`; `detail` contains the underlying error text.
 
 ### query parameters
 

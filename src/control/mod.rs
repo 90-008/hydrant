@@ -30,6 +30,7 @@ pub use repos::{ListedRecord, Record, RecordList, RepoHandle, RepoInfo, ReposCon
 use smol_str::{SmolStr, ToSmolStr};
 
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -39,7 +40,7 @@ use std::task::{Context, Poll};
 use futures::{FutureExt, Stream};
 use miette::{IntoDiagnostic, Result, WrapErr};
 use tokio::sync::{mpsc, watch};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 #[cfg(feature = "indexer")]
 use crate::backfill::BackfillWorker;
@@ -467,6 +468,13 @@ impl Hydrant {
                 .expect("firehose shared already set");
             let fire_shared = firehose.shared.get().unwrap();
 
+            // refresh seed snapshots before spawning any direct PDS sources. persisted
+            // sources may predate cursor seeding, and an already-open websocket will not
+            // pick up a later cursor update until it reconnects.
+            if !config.seed_hosts.is_empty() {
+                seed::refresh_seed_snapshots(&config.seed_hosts, &state).await;
+            }
+
             // add hosts from config
             let relay_hosts = config.relays.clone();
             if !relay_hosts.is_empty() {
@@ -510,9 +518,8 @@ impl Hydrant {
                     .await?;
             }
             // we use spawn_firehose_ingestor directly here since we dont want
-            // to go through the whole add_source machinery and checks
-            // its ok since we block here before running stuff like seed_hosts
-            // and whatnot
+            // to go through the whole add_source machinery and checks. seed
+            // cursor snapshots were refreshed before this loop.
 
             // 10c. seed firehose PDS sources from listHosts on configured seed URLs
             if !config.seed_hosts.is_empty() {
@@ -533,6 +540,7 @@ impl Hydrant {
                             tokio::time::sleep(retry_interval).await;
 
                             let mut to_restart: Vec<(Url, bool)> = Vec::new();
+                            let mut banned = 0usize;
                             {
                                 let meta = firehose.state.pds_meta.load();
                                 firehose
@@ -543,6 +551,7 @@ impl Hydrant {
                                         }
                                         let host = url.host_str().unwrap_or(url.as_str());
                                         if meta.is_banned(host) {
+                                            banned += 1;
                                             return true;
                                         }
                                         to_restart.push((url.clone(), is_pds));
@@ -551,8 +560,19 @@ impl Hydrant {
                                     .await;
                             }
 
+                            if !to_restart.is_empty() || banned != 0 {
+                                info!(
+                                    restart_count = to_restart.len(),
+                                    banned,
+                                    retry_interval_secs = retry_interval.as_secs(),
+                                    "offline firehose retry tick"
+                                );
+                            }
+
                             for (url, is_pds) in to_restart {
-                                let _ = firehose.restart_source(url, is_pds).await;
+                                if let Err(e) = firehose.restart_source(url.clone(), is_pds).await {
+                                    warn!(url = %url, is_pds, err = %e, "failed to restart firehose source");
+                                }
                             }
                         }
                     }
@@ -925,43 +945,68 @@ impl Hydrant {
                 *end.last_mut().unwrap() += 1;
                 end
             };
-            let start_bound = match cursor.as_deref() {
-                Some(host) => std::ops::Bound::Excluded(keys::firehose_cursor_key(host)),
-                None => std::ops::Bound::Included(keys::FIREHOSE_CURSOR_PREFIX.to_vec()),
-            };
 
-            // fetch one extra item to detect whether there is a next page
-            let mut hosts: Vec<Host> = Vec::with_capacity(limit + 1);
-            for item in state
-                .db
-                .cursors
-                .range((start_bound, std::ops::Bound::Excluded(prefix_end)))
-                .take(limit + 1)
-            {
-                let (k, v) = item.into_inner().into_diagnostic()?;
+            let mut all_hostnames = BTreeSet::new();
+            for item in state.db.cursors.range((
+                std::ops::Bound::Included(keys::FIREHOSE_CURSOR_PREFIX.to_vec()),
+                std::ops::Bound::Excluded(prefix_end),
+            )) {
+                let (k, _) = item.into_inner().into_diagnostic()?;
                 let hostname = std::str::from_utf8(&k[keys::FIREHOSE_CURSOR_PREFIX.len()..])
                     .into_diagnostic()
                     .wrap_err("firehose cursor key contains non-utf8 hostname")?;
-                let seq = i64::from_be_bytes(
-                    v.as_ref()
-                        .try_into()
-                        .into_diagnostic()
-                        .wrap_err("cursor value is not 8 bytes")?,
-                );
+                all_hostnames.insert(SmolStr::new(hostname));
+            }
+
+            {
+                let meta = state.pds_meta.load();
+                for hostname in meta.hosts.keys() {
+                    all_hostnames.insert(SmolStr::new(hostname));
+                }
+            }
+
+            let hostnames = all_hostnames.into_iter().collect::<Vec<_>>();
+            let start_idx = cursor
+                .as_deref()
+                .map(|after| hostnames.partition_point(|host| host.as_str() <= after))
+                .unwrap_or(0);
+
+            let selected = hostnames
+                .iter()
+                .skip(start_idx)
+                .take(limit + 1)
+                .cloned()
+                .collect::<Vec<_>>();
+
+            let mut hosts: Vec<Host> = Vec::with_capacity(selected.len().min(limit));
+            for hostname in selected.iter().take(limit) {
+                let seq = state
+                    .db
+                    .cursors
+                    .get(keys::firehose_cursor_key(hostname))
+                    .into_diagnostic()?
+                    .map(|v| {
+                        v.as_ref()
+                            .try_into()
+                            .into_diagnostic()
+                            .wrap_err("cursor value is not 8 bytes")
+                            .map(i64::from_be_bytes)
+                    })
+                    .transpose()?
+                    .unwrap_or(0);
                 let account_count = state
                     .db
                     .get_count_sync(&keys::pds_account_count_key(hostname));
                 let status = state.pds_meta.load().status(hostname);
                 hosts.push(Host {
-                    name: hostname.into(),
+                    name: hostname.clone(),
                     seq,
                     account_count,
                     status,
                 });
             }
 
-            let next_cursor = if hosts.len() > limit {
-                hosts.pop();
+            let next_cursor = if selected.len() > limit {
                 hosts.last().map(|h| h.name.clone())
             } else {
                 None
@@ -1110,6 +1155,104 @@ mod tests {
             ks.get("key2").into_diagnostic()?.as_deref(),
             Some(b"value2" as &[u8])
         );
+
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod host_listing_tests {
+    use super::*;
+    use crate::db::{keys, set_ks_count};
+    use crate::pds_meta::HostStatus;
+
+    fn test_config(path: &std::path::Path) -> Config {
+        Config {
+            database_path: path.to_path_buf(),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn list_hosts_includes_seeded_hosts_without_cursors() -> Result<()> {
+        let tmp = tempfile::tempdir().into_diagnostic()?;
+        let hydrant = Hydrant::new(test_config(tmp.path())).await?;
+
+        {
+            let state = hydrant.state.clone();
+            tokio::task::spawn_blocking(move || -> Result<()> {
+                let mut batch = state.db.inner.batch();
+                crate::db::pds_meta::set_status(
+                    &mut batch,
+                    &state.db.filter,
+                    "offline.example",
+                    HostStatus::Offline,
+                )?;
+                crate::db::pds_meta::set_status(
+                    &mut batch,
+                    &state.db.filter,
+                    "active.example",
+                    HostStatus::Active,
+                )?;
+                set_ks_count(
+                    &mut batch,
+                    &state.db,
+                    &keys::pds_account_count_key("offline.example"),
+                    7,
+                );
+                set_ks_count(
+                    &mut batch,
+                    &state.db,
+                    &keys::pds_account_count_key("active.example"),
+                    42,
+                );
+                state
+                    .db
+                    .cursors
+                    .insert(
+                        keys::firehose_cursor_key("active.example"),
+                        123_i64.to_be_bytes(),
+                    )
+                    .into_diagnostic()?;
+                batch.commit().into_diagnostic()?;
+                state.db.persist()
+            })
+            .await
+            .into_diagnostic()??;
+
+            crate::pds_meta::PdsMeta::update_host(
+                &hydrant.state.pds_meta,
+                "offline.example",
+                |h| {
+                    h.status = HostStatus::Offline;
+                },
+            );
+            crate::pds_meta::PdsMeta::update_host(&hydrant.state.pds_meta, "active.example", |h| {
+                h.status = HostStatus::Active;
+            });
+            hydrant.state.db.update_count("p|offline.example", 7);
+            hydrant.state.db.update_count("p|active.example", 42);
+        }
+
+        let (hosts, next) = hydrant.list_hosts(None, 10).await?;
+        assert!(next.is_none());
+
+        let offline = hosts
+            .iter()
+            .find(|h| h.name == "offline.example")
+            .expect("seeded host without cursor should be listed");
+        let active = hosts
+            .iter()
+            .find(|h| h.name == "active.example")
+            .expect("host with cursor should be listed");
+
+        assert_eq!(offline.seq, 0);
+        assert_eq!(offline.account_count, 7);
+        assert_eq!(offline.status, HostStatus::Offline);
+
+        assert_eq!(active.seq, 123);
+        assert_eq!(active.account_count, 42);
+        assert_eq!(active.status, HostStatus::Active);
 
         Ok(())
     }

@@ -124,6 +124,32 @@ def fetch-host-status [relay_base: string, host: string, timeout_secs: int] {
     }
 }
 
+def host-status-from-list [hosts: list<any>, host: string] {
+    let matches = ($hosts | where hostname == $host)
+
+    if ($matches | is-empty) {
+        {
+            http_status: 404,
+            hostname: $host,
+            status: null,
+            seq: null,
+            accountCount: null,
+            error: "not found in listHosts"
+        }
+    } else {
+        let listed = ($matches | first)
+        $listed
+        | merge {
+            http_status: 200,
+            hostname: ($listed.hostname? | default $host),
+            status: ($listed.status? | default null),
+            seq: ($listed.seq? | default null),
+            accountCount: ($listed.accountCount? | default null),
+            error: null
+        }
+    }
+}
+
 def compare-statuses [left: record, right: record] {
     {
         status_match: ($left.status == $right.status),
@@ -219,9 +245,9 @@ def main [
 
     let rows = (
         $host_rows
-        | par-each --threads $threads --keep-order { |host|
-            let left = (fetch-host-status $source_relay $host $timeout_secs)
-            let right = (fetch-host-status $compare_relay $host $timeout_secs)
+        | each { |host|
+            let left = (host-status-from-list $source_hosts $host)
+            let right = (host-status-from-list $compare_hosts $host)
             let cmp = (compare-statuses $left $right)
             let comparison = (classify-comparison $left $right $cmp)
             let source_listed = ($source_hostnames | any {|it| $it == $host })
