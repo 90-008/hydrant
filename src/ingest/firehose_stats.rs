@@ -540,6 +540,7 @@ impl RelayShardStats {
         add_duration(&self.resolve_doc_micros, elapsed);
     }
 
+    #[cfg_attr(all(feature = "relay", not(feature = "indexer")), allow(dead_code))]
     pub fn record_repo_status_probe(&self, elapsed: Duration) {
         self.repo_status_probe_calls.fetch_add(1, Ordering::Relaxed);
         add_duration(&self.repo_status_probe_micros, elapsed);

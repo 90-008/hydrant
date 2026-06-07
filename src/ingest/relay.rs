@@ -2,8 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 #[cfg(feature = "relay")]
 use std::sync::atomic::Ordering;
-#[cfg(feature = "firehose-diagnostics")]
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use fjall::OwnedWriteBatch;
 
@@ -44,6 +43,9 @@ use crate::types::StoredJetstreamEvent;
 use crate::types::{RepoState, RepoStatus};
 use crate::util;
 use smol_str::{SmolStr, ToSmolStr};
+
+const WRONG_HOST_AUTHORITY_RECHECK_INTERVAL: Duration = Duration::from_secs(60);
+const WRONG_HOST_AUTHORITY_CACHE_PRUNE_AT: usize = 8192;
 
 fn map_repo_status_probe(output: Option<GetRepoStatusOutput<'_>>) -> Option<RepoState<'static>> {
     let output = output?;
@@ -122,6 +124,7 @@ struct WorkerContext<'a> {
     hook: crate::ingest::indexer::IndexerTx,
     http: reqwest::Client,
     error_counts: HashMap<u64, u32, nohash_hasher::BuildNoHashHasher<u64>>,
+    wrong_host_authority: HashMap<u64, Instant, nohash_hasher::BuildNoHashHasher<u64>>,
 }
 
 struct WorkerMessage {
@@ -247,6 +250,7 @@ impl RelayWorker {
             hook,
             http,
             error_counts: Default::default(),
+            wrong_host_authority: Default::default(),
         };
 
         while let Some(msg) = rx.blocking_recv() {
@@ -887,6 +891,35 @@ impl WorkerContext<'_> {
         }
     }
 
+    fn wrong_host_authority_key(did: &Did, source_host: &str) -> u64 {
+        util::hash(&(did.as_str(), source_host))
+    }
+
+    fn recently_rejected_wrong_host_authority(&mut self, cache_key: u64) -> bool {
+        if self
+            .wrong_host_authority
+            .get(&cache_key)
+            .is_some_and(|checked_at| checked_at.elapsed() < WRONG_HOST_AUTHORITY_RECHECK_INTERVAL)
+        {
+            return true;
+        }
+
+        self.wrong_host_authority.remove(&cache_key);
+        false
+    }
+
+    fn remember_wrong_host_authority(&mut self, cache_key: u64) {
+        if self.wrong_host_authority.len() >= WRONG_HOST_AUTHORITY_CACHE_PRUNE_AT {
+            self.wrong_host_authority.retain(|_, checked_at| {
+                checked_at.elapsed() < WRONG_HOST_AUTHORITY_RECHECK_INTERVAL
+            });
+            if self.wrong_host_authority.len() >= WRONG_HOST_AUTHORITY_CACHE_PRUNE_AT {
+                self.wrong_host_authority.clear();
+            }
+        }
+        self.wrong_host_authority.insert(cache_key, Instant::now());
+    }
+
     fn check_host_authority(
         &mut self,
         did: &Did,
@@ -899,9 +932,16 @@ impl WorkerContext<'_> {
                 .and_then(|u| u.host_str().map(SmolStr::new))
         };
 
+        let cache_key = Self::wrong_host_authority_key(did, source_host);
         let expected = repo_state.pds.as_deref().and_then(pds_host);
         if expected.as_deref() == Some(source_host) {
+            self.wrong_host_authority.remove(&cache_key);
             return Ok(AuthorityOutcome::Authorized);
+        }
+        if let Some(expected) = expected.clone()
+            && self.recently_rejected_wrong_host_authority(cache_key)
+        {
+            return Ok(AuthorityOutcome::WrongHost { expected });
         }
 
         // try again once
@@ -910,9 +950,13 @@ impl WorkerContext<'_> {
             miette::bail!("can't get pds host???");
         };
 
-        Ok((expected.as_str() == source_host)
-            .then_some(AuthorityOutcome::WasStale)
-            .unwrap_or(AuthorityOutcome::WrongHost { expected }))
+        if expected.as_str() == source_host {
+            self.wrong_host_authority.remove(&cache_key);
+            Ok(AuthorityOutcome::WasStale)
+        } else {
+            self.remember_wrong_host_authority(cache_key);
+            Ok(AuthorityOutcome::WrongHost { expected })
+        }
     }
 
     fn refresh_doc(&mut self, did: &Did, repo_state: &mut RepoState) -> Result<()> {
@@ -1077,6 +1121,7 @@ impl WorkerContext<'_> {
         }
     }
 
+    #[cfg_attr(all(feature = "relay", not(feature = "indexer")), allow(dead_code))]
     async fn check_repo_status(
         &self,
         did: &Did<'_>,
@@ -1217,17 +1262,23 @@ impl WorkerContext<'_> {
             }
         }
 
-        // try to get upstream status
-        #[cfg(feature = "firehose-diagnostics")]
-        let probe_started = Instant::now();
-        let repo_state =
-            tokio::runtime::Handle::current().block_on(self.check_repo_status(did, &doc.pds));
-        #[cfg(feature = "firehose-diagnostics")]
-        self.stats.record_repo_status_probe(probe_started.elapsed());
-        let mut repo_state = repo_state
-            .ok()
-            .flatten()
-            .unwrap_or_else(RepoState::backfilling);
+        #[cfg(any(not(feature = "relay"), feature = "indexer"))]
+        let mut repo_state = {
+            // try to get upstream status
+            #[cfg(feature = "firehose-diagnostics")]
+            let probe_started = Instant::now();
+            let repo_state =
+                tokio::runtime::Handle::current().block_on(self.check_repo_status(did, &doc.pds));
+            #[cfg(feature = "firehose-diagnostics")]
+            self.stats.record_repo_status_probe(probe_started.elapsed());
+            repo_state
+                .ok()
+                .flatten()
+                .unwrap_or_else(RepoState::backfilling)
+        };
+
+        #[cfg(all(feature = "relay", not(feature = "indexer")))]
+        let mut repo_state = RepoState::backfilling();
 
         repo_state.update_from_doc(doc);
         RelayWorker::update_pds_account_count(
