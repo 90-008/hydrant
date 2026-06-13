@@ -170,7 +170,9 @@ pub(crate) fn repo_state_to_info(did: Did<'static>, s: RepoState<'_>, tracked: b
         pds: s.pds.and_then(|p| p.parse().ok()),
         signing_key: s.signing_key.map(|k| k.into_static()),
         last_updated_at: DateTime::from_timestamp_secs(s.last_updated_at),
-        last_message_at: s.last_message_time.and_then(DateTime::from_timestamp_secs),
+        last_message_at: s
+            .last_message_time
+            .and_then(DateTime::from_timestamp_millis),
     }
 }
 
@@ -178,6 +180,32 @@ pub struct Record {
     pub did: Did<'static>,
     pub cid: Cid<'static>,
     pub value: Data<'static>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use miette::IntoDiagnostic;
+
+    #[test]
+    fn repo_info_renders_message_time_from_millis() -> miette::Result<()> {
+        let mut state = RepoState::backfilling();
+        state.last_updated_at = 1_783_785_600;
+        state.last_message_time = Some(1_783_785_600_123);
+
+        let info = repo_state_to_info(Did::new("did:plc:testrepo").into_diagnostic()?, state, true);
+
+        assert_eq!(
+            info.last_updated_at.map(|t| t.timestamp()),
+            Some(1_783_785_600)
+        );
+        assert_eq!(
+            info.last_message_at
+                .map(|t| (t.timestamp(), t.timestamp_subsec_millis())),
+            Some((1_783_785_600, 123))
+        );
+        Ok(())
+    }
 }
 
 pub struct ListedRecord {

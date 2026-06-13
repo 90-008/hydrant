@@ -298,6 +298,13 @@ impl<'i> RepoState<'i> {
         }
     }
 
+    pub fn synced() -> Self {
+        Self {
+            status: RepoStatus::Synced,
+            ..Self::backfilling()
+        }
+    }
+
     // advances the high-water mark to event_ms if it's newer than what we've seen
     pub fn advance_message_time(&mut self, event_ms: i64) {
         self.last_message_time = Some(event_ms.max(self.last_message_time.unwrap_or(0)));
@@ -717,6 +724,14 @@ mod tests {
         assert!(!state.should_process_account_time(2_500));
         assert!(!state.should_process_account_time(2_499));
         assert!(state.should_process_account_time(2_501));
+    }
+
+    #[test]
+    fn synced_state_is_active_without_backfilling_status() {
+        let state = RepoState::synced();
+        assert!(state.active);
+        assert_eq!(state.status, RepoStatus::Synced);
+        assert!(state.root.is_none());
     }
 
     #[test]

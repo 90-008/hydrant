@@ -1278,7 +1278,7 @@ impl WorkerContext<'_> {
         };
 
         #[cfg(all(feature = "relay", not(feature = "indexer")))]
-        let mut repo_state = RepoState::backfilling();
+        let mut repo_state = RepoState::synced();
 
         repo_state.update_from_doc(doc);
         RelayWorker::update_pds_account_count(

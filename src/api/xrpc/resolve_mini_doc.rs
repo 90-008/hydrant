@@ -86,14 +86,19 @@ pub(super) async fn resolve_mini_doc(
         .await
         .map_err(|e| bad_request(nsid, format!("can't resolve identifier: {e}")))?;
 
-    let doc = hydrant.repos.get(&did).mini_doc().await.map_err(|e| match e {
-        MiniDocError::NotSynced => bad_request(nsid, "repo not synced"),
-        MiniDocError::RepoNotFound => bad_request(nsid, "repo not found"),
-        MiniDocError::CouldNotResolveIdentity => {
-            upstream_error(nsid, "identity could not be resolved")
-        }
-        MiniDocError::Other(e) => internal_error(nsid, e),
-    })?;
+    let doc = hydrant
+        .repos
+        .get(&did)
+        .mini_doc()
+        .await
+        .map_err(|e| match e {
+            MiniDocError::NotSynced => bad_request(nsid, "repo not synced"),
+            MiniDocError::RepoNotFound => bad_request(nsid, "repo not found"),
+            MiniDocError::CouldNotResolveIdentity => {
+                upstream_error(nsid, "identity could not be resolved")
+            }
+            MiniDocError::Other(e) => internal_error(nsid, e),
+        })?;
 
     Ok(ResolveMiniDocOutput {
         did: doc.did,
