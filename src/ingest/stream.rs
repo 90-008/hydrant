@@ -301,6 +301,7 @@ pub struct Commit<'a> {
     #[serde(deserialize_with = "deserialize_tid_or_empty")]
     pub since: Option<Tid>,
     pub time: Datetime,
+    #[serde(default)]
     pub too_big: bool,
 }
 
@@ -677,6 +678,31 @@ mod test {
     use super::FirehoseError;
     use super::{SubscribeReposMessage, decode_frame};
 
+    #[cfg(feature = "relay")]
+    #[derive(serde::Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct CommitWithoutTooBig<'a> {
+        #[serde(borrow)]
+        blobs: Vec<super::CidLink<'a>>,
+        #[serde(with = "jacquard_common::serde_bytes_helper")]
+        blocks: bytes::Bytes,
+        #[serde(borrow)]
+        commit: super::CidLink<'a>,
+        #[serde(borrow)]
+        ops: Vec<super::RepoOp<'a>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[serde(default)]
+        #[serde(borrow)]
+        prev_data: Option<super::CidLink<'a>>,
+        rebase: bool,
+        #[serde(borrow)]
+        repo: super::Did<'a>,
+        rev: super::Tid,
+        seq: i64,
+        since: Option<super::Tid>,
+        time: super::Datetime,
+    }
+
     #[test]
     fn test_decode_account() {
         const FRAME: &[u8] = b"omF0aCNhY2NvdW50Ym9wAaRjZGlkeCBkaWQ6cGxjOjNuNDNncWY2YTZua3J3MzU1cnNjNnJ0ZGNzZXEbAAAAAlP5Zt5kdGltZXgbMjAyNi0wMi0yNFQxNDowNToyMC41MjE1NDY5ZmFjdGl2ZfU=";
@@ -697,6 +723,38 @@ mod test {
             panic!("expected Commit");
         };
         assert!(c.since.is_none(), "since should be None for empty string");
+    }
+
+    #[cfg(feature = "relay")]
+    #[test]
+    fn test_decode_commit_missing_too_big_defaults_false() {
+        const FRAME: &[u8] = b"omF0ZyNjb21taXRib3ABq2NvcHOAY3Jldm0zbWdkeWNmdWIyeTIyY3NlcRsAAAACZ8sHJmRyZXBveCBkaWQ6cGxjOmpxM3p2cmI1ZXdnMnFndXA3M3Fzb3V6ZWR0aW1leBsyMDI2LTAzLTA1VDE1OjQ3OjU0LjcxNjMyOFplYmxvYnOAZXNpbmNlYGZibG9ja3NZAUk6omVyb290c4HYKlglAAFxEiAlaO/rjabPL4/e2QlxkoxzCCwv69hE4P3Vdxpv7f6uEWd2ZXJzaW9uAeABAXESICVo7+uNps8vj97ZCXGSjHMILC/r2ETg/dV3Gm/t/q4RpmNkaWR4IGRpZDpwbGM6anEzenZyYjVld2cycWd1cDczcXNvdXplY3Jldm0zbWdkeWNmdWIyeTIyY3NpZ1hAwKfrZtwwbN7dW0uSbviOs65NWQRvlS9Qc7oRtiorybMTEYxKGJaFK2kHIMEWIJqumb4751En2aJEpsilWlaQOWRkYXRh2CpYJQABcRIgnf7+Yd126j3K5QI4gLCDedV63yBILW/b4nWSifZHZ3tkcHJldvZndmVyc2lvbgMrAXESIJ3+/mHdduo9yuUCOICwg3nVet8gSC1v2+J1kon2R2d7omFlgGFs9mZjb21taXTYKlglAAFxEiAlaO/rjabPL4/e2QlxkoxzCCwv69hE4P3Vdxpv7f6uEWZyZWJhc2X0ZnRvb0JpZ/Q=";
+        let bytes = data_encoding::BASE64.decode(FRAME).unwrap();
+        let SubscribeReposMessage::Commit(c) = decode_frame(&bytes).unwrap() else {
+            panic!("expected Commit");
+        };
+        let frame = super::encode_frame(
+            "#commit",
+            &CommitWithoutTooBig {
+                blobs: c.blobs.clone(),
+                blocks: c.blocks.clone(),
+                commit: c.commit.clone(),
+                ops: c.ops.clone(),
+                prev_data: c.prev_data.clone(),
+                rebase: c.rebase,
+                repo: c.repo.clone(),
+                rev: c.rev,
+                seq: c.seq,
+                since: c.since,
+                time: c.time,
+            },
+        )
+        .unwrap();
+
+        let SubscribeReposMessage::Commit(c) = decode_frame(&frame).unwrap() else {
+            panic!("expected Commit");
+        };
+        assert!(!c.too_big, "missing tooBig should default to false");
     }
 
     #[cfg(feature = "relay")]
