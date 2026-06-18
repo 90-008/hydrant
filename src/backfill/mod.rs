@@ -410,7 +410,7 @@ enum SparseBackfillResult {
     Skipped,
 }
 
-const SPARSE_GET_BLOCKS_CHUNK: usize = 64;
+const SPARSE_GET_BLOCKS_CHUNK: usize = 100;
 const SPARSE_MAX_SCAN_ROUNDS: usize = 256;
 
 async fn process_did_sparse(
