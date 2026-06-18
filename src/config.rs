@@ -284,6 +284,39 @@ impl fmt::Display for SignatureVerification {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackfillStrategy {
+    /// always fetch full repo cars with `com.atproto.sync.getRepo`.
+    Full,
+    /// use sparse collection backfill when possible, falling back to full repo cars.
+    SparseFilter,
+    /// choose sparse collection backfill only when the configured filter supports it.
+    Auto,
+}
+
+impl FromStr for BackfillStrategy {
+    type Err = miette::Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        match s {
+            "full" => Ok(Self::Full),
+            "sparse-filter" => Ok(Self::SparseFilter),
+            "auto" => Ok(Self::Auto),
+            _ => Err(miette::miette!("invalid backfill strategy")),
+        }
+    }
+}
+
+impl fmt::Display for BackfillStrategy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Full => write!(f, "full"),
+            Self::SparseFilter => write!(f, "sparse-filter"),
+            Self::Auto => write!(f, "auto"),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     /// path to the database folder. set via `HYDRANT_DATABASE_PATH`.
@@ -324,6 +357,11 @@ pub struct Config {
     /// maximum number of concurrent backfill tasks.
     /// set via `HYDRANT_BACKFILL_CONCURRENCY_LIMIT`.
     pub backfill_concurrency_limit: usize,
+    /// backfill strategy. `full` preserves existing full-repo backfill behavior.
+    /// `sparse-filter` attempts authenticated sparse collection backfill first and falls back
+    /// to full repo backfill. `auto` uses sparse only when explicit collection filters exist.
+    /// set via `HYDRANT_BACKFILL_STRATEGY`.
+    pub backfill_strategy: BackfillStrategy,
 
     /// whether to run the network crawler. `None` defers to the default for the current mode.
     /// set via `HYDRANT_ENABLE_CRAWLER`.
@@ -518,6 +556,7 @@ impl Default for Config {
             cursor_save_interval: Duration::from_secs(3),
             repo_fetch_timeout: Duration::from_secs(300),
             backfill_concurrency_limit: 16,
+            backfill_strategy: BackfillStrategy::Full,
             enable_crawler: None,
             crawler_max_pending_repos: 2000,
             crawler_resume_pending_repos: 1000,
@@ -660,6 +699,7 @@ impl Config {
             "BACKFILL_CONCURRENCY_LIMIT",
             defaults.backfill_concurrency_limit
         );
+        let backfill_strategy = cfg!("BACKFILL_STRATEGY", defaults.backfill_strategy);
         let firehose_workers = cfg!("FIREHOSE_WORKERS", defaults.firehose_workers);
         let firehose_max_failures = cfg!("FIREHOSE_MAX_FAILURES", defaults.firehose_max_failures);
 
@@ -848,6 +888,7 @@ impl Config {
             cursor_save_interval,
             repo_fetch_timeout,
             backfill_concurrency_limit,
+            backfill_strategy,
             enable_crawler,
             crawler_max_pending_repos,
             crawler_resume_pending_repos,
@@ -912,6 +953,7 @@ impl fmt::Display for Config {
         config_line!(f, "full network indexing", self.full_network)?;
         config_line!(f, "verify signatures", self.verify_signatures)?;
         config_line!(f, "backfill concurrency", self.backfill_concurrency_limit)?;
+        config_line!(f, "backfill strategy", self.backfill_strategy)?;
         config_line!(f, "identity cache size", self.identity_cache_size)?;
         config_line!(
             f,

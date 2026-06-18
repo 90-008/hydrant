@@ -56,6 +56,7 @@ hydrant is configured via environment variables, all prefixed with `HYDRANT_` (e
 | variable | default | description |
 | :--- | :--- | :--- |
 | `BACKFILL_CONCURRENCY_LIMIT` | `16` (`64` full network) | maximum number of concurrent backfill tasks |
+| `BACKFILL_STRATEGY` | `full` | backfill strategy: `full` keeps the existing `getRepo` path, `sparse-filter` attempts authenticated sparse collection backfill before falling back to full, `auto` uses sparse only when explicit collection filters are configured |
 | `REPO_FETCH_TIMEOUT` | `5min` | timeout for fetching a repository |
 | `VERIFY_SIGNATURES` | `full` | signature verification level: `full`, `backfill-only`, or `none` |
 | `PLC_URL` | `https://plc.wtf`, `https://plc.directory` (full network) | base URL(s) of the PLC directory, comma-separated |

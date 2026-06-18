@@ -321,6 +321,7 @@ impl Hydrant {
                         config.verify_signatures,
                         SignatureVerification::Full | SignatureVerification::BackfillOnly
                     ),
+                    config.backfill_strategy,
                     state.backfill_enabled.subscribe(),
                 )
                 .run()

@@ -1,24 +1,29 @@
+use crate::config::BackfillStrategy;
 use crate::db::types::{DbAction, DbRkey, TrimmedDid};
 use crate::db::{self, CountDeltas, Db, keys, ser_repo_state};
 use crate::filter::FilterMode;
 use crate::ops;
 use crate::resolver::ResolverError;
+use crate::sparse_mst::{SparseScanner, sparse_probe_collection, sparse_ranges};
 use crate::state::AppState;
 use crate::types::{Commit, GaugeState, RepoState, RepoStatus, ResyncErrorKind, ResyncState};
 
 use fjall::Slice;
+use jacquard_api::com_atproto::sync::get_blocks::{GetBlocks, GetBlocksError};
+use jacquard_api::com_atproto::sync::get_record::{GetRecord, GetRecordError};
 use jacquard_api::com_atproto::sync::get_repo::{GetRepo, GetRepoError};
 use jacquard_common::IntoStatic;
 use jacquard_common::error::{ClientError, ClientErrorKind};
-use jacquard_common::types::cid::Cid;
+use jacquard_common::types::cid::{Cid as AtCid, IpldCid};
 use jacquard_common::types::did::Did;
+use jacquard_common::types::string::{Nsid, RecordKey};
 use jacquard_common::xrpc::{XrpcError, XrpcExt};
 use jacquard_repo::mst::Mst;
 use jacquard_repo::{BlockStore, MemoryBlockStore};
 use miette::{Diagnostic, IntoDiagnostic, Result};
 use reqwest::StatusCode;
 use smol_str::{SmolStr, ToSmolStr};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -43,6 +48,7 @@ pub struct BackfillWorker {
     http: reqwest::Client,
     semaphore: Arc<Semaphore>,
     verify_signatures: bool,
+    strategy: BackfillStrategy,
     in_flight: Arc<scc::HashSet<Did<'static>>>,
     enabled: tokio::sync::watch::Receiver<bool>,
 }
@@ -54,6 +60,7 @@ impl BackfillWorker {
         timeout: Duration,
         concurrency_limit: usize,
         verify_signatures: bool,
+        strategy: BackfillStrategy,
         enabled: tokio::sync::watch::Receiver<bool>,
     ) -> Self {
         Self {
@@ -68,6 +75,7 @@ impl BackfillWorker {
                 .expect("failed to build http client"),
             semaphore: Arc::new(Semaphore::new(concurrency_limit)),
             verify_signatures,
+            strategy,
             in_flight: Arc::new(scc::HashSet::new()),
             enabled,
         }
@@ -143,13 +151,15 @@ impl BackfillWorker {
                 let did = did.clone();
                 let buffer_tx = self.buffer_tx.clone();
                 let verify = self.verify_signatures;
+                let strategy = self.strategy;
 
                 let span = tracing::info_span!("backfill", did = %did);
                 tokio::spawn(
                     async move {
                         let _guard = guard;
                         let res =
-                            did_task(&state, http, buffer_tx, &did, key, permit, verify).await;
+                            did_task(&state, http, buffer_tx, &did, key, permit, verify, strategy)
+                                .await;
 
                         if let Err(e) = res {
                             error!(err = %e, "process failed");
@@ -184,10 +194,11 @@ async fn did_task(
     pending_key: Slice,
     _permit: tokio::sync::OwnedSemaphorePermit,
     verify_signatures: bool,
+    strategy: BackfillStrategy,
 ) -> Result<(), BackfillError> {
     let db = &state.db;
 
-    match process_did(state, &http, did, verify_signatures).await {
+    match process_did(state, &http, did, verify_signatures, strategy).await {
         Ok(Some(_repo_state)) => {
             let did_key = keys::repo_key(did);
 
@@ -384,11 +395,478 @@ impl From<ResolverError> for BackfillError {
     }
 }
 
+#[derive(Debug)]
+struct SparseBackfillSuccess {
+    state: RepoState<'static>,
+    records: usize,
+    node_blocks: usize,
+    node_bytes: usize,
+}
+
+#[derive(Debug)]
+enum SparseBackfillResult {
+    Imported(SparseBackfillSuccess),
+    Discarded,
+    Skipped,
+}
+
+const SPARSE_GET_BLOCKS_CHUNK: usize = 64;
+const SPARSE_MAX_SCAN_ROUNDS: usize = 256;
+
+async fn process_did_sparse(
+    app_state: &Arc<AppState>,
+    http: &reqwest::Client,
+    did: &Did<'static>,
+    pds: &url::Url,
+    state: RepoState<'static>,
+    verify_signatures: bool,
+) -> Result<SparseBackfillResult, BackfillError> {
+    let filter = app_state.filter.load();
+    let Some(probe_collection) = sparse_probe_collection(&filter.collections) else {
+        return Ok(SparseBackfillResult::Skipped);
+    };
+    let ranges = sparse_ranges(&filter.collections);
+    if ranges.is_empty() {
+        return Ok(SparseBackfillResult::Skipped);
+    }
+
+    let probe_collection = Nsid::new_owned(probe_collection.as_str()).into_diagnostic()?;
+    let probe_rkey = RecordKey::any_static("-").into_diagnostic()?;
+    let req = GetRecord::new()
+        .did(did.clone())
+        .collection(probe_collection)
+        .rkey(probe_rkey)
+        .build();
+
+    let resp = http.xrpc(url_to_fluent_uri(pds)).send(&req).await?;
+    let proof = match resp.into_output() {
+        Ok(o) => o,
+        Err(XrpcError::Xrpc(GetRecordError::RecordNotFound(_))) => {
+            return Ok(SparseBackfillResult::Skipped);
+        }
+        Err(XrpcError::Xrpc(
+            GetRecordError::RepoNotFound(_)
+            | GetRecordError::RepoTakendown(_)
+            | GetRecordError::RepoSuspended(_)
+            | GetRecordError::RepoDeactivated(_),
+        )) => return Ok(SparseBackfillResult::Skipped),
+        Err(e) => Err(e).into_diagnostic()?,
+    };
+
+    let parsed = jacquard_repo::car::reader::parse_car_bytes(&proof.body)
+        .await
+        .into_diagnostic()?;
+    let root_bytes = parsed
+        .blocks
+        .get(&parsed.root)
+        .ok_or_else(|| miette::miette!("root block missing from sparse proof CAR"))?;
+    let root_commit = jacquard_repo::commit::Commit::from_cbor(root_bytes).into_diagnostic()?;
+
+    if verify_signatures {
+        let pubkey = app_state.resolver.resolve_signing_key(did).await?;
+        root_commit
+            .verify(&pubkey)
+            .map_err(|e| miette::miette!("signature verification failed for {did}: {e}"))?;
+    }
+
+    let root_cid = root_commit.data;
+    let root_commit = Commit::from(root_commit);
+    let mut scanner = SparseScanner::new(ranges, parsed.blocks);
+    let mut scan_rounds = 0;
+    let scan = loop {
+        match scanner.scan(root_cid)? {
+            Ok(scan) => break scan,
+            Err(missing) => {
+                scan_rounds += 1;
+                if scan_rounds > SPARSE_MAX_SCAN_ROUNDS {
+                    return Err(
+                        miette::miette!("sparse mst scan exceeded fetch round limit").into(),
+                    );
+                }
+                if missing.is_empty() {
+                    return Ok(SparseBackfillResult::Skipped);
+                }
+                if missing.len() > SPARSE_MAX_SCAN_ROUNDS * SPARSE_GET_BLOCKS_CHUNK {
+                    return Err(
+                        miette::miette!("sparse mst scan exceeded missing block limit").into(),
+                    );
+                }
+                let blocks = fetch_blocks(http, pds, did, &missing).await?;
+                if missing.iter().all(|cid| !blocks.contains_key(cid)) {
+                    return Ok(SparseBackfillResult::Skipped);
+                }
+                scanner.insert_blocks(blocks);
+            }
+        }
+    };
+
+    let mut blocks = scanner.take_blocks();
+    let missing_records: Vec<IpldCid> = scan
+        .leaves
+        .iter()
+        .filter_map(|(_, cid)| (!blocks.contains_key(cid)).then_some(*cid))
+        .collect();
+    blocks.extend(fetch_blocks(http, pds, did, &missing_records).await?);
+
+    if let Some((_, missing)) = scan
+        .leaves
+        .iter()
+        .find(|(_, cid)| !blocks.contains_key(cid))
+    {
+        return Err(
+            miette::miette!("sparse record block missing after getBlocks: {missing}").into(),
+        );
+    }
+
+    let result =
+        persist_sparse_backfill(app_state, did, state, root_commit, scan.leaves, blocks).await?;
+
+    let Some((records, state)) = result else {
+        cleanup_discarded_repo(app_state, did).await?;
+        return Ok(SparseBackfillResult::Discarded);
+    };
+
+    Ok(SparseBackfillResult::Imported(SparseBackfillSuccess {
+        state,
+        records,
+        node_blocks: scan.node_blocks_seen,
+        node_bytes: scan.node_bytes_seen,
+    }))
+}
+
+async fn fetch_blocks(
+    http: &reqwest::Client,
+    pds: &url::Url,
+    did: &Did<'static>,
+    cids: &[IpldCid],
+) -> Result<BTreeMap<IpldCid, bytes::Bytes>, BackfillError> {
+    let mut out = BTreeMap::new();
+    for chunk in cids.chunks(SPARSE_GET_BLOCKS_CHUNK) {
+        if chunk.is_empty() {
+            continue;
+        }
+
+        let req = GetBlocks::new()
+            .did(did.clone())
+            .cids(
+                chunk
+                    .iter()
+                    .map(|cid| AtCid::from(cid.to_string()))
+                    .collect::<Vec<_>>(),
+            )
+            .build();
+        let resp = http.xrpc(url_to_fluent_uri(pds)).send(&req).await?;
+        let car = match resp.into_output() {
+            Ok(o) => o,
+            Err(XrpcError::Xrpc(GetBlocksError::BlockNotFound(_))) => {
+                return Ok(BTreeMap::new());
+            }
+            Err(XrpcError::Xrpc(
+                GetBlocksError::RepoNotFound(_)
+                | GetBlocksError::RepoTakendown(_)
+                | GetBlocksError::RepoSuspended(_)
+                | GetBlocksError::RepoDeactivated(_),
+            )) => return Ok(BTreeMap::new()),
+            Err(e) => Err(e).into_diagnostic()?,
+        };
+        let parsed = crate::car::parse_car_blocks(&car.body).await?;
+        out.extend(parsed);
+    }
+    Ok(out)
+}
+
+async fn persist_sparse_backfill(
+    app_state: &Arc<AppState>,
+    did: &Did<'static>,
+    mut state: RepoState<'static>,
+    root_commit: Commit,
+    leaves: Vec<(SmolStr, IpldCid)>,
+    blocks: BTreeMap<IpldCid, bytes::Bytes>,
+) -> Result<Option<(usize, RepoState<'static>)>, BackfillError> {
+    let app_state = app_state.clone();
+    let did = did.clone();
+    tokio::task::spawn_blocking(move || {
+        let filter = app_state.filter.load();
+        let ephemeral = app_state.ephemeral;
+        let only_index_links = app_state.only_index_links;
+        let mut count = 0;
+        let mut delta = 0;
+        let mut added_blocks = 0;
+        let mut collection_counts: HashMap<SmolStr, u64> = HashMap::new();
+        let mut batch = app_state.db.inner.batch();
+
+        let prefix = keys::record_prefix_did(&did);
+        let mut existing_cids: HashMap<(SmolStr, DbRkey), SmolStr> = HashMap::new();
+
+        if !ephemeral {
+            for guard in app_state.db.records.prefix(&prefix) {
+                let (key, cid_bytes) = guard.into_inner().into_diagnostic()?;
+                let mut remaining = key[prefix.len()..].splitn(2, |b| keys::SEP.eq(b));
+                let collection_raw = remaining
+                    .next()
+                    .ok_or_else(|| miette::miette!("invalid record key format: {key:?}"))?;
+                let rkey_raw = remaining
+                    .next()
+                    .ok_or_else(|| miette::miette!("invalid record key format: {key:?}"))?;
+
+                let collection = std::str::from_utf8(collection_raw)
+                    .map_err(|e| miette::miette!("invalid collection utf8: {e}"))?;
+                let rkey = keys::parse_rkey(rkey_raw)
+                    .map_err(|e| miette::miette!("invalid rkey '{key:?}' for {did}: {e}"))?;
+                let cid = cid::Cid::read_bytes(cid_bytes.as_ref())
+                    .map_err(|e| miette::miette!("invalid cid '{cid_bytes:?}' for {did}: {e}"))?
+                    .to_smolstr();
+
+                existing_cids.insert((collection.into(), rkey), cid);
+            }
+        }
+
+        let mut signal_seen = filter.mode == FilterMode::Full || filter.signals.is_empty();
+
+        for (key, cid) in leaves {
+            let (collection, rkey) = ops::parse_path(&key)?;
+
+            if !filter.matches_collection(collection) {
+                continue;
+            }
+
+            let Some(val) = blocks.get(&cid).cloned() else {
+                return Err(miette::miette!("missing sparse record block {cid}"));
+            };
+
+            if !signal_seen && filter.matches_signal(collection) {
+                debug!(collection = %collection, "signal matched");
+                signal_seen = true;
+            }
+
+            let rkey = DbRkey::new(rkey);
+            let path = (collection.to_smolstr(), rkey.clone());
+            let cid_obj = AtCid::ipld(cid);
+
+            *collection_counts.entry(path.0.clone()).or_default() += 1;
+
+            let existing_cid = existing_cids.remove(&path);
+            let action = if let Some(existing_cid) = &existing_cid {
+                if existing_cid == cid_obj.as_str() {
+                    trace!(collection = %collection, rkey = %rkey, cid = %cid, "skip unchanged sparse record");
+                    continue;
+                }
+                DbAction::Update
+            } else {
+                DbAction::Create
+            };
+            trace!(collection = %collection, rkey = %rkey, cid = %cid, ?action, "action sparse record");
+
+            let db_key = keys::record_key(&did, collection, &rkey);
+            let cid_raw = cid.to_bytes();
+            let block_key = Slice::from(keys::block_key(collection, &cid_raw));
+            if !ephemeral {
+                if !only_index_links {
+                    batch.insert(&app_state.db.blocks, block_key.clone(), val.as_ref());
+                }
+                batch.insert(&app_state.db.records, db_key, cid_raw);
+                #[cfg(feature = "backlinks")]
+                if let Ok(value) =
+                    serde_ipld_dagcbor::from_slice::<jacquard_common::Data>(val.as_ref())
+                {
+                    crate::backlinks::store::index_record(
+                        &mut batch,
+                        &app_state.db.backlinks,
+                        did.as_str(),
+                        collection,
+                        &rkey.to_smolstr(),
+                        &value,
+                    )?;
+                }
+            }
+
+            added_blocks += 1;
+            if action == DbAction::Create {
+                delta += 1;
+            }
+
+            #[cfg(feature = "indexer_stream")]
+            {
+                let event_id = app_state.db.next_event_id.fetch_add(1, Ordering::SeqCst);
+                let evt = StoredEvent {
+                    live: false,
+                    did: TrimmedDid::from(&did),
+                    rev: root_commit.rev,
+                    collection: CowStr::Borrowed(collection),
+                    rkey,
+                    action,
+                    data: if ephemeral {
+                        StoredData::Block(val)
+                    } else if only_index_links {
+                        StoredData::Nothing
+                    } else {
+                        StoredData::Ptr(cid_obj.to_ipld().expect("valid cid"))
+                    },
+                };
+                let bytes = rmp_serde::to_vec(&evt).into_diagnostic()?;
+                batch.insert(&app_state.db.events, keys::event_key(event_id), bytes);
+
+                #[cfg(feature = "jetstream")]
+                {
+                    let jetstream = crate::types::StoredJetstreamEvent::Commit {
+                        did: TrimmedDid::from(&did).into_static(),
+                        collection: CowStr::Borrowed(collection).into_static(),
+                        event_id,
+                        live: false,
+                    };
+                    crate::jetstream::stage_event(&mut batch, &app_state.db, jetstream, None)?;
+                }
+            }
+
+            count += 1;
+        }
+
+        for ((collection, rkey), cid) in existing_cids {
+            trace!(collection = %collection, rkey = %rkey, cid = %cid, "remove sparse-stale record");
+
+            batch.remove(
+                &app_state.db.records,
+                keys::record_key(&did, &collection, &rkey),
+            );
+            #[cfg(feature = "backlinks")]
+            crate::backlinks::store::delete_record(
+                &mut batch,
+                &app_state.db.backlinks,
+                did.as_str(),
+                &collection,
+                &rkey.to_smolstr(),
+            )?;
+
+            #[cfg(feature = "indexer_stream")]
+            {
+                let event_id = app_state.db.next_event_id.fetch_add(1, Ordering::SeqCst);
+                let evt = StoredEvent {
+                    live: false,
+                    did: TrimmedDid::from(&did),
+                    rev: root_commit.rev,
+                    collection: CowStr::Borrowed(&collection),
+                    rkey,
+                    action: DbAction::Delete,
+                    data: StoredData::Nothing,
+                };
+                let bytes = rmp_serde::to_vec(&evt).into_diagnostic()?;
+                batch.insert(&app_state.db.events, keys::event_key(event_id), bytes);
+
+                #[cfg(feature = "jetstream")]
+                {
+                    let jetstream = crate::types::StoredJetstreamEvent::Commit {
+                        did: TrimmedDid::from(&did).into_static(),
+                        collection: CowStr::Borrowed(&collection).into_static(),
+                        event_id,
+                        live: false,
+                    };
+                    crate::jetstream::stage_event(&mut batch, &app_state.db, jetstream, None)?;
+                }
+            }
+
+            delta -= 1;
+            count += 1;
+        }
+
+        if !signal_seen {
+            trace!(signals = ?filter.signals, "no signal-matching sparse records found, discarding repo");
+            return Ok::<_, miette::Report>(None);
+        }
+
+        state.root = Some(root_commit);
+        state.touch();
+
+        batch.insert(
+            &app_state.db.repos,
+            keys::repo_key(&did),
+            ser_repo_state(&state)?,
+        );
+
+        let metadata_key = keys::repo_metadata_key(&did);
+        let metadata_bytes = app_state
+            .db
+            .repo_metadata
+            .get(&metadata_key)
+            .into_diagnostic()?
+            .ok_or_else(|| miette::miette!("repo metadata not found for {}", did))?;
+        let mut metadata = crate::db::deser_repo_meta(&metadata_bytes)?;
+        metadata.tracked = true;
+        batch.insert(
+            &app_state.db.repo_metadata,
+            &metadata_key,
+            crate::db::ser_repo_meta(&metadata)?,
+        );
+
+        if !ephemeral {
+            db::replace_record_counts(
+                &mut batch,
+                &app_state.db,
+                &did,
+                collection_counts.iter().map(|(col, cnt)| (col.as_str(), *cnt)),
+            )?;
+        }
+
+        let mut count_deltas = CountDeltas::default();
+        if delta != 0 {
+            count_deltas.add("records", delta);
+        }
+        if added_blocks > 0 {
+            count_deltas.add("blocks", added_blocks);
+        }
+        let reservation = app_state.db.stage_count_deltas(&mut batch, &count_deltas);
+        batch.commit().into_diagnostic()?;
+        app_state.db.apply_count_deltas(&count_deltas);
+        drop(reservation);
+
+        Ok::<_, miette::Report>(Some((count, state)))
+    })
+    .await
+    .into_diagnostic()?
+    .map_err(BackfillError::from)
+}
+
+async fn cleanup_discarded_repo(
+    app_state: &Arc<AppState>,
+    did: &Did<'static>,
+) -> Result<(), BackfillError> {
+    let metadata_key = keys::repo_metadata_key(did);
+    let metadata_bytes = app_state
+        .db
+        .repo_metadata
+        .get(&metadata_key)
+        .into_diagnostic()?
+        .ok_or_else(|| miette::miette!("repo metadata not found for {}", did))?;
+    let metadata = crate::db::deser_repo_meta(metadata_bytes.as_ref())?;
+    let did_key = keys::repo_key(did);
+    let backfill_pending_key = keys::pending_key(metadata.index_id);
+    let app_state = app_state.clone();
+
+    tokio::task::spawn_blocking(move || {
+        let mut batch = app_state.db.inner.batch();
+        let mut count_deltas = CountDeltas::default();
+        batch.remove(&app_state.db.repos, &did_key);
+        batch.remove(&app_state.db.repo_metadata, &metadata_key);
+        batch.remove(&app_state.db.pending, backfill_pending_key);
+        count_deltas.add("repos", -1);
+        count_deltas.add("pending", -1);
+        let reservation = app_state.db.stage_count_deltas(&mut batch, &count_deltas);
+        batch.commit().into_diagnostic().inspect(|_| {
+            app_state.db.apply_count_deltas(&count_deltas);
+            drop(reservation);
+        })
+    })
+    .await
+    .into_diagnostic()??;
+
+    Ok(())
+}
+
 async fn process_did(
     app_state: &Arc<AppState>,
     http: &reqwest::Client,
     did: &Did<'static>,
     verify_signatures: bool,
+    strategy: BackfillStrategy,
 ) -> Result<Option<RepoState<'static>>, BackfillError> {
     debug!("starting...");
 
@@ -438,6 +916,54 @@ async fn process_did(
         };
         let _ = app_state.db.event_tx.send(ops::make_account_event(db, evt));
     };
+
+    if strategy != BackfillStrategy::Full {
+        let filter = app_state.filter.load();
+        let sparse_supported = !filter.collections.is_empty()
+            && sparse_probe_collection(&filter.collections).is_some();
+        let should_try_sparse = match strategy {
+            BackfillStrategy::Full => false,
+            BackfillStrategy::SparseFilter => sparse_supported,
+            BackfillStrategy::Auto => sparse_supported,
+        };
+
+        if should_try_sparse {
+            match process_did_sparse(app_state, http, did, &pds, state.clone(), verify_signatures)
+                .await
+            {
+                Ok(SparseBackfillResult::Imported(sparse)) => {
+                    #[cfg(feature = "indexer_stream")]
+                    if sparse.state.active != previous_state.active
+                        || sparse.state.status != previous_state.status
+                        || previous_state.pds.is_none()
+                    {
+                        emit_identity(&sparse.state.status, sparse.state.active);
+                    }
+
+                    trace!(
+                        records = sparse.records,
+                        node_blocks = sparse.node_blocks,
+                        node_bytes = sparse.node_bytes,
+                        active = sparse.state.active,
+                        status = ?sparse.state.status,
+                        "sparse backfill complete"
+                    );
+                    return Ok(Some(previous_state));
+                }
+                Ok(SparseBackfillResult::Discarded) => {
+                    return Ok(None);
+                }
+                Ok(SparseBackfillResult::Skipped) => {
+                    debug!("sparse backfill skipped, falling back to full getRepo");
+                }
+                Err(e) => {
+                    warn!(err = %e, "sparse backfill failed, falling back to full getRepo");
+                }
+            }
+        } else if strategy == BackfillStrategy::SparseFilter {
+            debug!("sparse backfill requested but filter is not sparse-compatible");
+        }
+    }
 
     // 2. fetch repo (car)
     let start = Instant::now();
@@ -637,7 +1163,7 @@ async fn process_did(
 
                     let rkey = DbRkey::new(rkey);
                     let path = (collection.to_smolstr(), rkey.clone());
-                    let cid_obj = Cid::ipld(cid);
+                    let cid_obj = AtCid::ipld(cid);
 
                     *collection_counts.entry(path.0.clone()).or_default() += 1;
 

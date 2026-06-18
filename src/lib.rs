@@ -40,6 +40,8 @@ pub(crate) mod backfill;
 #[cfg(feature = "backlinks")]
 pub mod backlinks;
 #[cfg(feature = "indexer")]
+pub(crate) mod car;
+#[cfg(feature = "indexer")]
 pub(crate) mod crawler;
 pub(crate) mod db;
 pub(crate) mod ingest;
@@ -49,6 +51,8 @@ pub(crate) mod jetstream;
 pub(crate) mod ops;
 pub(crate) mod patch;
 pub mod resolver;
+#[cfg(feature = "indexer")]
+pub(crate) mod sparse_mst;
 pub(crate) mod state;
 pub(crate) mod util;
 
