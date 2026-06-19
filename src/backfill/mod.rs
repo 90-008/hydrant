@@ -4,11 +4,12 @@ use crate::db::{self, CountDeltas, Db, keys, ser_repo_state};
 use crate::filter::FilterMode;
 use crate::ops;
 use crate::resolver::ResolverError;
-use crate::sparse_mst::{SparseScanner, sparse_probe_collection, sparse_ranges};
+use crate::sparse_mst::{SparseScanner, mst_node_layer, sparse_probe_collection, sparse_ranges};
 use crate::state::AppState;
 use crate::types::{Commit, GaugeState, RepoState, RepoStatus, ResyncErrorKind, ResyncState};
 
 use fjall::Slice;
+use futures::{StreamExt, stream};
 use jacquard_api::com_atproto::sync::get_blocks::{GetBlocks, GetBlocksError};
 use jacquard_api::com_atproto::sync::get_record::{GetRecord, GetRecordError};
 use jacquard_api::com_atproto::sync::get_repo::{GetRepo, GetRepoError};
@@ -40,6 +41,7 @@ use {
 pub mod manager;
 
 use crate::ingest::indexer::{IndexerMessage, IndexerTx};
+use crate::util::throttle::ThrottleHandle;
 use crate::util::{WatchEnabledExt, url_to_fluent_uri};
 
 pub struct BackfillWorker {
@@ -162,7 +164,14 @@ impl BackfillWorker {
                                 .await;
 
                         if let Err(e) = res {
-                            error!(err = %e, "process failed");
+                            match &e {
+                                BackfillError::Ratelimited => {
+                                    debug!(err = %e, "process failed");
+                                }
+                                _ => {
+                                    error!(err = %e, "process failed");
+                                }
+                            }
                             if let BackfillError::Generic(report) = &e {
                                 db::check_poisoned_report(report);
                             }
@@ -379,6 +388,31 @@ impl From<ClientError> for BackfillError {
     }
 }
 
+impl BackfillError {
+    fn from_sparse_client(e: ClientError, throttle: &ThrottleHandle) -> Self {
+        match e.kind() {
+            ClientErrorKind::Http {
+                status: StatusCode::TOO_MANY_REQUESTS,
+            } => {
+                throttle.record_ratelimit(None);
+                Self::Ratelimited
+            }
+            ClientErrorKind::Transport => {
+                let reason = e
+                    .source_err()
+                    .expect("transport error without source")
+                    .to_smolstr();
+                if let Some(secs) = throttle.record_failure_detail("transport", reason.to_string())
+                {
+                    debug!(secs, reason = %reason, "throttling pds after sparse transport error");
+                }
+                Self::Transport(reason)
+            }
+            _ => Self::Generic(e.into()),
+        }
+    }
+}
+
 impl From<miette::Report> for BackfillError {
     fn from(e: miette::Report) -> Self {
         Self::Generic(e)
@@ -411,7 +445,9 @@ enum SparseBackfillResult {
 }
 
 const SPARSE_GET_BLOCKS_CHUNK: usize = 100;
+const SPARSE_GET_BLOCKS_PARALLELISM: usize = 1;
 const SPARSE_MAX_SCAN_ROUNDS: usize = 256;
+const SPARSE_AUTO_FULL_MAX_ROOT_LAYER: usize = 2;
 
 async fn process_did_sparse(
     app_state: &Arc<AppState>,
@@ -420,6 +456,7 @@ async fn process_did_sparse(
     pds: &url::Url,
     state: RepoState<'static>,
     verify_signatures: bool,
+    strategy: BackfillStrategy,
 ) -> Result<SparseBackfillResult, BackfillError> {
     let filter = app_state.filter.load();
     let Some(probe_collection) = sparse_probe_collection(&filter.collections) else {
@@ -438,7 +475,26 @@ async fn process_did_sparse(
         .rkey(probe_rkey)
         .build();
 
-    let resp = http.xrpc(url_to_fluent_uri(pds)).send(&req).await?;
+    let throttle = app_state.throttler.get_handle(pds).await;
+    if throttle.is_throttled() {
+        return Err(BackfillError::Ratelimited);
+    }
+
+    let resp = {
+        let _permit = throttle.acquire().await;
+        if throttle.is_throttled() {
+            return Err(BackfillError::Ratelimited);
+        }
+        match http.xrpc(url_to_fluent_uri(pds)).send(&req).await {
+            Ok(resp) => {
+                if !throttle.is_throttled() {
+                    throttle.record_success();
+                }
+                resp
+            }
+            Err(e) => return Err(BackfillError::from_sparse_client(e, &throttle)),
+        }
+    };
     let proof = match resp.into_output() {
         Ok(o) => o,
         Err(XrpcError::Xrpc(GetRecordError::RecordNotFound(_))) => {
@@ -470,6 +526,21 @@ async fn process_did_sparse(
     }
 
     let root_cid = root_commit.data;
+    if strategy == BackfillStrategy::Auto {
+        if let Some(root_bytes) = parsed.blocks.get(&root_cid) {
+            if let Some(root_layer) = mst_node_layer(root_bytes)? {
+                if root_layer <= SPARSE_AUTO_FULL_MAX_ROOT_LAYER {
+                    debug!(
+                        root_layer,
+                        max_sparse_layer = SPARSE_AUTO_FULL_MAX_ROOT_LAYER,
+                        "sparse auto selected full getRepo for small repo"
+                    );
+                    return Ok(SparseBackfillResult::Skipped);
+                }
+            }
+        }
+    }
+
     let root_commit = Commit::from(root_commit);
     let mut scanner = SparseScanner::new(ranges, parsed.blocks);
     let mut scan_rounds = 0;
@@ -491,7 +562,7 @@ async fn process_did_sparse(
                         miette::miette!("sparse mst scan exceeded missing block limit").into(),
                     );
                 }
-                let blocks = fetch_blocks(http, pds, did, &missing).await?;
+                let blocks = fetch_blocks(http, pds, did, &missing, &throttle).await?;
                 if missing.iter().all(|cid| !blocks.contains_key(cid)) {
                     return Ok(SparseBackfillResult::Skipped);
                 }
@@ -500,26 +571,42 @@ async fn process_did_sparse(
         }
     };
 
-    let mut blocks = scanner.take_blocks();
-    let missing_records: Vec<IpldCid> = scan
+    let record_cids = scan
         .leaves
         .iter()
-        .filter_map(|(_, cid)| (!blocks.contains_key(cid)).then_some(*cid))
-        .collect();
-    blocks.extend(fetch_blocks(http, pds, did, &missing_records).await?);
+        .map(|(_, cid)| *cid)
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut scanned_blocks = scanner.take_blocks();
+    let missing_records = record_cids
+        .iter()
+        .filter_map(|cid| (!scanned_blocks.contains_key(cid)).then_some(*cid))
+        .collect::<Vec<_>>();
+    let mut record_blocks = record_cids
+        .iter()
+        .filter_map(|cid| scanned_blocks.remove(cid).map(|bytes| (*cid, bytes)))
+        .collect::<BTreeMap<_, _>>();
+    drop(scanned_blocks);
+    record_blocks.extend(fetch_blocks(http, pds, did, &missing_records, &throttle).await?);
 
     if let Some((_, missing)) = scan
         .leaves
         .iter()
-        .find(|(_, cid)| !blocks.contains_key(cid))
+        .find(|(_, cid)| !record_blocks.contains_key(cid))
     {
         return Err(
             miette::miette!("sparse record block missing after getBlocks: {missing}").into(),
         );
     }
 
-    let result =
-        persist_sparse_backfill(app_state, did, state, root_commit, scan.leaves, blocks).await?;
+    let result = persist_sparse_backfill(
+        app_state,
+        did,
+        state,
+        root_commit,
+        scan.leaves,
+        record_blocks,
+    )
+    .await?;
 
     let Some((records, state)) = result else {
         cleanup_discarded_repo(app_state, did).await?;
@@ -539,40 +626,76 @@ async fn fetch_blocks(
     pds: &url::Url,
     did: &Did<'static>,
     cids: &[IpldCid],
+    throttle: &ThrottleHandle,
 ) -> Result<BTreeMap<IpldCid, bytes::Bytes>, BackfillError> {
     let mut out = BTreeMap::new();
-    for chunk in cids.chunks(SPARSE_GET_BLOCKS_CHUNK) {
-        if chunk.is_empty() {
-            continue;
-        }
 
-        let req = GetBlocks::new()
-            .did(did.clone())
-            .cids(
-                chunk
-                    .iter()
-                    .map(|cid| AtCid::from(cid.to_string()))
-                    .collect::<Vec<_>>(),
+    let fetches = cids
+        .chunks(SPARSE_GET_BLOCKS_CHUNK)
+        .filter(|chunk| !chunk.is_empty())
+        .map(|chunk| {
+            fetch_block_chunk(
+                http.clone(),
+                pds.clone(),
+                did.clone(),
+                chunk.to_vec(),
+                throttle,
             )
-            .build();
-        let resp = http.xrpc(url_to_fluent_uri(pds)).send(&req).await?;
-        let car = match resp.into_output() {
-            Ok(o) => o,
-            Err(XrpcError::Xrpc(GetBlocksError::BlockNotFound(_))) => {
-                return Ok(BTreeMap::new());
-            }
-            Err(XrpcError::Xrpc(
-                GetBlocksError::RepoNotFound(_)
-                | GetBlocksError::RepoTakendown(_)
-                | GetBlocksError::RepoSuspended(_)
-                | GetBlocksError::RepoDeactivated(_),
-            )) => return Ok(BTreeMap::new()),
-            Err(e) => Err(e).into_diagnostic()?,
-        };
-        let parsed = crate::car::parse_car_blocks(&car.body).await?;
-        out.extend(parsed);
+        })
+        .collect::<Vec<_>>();
+    let fetches = stream::iter(fetches).buffer_unordered(SPARSE_GET_BLOCKS_PARALLELISM);
+    futures::pin_mut!(fetches);
+
+    while let Some(blocks) = fetches.next().await {
+        out.extend(blocks?);
     }
+
     Ok(out)
+}
+
+async fn fetch_block_chunk(
+    http: reqwest::Client,
+    pds: url::Url,
+    did: Did<'static>,
+    cids: Vec<IpldCid>,
+    throttle: &ThrottleHandle,
+) -> Result<BTreeMap<IpldCid, bytes::Bytes>, BackfillError> {
+    let req = GetBlocks::new()
+        .did(did.clone())
+        .cids(
+            cids.iter()
+                .map(|cid| AtCid::from(cid.to_string()))
+                .collect::<Vec<_>>(),
+        )
+        .build();
+    let resp = {
+        let _permit = throttle.acquire().await;
+        match http.xrpc(url_to_fluent_uri(&pds)).send(&req).await {
+            Ok(resp) => {
+                if !throttle.is_throttled() {
+                    throttle.record_success();
+                }
+                resp
+            }
+            Err(e) => return Err(BackfillError::from_sparse_client(e, throttle)),
+        }
+    };
+    let car = match resp.into_output() {
+        Ok(o) => o,
+        Err(XrpcError::Xrpc(GetBlocksError::BlockNotFound(_))) => {
+            return Ok(BTreeMap::new());
+        }
+        Err(XrpcError::Xrpc(
+            GetBlocksError::RepoNotFound(_)
+            | GetBlocksError::RepoTakendown(_)
+            | GetBlocksError::RepoSuspended(_)
+            | GetBlocksError::RepoDeactivated(_),
+        )) => return Ok(BTreeMap::new()),
+        Err(e) => Err(e).into_diagnostic()?,
+    };
+    crate::car::parse_car_blocks(&car.body)
+        .await
+        .map_err(BackfillError::from)
 }
 
 async fn persist_sparse_backfill(
@@ -611,6 +734,10 @@ async fn persist_sparse_backfill(
 
                 let collection = std::str::from_utf8(collection_raw)
                     .map_err(|e| miette::miette!("invalid collection utf8: {e}"))?;
+                if !filter.matches_collection(collection) {
+                    continue;
+                }
+
                 let rkey = keys::parse_rkey(rkey_raw)
                     .map_err(|e| miette::miette!("invalid rkey '{key:?}' for {did}: {e}"))?;
                 let cid = cid::Cid::read_bytes(cid_bytes.as_ref())
@@ -798,10 +925,11 @@ async fn persist_sparse_backfill(
         );
 
         if !ephemeral {
-            db::replace_record_counts(
+            db::replace_record_counts_matching(
                 &mut batch,
                 &app_state.db,
                 &did,
+                |collection| filter.matches_collection(collection),
                 collection_counts.iter().map(|(col, cnt)| (col.as_str(), *cnt)),
             )?;
         }
@@ -928,8 +1056,16 @@ async fn process_did(
         };
 
         if should_try_sparse {
-            match process_did_sparse(app_state, http, did, &pds, state.clone(), verify_signatures)
-                .await
+            match process_did_sparse(
+                app_state,
+                http,
+                did,
+                &pds,
+                state.clone(),
+                verify_signatures,
+                strategy,
+            )
+            .await
             {
                 Ok(SparseBackfillResult::Imported(sparse)) => {
                     #[cfg(feature = "indexer_stream")]
@@ -956,6 +1092,9 @@ async fn process_did(
                 Ok(SparseBackfillResult::Skipped) => {
                     debug!("sparse backfill skipped, falling back to full getRepo");
                 }
+                Err(e @ (BackfillError::Ratelimited | BackfillError::Transport(_))) => {
+                    return Err(e);
+                }
                 Err(e) => {
                     warn!(err = %e, "sparse backfill failed, falling back to full getRepo");
                 }
@@ -976,12 +1115,16 @@ async fn process_did(
             if matches!(e, GetRepoError::RepoNotFound(_)) {
                 warn!("repo not found, deleting");
                 let mut batch = db.inner.batch();
+                let mut count_deltas = CountDeltas::default();
                 if let Err(e) = crate::ops::delete_repo(&mut batch, db, did, &state) {
                     error!(err = %e, "failed to wipe repo during backfill");
                 }
+                count_deltas.add("pending", -1);
+                let reservation = db.stage_count_deltas(&mut batch, &count_deltas);
                 batch.commit().into_diagnostic()?;
-                // return None so did_task handles the repos/pending count decrements
-                // and skips sending BackfillFinished (nothing to drain for a deleted repo)
+                db.apply_count_deltas(&count_deltas);
+                drop(reservation);
+                // return None so did_task skips sending BackfillFinished (nothing to drain for a deleted repo)
                 return Ok(None);
             }
 

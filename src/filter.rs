@@ -56,7 +56,26 @@ mod indexer {
     fn nsid_matches(pattern: &str, col: &str) -> bool {
         pattern
             .strip_suffix(".*")
-            .map(|prefix| col == prefix || col.starts_with(prefix))
+            .map(|prefix| {
+                col.strip_prefix(prefix)
+                    .is_some_and(|suffix| suffix.starts_with('.'))
+            })
             .unwrap_or_else(|| col == pattern)
+    }
+}
+
+#[cfg(all(test, feature = "indexer"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wildcard_matches_on_nsid_boundaries() {
+        let mut filter = FilterConfig::new(FilterMode::Filter);
+        filter.collections.push(SmolStr::new("sh.tangled.*"));
+
+        assert!(filter.matches_collection("sh.tangled.repo"));
+        assert!(filter.matches_collection("sh.tangled.repo.issue"));
+        assert!(!filter.matches_collection("sh.tangledfoo.repo"));
+        assert!(!filter.matches_collection("sh.tangled"));
     }
 }

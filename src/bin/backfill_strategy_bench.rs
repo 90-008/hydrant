@@ -4,10 +4,12 @@ mod car;
 mod sparse_mst;
 
 use std::collections::BTreeMap;
+use std::io::Write;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use cid::Cid as IpldCid;
+use futures::{StreamExt, stream};
 use jacquard_api::com_atproto::sync::get_blocks::GetBlocks;
 use jacquard_api::com_atproto::sync::get_record::GetRecord;
 use jacquard_api::com_atproto::sync::get_repo::GetRepo;
@@ -21,10 +23,11 @@ use jacquard_repo::{BlockStore, MemoryBlockStore, Mst};
 use miette::{IntoDiagnostic, Result, WrapErr};
 use serde::Deserialize;
 use smol_str::SmolStr;
-use sparse_mst::{SparseScanner, sparse_probe_collection, sparse_ranges};
+use sparse_mst::{SparseScanner, mst_node_layer, sparse_probe_collection, sparse_ranges};
 use url::Url;
 
 const GET_BLOCKS_CHUNK: usize = 64;
+const GET_BLOCKS_PARALLELISM: usize = 4;
 
 #[derive(Debug)]
 struct Args {
@@ -104,11 +107,31 @@ struct FullBench {
 #[derive(Debug)]
 struct SparseBench {
     total: Duration,
+    root_layer: Option<usize>,
     seed_bytes: usize,
     node_bytes: usize,
     record_bytes: usize,
     node_blocks: usize,
     records: usize,
+}
+
+#[derive(Debug, Default)]
+struct BenchTotals {
+    repos: usize,
+    full_ms: u128,
+    full_bytes: usize,
+    sparse_ms: u128,
+    sparse_bytes: usize,
+}
+
+impl BenchTotals {
+    fn add(&mut self, full: &FullBench, sparse: &SparseBench) {
+        self.repos += 1;
+        self.full_ms += full.fetch.as_millis() + full.parse_and_walk.as_millis();
+        self.full_bytes += full.bytes;
+        self.sparse_ms += sparse.total.as_millis();
+        self.sparse_bytes += sparse.seed_bytes + sparse.node_bytes + sparse.record_bytes;
+    }
 }
 
 #[tokio::main]
@@ -126,15 +149,34 @@ async fn main() -> Result<()> {
     let ranges = sparse_ranges(&[args.pattern.clone()]);
 
     println!(
-        "did,pds,full_fetch_ms,full_parse_walk_ms,full_bytes,full_blocks,full_leaves,full_matching,sparse_total_ms,sparse_seed_bytes,sparse_node_bytes,sparse_record_bytes,sparse_node_blocks,sparse_records"
+        "did,pds,full_fetch_ms,full_parse_walk_ms,full_bytes,full_blocks,full_leaves,full_matching,sparse_total_ms,sparse_root_layer,sparse_seed_bytes,sparse_node_bytes,sparse_record_bytes,sparse_node_blocks,sparse_records"
     );
 
+    let mut totals = BenchTotals::default();
     for did in repos {
-        let pds = resolve_pds(&http, &args.plc_url, &did).await?;
-        let full = bench_full(&http, &pds, &did, &ranges).await?;
-        let sparse = bench_sparse(&http, &pds, &did, &[args.pattern.clone()]).await?;
+        let pds = match resolve_pds(&http, &args.plc_url, &did).await {
+            Ok(pds) => pds,
+            Err(err) => {
+                eprintln!("skipping {did}: resolve failed: {err:?}");
+                continue;
+            }
+        };
+        let full = match bench_full(&http, &pds, &did, &ranges).await {
+            Ok(full) => full,
+            Err(err) => {
+                eprintln!("skipping {did}: full bench failed: {err:?}");
+                continue;
+            }
+        };
+        let sparse = match bench_sparse(&http, &pds, &did, &[args.pattern.clone()]).await {
+            Ok(sparse) => sparse,
+            Err(err) => {
+                eprintln!("skipping {did}: sparse bench failed: {err:?}");
+                continue;
+            }
+        };
         println!(
-            "{did},{pds},{},{},{},{},{},{},{},{},{},{},{},{}",
+            "{did},{pds},{},{},{},{},{},{},{},{},{},{},{},{},{}",
             full.fetch.as_millis(),
             full.parse_and_walk.as_millis(),
             full.bytes,
@@ -142,13 +184,24 @@ async fn main() -> Result<()> {
             full.leaves,
             full.matching,
             sparse.total.as_millis(),
+            sparse
+                .root_layer
+                .map(|layer| layer.to_string())
+                .unwrap_or_default(),
             sparse.seed_bytes,
             sparse.node_bytes,
             sparse.record_bytes,
             sparse.node_blocks,
             sparse.records,
         );
+        totals.add(&full, &sparse);
     }
+
+    std::io::stdout().flush().into_diagnostic()?;
+    eprintln!(
+        "summary: repos={}, full_ms={}, full_bytes={}, sparse_ms={}, sparse_bytes={}",
+        totals.repos, totals.full_ms, totals.full_bytes, totals.sparse_ms, totals.sparse_bytes
+    );
 
     Ok(())
 }
@@ -285,6 +338,12 @@ async fn bench_sparse(
         .ok_or_else(|| miette::miette!("root block missing from sparse seed car"))?;
     let root_commit = jacquard_repo::commit::Commit::from_cbor(root_bytes).into_diagnostic()?;
     let root_cid = root_commit.data;
+    let root_layer = parsed
+        .blocks
+        .get(&root_cid)
+        .map(|bytes| mst_node_layer(bytes))
+        .transpose()?
+        .flatten();
 
     let mut node_fetch_bytes = 0usize;
     let mut scanner = SparseScanner::new(ranges, parsed.blocks);
@@ -310,6 +369,7 @@ async fn bench_sparse(
 
     Ok(SparseBench {
         total: start.elapsed(),
+        root_layer,
         seed_bytes,
         node_bytes: scan.node_bytes_seen + node_fetch_bytes,
         record_bytes,
@@ -326,40 +386,56 @@ async fn fetch_blocks(
 ) -> Result<(BTreeMap<IpldCid, Bytes>, usize)> {
     let mut out = BTreeMap::new();
     let mut bytes = 0usize;
-    for chunk in cids.chunks(GET_BLOCKS_CHUNK) {
-        if chunk.is_empty() {
-            continue;
-        }
 
-        let req = GetBlocks::new()
-            .did(did.clone())
-            .cids(
-                chunk
-                    .iter()
-                    .map(|cid| AtCid::from(cid.to_string()))
-                    .collect::<Vec<_>>(),
-            )
-            .build();
-        let resp = http.xrpc(to_fluent_uri(pds)).send(&req).await?;
-        let car = resp
-            .into_output()
-            .map_err(|err: XrpcError<_>| miette::miette!("getBlocks failed for {did}: {err}"))?;
-        bytes += car.body.len();
-        let parsed = car::parse_car_blocks(&car.body).await.wrap_err_with(|| {
-            let cids = chunk
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join(",");
-            format!(
-                "parse getBlocks CAR for {did} ({} requested, {} bytes, cids={cids})",
-                chunk.len(),
-                car.body.len()
-            )
-        })?;
-        out.extend(parsed);
+    let fetches = cids
+        .chunks(GET_BLOCKS_CHUNK)
+        .filter(|chunk| !chunk.is_empty())
+        .map(|chunk| fetch_block_chunk(http.clone(), pds.clone(), did.clone(), chunk.to_vec()))
+        .collect::<Vec<_>>();
+    let fetches = stream::iter(fetches).buffer_unordered(GET_BLOCKS_PARALLELISM);
+    futures::pin_mut!(fetches);
+
+    while let Some(chunk) = fetches.next().await {
+        let (blocks, chunk_bytes) = chunk?;
+        bytes += chunk_bytes;
+        out.extend(blocks);
     }
+
     Ok((out, bytes))
+}
+
+async fn fetch_block_chunk(
+    http: reqwest::Client,
+    pds: Url,
+    did: Did<'static>,
+    cids: Vec<IpldCid>,
+) -> Result<(BTreeMap<IpldCid, Bytes>, usize)> {
+    let req = GetBlocks::new()
+        .did(did.clone())
+        .cids(
+            cids.iter()
+                .map(|cid| AtCid::from(cid.to_string()))
+                .collect::<Vec<_>>(),
+        )
+        .build();
+    let resp = http.xrpc(to_fluent_uri(&pds)).send(&req).await?;
+    let car = resp
+        .into_output()
+        .map_err(|err: XrpcError<_>| miette::miette!("getBlocks failed for {did}: {err}"))?;
+    let bytes = car.body.len();
+    let parsed = car::parse_car_blocks(&car.body).await.wrap_err_with(|| {
+        let cids = cids
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(
+            "parse getBlocks CAR for {did} ({} requested, {} bytes, cids={cids})",
+            cids.len(),
+            bytes
+        )
+    })?;
+    Ok((parsed, bytes))
 }
 
 fn to_fluent_uri(url: &Url) -> fluent_uri::Uri<String> {

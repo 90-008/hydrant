@@ -3,6 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use bytes::Bytes;
 use cid::Cid as IpldCid;
 use jacquard_repo::mst::NodeData;
+use jacquard_repo::mst::util::layer_for_key;
 use miette::{IntoDiagnostic, Result, WrapErr};
 use smol_str::SmolStr;
 
@@ -83,6 +84,18 @@ fn prefix_upper_bound(prefix: &str) -> Option<SmolStr> {
     None
 }
 
+pub(crate) fn mst_node_layer(bytes: &[u8]) -> Result<Option<usize>> {
+    let node: NodeData = serde_ipld_dagcbor::from_slice(bytes)
+        .into_diagnostic()
+        .wrap_err("failed to decode mst node for layer estimate")?;
+    decode_node_entries(&node).map(|entries| {
+        entries.into_iter().find_map(|entry| match entry {
+            FlatEntry::Leaf { key, .. } => Some(layer_for_key(key.as_str())),
+            FlatEntry::Tree { .. } => None,
+        })
+    })
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct SparseScanOutput {
     pub(crate) leaves: Vec<(SmolStr, IpldCid)>,
@@ -93,33 +106,61 @@ pub(crate) struct SparseScanOutput {
 pub(crate) struct SparseScanner {
     ranges: Vec<KeyRange>,
     blocks: BTreeMap<IpldCid, Bytes>,
+    root: Option<IpldCid>,
+    pending_missing: BTreeSet<IpldCid>,
+    visited: BTreeSet<IpldCid>,
+    leaves: Vec<(SmolStr, IpldCid)>,
+    stats: ScanStats,
 }
 
 impl SparseScanner {
     pub(crate) fn new(ranges: Vec<KeyRange>, blocks: BTreeMap<IpldCid, Bytes>) -> Self {
-        Self { ranges, blocks }
+        Self {
+            ranges,
+            blocks,
+            root: None,
+            pending_missing: BTreeSet::new(),
+            visited: BTreeSet::new(),
+            leaves: Vec::new(),
+            stats: ScanStats::default(),
+        }
     }
 
     pub(crate) fn insert_blocks(&mut self, blocks: BTreeMap<IpldCid, Bytes>) {
         self.blocks.extend(blocks);
     }
 
-    pub(crate) fn scan(&self, root: IpldCid) -> Result<Result<SparseScanOutput, Vec<IpldCid>>> {
-        let mut visited = BTreeSet::new();
-        let mut missing = BTreeSet::new();
-        let mut leaves = Vec::new();
-        let mut stats = ScanStats::default();
+    pub(crate) fn scan(&mut self, root: IpldCid) -> Result<Result<SparseScanOutput, Vec<IpldCid>>> {
+        if let Some(existing_root) = self.root {
+            if existing_root != root {
+                return Err(miette::miette!(
+                    "sparse scanner root changed from {existing_root} to {root}"
+                ));
+            }
+        } else {
+            self.root = Some(root);
+            self.scan_node(root)?;
+        }
 
-        self.scan_node(root, &mut visited, &mut missing, &mut leaves, &mut stats)?;
+        let ready = self
+            .pending_missing
+            .iter()
+            .filter(|cid| self.blocks.contains_key(cid))
+            .copied()
+            .collect::<Vec<_>>();
+        for cid in ready {
+            self.pending_missing.remove(&cid);
+            self.scan_node(cid)?;
+        }
 
-        if missing.is_empty() {
+        if self.pending_missing.is_empty() {
             Ok(Ok(SparseScanOutput {
-                leaves,
-                node_blocks_seen: stats.node_blocks_seen,
-                node_bytes_seen: stats.node_bytes_seen,
+                leaves: self.leaves.clone(),
+                node_blocks_seen: self.stats.node_blocks_seen,
+                node_bytes_seen: self.stats.node_bytes_seen,
             }))
         } else {
-            Ok(Err(missing.into_iter().collect()))
+            Ok(Err(self.pending_missing.iter().copied().collect()))
         }
     }
 
@@ -127,25 +168,19 @@ impl SparseScanner {
         self.blocks
     }
 
-    fn scan_node(
-        &self,
-        cid: IpldCid,
-        visited: &mut BTreeSet<IpldCid>,
-        missing: &mut BTreeSet<IpldCid>,
-        leaves: &mut Vec<(SmolStr, IpldCid)>,
-        stats: &mut ScanStats,
-    ) -> Result<()> {
-        if !visited.insert(cid) {
+    fn scan_node(&mut self, cid: IpldCid) -> Result<()> {
+        if self.visited.contains(&cid) {
             return Ok(());
         }
 
         let Some(bytes) = self.blocks.get(&cid) else {
-            missing.insert(cid);
+            self.pending_missing.insert(cid);
             return Ok(());
         };
 
-        stats.node_blocks_seen += 1;
-        stats.node_bytes_seen += bytes.len();
+        self.visited.insert(cid);
+        self.stats.node_blocks_seen += 1;
+        self.stats.node_bytes_seen += bytes.len();
 
         let node: NodeData = serde_ipld_dagcbor::from_slice(bytes)
             .into_diagnostic()
@@ -156,7 +191,7 @@ impl SparseScanner {
             match &entries[idx] {
                 FlatEntry::Leaf { key, cid } => {
                     if self.ranges.iter().any(|range| range.contains(key)) {
-                        leaves.push((key.clone(), *cid));
+                        self.leaves.push((key.clone(), *cid));
                     }
                 }
                 FlatEntry::Tree { cid } => {
@@ -167,7 +202,7 @@ impl SparseScanner {
                         .iter()
                         .any(|range| range.intersects_subtree(lower, upper))
                     {
-                        self.scan_node(*cid, visited, missing, leaves, stats)?;
+                        self.scan_node(*cid)?;
                     }
                 }
             }
@@ -309,10 +344,55 @@ mod tests {
             Some(left),
         );
         let root_bytes = serde_ipld_dagcbor::to_vec(&root_node).unwrap();
-        let scanner = SparseScanner::new(wanted, BTreeMap::from([(root, root_bytes.into())]));
+        let mut scanner = SparseScanner::new(wanted, BTreeMap::from([(root, root_bytes.into())]));
 
         let missing = scanner.scan(root).unwrap().unwrap_err();
 
         assert_eq!(missing, vec![middle]);
+    }
+
+    #[test]
+    fn resumes_without_rescanning_known_nodes() {
+        let wanted = sparse_ranges(&[SmolStr::new("sh.tangled.*")]);
+        let middle = cid(1);
+        let root = cid(2);
+        let record = cid(3);
+        let root_node = node(
+            vec![
+                ("app.bsky.feed.post/1", cid(4), Some(middle)),
+                ("zz.example.record/1", cid(5), None),
+            ],
+            None,
+        );
+        let middle_node = node(vec![("sh.tangled.repo/1", record, None)], None);
+        let mut scanner = SparseScanner::new(
+            wanted,
+            BTreeMap::from([(root, serde_ipld_dagcbor::to_vec(&root_node).unwrap().into())]),
+        );
+
+        assert_eq!(scanner.scan(root).unwrap().unwrap_err(), vec![middle]);
+
+        scanner.insert_blocks(BTreeMap::from([(
+            middle,
+            serde_ipld_dagcbor::to_vec(&middle_node).unwrap().into(),
+        )]));
+        let scan = scanner.scan(root).unwrap().unwrap();
+
+        assert_eq!(
+            scan.leaves,
+            vec![(SmolStr::new("sh.tangled.repo/1"), record)]
+        );
+        assert_eq!(scan.node_blocks_seen, 2);
+    }
+
+    #[test]
+    fn estimates_node_layer_from_first_leaf() {
+        let root_node = node(vec![("sh.tangled.repo/1", cid(1), None)], None);
+        let bytes = serde_ipld_dagcbor::to_vec(&root_node).unwrap();
+
+        assert_eq!(
+            mst_node_layer(&bytes).unwrap(),
+            Some(layer_for_key("sh.tangled.repo/1"))
+        );
     }
 }

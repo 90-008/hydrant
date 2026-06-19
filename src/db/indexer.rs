@@ -110,6 +110,32 @@ pub fn replace_record_counts<'a>(
     Ok(())
 }
 
+pub fn replace_record_counts_matching<'a>(
+    batch: &mut OwnedWriteBatch,
+    db: &Db,
+    did: &Did<'_>,
+    matches_collection: impl Fn(&str) -> bool,
+    counts: impl IntoIterator<Item = (&'a str, u64)>,
+) -> Result<()> {
+    let prefix = keys::did_collection_prefix(did);
+    for guard in db.counts.prefix(&prefix) {
+        let key = guard.key().into_diagnostic()?;
+        let collection = key
+            .strip_prefix(prefix.as_slice())
+            .ok_or_else(|| miette::miette!("invalid collection count key: {key:?}"))
+            .and_then(|raw| std::str::from_utf8(raw).into_diagnostic())?;
+        if matches_collection(collection) {
+            batch.remove(&db.counts, key);
+        }
+    }
+
+    for (collection, count) in counts {
+        set_record_count(batch, db, did, collection, count);
+    }
+
+    Ok(())
+}
+
 pub fn update_record_count(
     batch: &mut OwnedWriteBatch,
     db: &Db,
@@ -207,6 +233,42 @@ mod tests {
         assert_eq!(get_record_count(&db, &did, "app.bsky.feed.post")?, 0);
         assert_eq!(get_record_count(&db, &did, "app.bsky.feed.like")?, 7);
         assert_eq!(get_record_count(&db, &did, "app.bsky.actor.profile")?, 1);
+        assert_eq!(
+            db.counts.prefix(keys::did_collection_prefix(&did)).count(),
+            2
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn replace_record_counts_matching_keeps_unmatched_collections() -> Result<()> {
+        let tmp = tempfile::tempdir().into_diagnostic()?;
+        let cfg = crate::config::Config {
+            database_path: tmp.path().to_path_buf(),
+            ..Default::default()
+        };
+        let db = Db::open(&cfg)?;
+        let did = Did::new("did:plc:yk4q3id7id6p5z3bypvshc64").into_diagnostic()?;
+
+        let mut batch = db.inner.batch();
+        set_record_count(&mut batch, &db, &did, "sh.tangled.repo", 3);
+        set_record_count(&mut batch, &db, &did, "app.bsky.feed.post", 2);
+        batch.commit().into_diagnostic()?;
+
+        let mut batch = db.inner.batch();
+        replace_record_counts_matching(
+            &mut batch,
+            &db,
+            &did,
+            |collection| collection.starts_with("sh.tangled."),
+            [("sh.tangled.repo.issue", 7)],
+        )?;
+        batch.commit().into_diagnostic()?;
+
+        assert_eq!(get_record_count(&db, &did, "sh.tangled.repo")?, 0);
+        assert_eq!(get_record_count(&db, &did, "sh.tangled.repo.issue")?, 7);
+        assert_eq!(get_record_count(&db, &did, "app.bsky.feed.post")?, 2);
         assert_eq!(
             db.counts.prefix(keys::did_collection_prefix(&did)).count(),
             2

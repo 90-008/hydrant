@@ -290,7 +290,8 @@ pub enum BackfillStrategy {
     Full,
     /// use sparse collection backfill when possible, falling back to full repo cars.
     SparseFilter,
-    /// choose sparse collection backfill only when the configured filter supports it.
+    /// choose sparse collection backfill for filtered repos unless the seed proof suggests
+    /// the repo is small enough for full `getRepo` to be cheaper.
     Auto,
 }
 
@@ -359,7 +360,8 @@ pub struct Config {
     pub backfill_concurrency_limit: usize,
     /// backfill strategy. `full` preserves existing full-repo backfill behavior.
     /// `sparse-filter` attempts authenticated sparse collection backfill first and falls back
-    /// to full repo backfill. `auto` uses sparse only when explicit collection filters exist.
+    /// to full repo backfill. `auto` probes filtered repos and falls back to full repo backfill
+    /// for tiny MST roots.
     /// set via `HYDRANT_BACKFILL_STRATEGY`.
     pub backfill_strategy: BackfillStrategy,
 
@@ -556,7 +558,7 @@ impl Default for Config {
             cursor_save_interval: Duration::from_secs(3),
             repo_fetch_timeout: Duration::from_secs(300),
             backfill_concurrency_limit: 16,
-            backfill_strategy: BackfillStrategy::Full,
+            backfill_strategy: BackfillStrategy::Auto,
             enable_crawler: None,
             crawler_max_pending_repos: 2000,
             crawler_resume_pending_repos: 1000,
