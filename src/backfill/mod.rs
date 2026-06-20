@@ -1086,6 +1086,38 @@ async fn process_did(
                     return Ok(Some(previous_state));
                 }
                 Ok(SparseBackfillResult::Discarded) => {
+                    let did_key = keys::repo_key(did);
+                    let metadata_key = keys::repo_metadata_key(did);
+                    let app_state_clone = app_state.clone();
+                    let did = did.clone();
+                    let pending_key = pending_key.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let mut batch = app_state_clone.db.inner.batch();
+                        let mut count_deltas = CountDeltas::default();
+                        let mut lifecycle_counts = app_state_clone.db.lifecycle_counts();
+                        let applied = lifecycle_counts.transition_pending_key(
+                            &mut batch,
+                            &did,
+                            pending_key.as_ref(),
+                            GaugeState::Synced,
+                        )?;
+                        batch.remove(&app_state_clone.db.pending, pending_key.clone());
+                        if applied {
+                            batch.remove(&app_state_clone.db.repos, &did_key);
+                            batch.remove(&app_state_clone.db.repo_metadata, &metadata_key);
+                            count_deltas.add_repos(-1);
+                        }
+                        let lifecycle_reservation = lifecycle_counts.stage(&mut batch);
+                        let reservation = app_state_clone.db.stage_count_deltas(&mut batch, &count_deltas);
+                        batch.commit().into_diagnostic().inspect(|_| {
+                            app_state_clone.db.apply_lifecycle_counts(lifecycle_reservation);
+                            app_state_clone.db.apply_count_deltas(&count_deltas);
+                            drop(reservation);
+                        })
+                    })
+                    .await
+                    .into_diagnostic()??;
+
                     return Ok(None);
                 }
                 Ok(SparseBackfillResult::Skipped) => {
