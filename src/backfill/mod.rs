@@ -170,7 +170,7 @@ impl BackfillWorker {
 
                         if let Err(e) = res {
                             match &e {
-                                BackfillError::Ratelimited => {
+                                BackfillError::Ratelimited | BackfillError::PreemptivelyThrottled => {
                                     debug!(err = %e, "process failed");
                                 }
                                 _ => {
