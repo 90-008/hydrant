@@ -46,6 +46,9 @@ Hydrant consists of several components:
     - `/ingestion` (`GET`/`PATCH`): Pause/resume crawler, firehose, and backfill components at runtime.
     - `/crawler/sources` (`GET`/`POST`/`DELETE`): Manage crawler relay sources at runtime.
     - `/firehose/sources` (`GET`/`POST`/`DELETE`): Manage firehose relay sources at runtime.
+    - `/pds/tiers` (`GET`/`PUT`/`DELETE`): PDS custom rate limit tiers.
+    - `/pds/rate-tiers` (`GET`): Predefined PDS rate tiers.
+    - `/pds/banned` (`GET`/`PUT`/`DELETE`): Block/unblock indexing of specific PDS hosts.
     - `/db/train` (`POST`): Train per-keyspace zstd dictionaries.
     - `/db/compact` (`POST`): Trigger manual database compaction.
     - `/cursors` (`DELETE`): Reset cursors.
@@ -91,10 +94,16 @@ See `examples/statusphere.rs` for a usage example.
 - **Keyspaces**: Use the `keys.rs` module to maintain consistent composite key formats.
 - **Schema evolution**: Treat versioned wire types in `src/types.rs` as frozen snapshots once shipped. If a stored type changes shape, add a new versioned type, export the newest version for live code, and add a forward migration that explicitly deserializes the previous version and writes the new one. Do not modify older migration input/output types in place. For example, if `RepoState` changes after `v7`, add `v8::RepoState` and a `v7 -> v8` migration instead of mutating `v7`.
 
+### Rate limiting & XRPC Client integration
+- **Header preservation**: The `jacquard-common` client statelessly discards HTTP response headers on non-200 responses. If rate-limiting headers (like `Retry-After` or `ratelimit-reset`) need to be processed for error responses (e.g. 429 Too Many Requests), wrap the client in a custom transport-level `HttpClient` wrapper (like `ThrottledHttpClient`) to intercept the response and update the throttler state before the headers are discarded.
+- **Pacing**: Use token bucket or leaky bucket pacing (`wait_for_allow`) in addition to task concurrency limits. Simply limiting task concurrency is insufficient to prevent 429 cascades when retrying many repositories on a single PDS.
+- **Preemptive Throttling**: Distinguish preemptive skips (e.g., when a PDS is known to be throttled) from direct rate limit failures. Avoid incrementing repository error retry counts on preemptive skips to prevent compounding backoffs unnecessarily.
+
 ## Database schema (keyspaces)
 
 Hydrant uses multiple `fjall` keyspaces:
 - `repos`: Maps `{DID}` -> `RepoState` (MessagePack).
+- `repo_metadata`: Maps `rm|{DID}` -> `RepoMetadata` (MessagePack).
 - `records`: Maps `{DID}|{COL}|{RKey}` -> `{CID}` (Binary).
 - `blocks`: Maps `{collection}|{CID bytes}` -> `Block Data` (Raw CBOR). The collection prefix enables per-collection zstd dictionary training.
 - `events`: Maps `{ID}` (u64 BE) -> `StoredEvent` (MessagePack). This is the source for the JSON stream API.
@@ -103,8 +112,14 @@ Hydrant uses multiple `fjall` keyspaces:
 - `resync`: Maps `{DID}` -> `ResyncState` (MessagePack) for retry logic/tombstones.
 - `resync_buffer`: Maps `{DID}|{Rev}` -> `Commit` (MessagePack). Used to buffer live events during backfill.
 - `counts`: Maps `k|{NAME}` or `r|{DID}|{COL}` -> `Count` (u64 BE Bytes).
-- `filter`: Stores filter config. Handled by the `db::filter` module. Includes mode key `m` -> `FilterMode` (MessagePack), and set entries for signals (`s|{NSID}`), collections (`c|{NSID}`), and excludes (`x|{DID}`) -> empty value.
+- `filter`: Stores filter config. Handled by the `db::filter` and `db::pds_meta` modules. Includes:
+    - Mode key `m` -> `FilterMode` (MessagePack).
+    - Set entries for signals (`s|{NSID}`), collections (`c|{NSID}`), and excludes (`x|{DID}`) -> empty value.
+    - PDS rate tiers: `{host}|tier` -> tier name (UTF-8 string).
+    - PDS host statuses: `{host}|status` -> `HostStatus` (MessagePack).
 - `crawler`: Stores crawler and firehose source URLs with prefixed keys. Retry entries use `ret|{DID}` -> empty value. Crawler sources use `src|{URL}` -> empty value. Firehose sources use `firehose|{URL}` -> empty value.
+- `relay_events` (feature-gated, relay mode): Maps `{SEQ}` (u64 BE) -> Relay event data.
+- `jetstream_events` (feature-gated, jetstream mode): Maps `{time_us}|{ID}` (16 bytes) -> Jetstream event data.
 - `backlinks` (feature-gated): Reverse index of record references for the backlinks feature.
 
 ## Safe commands

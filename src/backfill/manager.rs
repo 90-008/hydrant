@@ -115,6 +115,33 @@ pub fn retry_worker(state: Arc<AppState>) {
             match rmp_serde::from_slice::<ResyncState>(&value) {
                 Ok(ResyncState::Error { next_retry, .. }) => {
                     if next_retry <= now {
+                        let did_key = keys::repo_key(&did);
+                        let is_pds_throttled = if let Ok(Some(state_bytes)) = db.repos.get(&did_key)
+                        {
+                            if let Ok(repo_state) =
+                                rmp_serde::from_slice::<crate::types::RepoState>(&state_bytes)
+                            {
+                                if let Some(ref pds_str) = repo_state.pds {
+                                    if let Ok(pds_url) = url::Url::parse(pds_str.as_ref()) {
+                                        let now_ts = chrono::Utc::now().timestamp();
+                                        state.throttler.snapshot(&pds_url).is_throttled(now_ts)
+                                    } else {
+                                        false
+                                    }
+                                } else {
+                                    false
+                                }
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        };
+
+                        if is_pds_throttled {
+                            continue;
+                        }
+
                         debug!(did = %did, "retrying backfill");
 
                         let metadata_key = keys::repo_metadata_key(&did);

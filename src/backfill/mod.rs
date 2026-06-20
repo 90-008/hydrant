@@ -10,11 +10,12 @@ use crate::types::{Commit, GaugeState, RepoState, RepoStatus, ResyncErrorKind, R
 
 use fjall::Slice;
 use futures::{StreamExt, stream};
-use jacquard_api::com_atproto::sync::get_blocks::{GetBlocks, GetBlocksError};
+use jacquard_api::com_atproto::sync::get_blocks::GetBlocksError;
 use jacquard_api::com_atproto::sync::get_record::{GetRecord, GetRecordError};
 use jacquard_api::com_atproto::sync::get_repo::{GetRepo, GetRepoError};
 use jacquard_common::IntoStatic;
 use jacquard_common::error::{ClientError, ClientErrorKind};
+use jacquard_common::http_client::HttpClient;
 use jacquard_common::types::cid::{Cid as AtCid, IpldCid};
 use jacquard_common::types::did::Did;
 use jacquard_common::types::string::{Nsid, RecordKey};
@@ -47,7 +48,7 @@ use crate::util::{WatchEnabledExt, url_to_fluent_uri};
 pub struct BackfillWorker {
     state: Arc<AppState>,
     buffer_tx: IndexerTx,
-    http: reqwest::Client,
+    http: ThrottledHttpClient,
     semaphore: Arc<Semaphore>,
     verify_signatures: bool,
     strategy: BackfillStrategy,
@@ -65,16 +66,20 @@ impl BackfillWorker {
         strategy: BackfillStrategy,
         enabled: tokio::sync::watch::Receiver<bool>,
     ) -> Self {
+        let client = reqwest::Client::builder()
+            .timeout(timeout)
+            .zstd(true)
+            .brotli(true)
+            .gzip(true)
+            .build()
+            .expect("failed to build http client");
         Self {
-            state,
+            state: state.clone(),
             buffer_tx,
-            http: reqwest::Client::builder()
-                .timeout(timeout)
-                .zstd(true)
-                .brotli(true)
-                .gzip(true)
-                .build()
-                .expect("failed to build http client"),
+            http: ThrottledHttpClient {
+                client,
+                throttler: state.throttler.clone(),
+            },
             semaphore: Arc::new(Semaphore::new(concurrency_limit)),
             verify_signatures,
             strategy,
@@ -197,7 +202,7 @@ impl BackfillWorker {
 
 async fn did_task(
     state: &Arc<AppState>,
-    http: reqwest::Client,
+    http: ThrottledHttpClient,
     buffer_tx: IndexerTx,
     did: &Did<'static>,
     pending_key: Slice,
@@ -299,7 +304,7 @@ async fn did_task(
         }
         Err(e) => {
             match &e {
-                BackfillError::Ratelimited => {
+                BackfillError::Ratelimited | BackfillError::PreemptivelyThrottled => {
                     debug!("too many requests");
                 }
                 BackfillError::Transport(reason) => {
@@ -312,7 +317,9 @@ async fn did_task(
             }
 
             let error_kind = match &e {
-                BackfillError::Ratelimited => ResyncErrorKind::Ratelimited,
+                BackfillError::Ratelimited | BackfillError::PreemptivelyThrottled => {
+                    ResyncErrorKind::Ratelimited
+                }
                 BackfillError::Transport(_) => ResyncErrorKind::Transport,
                 BackfillError::Generic(_) => ResyncErrorKind::Generic,
                 BackfillError::Deleted => unreachable!("already handled"),
@@ -333,8 +340,12 @@ async fn did_task(
             };
 
             // Calculate new stats
-            retry_count += 1;
-            let next_retry = ResyncState::next_backoff(retry_count);
+            let next_retry = if matches!(e, BackfillError::PreemptivelyThrottled) {
+                chrono::Utc::now().timestamp() + 60
+            } else {
+                retry_count += 1;
+                ResyncState::next_backoff(retry_count)
+            };
 
             let resync_state = ResyncState::Error {
                 kind: error_kind,
@@ -401,6 +412,8 @@ enum BackfillError {
     Generic(miette::Report),
     #[error("too many requests")]
     Ratelimited,
+    #[error("pds is throttled")]
+    PreemptivelyThrottled,
     #[error("transport error: {0}")]
     Transport(SmolStr),
     #[error("repo was concurrently deleted")]
@@ -428,10 +441,7 @@ impl BackfillError {
         match e.kind() {
             ClientErrorKind::Http {
                 status: StatusCode::TOO_MANY_REQUESTS,
-            } => {
-                throttle.record_ratelimit(None);
-                Self::Ratelimited
-            }
+            } => Self::Ratelimited,
             ClientErrorKind::Transport => {
                 let reason = e
                     .source_err()
@@ -486,7 +496,7 @@ const SPARSE_AUTO_FULL_MAX_ROOT_LAYER: usize = 2;
 
 async fn process_did_sparse(
     app_state: &Arc<AppState>,
-    http: &reqwest::Client,
+    http: &ThrottledHttpClient,
     did: &Did<'static>,
     pds: &url::Url,
     state: RepoState<'static>,
@@ -512,13 +522,19 @@ async fn process_did_sparse(
 
     let throttle = app_state.throttler.get_handle(pds).await;
     if throttle.is_throttled() {
-        return Err(BackfillError::Ratelimited);
+        return Err(BackfillError::PreemptivelyThrottled);
     }
+
+    let tier = app_state.resolve_pds_tier(pds.host_str().unwrap_or(""));
 
     let resp = {
         let _permit = throttle.acquire().await;
         if throttle.is_throttled() {
-            return Err(BackfillError::Ratelimited);
+            return Err(BackfillError::PreemptivelyThrottled);
+        }
+        throttle.wait_for_allow(1, &tier).await;
+        if throttle.is_throttled() {
+            return Err(BackfillError::PreemptivelyThrottled);
         }
         match http.xrpc(url_to_fluent_uri(pds)).send(&req).await {
             Ok(resp) => {
@@ -597,7 +613,7 @@ async fn process_did_sparse(
                         miette::miette!("sparse mst scan exceeded missing block limit").into(),
                     );
                 }
-                let blocks = fetch_blocks(http, pds, did, &missing, &throttle).await?;
+                let blocks = fetch_blocks(http, pds, did, &missing, &throttle, &tier).await?;
                 if missing.iter().all(|cid| !blocks.contains_key(cid)) {
                     return Ok(SparseBackfillResult::Skipped);
                 }
@@ -621,7 +637,7 @@ async fn process_did_sparse(
         .filter_map(|cid| scanned_blocks.remove(cid).map(|bytes| (*cid, bytes)))
         .collect::<BTreeMap<_, _>>();
     drop(scanned_blocks);
-    record_blocks.extend(fetch_blocks(http, pds, did, &missing_records, &throttle).await?);
+    record_blocks.extend(fetch_blocks(http, pds, did, &missing_records, &throttle, &tier).await?);
 
     if let Some((_, missing)) = scan
         .leaves
@@ -656,11 +672,12 @@ async fn process_did_sparse(
 }
 
 async fn fetch_blocks(
-    http: &reqwest::Client,
+    http: &ThrottledHttpClient,
     pds: &url::Url,
     did: &Did<'static>,
     cids: &[IpldCid],
     throttle: &ThrottleHandle,
+    tier: &crate::config::RateTier,
 ) -> Result<BTreeMap<IpldCid, bytes::Bytes>, BackfillError> {
     let mut out = BTreeMap::new();
 
@@ -674,6 +691,7 @@ async fn fetch_blocks(
                 did.clone(),
                 chunk.to_vec(),
                 throttle,
+                tier,
             )
         })
         .collect::<Vec<_>>();
@@ -688,11 +706,12 @@ async fn fetch_blocks(
 }
 
 async fn fetch_block_chunk(
-    http: reqwest::Client,
+    http: ThrottledHttpClient,
     pds: url::Url,
     did: Did<'static>,
     cids: Vec<IpldCid>,
     throttle: &ThrottleHandle,
+    tier: &crate::config::RateTier,
 ) -> Result<BTreeMap<IpldCid, bytes::Bytes>, BackfillError> {
     let mut url = pds
         .join("xrpc/com.atproto.sync.getBlocks")
@@ -707,7 +726,9 @@ async fn fetch_block_chunk(
 
     let resp = {
         let _permit = throttle.acquire().await;
+        throttle.wait_for_allow(1, tier).await;
         match http
+            .client
             .get(url)
             .header(reqwest::header::ACCEPT, "application/vnd.ipld.car")
             .send()
@@ -743,6 +764,12 @@ async fn fetch_block_chunk(
             .await
             .map_err(BackfillError::from)
     } else {
+        let retry_after = if status == StatusCode::TOO_MANY_REQUESTS {
+            crate::util::parse_retry_after(&resp)
+        } else {
+            None
+        };
+
         let body = resp
             .bytes()
             .await
@@ -761,7 +788,7 @@ async fn fetch_block_chunk(
         }
 
         if status == StatusCode::TOO_MANY_REQUESTS {
-            throttle.record_ratelimit(None);
+            throttle.record_ratelimit(retry_after);
             return Err(BackfillError::Ratelimited);
         }
 
@@ -1030,7 +1057,7 @@ async fn persist_sparse_backfill(
 
 async fn process_did(
     app_state: &Arc<AppState>,
-    http: &reqwest::Client,
+    http: &ThrottledHttpClient,
     did: &Did<'static>,
     pending_key: Slice,
     verify_signatures: bool,
@@ -1168,7 +1195,11 @@ async fn process_did(
                 Ok(SparseBackfillResult::Skipped) => {
                     debug!("sparse backfill skipped, falling back to full getRepo");
                 }
-                Err(e @ (BackfillError::Ratelimited | BackfillError::Transport(_))) => {
+                Err(
+                    e @ (BackfillError::Ratelimited
+                    | BackfillError::PreemptivelyThrottled
+                    | BackfillError::Transport(_)),
+                ) => {
                     return Err(e);
                 }
                 Err(e) => {
@@ -1185,12 +1216,17 @@ async fn process_did(
     let req = GetRepo::new().did(did.clone()).build();
     let throttle = app_state.throttler.get_handle(&pds).await;
     if throttle.is_throttled() {
-        return Err(BackfillError::Ratelimited);
+        return Err(BackfillError::PreemptivelyThrottled);
     }
+    let tier = app_state.resolve_pds_tier(pds.host_str().unwrap_or(""));
     let resp = {
         let _permit = throttle.acquire().await;
         if throttle.is_throttled() {
-            return Err(BackfillError::Ratelimited);
+            return Err(BackfillError::PreemptivelyThrottled);
+        }
+        throttle.wait_for_allow(1, &tier).await;
+        if throttle.is_throttled() {
+            return Err(BackfillError::PreemptivelyThrottled);
         }
         match http.xrpc(url_to_fluent_uri(&pds)).send(&req).await {
             Ok(resp) => {
@@ -1673,4 +1709,60 @@ async fn process_did(
 
     trace!("complete");
     Ok(Some(previous_state))
+}
+
+#[derive(Clone)]
+pub struct ThrottledHttpClient {
+    pub client: reqwest::Client,
+    pub throttler: crate::util::throttle::Throttler,
+}
+
+impl HttpClient for ThrottledHttpClient {
+    type Error = reqwest::Error;
+
+    async fn send_http(
+        &self,
+        request: http::Request<Vec<u8>>,
+    ) -> Result<http::Response<Vec<u8>>, Self::Error> {
+        let uri = request.uri().clone();
+        let host_url = if let Some(host) = uri.host() {
+            let scheme = uri.scheme_str().unwrap_or("https");
+            let port_str = uri.port_u16().map(|p| format!(":{p}")).unwrap_or_default();
+            let url_str = format!("{scheme}://{host}{port_str}");
+            url::Url::parse(&url_str).ok()
+        } else {
+            None
+        };
+
+        let res = self.client.send_http(request).await;
+
+        if let Ok(ref resp) = res {
+            if resp.status() == StatusCode::TOO_MANY_REQUESTS {
+                if let Some(ref host_url) = host_url {
+                    let headers = resp.headers();
+                    let retry_after = headers
+                        .get(http::header::RETRY_AFTER)
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|s| s.parse::<u64>().ok());
+
+                    let rate_limit_reset = headers
+                        .get("ratelimit-reset")
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|s| s.parse::<i64>().ok())
+                        .map(|ts| {
+                            let now = chrono::Utc::now().timestamp();
+                            (ts - now).max(1) as u64
+                        });
+
+                    let delay_secs = retry_after.or(rate_limit_reset);
+                    self.throttler
+                        .get_handle(host_url)
+                        .await
+                        .record_ratelimit(delay_secs);
+                }
+            }
+        }
+
+        res
+    }
 }
