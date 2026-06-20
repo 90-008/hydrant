@@ -135,6 +135,18 @@ pub fn parse_count_delta_key(key: &[u8]) -> miette::Result<(u64, &str)> {
 
 pub const COUNT_DELTA_WATERMARK_KEY: &[u8] = b"w|count_delta_watermark";
 
+#[cfg(feature = "indexer")]
+pub const COUNT_GAUGE_PREFIX: &[u8] = &[b'g', SEP];
+
+#[cfg(feature = "indexer")]
+pub fn count_gauge_key(did: &Did) -> Vec<u8> {
+    let repo = TrimmedDid::from(did);
+    let mut key = Vec::with_capacity(COUNT_GAUGE_PREFIX.len() + repo.len());
+    key.extend_from_slice(COUNT_GAUGE_PREFIX);
+    repo.write_to_vec(&mut key);
+    key
+}
+
 pub const COUNT_COLLECTION_PREFIX: &[u8] = &[b'r', SEP];
 
 pub fn did_collection_prefix(did: &Did) -> Vec<u8> {

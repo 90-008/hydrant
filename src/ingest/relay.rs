@@ -18,7 +18,6 @@ use tokio::runtime::Handle;
 use tracing::{debug, error, info, info_span, trace, warn};
 use url::Url;
 
-use crate::db::keys::pds_account_count_key;
 #[cfg(all(feature = "relay", feature = "jetstream"))]
 use crate::db::types::TrimmedDid;
 use crate::db::{self, CountDeltas, keys};
@@ -859,9 +858,10 @@ impl RelayWorker {
         }
 
         let mut update_host = |host: &str, delta| {
-            let count_key = pds_account_count_key(host);
-            ctx.count_deltas.add(&count_key, delta);
-            let count = ctx.count_deltas.projected_count(&ctx.state.db, &count_key);
+            ctx.count_deltas.add_pds_account(host, delta);
+            let count = ctx
+                .count_deltas
+                .projected_pds_account_count(&ctx.state.db, host);
             ctx.state
                 .apply_host_limit_status(&mut ctx.batch, host, count);
         };
@@ -1251,7 +1251,10 @@ impl WorkerContext<'_> {
             }
 
             if let Some(host) = msg.firehose.host_str() {
-                let count = self.state.db.get_count_sync(&pds_account_count_key(host));
+                let count = self
+                    .state
+                    .db
+                    .get_count_sync(&keys::pds_account_count_key(host));
                 if self.state.is_over_account_limit(host, count) {
                     warn!(did = %did, host, count, "account limit reached for host, dropping new account");
                     #[cfg(feature = "firehose-diagnostics")]
@@ -1303,7 +1306,7 @@ impl WorkerContext<'_> {
                 ));
         }
 
-        self.count_deltas.add("repos", 1);
+        self.count_deltas.add_repos(1);
 
         #[cfg(feature = "firehose-diagnostics")]
         {

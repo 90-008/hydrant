@@ -207,26 +207,48 @@ async fn did_task(
 ) -> Result<(), BackfillError> {
     let db = &state.db;
 
-    match process_did(state, &http, did, verify_signatures, strategy).await {
+    match process_did(
+        state,
+        &http,
+        did,
+        pending_key.clone(),
+        verify_signatures,
+        strategy,
+    )
+    .await
+    {
         Ok(Some(_repo_state)) => {
-            let did_key = keys::repo_key(did);
+            let applied = tokio::task::spawn_blocking({
+                let state = state.clone();
+                let did = did.clone();
+                let pending_key = pending_key.clone();
+                move || {
+                    let db = &state.db;
+                    let did_key = keys::repo_key(&did);
+                    let mut batch = db.inner.batch();
+                    let mut lifecycle_counts = db.lifecycle_counts();
+                    let applied = lifecycle_counts.transition_pending_key(
+                        &mut batch,
+                        &did,
+                        pending_key.as_ref(),
+                        GaugeState::Synced,
+                    )?;
+                    batch.remove(&db.pending, pending_key.clone());
+                    if applied {
+                        batch.remove(&db.resync, &did_key);
+                    }
+                    let lifecycle_reservation = lifecycle_counts.stage(&mut batch);
+                    batch.commit().into_diagnostic()?;
+                    db.apply_lifecycle_counts(lifecycle_reservation);
+                    Ok::<_, miette::Report>(applied)
+                }
+            })
+            .await
+            .into_diagnostic()??;
 
-            // determine old gauge state
-            // if it was error/suspended etc, we need to know which error kind it was to decrement correctly.
-            let mut batch = db.inner.batch();
-            let mut count_deltas = CountDeltas::default();
-            // unconditionally remove from pending
-            batch.remove(&db.pending, pending_key);
-            // remove from resync, just in case
-            batch.remove(&db.resync, &did_key);
-            count_deltas.add_gauge_diff(&GaugeState::Pending, &GaugeState::Synced);
-            let reservation = db.stage_count_deltas(&mut batch, &count_deltas);
-
-            tokio::task::spawn_blocking(move || batch.commit().into_diagnostic())
-                .await
-                .into_diagnostic()??;
-            db.apply_count_deltas(&count_deltas);
-            drop(reservation);
+            if !applied {
+                return Ok(());
+            }
 
             let state = state.clone();
             tokio::task::spawn_blocking(move || {
@@ -250,16 +272,29 @@ async fn did_task(
         Ok(None) => Ok(()),
         Err(BackfillError::Deleted) => {
             warn!("orphaned pending entry, cleaning up");
-            let mut batch = db.inner.batch();
-            let mut count_deltas = CountDeltas::default();
-            batch.remove(&db.pending, pending_key);
-            count_deltas.add("pending", -1);
-            let reservation = db.stage_count_deltas(&mut batch, &count_deltas);
-            tokio::task::spawn_blocking(move || batch.commit().into_diagnostic())
-                .await
-                .into_diagnostic()??;
-            db.apply_count_deltas(&count_deltas);
-            drop(reservation);
+            tokio::task::spawn_blocking({
+                let state = state.clone();
+                let did = did.clone();
+                let pending_key = pending_key.clone();
+                move || {
+                    let db = &state.db;
+                    let mut batch = db.inner.batch();
+                    let mut lifecycle_counts = db.lifecycle_counts();
+                    lifecycle_counts.transition_pending_key(
+                        &mut batch,
+                        &did,
+                        pending_key.as_ref(),
+                        GaugeState::Synced,
+                    )?;
+                    batch.remove(&db.pending, pending_key);
+                    let lifecycle_reservation = lifecycle_counts.stage(&mut batch);
+                    batch.commit().into_diagnostic()?;
+                    db.apply_lifecycle_counts(lifecycle_reservation);
+                    Ok::<_, miette::Report>(())
+                }
+            })
+            .await
+            .into_diagnostic()??;
             Ok(())
         }
         Err(e) => {
@@ -291,12 +326,10 @@ async fn did_task(
                     .transpose()
             })?;
 
-            let (mut retry_count, prev_kind) = match existing_state {
-                Some(ResyncState::Error {
-                    kind, retry_count, ..
-                }) => (retry_count, Some(kind)),
+            let mut retry_count = match existing_state {
+                Some(ResyncState::Error { retry_count, .. }) => retry_count,
                 Some(ResyncState::Gone { .. }) => return Ok(()), // should handle gone? original code didn't really?
-                None => (0, None),
+                None => 0,
             };
 
             // Calculate new stats
@@ -308,19 +341,13 @@ async fn did_task(
                 retry_count,
                 next_retry,
             };
-            let old_gauge = prev_kind
-                .map(|k| GaugeState::Resync(Some(k)))
-                .unwrap_or(GaugeState::Pending);
-            let new_gauge = GaugeState::Resync(Some(error_kind));
-            let mut count_deltas = CountDeltas::default();
-            count_deltas.add_gauge_diff(&old_gauge, &new_gauge);
-
             let error_string = e.to_string();
 
             tokio::task::spawn_blocking({
                 let state = state.clone();
                 let did_key = did_key.into_static();
-                let count_deltas = count_deltas.clone();
+                let did = did.clone();
+                let pending_key = pending_key.clone();
                 move || {
                     // 3. save to resync
                     let serialized_resync_state =
@@ -340,16 +367,24 @@ async fn did_task(
                     };
 
                     let mut batch = state.db.inner.batch();
-                    batch.insert(&state.db.resync, &did_key, serialized_resync_state);
+                    let mut lifecycle_counts = state.db.lifecycle_counts();
+                    let applied = lifecycle_counts.transition_pending_key(
+                        &mut batch,
+                        &did,
+                        pending_key.as_ref(),
+                        GaugeState::Resync(Some(error_kind)),
+                    )?;
                     batch.remove(&state.db.pending, pending_key.clone());
-                    if let Some(state_bytes) = serialized_repo_state {
-                        batch.insert(&state.db.repos, &did_key, state_bytes);
+                    if applied {
+                        batch.insert(&state.db.resync, &did_key, serialized_resync_state);
+                        if let Some(state_bytes) = serialized_repo_state {
+                            batch.insert(&state.db.repos, &did_key, state_bytes);
+                        }
                     }
-                    let reservation = state.db.stage_count_deltas(&mut batch, &count_deltas);
-                    batch.commit().into_diagnostic().inspect(|_| {
-                        state.db.apply_count_deltas(&count_deltas);
-                        drop(reservation);
-                    })
+                    let lifecycle_reservation = lifecycle_counts.stage(&mut batch);
+                    batch.commit().into_diagnostic()?;
+                    state.db.apply_lifecycle_counts(lifecycle_reservation);
+                    Ok::<_, miette::Report>(())
                 }
             })
             .await
@@ -609,7 +644,6 @@ async fn process_did_sparse(
     .await?;
 
     let Some((records, state)) = result else {
-        cleanup_discarded_repo(app_state, did).await?;
         return Ok(SparseBackfillResult::Discarded);
     };
 
@@ -936,10 +970,10 @@ async fn persist_sparse_backfill(
 
         let mut count_deltas = CountDeltas::default();
         if delta != 0 {
-            count_deltas.add("records", delta);
+            count_deltas.add_records(delta);
         }
         if added_blocks > 0 {
-            count_deltas.add("blocks", added_blocks);
+            count_deltas.add_blocks(added_blocks);
         }
         let reservation = app_state.db.stage_count_deltas(&mut batch, &count_deltas);
         batch.commit().into_diagnostic()?;
@@ -953,46 +987,11 @@ async fn persist_sparse_backfill(
     .map_err(BackfillError::from)
 }
 
-async fn cleanup_discarded_repo(
-    app_state: &Arc<AppState>,
-    did: &Did<'static>,
-) -> Result<(), BackfillError> {
-    let metadata_key = keys::repo_metadata_key(did);
-    let metadata_bytes = app_state
-        .db
-        .repo_metadata
-        .get(&metadata_key)
-        .into_diagnostic()?
-        .ok_or_else(|| miette::miette!("repo metadata not found for {}", did))?;
-    let metadata = crate::db::deser_repo_meta(metadata_bytes.as_ref())?;
-    let did_key = keys::repo_key(did);
-    let backfill_pending_key = keys::pending_key(metadata.index_id);
-    let app_state = app_state.clone();
-
-    tokio::task::spawn_blocking(move || {
-        let mut batch = app_state.db.inner.batch();
-        let mut count_deltas = CountDeltas::default();
-        batch.remove(&app_state.db.repos, &did_key);
-        batch.remove(&app_state.db.repo_metadata, &metadata_key);
-        batch.remove(&app_state.db.pending, backfill_pending_key);
-        count_deltas.add("repos", -1);
-        count_deltas.add("pending", -1);
-        let reservation = app_state.db.stage_count_deltas(&mut batch, &count_deltas);
-        batch.commit().into_diagnostic().inspect(|_| {
-            app_state.db.apply_count_deltas(&count_deltas);
-            drop(reservation);
-        })
-    })
-    .await
-    .into_diagnostic()??;
-
-    Ok(())
-}
-
 async fn process_did(
     app_state: &Arc<AppState>,
     http: &reqwest::Client,
     did: &Did<'static>,
+    pending_key: Slice,
     verify_signatures: bool,
     strategy: BackfillStrategy,
 ) -> Result<Option<RepoState<'static>>, BackfillError> {
@@ -1115,15 +1114,22 @@ async fn process_did(
             if matches!(e, GetRepoError::RepoNotFound(_)) {
                 warn!("repo not found, deleting");
                 let mut batch = db.inner.batch();
-                let mut count_deltas = CountDeltas::default();
-                if let Err(e) = crate::ops::delete_repo(&mut batch, db, did, &state) {
-                    error!(err = %e, "failed to wipe repo during backfill");
+                let mut lifecycle_counts = db.lifecycle_counts();
+                let applied = lifecycle_counts.transition_pending_key(
+                    &mut batch,
+                    did,
+                    pending_key.as_ref(),
+                    GaugeState::Synced,
+                )?;
+                batch.remove(&db.pending, pending_key.clone());
+                if applied {
+                    if let Err(e) = crate::ops::delete_repo(&mut batch, db, did, &state) {
+                        error!(err = %e, "failed to wipe repo during backfill");
+                    }
                 }
-                count_deltas.add("pending", -1);
-                let reservation = db.stage_count_deltas(&mut batch, &count_deltas);
+                let lifecycle_reservation = lifecycle_counts.stage(&mut batch);
                 batch.commit().into_diagnostic()?;
-                db.apply_count_deltas(&count_deltas);
-                drop(reservation);
+                db.apply_lifecycle_counts(lifecycle_reservation);
                 // return None so did_task skips sending BackfillFinished (nothing to drain for a deleted repo)
                 return Ok(None);
             }
@@ -1147,18 +1153,41 @@ async fn process_did(
                 let resync_bytes = rmp_serde::to_vec(&resync_state).into_diagnostic()?;
 
                 let app_state_clone = app_state.clone();
-                app_state
-                    .db
-                    .update_repo_state_async(did, move |state, (key, batch)| {
-                        state.active = false;
-                        state.status = status;
-                        batch.insert(&app_state_clone.db.resync, key, resync_bytes);
-                        Ok((true, ()))
-                    })
-                    .await?;
+                let did = did.clone();
+                let pending_key = pending_key.clone();
+                tokio::task::spawn_blocking(move || {
+                    let db = &app_state_clone.db;
+                    let mut batch = db.inner.batch();
+                    let mut lifecycle_counts = db.lifecycle_counts();
+                    let applied = lifecycle_counts.transition_pending_key(
+                        &mut batch,
+                        &did,
+                        pending_key.as_ref(),
+                        GaugeState::Resync(None),
+                    )?;
+                    batch.remove(&db.pending, pending_key.clone());
+                    if applied {
+                        Db::update_repo_state(
+                            &mut batch,
+                            &db.repos,
+                            &did,
+                            move |state, (key, batch)| {
+                                state.active = false;
+                                state.status = status;
+                                batch.insert(&db.resync, key, resync_bytes);
+                                Ok((true, ()))
+                            },
+                        )?;
+                    }
+                    let lifecycle_reservation = lifecycle_counts.stage(&mut batch);
+                    batch.commit().into_diagnostic()?;
+                    db.apply_lifecycle_counts(lifecycle_reservation);
+                    Ok::<_, miette::Report>(())
+                })
+                .await
+                .into_diagnostic()??;
 
-                // return success so wrapper stops retrying
-                return Ok(Some(previous_state));
+                return Ok(None);
             }
 
             Err(e).into_diagnostic()?
@@ -1484,10 +1513,10 @@ async fn process_did(
 
             let mut count_deltas = CountDeltas::default();
             if delta != 0 {
-                count_deltas.add("records", delta);
+                count_deltas.add_records(delta);
             }
             if added_blocks > 0 {
-                count_deltas.add("blocks", added_blocks);
+                count_deltas.add_blocks(added_blocks);
             }
             let reservation = app_state.db.stage_count_deltas(&mut batch, &count_deltas);
             batch.commit().into_diagnostic()?;
@@ -1500,29 +1529,33 @@ async fn process_did(
         .into_diagnostic()??
     };
 
-    let metadata_key = keys::repo_metadata_key(did);
-    let metadata_bytes = db
-        .repo_metadata
-        .get(&metadata_key)
-        .into_diagnostic()?
-        .ok_or_else(|| miette::miette!("repo metadata not found for {}", did))?;
-    let metadata = crate::db::deser_repo_meta(metadata_bytes.as_ref())?;
-
     let Some(count) = result else {
         // signal mode: no signal-matching records found, clean up the optimistically-added repo
         let did_key = keys::repo_key(did);
-        let backfill_pending_key = keys::pending_key(metadata.index_id);
+        let metadata_key = keys::repo_metadata_key(did);
+        let backfill_pending_key = pending_key.clone();
         let app_state = app_state.clone();
+        let did = did.clone();
         tokio::task::spawn_blocking(move || {
             let mut batch = app_state.db.inner.batch();
             let mut count_deltas = CountDeltas::default();
-            batch.remove(&app_state.db.repos, &did_key);
-            batch.remove(&app_state.db.repo_metadata, &metadata_key);
-            batch.remove(&app_state.db.pending, backfill_pending_key);
-            count_deltas.add("repos", -1);
-            count_deltas.add("pending", -1);
+            let mut lifecycle_counts = app_state.db.lifecycle_counts();
+            let applied = lifecycle_counts.transition_pending_key(
+                &mut batch,
+                &did,
+                backfill_pending_key.as_ref(),
+                GaugeState::Synced,
+            )?;
+            batch.remove(&app_state.db.pending, backfill_pending_key.clone());
+            if applied {
+                batch.remove(&app_state.db.repos, &did_key);
+                batch.remove(&app_state.db.repo_metadata, &metadata_key);
+                count_deltas.add_repos(-1);
+            }
+            let lifecycle_reservation = lifecycle_counts.stage(&mut batch);
             let reservation = app_state.db.stage_count_deltas(&mut batch, &count_deltas);
             batch.commit().into_diagnostic().inspect(|_| {
+                app_state.db.apply_lifecycle_counts(lifecycle_reservation);
                 app_state.db.apply_count_deltas(&count_deltas);
                 drop(reservation);
             })

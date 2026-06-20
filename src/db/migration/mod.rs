@@ -11,6 +11,7 @@ mod v4;
 mod v5;
 mod v6;
 mod v7;
+mod v8;
 
 type MigrationFn = fn(&Db, &mut OwnedWriteBatch) -> Result<()>;
 
@@ -37,6 +38,7 @@ const MIGRATIONS: &[(&str, MigrationFn)] = &[
     ("pds_meta_layout", v5::pds_meta_layout),
     ("rebuild_pds_account_counts", v6::rebuild_pds_account_counts),
     ("repo_state_event_clocks", v7::repo_state_event_clocks),
+    ("rebuild_lifecycle_counts", v8::rebuild_lifecycle_counts),
 ];
 
 fn read_version(db: &Db) -> Result<u64> {

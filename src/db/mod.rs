@@ -30,9 +30,14 @@ pub mod compaction;
 pub mod ephemeral;
 pub mod filter;
 pub mod keys;
+#[cfg(feature = "indexer")]
+mod lifecycle_counts;
 pub mod migration;
 pub mod pds_meta;
 pub mod types;
+
+#[cfg(feature = "indexer")]
+pub(crate) use lifecycle_counts::LifecycleCountBatch;
 
 use tracing::error;
 
@@ -91,6 +96,8 @@ pub struct Db {
     count_delta_checkpoint_watermark: Arc<AtomicU64>,
     count_delta_gc_watermark: Arc<AtomicU64>,
     count_delta_in_flight: Arc<Mutex<BTreeSet<u64>>>,
+    #[cfg(feature = "indexer")]
+    lifecycle_count_lock: Arc<Mutex<()>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -99,7 +106,7 @@ pub struct CountDeltas {
 }
 
 impl CountDeltas {
-    pub(crate) fn add(&mut self, key: &str, delta: i64) {
+    fn add(&mut self, key: &str, delta: i64) {
         if delta == 0 {
             return;
         }
@@ -111,12 +118,30 @@ impl CountDeltas {
         }
     }
 
+    pub(crate) fn add_repos(&mut self, delta: i64) {
+        self.add("repos", delta);
+    }
+
     #[cfg(feature = "indexer")]
-    pub(crate) fn add_gauge_diff(
-        &mut self,
-        old: &crate::types::GaugeState,
-        new: &crate::types::GaugeState,
-    ) {
+    pub(crate) fn add_records(&mut self, delta: i64) {
+        self.add("records", delta);
+    }
+
+    #[cfg(feature = "indexer")]
+    pub(crate) fn add_blocks(&mut self, delta: i64) {
+        self.add("blocks", delta);
+    }
+
+    pub(crate) fn add_pds_account(&mut self, host: &str, delta: i64) {
+        self.add(&keys::pds_account_count_key(host), delta);
+    }
+
+    pub(crate) fn projected_pds_account_count(&self, db: &Db, host: &str) -> u64 {
+        self.projected_count(db, &keys::pds_account_count_key(host))
+    }
+
+    #[cfg(feature = "indexer")]
+    fn add_gauge_diff(&mut self, old: &crate::types::GaugeState, new: &crate::types::GaugeState) {
         use crate::types::GaugeState;
 
         if old == new {
@@ -171,7 +196,7 @@ impl CountDeltas {
         self.deltas.get(key).copied().unwrap_or(0)
     }
 
-    pub(crate) fn projected_count(&self, db: &Db, key: &str) -> u64 {
+    fn projected_count(&self, db: &Db, key: &str) -> u64 {
         apply_count_delta(db.get_count_sync(key), self.get(key))
     }
 
@@ -592,6 +617,8 @@ impl Db {
             count_delta_checkpoint_watermark: Arc::new(AtomicU64::new(0)),
             count_delta_gc_watermark,
             count_delta_in_flight: Arc::new(Mutex::new(BTreeSet::new())),
+            #[cfg(feature = "indexer")]
+            lifecycle_count_lock: Arc::new(Mutex::new(())),
         };
 
         migration::run(&this)?;
@@ -1204,8 +1231,8 @@ mod tests {
 
             let mut batch = db.inner.batch();
             let mut deltas = CountDeltas::default();
-            deltas.add("repos", 2);
-            deltas.add("pending", 1);
+            deltas.add_repos(2);
+            deltas.add_records(1);
             let reservation = db
                 .stage_count_deltas(&mut batch, &deltas)
                 .expect("count deltas should reserve ids");
@@ -1218,7 +1245,7 @@ mod tests {
         {
             let db = Db::open(&cfg)?;
             assert_eq!(db.get_count_sync("repos"), 12);
-            assert_eq!(db.get_count_sync("pending"), 1);
+            assert_eq!(db.get_count_sync("records"), 1);
             let checkpointed_watermark = db
                 .checkpoint_count_deltas()?
                 .expect("checkpoint should fold pending deltas");
@@ -1230,7 +1257,7 @@ mod tests {
         {
             let db = Db::open(&cfg)?;
             assert_eq!(db.get_count_sync("repos"), 12);
-            assert_eq!(db.get_count_sync("pending"), 1);
+            assert_eq!(db.get_count_sync("records"), 1);
             assert!(load_count_delta_watermark(&db)? >= 1);
         }
 
@@ -1245,7 +1272,7 @@ mod tests {
 
         let mut batch = db.inner.batch();
         let mut deltas = CountDeltas::default();
-        deltas.add("repos", 1);
+        deltas.add_repos(1);
         let reservation = db
             .stage_count_deltas(&mut batch, &deltas)
             .expect("count deltas should reserve ids");
@@ -1269,7 +1296,7 @@ mod tests {
 
         let mut batch = db.inner.batch();
         let mut deltas = CountDeltas::default();
-        deltas.add("repos", 1);
+        deltas.add_repos(1);
         let reservation = db
             .stage_count_deltas(&mut batch, &deltas)
             .expect("count deltas should reserve ids");

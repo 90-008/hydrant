@@ -145,6 +145,7 @@ impl CrawlerWorker {
                 let mut batch = app_state.db.inner.batch();
                 let mut surviving = Vec::new();
                 let mut count_deltas = CountDeltas::default();
+                let mut lifecycle_counts = app_state.db.lifecycle_counts();
                 for guard in guards {
                     let did_key = keys::repo_key(&guard);
                     let metadata_key = keys::repo_metadata_key(&guard);
@@ -173,17 +174,23 @@ impl CrawlerWorker {
                     // clear any stale retry entry, this DID is confirmed and being enqueued
                     batch.remove(&app_state.db.crawler, keys::crawler_retry_key(&guard));
                     trace!(did = %*guard, "enqueuing repo");
-                    count_deltas.add("repos", 1);
+                    count_deltas.add_repos(1);
                     #[cfg(feature = "indexer")]
-                    count_deltas.add("pending", 1);
+                    lifecycle_counts.transition(
+                        &mut batch,
+                        &guard,
+                        crate::types::GaugeState::Pending,
+                    )?;
                     surviving.push(guard);
                 }
                 if let Some(cursor) = cursor_update {
                     batch.insert(&app_state.db.cursors, cursor.key, cursor.value);
                 }
+                let lifecycle_reservation = lifecycle_counts.stage(&mut batch);
                 let reservation = app_state.db.stage_count_deltas(&mut batch, &count_deltas);
                 // todo: repo state overwrites here are acceptable?
                 batch.commit().into_diagnostic()?;
+                app_state.db.apply_lifecycle_counts(lifecycle_reservation);
                 app_state.db.apply_count_deltas(&count_deltas);
                 drop(reservation);
                 Ok(surviving)

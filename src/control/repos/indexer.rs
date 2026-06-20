@@ -2,7 +2,7 @@ use futures::{FutureExt, TryFutureExt};
 use rand::Rng;
 
 use super::*;
-use crate::db::CountDeltas;
+use crate::db::LifecycleCountBatch;
 
 impl ReposControl {
     /// iterates through pending repositories, returning their state.
@@ -103,7 +103,7 @@ impl ReposControl {
         db: &Db,
         did: &Did<'_>,
         batch: &mut fjall::OwnedWriteBatch,
-        count_deltas: &mut CountDeltas,
+        lifecycle_counts: &mut LifecycleCountBatch<'_>,
     ) -> Result<bool> {
         let did_key = keys::repo_key(did);
         let metadata_key = keys::repo_metadata_key(did);
@@ -114,7 +114,7 @@ impl ReposControl {
             .map(db::deser_repo_state)
             .transpose()?;
 
-        if let Some(repo_state) = existing {
+        if existing.is_some() {
             let metadata_bytes = db
                 .repo_metadata
                 .get(&metadata_key)
@@ -129,8 +129,6 @@ impl ReposControl {
                 .into_diagnostic()?
                 .is_some();
             if !is_pending {
-                let resync = db.resync.get(&did_key).into_diagnostic()?;
-                let old = db::Db::repo_gauge_state(&repo_state, resync.as_deref());
                 metadata.tracked = true;
                 // insert into pending with new index_id
                 let old_pending = keys::pending_key(metadata.index_id);
@@ -143,7 +141,7 @@ impl ReposControl {
                     &metadata_key,
                     crate::db::ser_repo_meta(&metadata)?,
                 );
-                count_deltas.add_gauge_diff(&old, &GaugeState::Pending);
+                lifecycle_counts.transition(batch, did, GaugeState::Pending)?;
                 return Ok(true);
             }
         }
@@ -170,18 +168,17 @@ impl ReposControl {
             let db = &state.db;
             let mut batch = db.inner.batch();
             let mut queued: Vec<Did<'static>> = Vec::new();
-            let mut count_deltas = CountDeltas::default();
+            let mut lifecycle_counts = db.lifecycle_counts();
 
             for did in dids {
-                if Self::_resync(db, &did, &mut batch, &mut count_deltas)? {
+                if Self::_resync(db, &did, &mut batch, &mut lifecycle_counts)? {
                     queued.push(did);
                 }
             }
 
-            let reservation = db.stage_count_deltas(&mut batch, &count_deltas);
+            let lifecycle_reservation = lifecycle_counts.stage(&mut batch);
             batch.commit().into_diagnostic()?;
-            db.apply_count_deltas(&count_deltas);
-            drop(reservation);
+            db.apply_lifecycle_counts(lifecycle_reservation);
             state.db.persist()?;
             Ok::<_, miette::Report>(queued)
         })
@@ -210,7 +207,8 @@ impl ReposControl {
             let db = &state.db;
             let mut batch = db.inner.batch();
             let mut queued: Vec<Did<'static>> = Vec::new();
-            let mut count_deltas = CountDeltas::default();
+            let mut count_deltas = crate::db::CountDeltas::default();
+            let mut lifecycle_counts = db.lifecycle_counts();
 
             for did in dids {
                 let did_key = keys::repo_key(&did);
@@ -222,7 +220,8 @@ impl ReposControl {
                     .transpose()?;
 
                 if let Some(metadata) = existing_metadata {
-                    if !metadata.tracked && Self::_resync(db, &did, &mut batch, &mut count_deltas)?
+                    if !metadata.tracked
+                        && Self::_resync(db, &did, &mut batch, &mut lifecycle_counts)?
                     {
                         queued.push(did);
                     }
@@ -236,14 +235,16 @@ impl ReposControl {
                         crate::db::ser_repo_meta(&metadata)?,
                     );
                     batch.insert(&db.pending, keys::pending_key(metadata.index_id), &did_key);
-                    count_deltas.add("repos", 1);
-                    count_deltas.add_gauge_diff(&GaugeState::Synced, &GaugeState::Pending);
+                    count_deltas.add_repos(1);
+                    lifecycle_counts.transition(&mut batch, &did, GaugeState::Pending)?;
                     queued.push(did);
                 }
             }
 
+            let lifecycle_reservation = lifecycle_counts.stage(&mut batch);
             let reservation = db.stage_count_deltas(&mut batch, &count_deltas);
             batch.commit().into_diagnostic()?;
+            db.apply_lifecycle_counts(lifecycle_reservation);
             db.apply_count_deltas(&count_deltas);
             drop(reservation);
             state.db.persist()?;
@@ -269,7 +270,7 @@ impl ReposControl {
             let db = &state.db;
             let mut batch = db.inner.batch();
             let mut untracked: Vec<Did<'static>> = Vec::new();
-            let mut count_deltas = CountDeltas::default();
+            let mut lifecycle_counts = db.lifecycle_counts();
 
             for did in dids {
                 let did_key = keys::repo_key(&did);
@@ -281,7 +282,7 @@ impl ReposControl {
                     .map(db::deser_repo_state)
                     .transpose()?;
 
-                if let Some(repo_state) = existing {
+                if existing.is_some() {
                     let metadata_bytes = db.repo_metadata.get(&metadata_key).into_diagnostic()?;
                     let existing_metadata = metadata_bytes
                         .map(|b| crate::db::deser_repo_meta(&b))
@@ -290,8 +291,6 @@ impl ReposControl {
                     if let Some(mut metadata) = existing_metadata
                         && metadata.tracked
                     {
-                        let resync = db.resync.get(&did_key).into_diagnostic()?;
-                        let old = db::Db::repo_gauge_state(&repo_state, resync.as_deref());
                         metadata.tracked = false;
                         batch.insert(
                             &db.repo_metadata,
@@ -300,18 +299,15 @@ impl ReposControl {
                         );
                         batch.remove(&db.pending, keys::pending_key(metadata.index_id));
                         batch.remove(&db.resync, &did_key);
-                        if old != GaugeState::Synced {
-                            count_deltas.add_gauge_diff(&old, &GaugeState::Synced);
-                        }
+                        lifecycle_counts.transition(&mut batch, &did, GaugeState::Synced)?;
                         untracked.push(did);
                     }
                 }
             }
 
-            let reservation = db.stage_count_deltas(&mut batch, &count_deltas);
+            let lifecycle_reservation = lifecycle_counts.stage(&mut batch);
             batch.commit().into_diagnostic()?;
-            db.apply_count_deltas(&count_deltas);
-            drop(reservation);
+            db.apply_lifecycle_counts(lifecycle_reservation);
             state.db.persist()?;
             Ok::<_, miette::Report>(untracked)
         })

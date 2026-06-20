@@ -1,5 +1,5 @@
 use crate::db::types::TrimmedDid;
-use crate::db::{self, CountDeltas, keys};
+use crate::db::{self, keys};
 use crate::state::AppState;
 use crate::types::{GaugeState, ResyncState};
 use miette::{IntoDiagnostic, Result};
@@ -11,9 +11,9 @@ use tracing::{debug, error, info};
 pub fn queue_gone_backfills(state: &Arc<AppState>) -> Result<()> {
     debug!("scanning for deactivated/takendown repos to retry...");
     let mut transitions = 0usize;
-    let mut count_deltas = CountDeltas::default();
 
     let mut batch = state.db.inner.batch();
+    let mut lifecycle_counts = state.db.lifecycle_counts();
 
     for guard in state.db.resync.iter() {
         let (key, val) = guard.into_inner().into_diagnostic()?;
@@ -63,7 +63,7 @@ pub fn queue_gone_backfills(state: &Arc<AppState>) -> Result<()> {
                 crate::db::ser_repo_meta(&metadata)?,
             );
 
-            count_deltas.add_gauge_diff(&GaugeState::Resync(None), &GaugeState::Pending);
+            lifecycle_counts.transition(&mut batch, &did, GaugeState::Pending)?;
             transitions += 1;
         }
     }
@@ -72,10 +72,9 @@ pub fn queue_gone_backfills(state: &Arc<AppState>) -> Result<()> {
         return Ok(());
     }
 
-    let reservation = state.db.stage_count_deltas(&mut batch, &count_deltas);
+    let lifecycle_reservation = lifecycle_counts.stage(&mut batch);
     batch.commit().into_diagnostic()?;
-    state.db.apply_count_deltas(&count_deltas);
-    drop(reservation);
+    state.db.apply_lifecycle_counts(lifecycle_reservation);
 
     state.notify_backfill();
 
@@ -92,9 +91,9 @@ pub fn retry_worker(state: Arc<AppState>) {
 
         let now = chrono::Utc::now().timestamp();
         let mut transitions = 0usize;
-        let mut count_deltas = CountDeltas::default();
 
         let mut batch = state.db.inner.batch();
+        let mut lifecycle_counts = state.db.lifecycle_counts();
 
         for guard in db.resync.iter() {
             let (key, value) = match guard.into_inner() {
@@ -114,9 +113,7 @@ pub fn retry_worker(state: Arc<AppState>) {
             };
 
             match rmp_serde::from_slice::<ResyncState>(&value) {
-                Ok(ResyncState::Error {
-                    kind, next_retry, ..
-                }) => {
+                Ok(ResyncState::Error { next_retry, .. }) => {
                     if next_retry <= now {
                         debug!(did = %did, "retrying backfill");
 
@@ -144,16 +141,9 @@ pub fn retry_worker(state: Arc<AppState>) {
                             }
                         };
 
-                        // move from resync back into pending
-                        batch.remove(&state.db.resync, key.clone());
                         let old_pending = keys::pending_key(metadata.index_id);
-                        batch.remove(&state.db.pending, old_pending);
                         metadata.index_id = rand::random::<u64>();
-                        batch.insert(
-                            &state.db.pending,
-                            keys::pending_key(metadata.index_id),
-                            key.clone(),
-                        );
+                        let new_pending = keys::pending_key(metadata.index_id);
                         let serialized_metadata = match crate::db::ser_repo_meta(&metadata) {
                             Ok(s) => s,
                             Err(e) => {
@@ -161,10 +151,18 @@ pub fn retry_worker(state: Arc<AppState>) {
                                 continue;
                             }
                         };
-                        batch.insert(&state.db.repo_metadata, &metadata_key, serialized_metadata);
+                        if let Err(e) =
+                            lifecycle_counts.transition(&mut batch, &did, GaugeState::Pending)
+                        {
+                            error!(did = %did, err = %e, "failed to stage lifecycle transition");
+                            continue;
+                        }
 
-                        count_deltas
-                            .add_gauge_diff(&GaugeState::Resync(Some(kind)), &GaugeState::Pending);
+                        // move from resync back into pending
+                        batch.remove(&state.db.resync, key.clone());
+                        batch.remove(&state.db.pending, old_pending);
+                        batch.insert(&state.db.pending, new_pending, key.clone());
+                        batch.insert(&state.db.repo_metadata, &metadata_key, serialized_metadata);
                         transitions += 1;
                     }
                 }
@@ -182,14 +180,14 @@ pub fn retry_worker(state: Arc<AppState>) {
             continue;
         }
 
-        let reservation = state.db.stage_count_deltas(&mut batch, &count_deltas);
+        let lifecycle_reservation = lifecycle_counts.stage(&mut batch);
         if let Err(e) = batch.commit() {
             error!(err = %e, "failed to commit batch");
             db::check_poisoned(&e);
+            drop(lifecycle_reservation);
             continue;
         }
-        state.db.apply_count_deltas(&count_deltas);
-        drop(reservation);
+        state.db.apply_lifecycle_counts(lifecycle_reservation);
         state.notify_backfill();
         info!(count = transitions, "queued retries");
     }

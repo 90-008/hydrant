@@ -3,6 +3,7 @@ use fjall::Slice;
 
 #[cfg(feature = "backlinks")]
 use jacquard_common::Data;
+use jacquard_common::IntoStatic;
 use jacquard_common::types::did::Did;
 use miette::{Context, IntoDiagnostic, Result};
 use std::collections::HashMap;
@@ -14,7 +15,7 @@ use crate::filter::FilterConfig;
 use crate::ingest::stream::Commit;
 use crate::ingest::validation::ValidatedCommit;
 use crate::state::AppState;
-use crate::types::{RepoState, RepoStatus, ResyncState};
+use crate::types::{GaugeState, RepoState, RepoStatus, ResyncErrorKind, ResyncState};
 
 #[cfg(feature = "indexer_stream")]
 use {
@@ -22,7 +23,7 @@ use {
         AccountEvt, BroadcastEvent, IdentityEvt, LiveRecordEvent, MarshallableEvt, StoredData,
         StoredEvent,
     },
-    jacquard_common::{CowStr, IntoStatic},
+    jacquard_common::CowStr,
     std::sync::atomic::Ordering,
 };
 
@@ -86,7 +87,6 @@ pub fn delete_repo(
         batch.remove(&db.pending, keys::pending_key(metadata.index_id));
     }
 
-    // 1. delete from resync, and metadata
     // we don't delete from repos, relay uses it as a tombstone
     // todo: we should still delete it after some time
     batch.remove(&db.resync, &repo_key);
@@ -130,6 +130,7 @@ pub fn delete_repo(
 pub fn transition_repo<'s>(
     batch: &mut OwnedWriteBatch,
     db: &Db,
+    lifecycle_transitions: &mut Vec<(Did<'static>, GaugeState)>,
     did: &Did,
     mut repo_state: RepoState<'s>,
     new_status: RepoStatus,
@@ -147,11 +148,16 @@ pub fn transition_repo<'s>(
         // manage queues
         match &new_status {
             RepoStatus::Synced => {
+                lifecycle_transitions.push((did.clone().into_static(), GaugeState::Synced));
                 batch.remove(&db.pending, pending_key.as_slice());
                 // we dont have to remove from resync here because it has to transition resync -> pending first
             }
             RepoStatus::Error(msg) => {
                 tracing::warn!("transitioning to error: {msg}");
+                lifecycle_transitions.push((
+                    did.clone().into_static(),
+                    GaugeState::Resync(Some(ResyncErrorKind::Generic)),
+                ));
                 batch.remove(&db.pending, pending_key.as_slice());
                 // TODO: we need to make errors have kind instead of "message" in repo status
                 // and then pass it to resync error kind
@@ -167,6 +173,7 @@ pub fn transition_repo<'s>(
                 );
             }
             RepoStatus::Deactivated | RepoStatus::Takendown | RepoStatus::Suspended => {
+                lifecycle_transitions.push((did.clone().into_static(), GaugeState::Resync(None)));
                 // this shouldnt be needed since a repo wont be in a pending state when it gets to any of these states
                 // batch.remove(&db.pending, &pending_key);
                 let resync_state = ResyncState::Gone {
@@ -179,11 +186,16 @@ pub fn transition_repo<'s>(
                 );
             }
             RepoStatus::Deleted => {
+                lifecycle_transitions.push((did.clone().into_static(), GaugeState::Synced));
                 // terminal state: remove from queues, no resync entry needed
                 batch.remove(&db.pending, pending_key.as_slice());
                 batch.remove(&db.resync, &repo_key);
             }
             RepoStatus::Desynchronized | RepoStatus::Throttled => {
+                lifecycle_transitions.push((
+                    did.clone().into_static(),
+                    GaugeState::Resync(Some(ResyncErrorKind::Generic)),
+                ));
                 // like an error: remove from pending and schedule a resync attempt
                 batch.remove(&db.pending, pending_key.as_slice());
                 let resync_state = crate::types::ResyncState::Error {

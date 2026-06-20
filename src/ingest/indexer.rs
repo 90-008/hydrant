@@ -169,6 +169,7 @@ pub struct FirehoseWorker {
 struct WorkerContext<'a> {
     state: &'a AppState,
     batch: OwnedWriteBatch,
+    lifecycle_transitions: &'a mut Vec<(Did<'static>, GaugeState)>,
     added_blocks: &'a mut i64,
     records_delta: &'a mut i64,
     count_deltas: &'a mut CountDeltas,
@@ -222,6 +223,7 @@ impl FirehoseWorker {
         let mut broadcast_events = Vec::new();
         #[cfg(feature = "jetstream")]
         let mut jetstream_events = Vec::new();
+        let mut lifecycle_transitions = Vec::new();
 
         while let Some(msg) = rx.blocking_recv() {
             let batch = state.db.inner.batch();
@@ -229,6 +231,7 @@ impl FirehoseWorker {
             broadcast_events.clear();
             #[cfg(feature = "jetstream")]
             jetstream_events.clear();
+            lifecycle_transitions.clear();
 
             let mut added_blocks = 0;
             let mut records_delta = 0;
@@ -237,6 +240,7 @@ impl FirehoseWorker {
             let mut ctx = WorkerContext {
                 state: &state,
                 batch,
+                lifecycle_transitions: &mut lifecycle_transitions,
                 added_blocks: &mut added_blocks,
                 records_delta: &mut records_delta,
                 count_deltas: &mut count_deltas,
@@ -262,6 +266,7 @@ impl FirehoseWorker {
                                         let res = ops::transition_repo(
                                             &mut ctx.batch,
                                             &state.db,
+                                            ctx.lifecycle_transitions,
                                             &did,
                                             s,
                                             RepoStatus::Synced,
@@ -368,7 +373,7 @@ impl FirehoseWorker {
                             ) {
                                 Ok(RepoProcessResult::Ok(_)) => {}
                                 Ok(RepoProcessResult::Deleted) => {
-                                    ctx.count_deltas.add("repos", -1);
+                                    ctx.count_deltas.add_repos(-1);
                                 }
                                 Ok(RepoProcessResult::NeedsBackfill(Some(commit))) => {
                                     try_persist(commit);
@@ -420,17 +425,32 @@ impl FirehoseWorker {
 
             let mut batch = ctx.batch;
             if added_blocks > 0 {
-                count_deltas.add("blocks", added_blocks);
+                count_deltas.add_blocks(added_blocks);
             }
             if records_delta != 0 {
-                count_deltas.add("records", records_delta);
+                count_deltas.add_records(records_delta);
+            }
+            let mut lifecycle_counts = state.db.lifecycle_counts();
+            let mut lifecycle_failed = false;
+            for (did, gauge) in lifecycle_transitions.drain(..) {
+                if let Err(e) = lifecycle_counts.transition(&mut batch, &did, gauge) {
+                    error!(did = %did, err = %e, "failed to stage lifecycle transition");
+                    lifecycle_failed = true;
+                    break;
+                }
+            }
+            if lifecycle_failed {
+                continue;
             }
             let reservation = state.db.stage_count_deltas(&mut batch, &count_deltas);
+            let lifecycle_reservation = lifecycle_counts.stage(&mut batch);
             if let Err(e) = batch.commit() {
                 error!(shard = id, err = %e, "failed to commit batch");
+                drop(lifecycle_reservation);
                 drop(reservation);
                 continue;
             }
+            state.db.apply_lifecycle_counts(lifecycle_reservation);
             state.db.apply_count_deltas(&count_deltas);
             drop(reservation);
             #[cfg(feature = "indexer_stream")]
@@ -609,6 +629,8 @@ impl FirehoseWorker {
             match &account.status {
                 Some(AccountStatus::Deleted) => {
                     debug!("account deleted, wiping data");
+                    ctx.lifecycle_transitions
+                        .push((did.clone().into_static(), GaugeState::Synced));
                     crate::ops::delete_repo(&mut ctx.batch, db, did, &repo_state)?;
                     return Ok(RepoProcessResult::Deleted);
                 }
@@ -616,16 +638,16 @@ impl FirehoseWorker {
                     // status update logic is now handled in RelayWorker;
                     // FirehoseWorker just needs to update gauges if status changed.
                     if changed && was_active {
-                        ctx.count_deltas
-                            .add_gauge_diff(&GaugeState::Synced, &GaugeState::Resync(None));
+                        ctx.lifecycle_transitions
+                            .push((did.clone().into_static(), GaugeState::Resync(None)));
                     }
                 }
             }
         } else {
             // if account became active, update gauges
             if !was_active {
-                ctx.count_deltas
-                    .add_gauge_diff(&GaugeState::Resync(None), &GaugeState::Synced);
+                ctx.lifecycle_transitions
+                    .push((did.clone().into_static(), GaugeState::Synced));
             }
         }
 
@@ -692,12 +714,9 @@ impl FirehoseWorker {
     ) -> Result<RepoState<'s>, IngestError> {
         let db = &ctx.state.db;
         let mut batch = db.inner.batch();
-        let mut count_deltas = CountDeltas::default();
+        let mut lifecycle_counts = db.lifecycle_counts();
         let repo_key = keys::repo_key(did);
         let meta_key = keys::repo_metadata_key(did);
-
-        let resync_bytes = db.resync.get(&repo_key).into_diagnostic()?;
-        let old_gauge = crate::db::Db::repo_gauge_state(&repo_state, resync_bytes.as_deref());
 
         let existing_metadata = db
             .repo_metadata
@@ -728,12 +747,11 @@ impl FirehoseWorker {
         batch.insert(&db.pending, keys::pending_key(metadata.index_id), &repo_key);
         batch.insert(&db.repo_metadata, &meta_key, ser_repo_meta(&metadata)?);
         if !was_pending {
-            count_deltas.add_gauge_diff(&old_gauge, &crate::types::GaugeState::Pending);
+            lifecycle_counts.transition(&mut batch, did, GaugeState::Pending)?;
         }
-        let reservation = db.stage_count_deltas(&mut batch, &count_deltas);
+        let lifecycle_reservation = lifecycle_counts.stage(&mut batch);
         batch.commit().into_diagnostic()?;
-        db.apply_count_deltas(&count_deltas);
-        drop(reservation);
+        db.apply_lifecycle_counts(lifecycle_reservation);
 
         if !was_pending {
             ctx.state.notify_backfill();

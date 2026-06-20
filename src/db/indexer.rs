@@ -1,4 +1,3 @@
-use crate::types::{GaugeState, RepoStatus, ResyncState};
 use fjall::{Keyspace, OwnedWriteBatch};
 use jacquard_common::IntoStatic;
 use jacquard_common::types::string::Did;
@@ -28,54 +27,6 @@ impl Db {
             Ok(Some((state, result)))
         } else {
             Ok(None)
-        }
-    }
-
-    pub(crate) async fn update_repo_state_async<F, T>(
-        &self,
-        did: &Did<'_>,
-        f: F,
-    ) -> Result<Option<(RepoState<'static>, T)>>
-    where
-        F: FnOnce(&mut RepoState, (&[u8], &mut fjall::OwnedWriteBatch)) -> Result<(bool, T)>
-            + Send
-            + 'static,
-        T: Send + 'static,
-    {
-        let mut batch = self.inner.batch();
-        let repos = self.repos.clone();
-        let did = did.clone().into_static();
-
-        tokio::task::spawn_blocking(move || {
-            let Some((state, t)) = Self::update_repo_state(&mut batch, &repos, &did, f)? else {
-                return Ok(None);
-            };
-            batch.commit().into_diagnostic()?;
-            Ok(Some((state, t)))
-        })
-        .await
-        .into_diagnostic()?
-    }
-
-    pub(crate) fn repo_gauge_state(
-        repo_state: &RepoState,
-        resync_bytes: Option<&[u8]>,
-    ) -> GaugeState {
-        match repo_state.status {
-            RepoStatus::Synced => GaugeState::Synced,
-            RepoStatus::Error(_)
-            | RepoStatus::Deactivated
-            | RepoStatus::Takendown
-            | RepoStatus::Suspended
-            | RepoStatus::Deleted
-            | RepoStatus::Desynchronized
-            | RepoStatus::Throttled => resync_bytes
-                .and_then(|b| rmp_serde::from_slice::<ResyncState>(b).ok())
-                .and_then(|s| match s {
-                    ResyncState::Error { kind, .. } => Some(GaugeState::Resync(Some(kind))),
-                    _ => None,
-                })
-                .unwrap_or(GaugeState::Resync(None)),
         }
     }
 }
