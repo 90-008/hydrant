@@ -99,7 +99,37 @@ impl<'a> LifecycleCountBatch<'a> {
         }
 
         if self.db.repos.get(did_key).into_diagnostic()?.is_some() {
-            miette::bail!("missing lifecycle count projection for existing repo {did}");
+            let metadata_key = keys::repo_metadata_key(did);
+            let index_id = self
+                .db
+                .repo_metadata
+                .get(&metadata_key)
+                .into_diagnostic()?
+                .and_then(|bytes| deser_repo_meta(bytes.as_ref()).ok())
+                .map(|meta| meta.index_id);
+
+            let mut is_pending = false;
+            if let Some(index_id) = index_id {
+                if self
+                    .db
+                    .pending
+                    .get(keys::pending_key(index_id))
+                    .into_diagnostic()?
+                    .is_some()
+                {
+                    is_pending = true;
+                }
+            }
+
+            let gauge = if is_pending {
+                GaugeState::Pending
+            } else if let Some(resync_bytes) = self.db.resync.get(did_key).into_diagnostic()? {
+                gauge_from_resync(&resync_bytes)
+            } else {
+                GaugeState::Synced
+            };
+
+            return Ok((gauge, false));
         }
 
         Ok((GaugeState::Synced, false))
