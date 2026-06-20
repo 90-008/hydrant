@@ -694,42 +694,83 @@ async fn fetch_block_chunk(
     cids: Vec<IpldCid>,
     throttle: &ThrottleHandle,
 ) -> Result<BTreeMap<IpldCid, bytes::Bytes>, BackfillError> {
-    let req = GetBlocks::new()
-        .did(did.clone())
-        .cids(
-            cids.iter()
-                .map(|cid| AtCid::from(cid.to_string()))
-                .collect::<Vec<_>>(),
-        )
-        .build();
+    let mut url = pds
+        .join("xrpc/com.atproto.sync.getBlocks")
+        .map_err(|e| BackfillError::Generic(miette::miette!("Invalid URL: {e}")))?;
+    {
+        let mut query = url.query_pairs_mut();
+        query.append_pair("did", did.as_str());
+        for cid in &cids {
+            query.append_pair("cids", &cid.to_string());
+        }
+    }
+
     let resp = {
         let _permit = throttle.acquire().await;
-        match http.xrpc(url_to_fluent_uri(&pds)).send(&req).await {
+        match http
+            .get(url)
+            .header(reqwest::header::ACCEPT, "application/vnd.ipld.car")
+            .send()
+            .await
+        {
             Ok(resp) => {
                 if !throttle.is_throttled() {
                     throttle.record_success();
                 }
                 resp
             }
-            Err(e) => return Err(BackfillError::from_sparse_client(e, throttle)),
+            Err(e) => {
+                let reason = e.to_string();
+                if let Some(secs) = throttle.record_failure_detail("transport", reason.clone()) {
+                    warn!(
+                        %pds,
+                        reason,
+                        "PDS offline, blacklisting for {secs}s"
+                    );
+                }
+                return Err(BackfillError::Transport(reason.into()));
+            }
         }
     };
-    let car = match resp.into_output() {
-        Ok(o) => o,
-        Err(XrpcError::Xrpc(GetBlocksError::BlockNotFound(_))) => {
-            return Ok(BTreeMap::new());
+
+    let status = resp.status();
+    if status.is_success() {
+        let body = resp
+            .bytes()
+            .await
+            .map_err(|e| BackfillError::Transport(e.to_string().into()))?;
+        crate::car::parse_car_blocks(&body)
+            .await
+            .map_err(BackfillError::from)
+    } else {
+        let body = resp
+            .bytes()
+            .await
+            .map_err(|e| BackfillError::Transport(e.to_string().into()))?;
+        if let Ok(err) = serde_json::from_slice::<GetBlocksError>(&body) {
+            match err {
+                GetBlocksError::BlockNotFound(_)
+                | GetBlocksError::RepoNotFound(_)
+                | GetBlocksError::RepoTakendown(_)
+                | GetBlocksError::RepoSuspended(_)
+                | GetBlocksError::RepoDeactivated(_) => {
+                    return Ok(BTreeMap::new());
+                }
+                _ => {}
+            }
         }
-        Err(XrpcError::Xrpc(
-            GetBlocksError::RepoNotFound(_)
-            | GetBlocksError::RepoTakendown(_)
-            | GetBlocksError::RepoSuspended(_)
-            | GetBlocksError::RepoDeactivated(_),
-        )) => return Ok(BTreeMap::new()),
-        Err(e) => Err(e).into_diagnostic()?,
-    };
-    crate::car::parse_car_blocks(&car.body)
-        .await
-        .map_err(BackfillError::from)
+
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            throttle.record_ratelimit(None);
+            return Err(BackfillError::Ratelimited);
+        }
+
+        Err(miette::miette!(
+            "getBlocks failed with HTTP {status}: {}",
+            String::from_utf8_lossy(&body)
+        )
+        .into())
+    }
 }
 
 async fn persist_sparse_backfill(
@@ -1108,9 +1149,13 @@ async fn process_did(
                             count_deltas.add_repos(-1);
                         }
                         let lifecycle_reservation = lifecycle_counts.stage(&mut batch);
-                        let reservation = app_state_clone.db.stage_count_deltas(&mut batch, &count_deltas);
+                        let reservation = app_state_clone
+                            .db
+                            .stage_count_deltas(&mut batch, &count_deltas);
                         batch.commit().into_diagnostic().inspect(|_| {
-                            app_state_clone.db.apply_lifecycle_counts(lifecycle_reservation);
+                            app_state_clone
+                                .db
+                                .apply_lifecycle_counts(lifecycle_reservation);
                             app_state_clone.db.apply_count_deltas(&count_deltas);
                             drop(reservation);
                         })
@@ -1138,7 +1183,25 @@ async fn process_did(
     // 2. fetch repo (car)
     let start = Instant::now();
     let req = GetRepo::new().did(did.clone()).build();
-    let resp = http.xrpc(url_to_fluent_uri(&pds)).send(&req).await?;
+    let throttle = app_state.throttler.get_handle(&pds).await;
+    if throttle.is_throttled() {
+        return Err(BackfillError::Ratelimited);
+    }
+    let resp = {
+        let _permit = throttle.acquire().await;
+        if throttle.is_throttled() {
+            return Err(BackfillError::Ratelimited);
+        }
+        match http.xrpc(url_to_fluent_uri(&pds)).send(&req).await {
+            Ok(resp) => {
+                if !throttle.is_throttled() {
+                    throttle.record_success();
+                }
+                resp
+            }
+            Err(e) => return Err(BackfillError::from_sparse_client(e, &throttle)),
+        }
+    };
 
     let car_bytes = match resp.into_output() {
         Ok(o) => o,
