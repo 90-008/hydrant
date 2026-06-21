@@ -353,13 +353,13 @@ impl Db {
         // and also update any relevant /debug/* endpoints
 
         #[cfg(feature = "indexer_stream")]
-        let (event_tx, _) = broadcast::channel(10000);
+        let (event_tx, _) = broadcast::channel(512);
 
         #[cfg(feature = "relay")]
-        let (relay_broadcast_tx, _) = broadcast::channel(10000);
+        let (relay_broadcast_tx, _) = broadcast::channel(512);
 
         #[cfg(feature = "jetstream")]
-        let (jetstream_tx, _) = broadcast::channel(10000);
+        let (jetstream_tx, _) = broadcast::channel(512);
 
         let this = Self {
             inner: db,
