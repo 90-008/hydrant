@@ -1,11 +1,11 @@
-use std::time::Duration;
-use url::Url;
 use miette::Result;
 use smol_str::SmolStr;
+use std::time::Duration;
+use url::Url;
 
-use crate::pds_meta::{TierPolicy, TierRule};
-use super::types::{RateTier, CrawlerMode, CrawlerSource, FirehoseSource};
 use super::Config;
+use super::types::{CrawlerMode, CrawlerSource, FirehoseSource, RateTier};
+use crate::pds_meta::{TierPolicy, TierRule};
 
 /// this is for internal use only, please don't use this macro.
 #[doc(hidden)]
@@ -124,6 +124,7 @@ impl Config {
         let verify_mst: bool = cfg!("VERIFY_MST", defaults.verify_mst);
         let rev_clock_skew_secs: i64 = cfg!("REV_CLOCK_SKEW", defaults.rev_clock_skew_secs);
         let enable_firehose = cfg!("ENABLE_FIREHOSE", defaults.enable_firehose);
+        let enable_backfill = cfg!("ENABLE_BACKFILL", defaults.enable_backfill);
         let enable_crawler = std::env::var("HYDRANT_ENABLE_CRAWLER")
             .ok()
             .and_then(|s| s.parse().ok());
@@ -316,6 +317,7 @@ impl Config {
             relays: relay_hosts,
             plc_urls,
             enable_firehose,
+            enable_backfill,
             firehose_workers,
             firehose_max_failures,
             cursor_save_interval,

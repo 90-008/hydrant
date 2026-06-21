@@ -103,7 +103,7 @@ impl AppState {
         let (crawler_enabled, _) = watch::channel(crawler_default);
         let (firehose_enabled, _) = watch::channel(config.enable_firehose);
         #[cfg(feature = "indexer")]
-        let (backfill_enabled, _) = watch::channel(true);
+        let (backfill_enabled, _) = watch::channel(config.enable_backfill);
 
         Ok(Self {
             db,

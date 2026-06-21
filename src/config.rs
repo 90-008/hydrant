@@ -1,16 +1,19 @@
+use smol_str::SmolStr;
+use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;
 use std::time::Duration;
-use std::collections::HashMap;
 use url::Url;
-use smol_str::SmolStr;
 
 use crate::pds_meta::TierPolicy;
 
-pub mod types;
 pub mod env;
+pub mod types;
 
-pub use types::{RateTier, CrawlerMode, CrawlerSource, FirehoseSource, Compression, SignatureVerification, BackfillStrategy};
+pub use types::{
+    BackfillStrategy, Compression, CrawlerMode, CrawlerSource, FirehoseSource, RateTier,
+    SignatureVerification,
+};
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -37,6 +40,9 @@ pub struct Config {
     /// whether to ingest events from relay firehose subscriptions.
     /// set via `HYDRANT_ENABLE_FIREHOSE`.
     pub enable_firehose: bool,
+    /// whether to process queued repository backfills.
+    /// set via `HYDRANT_ENABLE_BACKFILL`.
+    pub enable_backfill: bool,
     /// number of concurrent workers processing firehose events.
     /// set via `HYDRANT_FIREHOSE_WORKERS`.
     pub firehose_workers: usize,
@@ -247,6 +253,7 @@ impl Default for Config {
             seed_hosts: vec![Url::parse("https://bsky.network").unwrap()],
             plc_urls: vec![Url::parse("https://plc.wtf").unwrap()],
             enable_firehose: true,
+            enable_backfill: true,
             firehose_workers: 8,
             firehose_max_failures: 15,
             cursor_save_interval: Duration::from_secs(3),
@@ -351,6 +358,7 @@ impl fmt::Display for Config {
         config_line!(f, "plc urls", format_args!("{:?}", self.plc_urls))?;
         config_line!(f, "full network indexing", self.full_network)?;
         config_line!(f, "verify signatures", self.verify_signatures)?;
+        config_line!(f, "backfill enabled", self.enable_backfill)?;
         config_line!(f, "backfill concurrency", self.backfill_concurrency_limit)?;
         config_line!(f, "backfill strategy", self.backfill_strategy)?;
         config_line!(f, "identity cache size", self.identity_cache_size)?;
