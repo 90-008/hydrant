@@ -134,6 +134,8 @@ impl<E: Serialize + IntoStatic + std::error::Error> IntoResponse for XrpcErrorRe
 
 pub type XrpcResult<T, E = GenericXrpcError> = Result<T, XrpcErrorResponse<E>>;
 
+const XRPC_PROCEDURE_BODY_LIMIT: usize = 64 * 1024; // 64 KiB
+
 pub struct ExtractXrpc<E: XrpcEndpoint>(pub E::Request<'static>);
 
 impl<S, E> FromRequest<S> for ExtractXrpc<E>
@@ -158,9 +160,9 @@ where
                 Ok(ExtractXrpc(res.into_static()))
             }
             XrpcMethod::Procedure(_) => {
-                let body = axum::body::to_bytes(req.into_body(), usize::MAX)
+                let body = axum::body::to_bytes(req.into_body(), XRPC_PROCEDURE_BODY_LIMIT)
                     .await
-                    .map_err(|e| internal_error(nsid, e))?;
+                    .map_err(|e| payload_too_large(nsid, e))?;
                 let res: E::Request<'_> =
                     serde_json::from_slice(&body).map_err(|e| bad_request(nsid, e))?;
                 Ok(ExtractXrpc(res.into_static()))
@@ -197,6 +199,22 @@ fn bad_request<E: std::error::Error + IntoStatic>(
             nsid,
             method: "GET",
             http_status: StatusCode::BAD_REQUEST,
+        }),
+    }
+}
+
+fn payload_too_large<E: std::error::Error + IntoStatic>(
+    nsid: &'static str,
+    message: impl Display,
+) -> XrpcErrorResponse<E> {
+    XrpcErrorResponse {
+        status: StatusCode::PAYLOAD_TOO_LARGE,
+        error: XrpcError::Generic(GenericXrpcError {
+            error: "PayloadTooLarge".into(),
+            message: Some(message.to_smolstr()),
+            nsid,
+            method: "POST",
+            http_status: StatusCode::PAYLOAD_TOO_LARGE,
         }),
     }
 }

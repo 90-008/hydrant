@@ -186,6 +186,7 @@ fn did_list_response(dids: Vec<Did<'static>>, headers: &HeaderMap) -> Response {
     }
 }
 
+#[cfg(feature = "indexer")]
 const MAX_BODY_SIZE: usize = 8 * 1024 * 1024; // 8 MiB
 
 #[cfg(feature = "indexer")]
