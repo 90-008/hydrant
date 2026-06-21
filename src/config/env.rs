@@ -132,6 +132,7 @@ impl Config {
         let verify_mst: bool = cfg!("VERIFY_MST", defaults.verify_mst);
         let rev_clock_skew_secs: i64 = cfg!("REV_CLOCK_SKEW", defaults.rev_clock_skew_secs);
         let enable_firehose = cfg!("ENABLE_FIREHOSE", defaults.enable_firehose);
+        let enable_backfill = cfg!("ENABLE_BACKFILL", defaults.enable_backfill);
         let enable_crawler = std::env::var("HYDRANT_ENABLE_CRAWLER")
             .ok()
             .and_then(|s| s.parse().ok());
@@ -325,6 +326,7 @@ impl Config {
             firehose_workers,
             firehose_max_failures,
             cursor_save_interval,
+            enable_backfill,
             repo_fetch_timeout,
             backfill_concurrency_limit,
             backfill_strategy,
