@@ -2953,7 +2953,7 @@ dependencies = [
 [[package]]
 name = "rmp"
 version = "0.8.15"
-source = "git+https://github.com/90-008/msgpack-rust.git#19c54a922301d06310a816c3a6a097aeb73ea3ae"
+source = "git+https://github.com/90-008/msgpack-rust.git?rev=19c54a922301d06310a816c3a6a097aeb73ea3ae#19c54a922301d06310a816c3a6a097aeb73ea3ae"
 dependencies = [
  "num-traits",
 ]
@@ -2961,7 +2961,7 @@ dependencies = [
 [[package]]
 name = "rmp-serde"
 version = "1.3.1"
-source = "git+https://github.com/90-008/msgpack-rust.git#19c54a922301d06310a816c3a6a097aeb73ea3ae"
+source = "git+https://github.com/90-008/msgpack-rust.git?rev=19c54a922301d06310a816c3a6a097aeb73ea3ae#19c54a922301d06310a816c3a6a097aeb73ea3ae"
 dependencies = [
  "rmp",
  "serde",

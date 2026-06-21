@@ -26,7 +26,7 @@ miette = { version = "7", features = ["fancy"] }
 serde = { version = "1.0", features = ["derive", "rc"] }
 serde_bytes = "0.11"
 serde_json = "1.0"
-rmp-serde = { git = "https://github.com/90-008/msgpack-rust.git" }
+rmp-serde = { git = "https://github.com/90-008/msgpack-rust.git", rev = "19c54a922301d06310a816c3a6a097aeb73ea3ae" }
 
 fjall = { git = "https://github.com/90-008/fjall.git", rev = "aee642660079ec0a0f70f2f1fb45b8fa71fa4322", features = ["lz4", "zstd"], version = "3.1.2" }
 lsm-tree = { git = "https://github.com/90-008/lsm-tree.git", features = ["lz4", "zstd"] }
