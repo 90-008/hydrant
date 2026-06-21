@@ -1,5 +1,5 @@
-pub(crate) mod types;
 pub(crate) mod engine;
+pub(crate) mod types;
 
 #[cfg(feature = "indexer_stream")]
 pub(crate) mod indexer;
@@ -20,5 +20,5 @@ pub(crate) use jetstream::{
     JetstreamAccount, JetstreamCommit, JetstreamEvent, JetstreamIdentity, JetstreamPayload,
 };
 
-pub(crate) use types::*;
 pub(crate) use engine::*;
+pub(crate) use types::*;

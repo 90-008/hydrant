@@ -1,6 +1,6 @@
-use std::collections::BTreeMap;
-use miette::{IntoDiagnostic, Result};
 use super::Hydrant;
+use miette::{IntoDiagnostic, Result};
+use std::collections::BTreeMap;
 
 /// database statistics returned by [`Hydrant::stats`].
 #[derive(serde::Serialize)]

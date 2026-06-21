@@ -1,20 +1,20 @@
+use fjall::OwnedWriteBatch;
+use jacquard_common::IntoStatic;
+use jacquard_common::types::did::Did;
+use miette::{IntoDiagnostic, Result};
 use std::sync::Arc;
 use std::sync::atomic::Ordering::SeqCst;
 use tokio::runtime::Handle as TokioHandle;
 use tracing::{debug, error, warn};
-use fjall::OwnedWriteBatch;
-use jacquard_common::IntoStatic;
-use jacquard_common::types::did::Did;
-use miette::{Result, IntoDiagnostic};
 
 use crate::db::{self, CountDeltas, keys, ser_repo_meta};
+use crate::ingest::stream::types::AccountStatus;
+use crate::ingest::stream::{Account, Commit, Identity};
+use crate::ingest::validation;
+use crate::ops;
+use crate::resolver::ResolverError;
 use crate::state::AppState;
 use crate::types::{GaugeState, RepoMetadata, RepoState, RepoStatus};
-use crate::ops;
-use crate::ingest::stream::{Commit, Identity, Account};
-use crate::ingest::validation;
-use crate::resolver::ResolverError;
-use crate::ingest::stream::types::AccountStatus;
 
 #[cfg(feature = "jetstream")]
 use crate::{
@@ -28,8 +28,8 @@ use {
 };
 
 use super::message::{
-    IndexerRx, IndexerMessage, IndexerEvent, IndexerEventData, IndexerCommitData,
-    IndexerIdentityData, IndexerAccountData,
+    IndexerAccountData, IndexerCommitData, IndexerEvent, IndexerEventData, IndexerIdentityData,
+    IndexerMessage, IndexerRx,
 };
 use super::worker::{FirehoseWorker, IngestError, RepoProcessResult};
 

@@ -8,8 +8,8 @@ use tokio::sync::{broadcast, mpsc};
 use tracing::warn;
 
 use super::types::{
-    PendingLiveEvents, ReplayChunk, SendOutcome, StreamBroadcast, StreamOptions, StreamTooSlow,
-    STREAM_SEND_RETRY_PAUSE,
+    PendingLiveEvents, ReplayChunk, STREAM_SEND_RETRY_PAUSE, SendOutcome, StreamBroadcast,
+    StreamOptions, StreamTooSlow,
 };
 
 pub(crate) fn run_ordered_stream<B, O, E>(

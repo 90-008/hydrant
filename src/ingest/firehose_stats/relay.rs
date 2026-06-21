@@ -1,11 +1,11 @@
+use parking_lot::Mutex;
+use serde::Serialize;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::Duration;
-use parking_lot::Mutex;
-use serde::Serialize;
 
-use super::{now_ts, add_duration, add_duration_with_max, nonzero_i64};
+use super::{add_duration, add_duration_with_max, nonzero_i64, now_ts};
 
 #[derive(Clone, Copy, Debug)]
 pub enum RelayMessageKind {

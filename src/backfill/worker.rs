@@ -1,19 +1,19 @@
-use std::sync::Arc;
-use std::time::Duration;
-use tokio::sync::Semaphore;
-use tracing::{debug, error, info, Instrument};
-use jacquard_common::types::did::Did;
-use jacquard_common::IntoStatic;
 use crate::backfill::client::ThrottledHttpClient;
 use crate::backfill::error::BackfillError;
 use crate::config::BackfillStrategy;
 use crate::db::{self, types::TrimmedDid};
-use crate::state::AppState;
 use crate::ingest::indexer::IndexerTx;
+use crate::state::AppState;
 use crate::util::WatchEnabledExt;
+use jacquard_common::IntoStatic;
+use jacquard_common::types::did::Did;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::Semaphore;
+use tracing::{Instrument, debug, error, info};
 
-pub mod task;
 pub mod process;
+pub mod task;
 
 pub struct BackfillWorker {
     state: Arc<AppState>,
@@ -134,9 +134,10 @@ impl BackfillWorker {
                 tokio::spawn(
                     async move {
                         let _guard = guard;
-                        let res =
-                            task::did_task(&state, http, buffer_tx, &did, key, permit, verify, strategy)
-                                .await;
+                        let res = task::did_task(
+                            &state, http, buffer_tx, &did, key, permit, verify, strategy,
+                        )
+                        .await;
 
                         if let Err(e) = res {
                             match &e {

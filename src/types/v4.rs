@@ -1,9 +1,9 @@
-use serde::{Deserialize, Serialize};
-use jacquard_common::types::string::Handle;
-use jacquard_common::CowStr;
-use smol_str::SmolStr;
-use crate::db::types::DidKey;
 pub(crate) use super::v2::Commit;
+use crate::db::types::DidKey;
+use jacquard_common::CowStr;
+use jacquard_common::types::string::Handle;
+use serde::{Deserialize, Serialize};
+use smol_str::SmolStr;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum RepoStatus {

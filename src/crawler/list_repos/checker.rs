@@ -1,7 +1,3 @@
-use std::collections::{HashMap, HashSet};
-use std::ops::{Add, Sub};
-use std::sync::Arc;
-use std::time::Duration;
 use chrono::{DateTime, TimeDelta, Utc};
 use fjall::OwnedWriteBatch;
 use futures::{Future, FutureExt};
@@ -11,17 +7,21 @@ use miette::{IntoDiagnostic, Result};
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use smol_str::{SmolStr, ToSmolStr};
+use std::collections::{HashMap, HashSet};
+use std::ops::{Add, Sub};
+use std::sync::Arc;
+use std::time::Duration;
 use tracing::{Instrument, error, info_span, trace, warn};
 use url::Url;
 
+use super::super::InFlightGuard;
 use crate::db::{Db, keys};
 use crate::state::AppState;
 use crate::util::throttle::{OrFailure, ThrottleHandle, Throttler};
 use crate::util::{
-    ErrorForStatus, RetryOutcome, RetryWithBackoff, is_io_error_their_fault,
-    is_status_their_fault, is_tls_cert_error, parse_retry_after,
+    ErrorForStatus, RetryOutcome, RetryWithBackoff, is_io_error_their_fault, is_status_their_fault,
+    is_tls_cert_error, parse_retry_after,
 };
-use super::super::InFlightGuard;
 
 pub(super) const MAX_RETRY_ATTEMPTS: u32 = 5;
 

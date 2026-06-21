@@ -1,8 +1,8 @@
+use futures::FutureExt;
+use miette::{IntoDiagnostic, Result};
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use futures::FutureExt;
-use miette::{IntoDiagnostic, Result};
 use tokio::sync::watch;
 use tracing::{debug, error, info, warn};
 use url::Url;
@@ -12,17 +12,17 @@ use crate::db::{self, filter as db_filter, load_persisted_firehose_sources};
 use crate::filter::FilterMode;
 use crate::state::AppState;
 
-use super::{FilterControl, pds::PdsControl, ReposControl, DbControl};
 use super::firehose::{FirehoseHandle, FirehoseShared};
+use super::{DbControl, FilterControl, ReposControl, pds::PdsControl};
 
+#[cfg(feature = "indexer")]
+use super::{BackfillHandle, crawler};
 #[cfg(feature = "indexer")]
 use crate::backfill::BackfillWorker;
 #[cfg(feature = "indexer")]
 use crate::db::load_persisted_crawler_sources;
 #[cfg(feature = "indexer")]
 use crate::ingest::indexer::FirehoseWorker;
-#[cfg(feature = "indexer")]
-use super::{crawler, BackfillHandle};
 
 #[cfg(feature = "backlinks")]
 use crate::backlinks::BacklinksControl;

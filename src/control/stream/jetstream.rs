@@ -1,24 +1,23 @@
+use bytes::Bytes;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, mpsc};
 use tracing::{error, warn};
-use bytes::Bytes;
 
 use crate::db::keys;
 use crate::state::AppState;
 use crate::types::{JetstreamBroadcast, StoredJetstreamEvent};
 
-#[cfg(feature = "indexer_stream")]
-use crate::types::StoredEvent;
 #[cfg(feature = "relay")]
 use crate::ingest::stream::{SubscribeReposMessage, decode_frame};
+#[cfg(feature = "indexer_stream")]
+use crate::types::StoredEvent;
 
-use crate::control::{JetstreamStreamError, JetstreamFilter};
 use super::{
-    StreamOptions, ReplayChunk, StreamTooSlow,
-    STREAM_SEND_RETRY_PAUSE, replay_chunk_size_for, note_replay_blocked, clear_replay_blocked,
-    send_stream_error,
+    ReplayChunk, STREAM_SEND_RETRY_PAUSE, StreamOptions, StreamTooSlow, clear_replay_blocked,
+    note_replay_blocked, replay_chunk_size_for, send_stream_error,
 };
+use crate::control::{JetstreamFilter, JetstreamStreamError};
 
 #[cfg(feature = "indexer_stream")]
 use super::indexer::stored_to_event;

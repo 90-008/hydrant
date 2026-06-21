@@ -1,18 +1,18 @@
-use std::collections::HashMap;
-use std::ops::Mul;
-use std::time::Duration;
 use chrono::TimeDelta;
 use jacquard_common::types::string::Did;
 use miette::{IntoDiagnostic, Result};
 use rand::RngExt;
 use rand::rngs::SmallRng;
+use std::collections::HashMap;
+use std::ops::Mul;
+use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info};
 
-use crate::db::keys;
-use super::super::worker::CrawlerBatch;
 use super::super::InFlight;
-use super::checker::{RetryState, SignalChecker, MAX_RETRY_ATTEMPTS};
+use super::super::worker::CrawlerBatch;
+use super::checker::{MAX_RETRY_ATTEMPTS, RetryState, SignalChecker};
+use crate::db::keys;
 
 const MAX_RETRY_BATCH: usize = 1000;
 

@@ -1,29 +1,29 @@
 use miette::Result;
-use tokio::runtime::Handle;
-use tracing::{debug, warn};
-use url::Url;
 use smol_str::SmolStr;
 #[cfg(all(feature = "relay", feature = "jetstream"))]
 use smol_str::ToSmolStr;
+use tokio::runtime::Handle;
+use tracing::{debug, warn};
+use url::Url;
 
 use crate::db::{self, keys};
 use crate::types::{RepoState, RepoStatus};
 
+#[cfg(all(feature = "relay", feature = "jetstream"))]
+use crate::db::types::TrimmedDid;
+#[cfg(feature = "relay")]
+use crate::ingest::stream::encode_frame;
+use crate::ingest::stream::{Account, AccountStatus, Commit, Identity, Sync};
+use crate::ingest::validation::ValidatedCommit;
 #[cfg(feature = "relay")]
 use crate::types::RelayBroadcast;
 #[cfg(all(feature = "relay", feature = "jetstream"))]
 use crate::types::StoredJetstreamEvent;
 #[cfg(all(feature = "relay", feature = "jetstream"))]
-use crate::db::types::TrimmedDid;
-#[cfg(feature = "relay")]
-use crate::ingest::stream::encode_frame;
-use crate::ingest::stream::{Commit, Sync, Identity, Account, AccountStatus};
-use crate::ingest::validation::ValidatedCommit;
-use jacquard_common::IntoStatic;
-#[cfg(all(feature = "relay", feature = "jetstream"))]
 use jacquard_common::CowStr;
+use jacquard_common::IntoStatic;
 
-use super::{WorkerContext, RelayWorker};
+use super::{RelayWorker, WorkerContext};
 
 impl RelayWorker {
     pub(crate) fn handle_commit(

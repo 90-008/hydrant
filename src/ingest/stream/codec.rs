@@ -1,6 +1,6 @@
-use serde::{Deserialize, Serialize};
 use super::FirehoseError;
-use super::types::{SubscribeReposMessage, Info, InfoName};
+use super::types::{Info, InfoName, SubscribeReposMessage};
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Deserialize, Serialize)]
 struct EventHeader {

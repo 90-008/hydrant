@@ -4,8 +4,8 @@ use std::time::Instant;
 
 use fjall::Slice;
 use miette::{IntoDiagnostic, Result};
-use tracing::{debug, error, trace, warn};
 use smol_str::{SmolStr, ToSmolStr};
+use tracing::{debug, error, trace, warn};
 
 use jacquard_api::com_atproto::sync::get_repo::{GetRepo, GetRepoError};
 use jacquard_common::IntoStatic;
@@ -287,7 +287,7 @@ pub(crate) async fn process_did(
                                 state.status = status;
                                 batch.insert(&db.resync, key, resync_bytes);
                                 Ok((true, ()))
-                             },
+                            },
                         )?;
                     }
                     let lifecycle_reservation = lifecycle_counts.stage(&mut batch);

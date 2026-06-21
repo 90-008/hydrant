@@ -1,8 +1,8 @@
-use std::sync::Arc;
-use miette::{IntoDiagnostic, Result};
-use futures::FutureExt;
-use crate::state::AppState;
 use super::Hydrant;
+use crate::state::AppState;
+use futures::FutureExt;
+use miette::{IntoDiagnostic, Result};
+use std::sync::Arc;
 
 /// control over database maintenance operations.
 ///

@@ -1,23 +1,23 @@
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::time::Duration;
 use jacquard_api::com_atproto::sync::list_repos::ListReposOutput;
 use jacquard_common::{IntoStatic, types::string::Did};
 use miette::{Context, IntoDiagnostic, Result};
 use reqwest::StatusCode;
 use smol_str::{SmolStr, ToSmolStr};
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, error, info, warn};
 use url::Url;
 
+use super::super::worker::{CrawlerBatch, CursorUpdate};
+use super::super::{CrawlerStats, InFlight, base_url};
+use super::checker::SignalChecker;
 use crate::db::keys::crawler_cursor_key;
 use crate::db::{Db, keys};
 use crate::state::AppState;
 use crate::util::WatchEnabledExt;
 use crate::util::{ErrorForStatus, RetryOutcome, RetryWithBackoff};
-use super::super::worker::{CrawlerBatch, CursorUpdate};
-use super::super::{CrawlerStats, InFlight, base_url};
-use super::checker::SignalChecker;
 
 const BLOCKING_TASK_TIMEOUT: Duration = Duration::from_secs(30);
 

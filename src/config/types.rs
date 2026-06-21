@@ -1,9 +1,9 @@
+use miette::Result;
+use serde::{Deserialize, Serialize};
+use smol_str::ToSmolStr;
 use std::fmt;
 use std::str::FromStr;
 use url::Url;
-use serde::{Deserialize, Serialize};
-use smol_str::ToSmolStr;
-use miette::Result;
 
 /// rate limit parameters for a named tier of PDS connections.
 ///

@@ -9,9 +9,9 @@ pub(crate) mod repos;
 mod seed;
 pub(crate) mod stream;
 
-pub mod hydrant;
-pub mod hosts;
 pub mod db;
+pub mod hosts;
+pub mod hydrant;
 pub mod stats;
 
 #[cfg(feature = "indexer")]
@@ -35,9 +35,9 @@ pub use firehose::{FirehoseHandle, FirehoseSourceInfo};
 pub use pds::{PdsControl, PdsTierAssignment, PdsTierDefinition};
 pub use repos::{ListedRecord, Record, RecordList, RepoHandle, RepoInfo, ReposControl};
 
-pub use hydrant::Hydrant;
-pub use hosts::{ApiBinds, Host};
 pub use db::DbControl;
+pub use hosts::{ApiBinds, Host};
+pub use hydrant::Hydrant;
 pub use stats::StatsResponse;
 
 #[cfg(feature = "indexer_stream")]
@@ -55,16 +55,16 @@ use crate::types::MarshallableEvt;
 pub type Event = MarshallableEvt<'static>;
 
 // Crate-internal re-exports for submodules using `super::*`
+pub(crate) use crate::state::AppState;
+pub(crate) use futures::Stream;
+pub(crate) use std::pin::Pin;
 pub(crate) use std::sync::Arc;
 pub(crate) use std::sync::atomic::{AtomicBool, Ordering};
-pub(crate) use std::pin::Pin;
 pub(crate) use std::task::{Context, Poll};
-pub(crate) use futures::Stream;
-pub(crate) use tokio::sync::mpsc;
-pub(crate) use crate::state::AppState;
 #[cfg(feature = "indexer_stream")]
 use stream::event_stream_thread;
-#[cfg(feature = "relay")]
-use stream::relay_stream_thread;
 #[cfg(feature = "jetstream")]
 use stream::jetstream_stream_thread;
+#[cfg(feature = "relay")]
+use stream::relay_stream_thread;
+pub(crate) use tokio::sync::mpsc;

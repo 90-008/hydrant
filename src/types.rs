@@ -9,13 +9,13 @@ use smol_str::ToSmolStr;
 use crate::db::types::DbTid;
 use crate::resolver::MiniDoc;
 
+pub(crate) mod event;
 pub(crate) mod v2;
 pub(crate) mod v4;
 pub(crate) mod v7;
-pub(crate) mod event;
 
-pub(crate) use v7::*;
 pub(crate) use event::*;
+pub(crate) use v7::*;
 
 impl<'c> From<AtpCommit<'c>> for Commit {
     fn from(value: AtpCommit<'c>) -> Self {
@@ -224,9 +224,9 @@ pub(crate) enum ResyncState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use miette::IntoDiagnostic;
-    use jacquard_common::types::string::Handle;
     use crate::db::types::DidKey;
+    use jacquard_common::types::string::Handle;
+    use miette::IntoDiagnostic;
 
     #[test]
     fn identity_dedupe_does_not_depend_on_commit_clock() {

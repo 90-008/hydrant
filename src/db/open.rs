@@ -1,24 +1,24 @@
-use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicU64, Ordering};
-#[cfg(feature = "jetstream")]
-use std::sync::atomic::AtomicI64;
-use std::collections::BTreeSet;
-use tokio::sync::broadcast;
-use scc::HashMap;
-use smol_str::SmolStr;
-use miette::{Result, IntoDiagnostic, Context};
 use fjall::{
-    config::{BlockSizePolicy, CompressionPolicy, RestartIntervalPolicy},
     CompressionType, Database, KeyspaceCreateOptions,
+    config::{BlockSizePolicy, CompressionPolicy, RestartIntervalPolicy},
 };
 use lsm_tree::compaction::Factory;
+use miette::{Context, IntoDiagnostic, Result};
+use scc::HashMap;
+use smol_str::SmolStr;
+use std::collections::BTreeSet;
+#[cfg(feature = "jetstream")]
+use std::sync::atomic::AtomicI64;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use tokio::sync::broadcast;
 
-use crate::config::{Config, Compression};
+use crate::config::{Compression, Config};
 
-use super::{Db, migration};
 use super::compaction::CountsGcFilterFactory;
-use super::counts::{load_count_delta_watermark, replay_count_deltas, read_u64_counter};
+use super::counts::{load_count_delta_watermark, read_u64_counter, replay_count_deltas};
 use super::keys;
+use super::{Db, migration};
 
 const fn kb(v: u32) -> u32 {
     v * 1024

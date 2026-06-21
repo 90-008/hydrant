@@ -1,11 +1,14 @@
+use parking_lot::Mutex;
+use serde::Serialize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::Duration;
-use parking_lot::Mutex;
-use serde::Serialize;
 use url::Url;
 
-use super::{now_ts, duration_micros, nonzero_i64, RelayWorkerStats, RelayWorkerStatsSnapshot, RelayShardStats};
+use super::{
+    RelayShardStats, RelayWorkerStats, RelayWorkerStatsSnapshot, duration_micros, nonzero_i64,
+    now_ts,
+};
 
 #[derive(Default)]
 pub struct FirehoseStats {

@@ -4,8 +4,8 @@ use miette::{Context, IntoDiagnostic, Result};
 use smol_str::SmolStr;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 use std::sync::Mutex;
+use std::sync::atomic::Ordering;
 use tracing::error;
 
 #[derive(Debug, Clone, Default)]
@@ -49,7 +49,11 @@ impl CountDeltas {
     }
 
     #[cfg(feature = "indexer")]
-    pub(crate) fn add_gauge_diff(&mut self, old: &crate::types::GaugeState, new: &crate::types::GaugeState) {
+    pub(crate) fn add_gauge_diff(
+        &mut self,
+        old: &crate::types::GaugeState,
+        new: &crate::types::GaugeState,
+    ) {
         use crate::types::GaugeState;
 
         if old == new {

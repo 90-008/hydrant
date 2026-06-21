@@ -1,8 +1,8 @@
-use url::Url;
+use crate::ingest::mailbox::{ShardedMessage, ShardedReceiver, ShardedSender};
 use crate::ingest::stream;
-use crate::ingest::mailbox::{ShardedMessage, ShardedSender, ShardedReceiver};
 use jacquard_common::types::did::Did;
 use miette::Result;
+use url::Url;
 
 #[derive(Debug)]
 pub struct IndexerCommitData {

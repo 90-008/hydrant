@@ -1,16 +1,16 @@
+use miette::{Diagnostic, IntoDiagnostic, Result};
 use std::sync::Arc;
-use miette::{Diagnostic, Result, IntoDiagnostic};
 use thiserror::Error;
 use tokio::runtime::Handle as TokioHandle;
 use tracing::info;
 
+use super::message::{IndexerRx, IndexerTx};
+use crate::ingest::mailbox::ShardedSender;
+use crate::ingest::stream::Commit;
 use crate::resolver::{NoSigningKeyError, ResolverError};
-use jacquard_repo::error::CommitError;
 use crate::state::AppState;
 use crate::types::RepoState;
-use crate::ingest::stream::Commit;
-use crate::ingest::mailbox::ShardedSender;
-use super::message::{IndexerTx, IndexerRx};
+use jacquard_repo::error::CommitError;
 
 #[derive(Debug, Diagnostic, Error)]
 pub(crate) enum IngestError {

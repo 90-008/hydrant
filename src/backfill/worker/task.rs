@@ -1,17 +1,17 @@
-use std::sync::Arc;
 use fjall::Slice;
-use miette::{Result, IntoDiagnostic};
-use tracing::{debug, error, warn};
-use jacquard_common::types::did::Did;
 use jacquard_common::IntoStatic;
+use jacquard_common::types::did::Did;
+use miette::{IntoDiagnostic, Result};
+use std::sync::Arc;
+use tracing::{debug, error, warn};
 
 use crate::backfill::client::ThrottledHttpClient;
 use crate::backfill::error::BackfillError;
 use crate::config::BackfillStrategy;
 use crate::db::{Db, keys};
-use crate::types::{RepoState, RepoStatus, ResyncErrorKind, ResyncState, GaugeState};
-use crate::state::AppState;
 use crate::ingest::indexer::{IndexerMessage, IndexerTx};
+use crate::state::AppState;
+use crate::types::{GaugeState, RepoState, RepoStatus, ResyncErrorKind, ResyncState};
 
 use super::process::process_did;
 

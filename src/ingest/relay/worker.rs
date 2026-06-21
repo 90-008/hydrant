@@ -10,12 +10,12 @@ use tracing::{debug, error, info, info_span, trace, warn};
 use url::Url;
 
 use crate::db::CountDeltas;
-use crate::ingest::{BufferRx, BufferTx, IngestMessage};
-use crate::ingest::stream::{SubscribeReposMessage, InfoName};
+use crate::ingest::stream::{InfoName, SubscribeReposMessage};
 use crate::ingest::validation::ValidationOptions;
+use crate::ingest::{BufferRx, BufferTx, IngestMessage};
 use crate::state::AppState;
 
-use super::{WorkerContext, AuthorityOutcome};
+use super::{AuthorityOutcome, WorkerContext};
 
 #[cfg(feature = "firehose-diagnostics")]
 use super::relay_message_kind;
@@ -156,7 +156,9 @@ impl RelayWorker {
                 match inf.name {
                     InfoName::OutdatedCursor => {}
                     InfoName::Other(name) => {
-                        let message = inf.message.unwrap_or(jacquard_common::CowStr::Borrowed("<no message>"));
+                        let message = inf
+                            .message
+                            .unwrap_or(jacquard_common::CowStr::Borrowed("<no message>"));
                         info!(name = %name, "relay sent info: {message}");
                     }
                 }
@@ -310,9 +312,15 @@ impl RelayWorker {
             ctx.stats.record_host_authority(
                 authority_started.elapsed(),
                 match &outcome_result {
-                    Ok(AuthorityOutcome::Authorized) => crate::ingest::firehose_stats::HostAuthorityStatsOutcome::Authorized,
-                    Ok(AuthorityOutcome::WasStale) => crate::ingest::firehose_stats::HostAuthorityStatsOutcome::WasStale,
-                    Ok(AuthorityOutcome::WrongHost { .. }) => crate::ingest::firehose_stats::HostAuthorityStatsOutcome::WrongHost,
+                    Ok(AuthorityOutcome::Authorized) => {
+                        crate::ingest::firehose_stats::HostAuthorityStatsOutcome::Authorized
+                    }
+                    Ok(AuthorityOutcome::WasStale) => {
+                        crate::ingest::firehose_stats::HostAuthorityStatsOutcome::WasStale
+                    }
+                    Ok(AuthorityOutcome::WrongHost { .. }) => {
+                        crate::ingest::firehose_stats::HostAuthorityStatsOutcome::WrongHost
+                    }
                     Err(_) => crate::ingest::firehose_stats::HostAuthorityStatsOutcome::Error,
                 },
             );
@@ -333,8 +341,10 @@ impl RelayWorker {
                 let started = Instant::now();
                 let result = Self::handle_commit(ctx, &mut repo_state, &msg.firehose, *commit);
                 #[cfg(feature = "firehose-diagnostics")]
-                ctx.stats
-                    .record_handle_message(crate::ingest::firehose_stats::RelayMessageKind::Commit, started.elapsed());
+                ctx.stats.record_handle_message(
+                    crate::ingest::firehose_stats::RelayMessageKind::Commit,
+                    started.elapsed(),
+                );
                 result
             }
             SubscribeReposMessage::Sync(sync) => {
@@ -343,8 +353,10 @@ impl RelayWorker {
                 let started = Instant::now();
                 let result = Self::handle_sync(ctx, &mut repo_state, &msg.firehose, *sync);
                 #[cfg(feature = "firehose-diagnostics")]
-                ctx.stats
-                    .record_handle_message(crate::ingest::firehose_stats::RelayMessageKind::Sync, started.elapsed());
+                ctx.stats.record_handle_message(
+                    crate::ingest::firehose_stats::RelayMessageKind::Sync,
+                    started.elapsed(),
+                );
                 result
             }
             SubscribeReposMessage::Identity(identity) => {
@@ -359,8 +371,10 @@ impl RelayWorker {
                     msg.is_pds,
                 );
                 #[cfg(feature = "firehose-diagnostics")]
-                ctx.stats
-                    .record_handle_message(crate::ingest::firehose_stats::RelayMessageKind::Identity, started.elapsed());
+                ctx.stats.record_handle_message(
+                    crate::ingest::firehose_stats::RelayMessageKind::Identity,
+                    started.elapsed(),
+                );
                 result
             }
             SubscribeReposMessage::Account(account) => {
@@ -370,8 +384,10 @@ impl RelayWorker {
                 let result =
                     Self::handle_account(ctx, &mut repo_state, &msg.firehose, *account, msg.is_pds);
                 #[cfg(feature = "firehose-diagnostics")]
-                ctx.stats
-                    .record_handle_message(crate::ingest::firehose_stats::RelayMessageKind::Account, started.elapsed());
+                ctx.stats.record_handle_message(
+                    crate::ingest::firehose_stats::RelayMessageKind::Account,
+                    started.elapsed(),
+                );
                 result
             }
             _ => Ok(()),

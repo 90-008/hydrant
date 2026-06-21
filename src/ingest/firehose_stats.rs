@@ -1,15 +1,15 @@
-mod source;
 mod relay;
+mod source;
 
-pub use source::{FirehoseStats, FirehoseSourceStats, FirehoseStatsSnapshot, FirehoseMessageStats};
 pub use relay::{
-    RelayWorkerStats, RelayShardStats, RelayShardStatsSnapshot, RelayShardTimings,
-    RelayMessageKind, RepoStateLoadOutcome, HostAuthorityStatsOutcome, ValidationStatsOutcome,
-    RelayWorkerStatsSnapshot,
+    HostAuthorityStatsOutcome, RelayMessageKind, RelayShardStats, RelayShardStatsSnapshot,
+    RelayShardTimings, RelayWorkerStats, RelayWorkerStatsSnapshot, RepoStateLoadOutcome,
+    ValidationStatsOutcome,
 };
+pub use source::{FirehoseMessageStats, FirehoseSourceStats, FirehoseStats, FirehoseStatsSnapshot};
 
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::Duration;
-use std::sync::atomic::{AtomicU64, AtomicI64, Ordering};
 
 fn now_ts() -> i64 {
     chrono::Utc::now().timestamp()

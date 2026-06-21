@@ -1,27 +1,27 @@
+use futures::FutureExt;
+use miette::{IntoDiagnostic, Result};
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use futures::FutureExt;
-use miette::{IntoDiagnostic, Result};
 use tokio::sync::watch;
 use tracing::{debug, error, info, warn};
 use url::Url;
 
+use super::super::firehose::FirehoseShared;
+use super::super::seed;
+use super::Hydrant;
 use crate::config::SignatureVerification;
 use crate::db::{self, load_persisted_firehose_sources};
 use crate::state::AppState;
-use super::super::seed;
-use super::super::firehose::FirehoseShared;
-use super::Hydrant;
 
+#[cfg(feature = "indexer")]
+use super::super::crawler;
 #[cfg(feature = "indexer")]
 use crate::backfill::BackfillWorker;
 #[cfg(feature = "indexer")]
 use crate::db::load_persisted_crawler_sources;
 #[cfg(feature = "indexer")]
 use crate::ingest::indexer::FirehoseWorker;
-#[cfg(feature = "indexer")]
-use super::super::crawler;
 
 impl Hydrant {
     /// start all background components and return a future that resolves when any

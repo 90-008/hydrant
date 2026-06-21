@@ -1,8 +1,8 @@
-use serde::{Deserialize, Serialize};
-use jacquard_common::types::string::Handle;
-use jacquard_common::CowStr;
-use crate::db::types::DidKey;
 pub(crate) use super::v4::{Commit, RepoMetadata, RepoStatus};
+use crate::db::types::DidKey;
+use jacquard_common::CowStr;
+use jacquard_common::types::string::Handle;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(bound(deserialize = "'i: 'de"))]

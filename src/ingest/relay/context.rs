@@ -4,37 +4,35 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use fjall::OwnedWriteBatch;
-use jacquard_api::com_atproto::sync::get_repo_status::{
-    GetRepoStatus, GetRepoStatusError,
-};
+use jacquard_api::com_atproto::sync::get_repo_status::{GetRepoStatus, GetRepoStatusError};
+use jacquard_common::IntoStatic;
 use jacquard_common::types::crypto::PublicKey;
 use jacquard_common::types::did::Did;
 use jacquard_common::xrpc::{XrpcError, XrpcExt};
-use jacquard_common::IntoStatic;
 use miette::{IntoDiagnostic, Result};
+use smol_str::{SmolStr, ToSmolStr};
 use tokio::runtime::Handle;
 use tracing::{debug, trace, warn};
 use url::Url;
-use smol_str::{SmolStr, ToSmolStr};
 
 use crate::db::{self, CountDeltas, keys};
 use crate::state::AppState;
 use crate::types::{RepoState, RepoStatus};
 use crate::util;
 
-#[cfg(feature = "relay")]
-use crate::types::RelayBroadcast;
-#[cfg(feature = "relay")]
-use std::sync::atomic::Ordering;
+use super::{
+    AuthorityOutcome, RelayWorker, WRONG_HOST_AUTHORITY_CACHE_PRUNE_AT,
+    WRONG_HOST_AUTHORITY_RECHECK_INTERVAL, WorkerMessage, map_repo_status_probe,
+};
 use crate::ingest::stream::AccountStatus;
 use crate::ingest::stream::SubscribeReposMessage;
 use crate::ingest::validation::{
     CommitValidationError, SyncValidationError, ValidatedCommit, ValidatedSync, ValidationContext,
 };
-use super::{
-    AuthorityOutcome, RelayWorker, WorkerMessage, WRONG_HOST_AUTHORITY_RECHECK_INTERVAL,
-    WRONG_HOST_AUTHORITY_CACHE_PRUNE_AT, map_repo_status_probe,
-};
+#[cfg(feature = "relay")]
+use crate::types::RelayBroadcast;
+#[cfg(feature = "relay")]
+use std::sync::atomic::Ordering;
 
 #[cfg(feature = "firehose-diagnostics")]
 use super::{commit_validation_outcome, sync_validation_outcome};
@@ -339,7 +337,10 @@ impl WorkerContext<'_> {
         Ok(map_repo_status_probe(Some(output)))
     }
 
-    pub(crate) fn load_repo_state(&mut self, msg: &WorkerMessage) -> Result<Option<RepoState<'static>>> {
+    pub(crate) fn load_repo_state(
+        &mut self,
+        msg: &WorkerMessage,
+    ) -> Result<Option<RepoState<'static>>> {
         let db = &self.state.db;
         let did = msg.msg.did().expect("we checked if valid");
         let repo_key = keys::repo_key(did);
@@ -355,8 +356,9 @@ impl WorkerContext<'_> {
         if metadata.is_some_and(|m| !m.tracked) {
             trace!(did = %did, "ignoring message, repo is explicitly untracked");
             #[cfg(feature = "firehose-diagnostics")]
-            self.stats
-                .record_repo_state_outcome(crate::ingest::firehose_stats::RepoStateLoadOutcome::Drop);
+            self.stats.record_repo_state_outcome(
+                crate::ingest::firehose_stats::RepoStateLoadOutcome::Drop,
+            );
             return Ok(None);
         }
 
@@ -369,8 +371,9 @@ impl WorkerContext<'_> {
 
         if let Some(repo_state) = repo_state_opt {
             #[cfg(feature = "firehose-diagnostics")]
-            self.stats
-                .record_repo_state_outcome(crate::ingest::firehose_stats::RepoStateLoadOutcome::Hit);
+            self.stats.record_repo_state_outcome(
+                crate::ingest::firehose_stats::RepoStateLoadOutcome::Hit,
+            );
             return Ok(Some(repo_state));
         }
 
@@ -382,8 +385,9 @@ impl WorkerContext<'_> {
                     SubscribeReposMessage::Commit(c) => c,
                     _ => {
                         #[cfg(feature = "firehose-diagnostics")]
-                        self.stats
-                            .record_repo_state_outcome(crate::ingest::firehose_stats::RepoStateLoadOutcome::Drop);
+                        self.stats.record_repo_state_outcome(
+                            crate::ingest::firehose_stats::RepoStateLoadOutcome::Drop,
+                        );
                         return Ok(None);
                     }
                 };
@@ -404,8 +408,9 @@ impl WorkerContext<'_> {
                 if !touches_signal {
                     trace!(did = %did, "dropping commit, no signal-matching ops");
                     #[cfg(feature = "firehose-diagnostics")]
-                    self.stats
-                        .record_repo_state_outcome(crate::ingest::firehose_stats::RepoStateLoadOutcome::Drop);
+                    self.stats.record_repo_state_outcome(
+                        crate::ingest::firehose_stats::RepoStateLoadOutcome::Drop,
+                    );
                     return Ok(None);
                 }
             }
@@ -432,8 +437,9 @@ impl WorkerContext<'_> {
             if pds_host.as_deref() != msg.firehose.host_str() {
                 warn!(did = %did, got = ?pds_host, expected = ?msg.firehose.host_str(), "message rejected: wrong host for new account");
                 #[cfg(feature = "firehose-diagnostics")]
-                self.stats
-                    .record_repo_state_outcome(crate::ingest::firehose_stats::RepoStateLoadOutcome::Drop);
+                self.stats.record_repo_state_outcome(
+                    crate::ingest::firehose_stats::RepoStateLoadOutcome::Drop,
+                );
                 return Ok(None);
             }
 
@@ -445,8 +451,9 @@ impl WorkerContext<'_> {
                 if self.state.is_over_account_limit(host, count) {
                     warn!(did = %did, host, count, "account limit reached for host, dropping new account");
                     #[cfg(feature = "firehose-diagnostics")]
-                    self.stats
-                        .record_repo_state_outcome(crate::ingest::firehose_stats::RepoStateLoadOutcome::Drop);
+                    self.stats.record_repo_state_outcome(
+                        crate::ingest::firehose_stats::RepoStateLoadOutcome::Drop,
+                    );
                     return Ok(None);
                 }
             }
@@ -497,8 +504,9 @@ impl WorkerContext<'_> {
 
         #[cfg(feature = "firehose-diagnostics")]
         {
-            self.stats
-                .record_repo_state_outcome(crate::ingest::firehose_stats::RepoStateLoadOutcome::Miss);
+            self.stats.record_repo_state_outcome(
+                crate::ingest::firehose_stats::RepoStateLoadOutcome::Miss,
+            );
             self.stats.record_new_account(new_account_started.elapsed());
         }
 
@@ -506,7 +514,10 @@ impl WorkerContext<'_> {
     }
 
     #[cfg(feature = "relay")]
-    pub(crate) fn queue_emit(&mut self, make_frame: impl FnOnce(i64) -> Result<bytes::Bytes>) -> Result<u64> {
+    pub(crate) fn queue_emit(
+        &mut self,
+        make_frame: impl FnOnce(i64) -> Result<bytes::Bytes>,
+    ) -> Result<u64> {
         #[cfg(feature = "firehose-diagnostics")]
         let started = Instant::now();
         let result = (|| {

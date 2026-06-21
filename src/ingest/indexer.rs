@@ -1,9 +1,9 @@
 pub mod message;
-pub mod worker;
 pub mod shard;
+pub mod worker;
 
 pub use message::{
-    IndexerCommitData, IndexerIdentityData, IndexerAccountData, IndexerEventData, IndexerEvent,
+    IndexerAccountData, IndexerCommitData, IndexerEvent, IndexerEventData, IndexerIdentityData,
     IndexerMessage, IndexerTx,
 };
 pub use worker::FirehoseWorker;

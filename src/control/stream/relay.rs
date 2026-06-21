@@ -7,8 +7,8 @@ use crate::db::keys;
 use crate::state::AppState;
 use crate::types::RelayBroadcast;
 
-use crate::control::RelayStreamError;
 use super::{ReplayChunk, StreamOptions, run_ordered_stream, stream_seq_after};
+use crate::control::RelayStreamError;
 
 pub(crate) fn relay_stream_thread(
     state: Arc<AppState>,

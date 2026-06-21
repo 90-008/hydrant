@@ -21,9 +21,9 @@ use url::Url;
 
 pub mod compaction;
 pub mod counts;
-pub use counts::{CountDeltas, load_count_delta_watermark, set_ks_count};
 #[cfg(feature = "indexer")]
 pub(crate) use counts::CountDeltaReservation;
+pub use counts::{CountDeltas, load_count_delta_watermark, set_ks_count};
 pub mod ephemeral;
 pub mod filter;
 pub mod keys;
@@ -251,8 +251,6 @@ pub fn check_poisoned_report(e: &miette::Report) {
     self::check_poisoned(err);
 }
 
-
-
 /// load the persisted (day, count) pair for the daily PDS add counter, if present.
 /// returns `None` if no entry exists or the stored data is malformed.
 #[cfg(feature = "relay")]
@@ -303,5 +301,3 @@ pub fn load_persisted_firehose_sources(
     }
     Ok(sources)
 }
-
-

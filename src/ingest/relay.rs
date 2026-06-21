@@ -6,11 +6,9 @@ use jacquard_api::com_atproto::sync::get_repo_status::{
 use smol_str::SmolStr;
 
 #[cfg(feature = "firehose-diagnostics")]
-use crate::ingest::stream::SubscribeReposMessage;
+use crate::ingest::firehose_stats::{RelayMessageKind, ValidationStatsOutcome};
 #[cfg(feature = "firehose-diagnostics")]
-use crate::ingest::firehose_stats::{
-    RelayMessageKind, ValidationStatsOutcome,
-};
+use crate::ingest::stream::SubscribeReposMessage;
 #[cfg(feature = "firehose-diagnostics")]
 use crate::ingest::validation::{
     CommitValidationError, SyncValidationError, ValidatedCommit, ValidatedSync,
@@ -22,13 +20,15 @@ pub mod handlers;
 pub mod worker;
 
 pub(crate) use context::WorkerContext;
-pub(crate) use worker::WorkerMessage;
 pub use worker::RelayWorker;
+pub(crate) use worker::WorkerMessage;
 
 pub(crate) const WRONG_HOST_AUTHORITY_RECHECK_INTERVAL: Duration = Duration::from_secs(60);
 pub(crate) const WRONG_HOST_AUTHORITY_CACHE_PRUNE_AT: usize = 8192;
 
-pub(crate) fn map_repo_status_probe(output: Option<GetRepoStatusOutput<'_>>) -> Option<RepoState<'static>> {
+pub(crate) fn map_repo_status_probe(
+    output: Option<GetRepoStatusOutput<'_>>,
+) -> Option<RepoState<'static>> {
     let output = output?;
 
     let mut repo_state = RepoState::backfilling();

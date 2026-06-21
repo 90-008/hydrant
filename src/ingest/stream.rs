@@ -12,18 +12,18 @@ use tokio_websockets::{ClientBuilder, Message as WsMsg, WebSocketStream};
 use tracing::trace;
 use url::Url;
 
-pub mod types;
 pub mod codec;
+pub mod types;
 
+pub use codec::decode_frame;
 #[allow(unused_imports)]
 pub use types::{
-    Datetime, RepoOpAction, RepoOp, Commit, Identity, AccountStatus, Account, Sync, InfoName,
-    Info, SubscribeReposMessage,
+    Account, AccountStatus, Commit, Datetime, Identity, Info, InfoName, RepoOp, RepoOpAction,
+    SubscribeReposMessage, Sync,
 };
-pub use codec::decode_frame;
 
 #[cfg(feature = "relay")]
-pub use codec::{encode_frame, encode_error_frame};
+pub use codec::{encode_error_frame, encode_frame};
 
 #[derive(Debug, Error, Diagnostic)]
 pub enum FirehoseError {
@@ -148,14 +148,14 @@ impl FirehoseStream {
 mod test {
     #[cfg(feature = "relay")]
     use super::FirehoseError;
+    #[cfg(feature = "relay")]
+    use super::types::{Datetime, RepoOp};
     use super::{SubscribeReposMessage, decode_frame};
     #[cfg(feature = "relay")]
     use jacquard_common::types::{
         cid::CidLink,
         string::{Did, Tid},
     };
-    #[cfg(feature = "relay")]
-    use super::types::{RepoOp, Datetime};
 
     #[cfg(feature = "relay")]
     #[derive(serde::Serialize)]

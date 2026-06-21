@@ -13,8 +13,8 @@ use jacquard_common::{CowStr, IntoStatic, RawData};
 use jacquard_repo::DAG_CBOR_CID_CODEC;
 use sha2::{Digest, Sha256};
 
-use crate::control::{Event, StreamError};
 use super::{ReplayChunk, StreamBroadcast, StreamOptions, run_ordered_stream, stream_seq_after};
+use crate::control::{Event, StreamError};
 
 pub(crate) fn event_stream_thread(
     state: Arc<AppState>,

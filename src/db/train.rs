@@ -1,6 +1,6 @@
+use miette::{IntoDiagnostic, Result};
 use std::cell::RefCell;
 use std::collections::HashSet;
-use miette::{Result, IntoDiagnostic};
 
 use super::Db;
 #[cfg(feature = "indexer")]

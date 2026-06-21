@@ -1,11 +1,11 @@
-use std::collections::BTreeSet;
-use smol_str::{SmolStr, ToSmolStr};
 use miette::{IntoDiagnostic, Result, WrapErr};
+use smol_str::{SmolStr, ToSmolStr};
+use std::collections::BTreeSet;
 use url::Url;
 
+use super::Hydrant;
 use crate::db::keys;
 use crate::pds_meta::HostStatus;
-use super::Hydrant;
 
 #[derive(Debug, Clone)]
 pub struct ApiBinds {
