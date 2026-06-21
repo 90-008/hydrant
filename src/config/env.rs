@@ -1,11 +1,11 @@
-use std::time::Duration;
-use url::Url;
 use miette::Result;
 use smol_str::SmolStr;
+use std::time::Duration;
+use url::Url;
 
-use crate::pds_meta::{TierPolicy, TierRule};
-use super::types::{RateTier, CrawlerMode, CrawlerSource, FirehoseSource};
+use super::types::{CrawlerMode, CrawlerSource, FirehoseSource, RateTier};
 use super::Config;
+use crate::pds_meta::{TierPolicy, TierRule};
 
 /// this is for internal use only, please don't use this macro.
 #[doc(hidden)]
@@ -54,6 +54,14 @@ fn load_dotenv() {
             // SAFETY: single-threaded at startup; no other threads are reading env yet.
             unsafe { std::env::set_var(key, val) };
         }
+    }
+}
+
+fn parse_new_host_limit(default: Option<u64>) -> Option<u64> {
+    match std::env::var("HYDRANT_NEW_HOST_LIMIT") {
+        Ok(s) if s.trim().eq_ignore_ascii_case("none") => None,
+        Ok(s) => s.trim().parse().ok().or(default),
+        Err(_) => default,
     }
 }
 
@@ -204,9 +212,7 @@ impl Config {
 
         let enable_backlinks: bool = cfg!("ENABLE_BACKLINKS", defaults.enable_backlinks);
         let only_index_links: bool = cfg!("ONLY_INDEX_LINKS", defaults.only_index_links);
-        let max_pds_added_per_day: Option<u64> = std::env::var("HYDRANT_NEW_HOST_LIMIT")
-            .ok()
-            .and_then(|s| s.parse().ok());
+        let max_pds_added_per_day = parse_new_host_limit(defaults.new_host_limit);
 
         let offline_retry_interval: Option<Duration> =
             match std::env::var("HYDRANT_OFFLINE_HOST_RETRY_INTERVAL")
@@ -353,5 +359,41 @@ impl Config {
             stream_pending_event_limit,
             stream_send_timeout,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_new_host_limit;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn new_host_limit_uses_default_when_env_is_unset() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe { std::env::remove_var("HYDRANT_NEW_HOST_LIMIT") };
+
+        assert_eq!(parse_new_host_limit(Some(50)), Some(50));
+    }
+
+    #[test]
+    fn new_host_limit_honors_explicit_env_value() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe { std::env::set_var("HYDRANT_NEW_HOST_LIMIT", "7") };
+
+        assert_eq!(parse_new_host_limit(Some(50)), Some(7));
+
+        unsafe { std::env::remove_var("HYDRANT_NEW_HOST_LIMIT") };
+    }
+
+    #[test]
+    fn new_host_limit_can_be_explicitly_disabled() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe { std::env::set_var("HYDRANT_NEW_HOST_LIMIT", "none") };
+
+        assert_eq!(parse_new_host_limit(Some(50)), None);
+
+        unsafe { std::env::remove_var("HYDRANT_NEW_HOST_LIMIT") };
     }
 }
