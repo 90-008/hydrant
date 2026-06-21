@@ -35,6 +35,7 @@ pub async fn handle(
         if !allowed {
             return Err(rate_limited(
                 nsid,
+                "POST",
                 "daily limit for new PDS sources reached",
             ));
         }

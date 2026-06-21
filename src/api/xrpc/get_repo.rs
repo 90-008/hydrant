@@ -44,6 +44,12 @@ pub async fn handle(
         });
     }
 
+    let _permit = hydrant
+        .state
+        .get_repo_semaphore
+        .try_acquire()
+        .map_err(|_| rate_limited(nsid, "GET", "too many concurrent getRepo requests"))?;
+
     let Some(car_bytes) = repo
         .generate_car()
         .await

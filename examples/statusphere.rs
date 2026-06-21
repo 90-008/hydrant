@@ -125,7 +125,10 @@ async fn handle_stream(index: Arc<StatusIndex>, repos: ReposControl, mut stream:
             let did = rec.did.as_str().to_owned();
             match rec.action.as_str() {
                 "create" | "update" => {
-                    let Some(record) = rec.record else { continue };
+                    let Some(record_raw) = rec.record else { continue };
+                    let Ok(record) = serde_json::from_str::<serde_json::Value>(record_raw.get()) else {
+                        continue;
+                    };
                     let Some(emoji) = record
                         .get("status")
                         .and_then(|v| v.as_str())

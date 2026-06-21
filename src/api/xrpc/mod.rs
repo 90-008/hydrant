@@ -219,9 +219,9 @@ fn payload_too_large<E: std::error::Error + IntoStatic>(
     }
 }
 
-#[cfg(feature = "relay")]
 fn rate_limited<E: std::error::Error + IntoStatic>(
     nsid: &'static str,
+    method: &'static str,
     message: impl Display,
 ) -> XrpcErrorResponse<E> {
     XrpcErrorResponse {
@@ -230,7 +230,7 @@ fn rate_limited<E: std::error::Error + IntoStatic>(
             error: "RateLimitExceeded".into(),
             message: Some(message.to_smolstr()),
             nsid,
-            method: "POST",
+            method,
             http_status: StatusCode::TOO_MANY_REQUESTS,
         }),
     }

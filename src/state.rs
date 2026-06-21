@@ -7,7 +7,7 @@ use miette::Result;
 use smol_str::SmolStr;
 #[cfg(feature = "indexer")]
 use tokio::sync::Notify;
-use tokio::sync::watch;
+use tokio::sync::{watch, Semaphore};
 use url::Url;
 
 #[cfg(feature = "firehose-diagnostics")]
@@ -45,6 +45,7 @@ pub struct AppState {
     pub ephemeral: bool,
     pub ephemeral_ttl: Duration,
     pub only_index_links: bool,
+    pub get_repo_semaphore: Semaphore,
 }
 
 impl AppState {
@@ -124,6 +125,7 @@ impl AppState {
             ephemeral: config.ephemeral,
             ephemeral_ttl: config.ephemeral_ttl,
             only_index_links: config.only_index_links,
+            get_repo_semaphore: Semaphore::new(config.get_repo_concurrency_limit),
             throttler: Throttler::new(),
             #[cfg(feature = "relay")]
             pds_daily_limit,
