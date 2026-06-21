@@ -16,12 +16,18 @@ use jacquard_identity::resolver::{
 };
 use miette::{Diagnostic, IntoDiagnostic};
 use reqwest::StatusCode;
+use reqwest::redirect::Policy;
 use scc::HashCache;
 use smol_str::SmolStr;
 use thiserror::Error;
 use url::Url;
 
 use crate::util::url_to_fluent_uri;
+
+// as per spec: https://web.plc.directory/spec/v0.1/did-plc
+// "As an anti-abuse mechanism, operations have a maximum size when encoded as
+// DAG-CBOR. The current limit is 7500 bytes."
+const MAX_DID_DOC_BYTES: usize = 16384; // this is generous i think but we deal with json so..
 
 #[derive(Debug, Diagnostic, Error)]
 pub enum ResolverError {
@@ -71,7 +77,10 @@ pub struct Resolver {
 
 impl Resolver {
     pub fn new(plc_urls: Vec<Url>, identity_cache_size: u64) -> Self {
-        let http = reqwest::Client::new();
+        let http = reqwest::Client::builder()
+            .redirect(Policy::none())
+            .build()
+            .expect("resolver HTTP client configuration should be valid");
         let mut jacquards = Vec::with_capacity(plc_urls.len());
 
         for url in plc_urls {
@@ -215,16 +224,19 @@ impl Resolver {
             .req(did.starts_with("did:plc:"), |j| j.resolve_did_doc(did))
             .await?;
 
-        let handle = {
-            let parsed = doc_resp.parse();
-            parsed.ok().and_then(|doc| {
-                let mut handles = doc.handles();
-                handles
-                    .is_empty()
-                    .not()
-                    .then(|| handles.remove(0).into_static())
-            })
-        };
+        if doc_resp.buffer.len() > MAX_DID_DOC_BYTES {
+            return Err(ResolverError::Generic(miette::miette!(
+                "DID doc response exceeds {} byte limit",
+                MAX_DID_DOC_BYTES
+            )));
+        }
+
+        let doc = doc_resp.parse_validated()?;
+        let mut handles = doc.handles();
+        let handle = handles
+            .is_empty()
+            .not()
+            .then(|| handles.remove(0).into_static());
 
         let data: Data<'_> = serde_json::from_slice(&doc_resp.buffer)
             .map_err(|e| ResolverError::Generic(miette::miette!("failed to parse DID doc: {e}")))?;
