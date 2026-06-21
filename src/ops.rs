@@ -263,6 +263,8 @@ pub fn apply_commit<'s>(
     #[cfg(feature = "indexer_stream")]
     let mut last_event_id = None;
     #[cfg(feature = "jetstream")]
+    let should_stage_jetstream = db.jetstream_tx.receiver_count() > 0;
+    #[cfg(feature = "jetstream")]
     let mut jetstream_events = Vec::new();
 
     for op in &commit.ops {
@@ -398,16 +400,20 @@ pub fn apply_commit<'s>(
                     event_id,
                     live: true,
                 };
-                let ephemeral = crate::jetstream::build_ephemeral_from_stored(
-                    did_trimmed.to_did().as_str(),
-                    rev.to_tid().as_str(),
-                    action.as_str(),
-                    collection.as_str(),
-                    rkey.to_smolstr().as_str(),
-                    &data,
-                    inline_block.as_ref(),
-                    true,
-                );
+                let ephemeral = should_stage_jetstream
+                    .then(|| {
+                        crate::jetstream::build_ephemeral_from_stored(
+                            did_trimmed.to_did().as_str(),
+                            rev.to_tid().as_str(),
+                            action.as_str(),
+                            collection.as_str(),
+                            rkey.to_smolstr().as_str(),
+                            &data,
+                            inline_block.as_ref(),
+                            true,
+                        )
+                    })
+                    .flatten();
                 jetstream_events.push(crate::jetstream::stage_event(
                     batch, db, jetstream, ephemeral,
                 )?);

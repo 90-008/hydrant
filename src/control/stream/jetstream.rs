@@ -288,7 +288,7 @@ pub(crate) struct JetstreamCommit<'a> {
     pub(crate) collection: &'a str,
     pub(crate) rkey: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) record: Option<&'a serde_json::Value>,
+    pub(crate) record: Option<&'a serde_json::value::RawValue>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) cid: Option<String>,
     pub(crate) live: bool,
@@ -335,6 +335,8 @@ fn jetstream_event_to_bytes(
             let evt = stored_to_event(state, *event_id, stored, None)?;
             let rec = evt.record?;
             let did_str = rec.did.as_str();
+            // serialize the record to raw json so it embeds without re-encoding.
+            let record_raw = rec.record.as_deref();
 
             let json_event = JetstreamEvent {
                 did: did_str,
@@ -345,7 +347,7 @@ fn jetstream_event_to_bytes(
                         operation: rec.action.as_str(),
                         collection: rec.collection.as_str(),
                         rkey: rec.rkey.as_str(),
-                        record: rec.record.as_ref(),
+                        record: record_raw,
                         cid: rec.cid.map(|cid| cid.to_string()),
                         live: *live,
                     },
@@ -371,7 +373,7 @@ fn jetstream_event_to_bytes(
             let (collection, rkey) = op.path.split_once('/')?;
             let action = op.action.as_str();
 
-            let mut record_owned = None;
+            let mut record_raw: Option<Box<serde_json::value::RawValue>> = None;
             let cid = if matches!(action, "create" | "update") {
                 let cid = op.cid.as_ref()?;
                 let cid_ipld = cid.to_ipld().ok()?;
@@ -382,7 +384,7 @@ fn jetstream_event_to_bytes(
                     .ok()?;
                 let block = parsed.blocks.get(&cid_ipld)?;
                 let val = serde_ipld_dagcbor::from_slice::<jacquard_common::RawData>(block).ok()?;
-                record_owned = Some(serde_json::to_value(val).ok()?);
+                record_raw = serde_json::value::to_raw_value(&val).ok();
                 Some(cid.to_string())
             } else {
                 None
@@ -397,7 +399,7 @@ fn jetstream_event_to_bytes(
                         operation: action,
                         collection,
                         rkey,
-                        record: record_owned.as_ref(),
+                        record: record_raw.as_deref(),
                         cid,
                         live: true,
                     },

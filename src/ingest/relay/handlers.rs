@@ -97,27 +97,27 @@ impl RelayWorker {
             })?;
             #[cfg(feature = "jetstream")]
             {
-                let parsed_car = tokio::runtime::Handle::current()
-                    .block_on(jacquard_repo::car::reader::parse_car_bytes(
-                        commit.blocks.as_ref(),
-                    ))
-                    .ok();
-                for (op_index, collection) in jetstream_ops {
+                // skip car parse and record materialization when no jetstream subscribers are
+                // connected — the stream thread re-reads from relay_events as a fallback.
+                let parsed_car = (ctx.state.db.jetstream_tx.receiver_count() > 0)
+                    .then(|| {
+                        tokio::runtime::Handle::current()
+                            .block_on(jacquard_repo::car::reader::parse_car_bytes(
+                                commit.blocks.as_ref(),
+                            ))
+                            .ok()
+                    })
+                    .flatten();
+                for (op_index, collection) in &jetstream_ops {
                     let ephemeral = parsed_car.as_ref().and_then(|car| {
-                        crate::jetstream::build_ephemeral_from_relay(
-                            &commit,
-                            op_index,
-                            collection.as_str(),
-                            true,
-                            car,
-                        )
+                        build_relay_commit_ephemeral(&commit, *op_index, collection, car)
                     });
                     ctx.pending_jetstream_events.push((
                         StoredJetstreamEvent::RelayCommit {
                             did: jetstream_did.clone(),
-                            collection,
+                            collection: collection.clone(),
                             relay_seq: _relay_seq,
-                            op_index,
+                            op_index: *op_index,
                         },
                         ephemeral,
                     ));
@@ -420,4 +420,40 @@ impl RelayWorker {
 fn split_collection(path: &str) -> Option<CowStr<'static>> {
     path.split_once('/')
         .map(|(collection, _)| CowStr::Owned(collection.to_smolstr()))
+}
+
+#[cfg(all(feature = "relay", feature = "jetstream"))]
+fn build_relay_commit_ephemeral(
+    commit: &crate::ingest::stream::Commit,
+    op_index: u32,
+    collection: &jacquard_common::CowStr<'static>,
+    car: &jacquard_repo::car::reader::ParsedCar,
+) -> Option<crate::jetstream::JetstreamEphemeral> {
+    let op = commit.ops.get(op_index as usize)?;
+    let (_, rkey) = op.path.split_once('/')?;
+    let action = op.action.as_str();
+
+    let (record, cid) = if matches!(action, "create" | "update") {
+        let cid_link = op.cid.as_ref()?;
+        let cid_ipld = cid_link.to_ipld().ok()?;
+        let block = car.blocks.get(&cid_ipld)?;
+        let val = serde_ipld_dagcbor::from_slice::<jacquard_common::RawData>(block).ok()?;
+        let record = serde_json::value::to_raw_value(&val)
+            .ok()
+            .map(std::sync::Arc::from);
+        (record, Some(cid_link.to_string()))
+    } else {
+        (None, None)
+    };
+
+    Some(crate::jetstream::JetstreamEphemeral {
+        did: commit.repo.as_str().to_string(),
+        rev: commit.rev.as_str().to_string(),
+        operation: action.to_string(),
+        collection: collection.as_str().to_string(),
+        rkey: rkey.to_string(),
+        record,
+        cid,
+        live: true,
+    })
 }

@@ -148,7 +148,7 @@ pub(crate) fn stored_to_event(
         StoredData::Ptr(cid) => {
             if let Some(bytes) = inline_block {
                 match serde_ipld_dagcbor::from_slice::<RawData>(&bytes) {
-                    Ok(val) => Some((cid, serde_json::to_value(val).ok()?)),
+                    Ok(val) => Some((cid, Arc::from(serde_json::value::to_raw_value(&val).ok()?))),
                     Err(e) => {
                         error!(err = %e, "cant parse block");
                         return None;
@@ -162,7 +162,9 @@ pub(crate) fn stored_to_event(
                 match block {
                     Ok(Some(bytes)) => {
                         match serde_ipld_dagcbor::from_slice::<RawData>(bytes.as_ref()) {
-                            Ok(val) => Some((cid, serde_json::to_value(val).ok()?)),
+                            Ok(val) => {
+                                Some((cid, Arc::from(serde_json::value::to_raw_value(&val).ok()?)))
+                            }
                             Err(e) => {
                                 error!(err = %e, "cant parse block");
                                 return None;
@@ -187,7 +189,7 @@ pub(crate) fn stored_to_event(
                 cid::multihash::Multihash::wrap(ATP_CID_HASH, &digest).expect("valid sha256 hash");
             let cid = IpldCid::new_v1(DAG_CBOR_CID_CODEC, hash);
             match serde_ipld_dagcbor::from_slice::<RawData>(&block) {
-                Ok(val) => Some((cid, serde_json::to_value(val).ok()?)),
+                Ok(val) => Some((cid, Arc::from(serde_json::value::to_raw_value(&val).ok()?))),
                 Err(e) => {
                     error!(err = %e, "cant parse block");
                     return None;

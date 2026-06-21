@@ -7,7 +7,7 @@ use jacquard_common::types::string::{Did, Rkey};
 use jacquard_common::types::tid::Tid;
 use jacquard_common::{CowStr, types::string::Handle};
 use serde::{Deserialize, Serialize, Serializer};
-use serde_json::Value;
+use serde_json::value::RawValue;
 use std::fmt::Debug;
 
 #[cfg(any(feature = "indexer_stream", feature = "jetstream"))]
@@ -65,7 +65,7 @@ pub struct RecordEvt<'i> {
     pub rkey: Rkey<'i>,
     pub action: CowStr<'i>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub record: Option<Value>,
+    pub record: Option<std::sync::Arc<RawValue>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(serialize_with = "crate::util::opt_cid_serialize_str")]
     pub cid: Option<IpldCid>,
