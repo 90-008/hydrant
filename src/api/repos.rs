@@ -186,6 +186,8 @@ fn did_list_response(dids: Vec<Did<'static>>, headers: &HeaderMap) -> Response {
     }
 }
 
+const MAX_BODY_SIZE: usize = 8 * 1024 * 1024; // 8 MiB
+
 #[cfg(feature = "indexer")]
 async fn parse_body(
     body: Body,
@@ -197,7 +199,7 @@ async fn parse_body(
         .unwrap_or("")
         .to_string();
 
-    let body_bytes = axum::body::to_bytes(body, usize::MAX)
+    let body_bytes = axum::body::to_bytes(body, MAX_BODY_SIZE)
         .await
         .map_err(bad_request)?;
 
