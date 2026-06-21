@@ -254,6 +254,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "indexer_stream")]
     fn full_path_filter_matches_commit_collection() {
         use crate::db::types::TrimmedDid;
         use crate::types::StoredJetstreamEvent;
