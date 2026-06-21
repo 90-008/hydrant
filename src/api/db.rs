@@ -21,10 +21,12 @@ pub async fn handle_train_dict(
 pub async fn handle_compact(
     State(hydrant): State<Hydrant>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    hydrant
-        .db
-        .compact()
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if let Err(e) = hydrant.db.compact().await {
+        let err_msg = e.to_string();
+        if err_msg.contains("already in progress") {
+            return Err((StatusCode::CONFLICT, err_msg));
+        }
+        return Err((StatusCode::INTERNAL_SERVER_ERROR, err_msg));
+    }
     Ok(StatusCode::OK)
 }

@@ -411,6 +411,7 @@ impl Db {
             count_delta_in_flight: Arc::new(Mutex::new(BTreeSet::new())),
             #[cfg(feature = "indexer")]
             lifecycle_count_lock: Arc::new(Mutex::new(())),
+            compaction_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
 
         migration::run(&this)?;

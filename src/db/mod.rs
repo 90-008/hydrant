@@ -94,6 +94,7 @@ pub struct Db {
     count_delta_in_flight: Arc<Mutex<BTreeSet<u64>>>,
     #[cfg(feature = "indexer")]
     lifecycle_count_lock: Arc<Mutex<()>>,
+    pub(crate) compaction_running: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Db {
@@ -107,6 +108,22 @@ impl Db {
     }
 
     pub async fn compact(&self) -> Result<()> {
+        use std::sync::atomic::Ordering;
+        if self
+            .compaction_running
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            return Err(miette::miette!("compaction already in progress"));
+        }
+        struct Guard(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Release);
+            }
+        }
+        let _guard = Guard(self.compaction_running.clone());
+
         let compact = |ks: Keyspace| async move {
             tokio::task::spawn_blocking(move || ks.major_compact().into_diagnostic())
                 .await
@@ -300,4 +317,37 @@ pub fn load_persisted_firehose_sources(
         });
     }
     Ok(sources)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+    use std::sync::atomic::Ordering;
+
+    #[tokio::test]
+    async fn test_db_compact_concurrency_guard() -> Result<()> {
+        let tmp = tempfile::tempdir().into_diagnostic()?;
+        let mut cfg = Config::default();
+        cfg.database_path = tmp.path().to_path_buf();
+
+        let db = Db::open(&cfg)?;
+
+        // Manually mark compaction as running
+        db.compaction_running.store(true, Ordering::SeqCst);
+
+        // Attempting to compact should now fail
+        let res = db.compact().await;
+        assert!(res.is_err());
+        assert!(res.unwrap_err().to_string().contains("already in progress"));
+
+        // Release the lock
+        db.compaction_running.store(false, Ordering::SeqCst);
+
+        // Compacting should now succeed
+        let res = db.compact().await;
+        assert!(res.is_ok());
+
+        Ok(())
+    }
 }
