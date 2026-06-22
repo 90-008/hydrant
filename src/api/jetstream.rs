@@ -253,22 +253,32 @@ fn handle_options_message(msg: Message, options: &JetstreamFilter) -> Result<boo
     Ok(true)
 }
 
+thread_local! {
+    static ZSTD_COMPRESSOR: std::cell::RefCell<zstd::bulk::Compressor<'static>> = std::cell::RefCell::new(
+        zstd::bulk::Compressor::new(3).expect("failed to initialize zstd compressor")
+    );
+}
+
 fn frame_for_event(
     json: &[u8],
     compress: bool,
     options: &JetstreamFilter,
 ) -> Result<Option<Message>, String> {
+    if exceeds_max(json.len(), options) {
+        return Ok(None);
+    }
+
     if compress {
-        let compressed = zstd::bulk::compress(json, 3).map_err(|e| e.to_string())?;
+        let compressed = ZSTD_COMPRESSOR.with(|c| {
+            c.borrow_mut().compress(json)
+        }).map_err(|e| e.to_string())?;
+
         if exceeds_max(compressed.len(), options) {
             return Ok(None);
         }
         return Ok(Some(Message::binary(compressed)));
     }
 
-    if exceeds_max(json.len(), options) {
-        return Ok(None);
-    }
     let text = std::str::from_utf8(json).map_err(|e| e.to_string())?;
     Ok(Some(Message::text(text.to_string())))
 }
@@ -327,4 +337,36 @@ struct SubscriberOptionsUpdatePayload {
     max_message_size_bytes: i64,
     #[serde(default, rename = "wantedEventTypes")]
     wanted_event_types: Vec<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_frame_for_event_size_limits() {
+        let json = b"{\"hello\": \"world\"}";
+        // options with max size 5
+        let options = JetstreamFilter::new(
+            JetstreamSubscriberOptions::parse(&[], &[], 5, &[]).unwrap()
+        );
+        
+        // Uncompressed exceeds limit
+        let res = frame_for_event(json, false, &options).unwrap();
+        assert!(res.is_none());
+
+        // Compressed with uncompressed exceeding limit
+        let res = frame_for_event(json, true, &options).unwrap();
+        assert!(res.is_none());
+
+        // Fits within limit
+        let options_large = JetstreamFilter::new(
+            JetstreamSubscriberOptions::parse(&[], &[], 100, &[]).unwrap()
+        );
+        let res_uncompressed = frame_for_event(json, false, &options_large).unwrap().unwrap();
+        assert!(res_uncompressed.is_text());
+
+        let res_compressed = frame_for_event(json, true, &options_large).unwrap().unwrap();
+        assert!(res_compressed.is_binary());
+    }
 }
