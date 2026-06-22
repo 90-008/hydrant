@@ -322,7 +322,7 @@ impl FirehoseHandle {
         .await
         .into_diagnostic()??;
 
-        let _ = self.known_sources.insert_async(url.clone(), is_pds).await;
+        let _ = self.known_sources.upsert_async(url.clone(), is_pds).await;
 
         // reset failure state so the fresh task gets a clean slate.
         // if the previous task exited after max failures, the failure counter

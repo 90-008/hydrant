@@ -248,7 +248,7 @@ impl Hydrant {
                 for source in &relay_hosts {
                     let _ = firehose
                         .known_sources
-                        .insert_async(source.url.clone(), source.is_pds)
+                        .upsert_async(source.url.clone(), source.is_pds)
                         .await;
                     firehose
                         .spawn_firehose_ingestor(source, fire_shared, true)
@@ -266,7 +266,7 @@ impl Hydrant {
             for source in &persisted_sources {
                 let _ = firehose
                     .known_sources
-                    .insert_async(source.url.clone(), source.is_pds)
+                    .upsert_async(source.url.clone(), source.is_pds)
                     .await;
                 if firehose.tasks.contains_async(&source.url).await {
                     continue;
