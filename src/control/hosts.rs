@@ -110,43 +110,61 @@ impl Hydrant {
         let cursor = cursor.map(str::to_string);
 
         tokio::task::spawn_blocking(move || {
+            let start_bound = match &cursor {
+                Some(after) => std::ops::Bound::Included(keys::firehose_cursor_key(after)),
+                None => std::ops::Bound::Included(keys::FIREHOSE_CURSOR_PREFIX.to_vec()),
+            };
+
             let prefix_end = {
                 let mut end = keys::FIREHOSE_CURSOR_PREFIX.to_vec();
                 *end.last_mut().unwrap() += 1;
                 end
             };
+            let end_bound = std::ops::Bound::Excluded(prefix_end);
 
-            let mut all_hostnames = BTreeSet::new();
-            for item in state.db.cursors.range((
-                std::ops::Bound::Included(keys::FIREHOSE_CURSOR_PREFIX.to_vec()),
-                std::ops::Bound::Excluded(prefix_end),
-            )) {
+            let mut db_hosts = Vec::new();
+            for item in state.db.cursors.range((start_bound, end_bound)) {
                 let (k, _) = item.into_inner().into_diagnostic()?;
                 let hostname = std::str::from_utf8(&k[keys::FIREHOSE_CURSOR_PREFIX.len()..])
                     .into_diagnostic()
                     .wrap_err("firehose cursor key contains non-utf8 hostname")?;
-                all_hostnames.insert(SmolStr::new(hostname));
-            }
 
-            {
-                let meta = state.pds_meta.load();
-                for hostname in meta.hosts.keys() {
-                    all_hostnames.insert(SmolStr::new(hostname));
+                if let Some(after) = &cursor {
+                    if hostname <= after.as_str() {
+                        continue;
+                    }
+                }
+
+                db_hosts.push(SmolStr::new(hostname));
+                if db_hosts.len() >= limit + 1 {
+                    break;
                 }
             }
 
-            let hostnames = all_hostnames.into_iter().collect::<Vec<_>>();
-            let start_idx = cursor
-                .as_deref()
-                .map(|after| hostnames.partition_point(|host| host.as_str() <= after))
-                .unwrap_or(0);
+            let mut meta_hosts = Vec::new();
+            {
+                let meta = state.pds_meta.load();
+                for hostname in meta.hosts.keys() {
+                    if let Some(after) = &cursor {
+                        if hostname.as_str() <= after.as_str() {
+                            continue;
+                        }
+                    }
+                    meta_hosts.push(SmolStr::new(hostname));
+                }
+            }
+            meta_hosts.sort();
+            meta_hosts.truncate(limit + 1);
 
-            let selected = hostnames
-                .iter()
-                .skip(start_idx)
-                .take(limit + 1)
-                .cloned()
-                .collect::<Vec<_>>();
+            let mut merged = BTreeSet::new();
+            for host in db_hosts {
+                merged.insert(host);
+            }
+            for host in meta_hosts {
+                merged.insert(host);
+            }
+
+            let selected: Vec<SmolStr> = merged.into_iter().take(limit + 1).collect();
 
             let mut hosts: Vec<Host> = Vec::with_capacity(selected.len().min(limit));
             for hostname in selected.iter().take(limit) {
@@ -283,6 +301,60 @@ mod host_listing_tests {
         assert_eq!(active.seq, 123);
         assert_eq!(active.account_count, 42);
         assert_eq!(active.status, HostStatus::Active);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn list_hosts_pagination_correctness() -> Result<()> {
+        let tmp = tempfile::tempdir().into_diagnostic()?;
+        let hydrant = Hydrant::new(test_config(tmp.path())).await?;
+
+        // Seed some in DB: host2, host4, host6
+        {
+            let state = hydrant.state.clone();
+            tokio::task::spawn_blocking(move || -> Result<()> {
+                state.db.cursors.insert(keys::firehose_cursor_key("host2"), 2_i64.to_be_bytes()).into_diagnostic()?;
+                state.db.cursors.insert(keys::firehose_cursor_key("host4"), 4_i64.to_be_bytes()).into_diagnostic()?;
+                state.db.cursors.insert(keys::firehose_cursor_key("host6"), 6_i64.to_be_bytes()).into_diagnostic()?;
+                state.db.persist()
+            })
+            .await
+            .into_diagnostic()??;
+        }
+
+        // Seed some in memory: host1, host3, host5
+        crate::pds_meta::PdsMeta::update_host(&hydrant.state.pds_meta, "host1", |h| {
+            h.status = HostStatus::Active;
+        });
+        crate::pds_meta::PdsMeta::update_host(&hydrant.state.pds_meta, "host3", |h| {
+            h.status = HostStatus::Active;
+        });
+        crate::pds_meta::PdsMeta::update_host(&hydrant.state.pds_meta, "host5", |h| {
+            h.status = HostStatus::Active;
+        });
+
+        // Lexicographically sorted: host1, host2, host3, host4, host5, host6
+        // Page 1: limit = 2
+        let (hosts1, next1) = hydrant.list_hosts(None, 2).await?;
+        assert_eq!(hosts1.len(), 2);
+        assert_eq!(hosts1[0].name.as_str(), "host1");
+        assert_eq!(hosts1[1].name.as_str(), "host2");
+        assert_eq!(next1.as_deref(), Some("host2"));
+
+        // Page 2: limit = 2, cursor = host2
+        let (hosts2, next2) = hydrant.list_hosts(next1.as_deref(), 2).await?;
+        assert_eq!(hosts2.len(), 2);
+        assert_eq!(hosts2[0].name.as_str(), "host3");
+        assert_eq!(hosts2[1].name.as_str(), "host4");
+        assert_eq!(next2.as_deref(), Some("host4"));
+
+        // Page 3: limit = 2, cursor = host4
+        let (hosts3, next3) = hydrant.list_hosts(next2.as_deref(), 2).await?;
+        assert_eq!(hosts3.len(), 2);
+        assert_eq!(hosts3[0].name.as_str(), "host5");
+        assert_eq!(hosts3[1].name.as_str(), "host6");
+        assert!(next3.is_none());
 
         Ok(())
     }
