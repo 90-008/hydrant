@@ -376,6 +376,10 @@ impl FirehoseIngestor {
 
             match res {
                 Ok(()) => {}
+                // 1001 "going away" means the server shut down cleanly (restart, deploy, etc.).
+                // this is not a real failure so we intentionally skip on_failure / backoff and
+                // reconnect quickly. a malicious source could abuse this but they could equally
+                // just drop the TCP connection, which would hit the normal backoff path anyway.
                 Err(FirehoseError::StreamClosed { code: 1001, reason }) => {
                     #[cfg(feature = "firehose-diagnostics")]
                     self.stats.record_stream_error("stream_closed");
