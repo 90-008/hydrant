@@ -483,6 +483,9 @@ impl Db {
         this.count_delta_gc_watermark
             .store(durable_watermark, Ordering::Relaxed);
 
+        // always stay strictly above the durable watermark so that after a migration
+        // deletes delta keys, new deltas are not assigned ids that checkpoint/replay
+        // would silently skip (finding 5f309024bc588191aa1a79eb449e3630).
         let next_count_delta_id = this
             .counts
             .prefix(keys::COUNT_DELTA_PREFIX)
@@ -493,7 +496,8 @@ impl Db {
                 Ok(id + 1)
             })
             .transpose()?
-            .unwrap_or(durable_watermark.saturating_add(1));
+            .unwrap_or(0)
+            .max(durable_watermark.saturating_add(1));
         this.next_count_delta_id
             .store(next_count_delta_id, Ordering::Relaxed);
 
