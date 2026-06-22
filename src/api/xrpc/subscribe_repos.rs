@@ -6,7 +6,7 @@ use axum_tws::{Message, WebSocket, WebSocketUpgrade};
 use serde::Deserialize;
 use tracing::error;
 
-use crate::api::ws::{WsAction, run_socket};
+use crate::api::ws::{WsAction, control_frame_only_limits, run_socket};
 use crate::control::{Hydrant, RelayStreamError};
 use crate::ingest::stream::encode_error_frame;
 
@@ -20,7 +20,8 @@ pub async fn handle(
     Query(query): Query<SubscribeReposQuery>,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_socket(socket, hydrant, query))
+    ws.limits(control_frame_only_limits())
+        .on_upgrade(move |socket| handle_socket(socket, hydrant, query))
 }
 
 async fn handle_socket(socket: WebSocket, hydrant: Hydrant, query: SubscribeReposQuery) {

@@ -9,7 +9,7 @@ use axum_tws::{Message, WebSocket, WebSocketUpgrade};
 use serde::Deserialize;
 use tracing::error;
 
-use super::ws::{WsAction, run_socket};
+use super::ws::{WsAction, control_frame_only_limits, run_socket};
 
 pub fn router() -> Router<Hydrant> {
     Router::new().route("/", get(handle_stream))
@@ -25,7 +25,8 @@ pub async fn handle_stream(
     Query(query): Query<StreamQuery>,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_socket(socket, hydrant, query))
+    ws.limits(control_frame_only_limits())
+        .on_upgrade(move |socket| handle_socket(socket, hydrant, query))
 }
 
 async fn handle_socket(socket: WebSocket, hydrant: Hydrant, query: StreamQuery) {

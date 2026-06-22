@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use axum_tws::{Message, WebSocket};
+use axum_tws::{Limits, Message, WebSocket};
 use bytes::Bytes;
 use futures::{SinkExt, Stream, StreamExt};
 use tokio::time::{MissedTickBehavior, interval, timeout};
@@ -8,6 +8,11 @@ use tracing::{debug, warn};
 
 const PING_INTERVAL: Duration = Duration::from_secs(30);
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
+const CONTROL_FRAME_PAYLOAD_LIMIT: usize = 125;
+
+pub(super) fn control_frame_only_limits() -> Limits {
+    Limits::default().max_payload_len(Some(CONTROL_FRAME_PAYLOAD_LIMIT))
+}
 
 pub(super) enum WsAction {
     Send(Message),
