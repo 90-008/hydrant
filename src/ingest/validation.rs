@@ -1,6 +1,6 @@
 use jacquard_common::IntoStatic;
 use jacquard_common::types::crypto::PublicKey;
-use jacquard_repo::MemoryBlockStore;
+use jacquard_repo::{BlockStore, MemoryBlockStore};
 use jacquard_repo::Mst;
 use jacquard_repo::car::reader::{ParsedCar, parse_car_bytes};
 use jacquard_repo::commit::Commit as AtpCommit;
@@ -116,6 +116,8 @@ pub struct ValidationOptions {
     pub rev_clock_skew_secs: i64,
     /// run MST inversion validation (expensive). default: false
     pub verify_mst: bool,
+    /// cryptographically verify block CIDs. default: false
+    pub verify_cids: bool,
 }
 
 impl Default for ValidationOptions {
@@ -123,6 +125,7 @@ impl Default for ValidationOptions {
         Self {
             rev_clock_skew_secs: 300,
             verify_mst: false,
+            verify_cids: false,
         }
     }
 }
@@ -147,7 +150,7 @@ impl ValidationContext<'_> {
         msg: &Sync<'_>,
         signing_key: Option<&PublicKey>,
     ) -> Result<ValidatedSync, SyncValidationError> {
-        validate_sync(msg, signing_key)
+        validate_sync(msg, signing_key, self.opts)
     }
 }
 
@@ -206,6 +209,20 @@ pub fn validate_commit<'c>(
         .block_on(parse_car_bytes(msg.blocks.as_ref()))
         .map_err(|e| CommitValidationError::MalformedCar(miette::miette!("{e}")))?;
 
+    if opts.verify_cids {
+        let temp_store = MemoryBlockStore::new();
+        for (claimed_cid, bytes) in &parsed.blocks {
+            let computed_cid = handle
+                .block_on(temp_store.put(bytes.as_ref()))
+                .map_err(|e| CommitValidationError::MalformedCar(miette::miette!("{e}")))?;
+            if computed_cid != *claimed_cid {
+                return Err(CommitValidationError::MalformedCar(miette::miette!(
+                    "CAR block CID mismatch: claimed {claimed_cid}, computed {computed_cid}"
+                )));
+            }
+        }
+    }
+
     let root_bytes = parsed.blocks.get(&parsed.root).ok_or_else(|| {
         CommitValidationError::MalformedCar(miette::miette!("root block missing from CAR"))
     })?;
@@ -220,6 +237,12 @@ pub fn validate_commit<'c>(
     }
     if commit_obj.rev.as_str() != msg.rev.as_str() {
         return Err(CommitValidationError::FieldMismatch { field: "rev" });
+    }
+    let msg_commit = msg.commit.to_ipld().map_err(|e| {
+        CommitValidationError::MalformedCar(miette::miette!("invalid commit CID: {e}"))
+    })?;
+    if msg_commit != parsed.root {
+        return Err(CommitValidationError::FieldMismatch { field: "commit" });
     }
 
     // 7. signature verification
@@ -262,7 +285,7 @@ pub fn validate_commit<'c>(
     }
 
     // 11. MST inversion
-    if opts.verify_mst {
+    if opts.verify_mst || signing_key.is_some() {
         verify_mst(msg, &parsed, &commit_obj, &handle)
             .map_err(CommitValidationError::MstInvalid)?;
     }
@@ -279,6 +302,7 @@ pub fn validate_commit<'c>(
 pub fn validate_sync<'c>(
     msg: &'c Sync<'c>,
     signing_key: Option<&PublicKey>,
+    opts: &ValidationOptions,
 ) -> Result<ValidatedSync, SyncValidationError> {
     let handle = tokio::runtime::Handle::current();
     const MAX_BLOCKS_BYTES: usize = 2_097_152;
@@ -292,6 +316,20 @@ pub fn validate_sync<'c>(
     let parsed = handle
         .block_on(parse_car_bytes(msg.blocks.as_ref()))
         .map_err(|e| SyncValidationError::MalformedCar(miette::miette!("{e}")))?;
+
+    if opts.verify_cids {
+        let temp_store = MemoryBlockStore::new();
+        for (claimed_cid, bytes) in &parsed.blocks {
+            let computed_cid = handle
+                .block_on(temp_store.put(bytes.as_ref()))
+                .map_err(|e| SyncValidationError::MalformedCar(miette::miette!("{e}")))?;
+            if computed_cid != *claimed_cid {
+                return Err(SyncValidationError::MalformedCar(miette::miette!(
+                    "CAR block CID mismatch: claimed {claimed_cid}, computed {computed_cid}"
+                )));
+            }
+        }
+    }
 
     let root_bytes = parsed.blocks.get(&parsed.root).ok_or_else(|| {
         SyncValidationError::MalformedCar(miette::miette!("root block missing from CAR"))

@@ -59,6 +59,7 @@ impl Hydrant {
                 crate::ingest::validation::ValidationOptions {
                     verify_mst: config.verify_mst,
                     rev_clock_skew_secs: config.rev_clock_skew_secs,
+                    verify_cids: config.verify_cids,
                 },
             );
 
