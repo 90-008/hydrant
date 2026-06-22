@@ -45,6 +45,7 @@ pub struct AppState {
     pub ephemeral: bool,
     pub ephemeral_ttl: Duration,
     pub only_index_links: bool,
+    pub verify_cids: bool,
     pub get_repo_semaphore: Semaphore,
 }
 
@@ -125,6 +126,7 @@ impl AppState {
             ephemeral: config.ephemeral,
             ephemeral_ttl: config.ephemeral_ttl,
             only_index_links: config.only_index_links,
+            verify_cids: config.verify_cids,
             get_repo_semaphore: Semaphore::new(config.get_repo_concurrency_limit),
             throttler: Throttler::new(),
             #[cfg(feature = "relay")]

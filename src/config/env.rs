@@ -216,6 +216,7 @@ impl Config {
             "GET_REPO_CONCURRENCY_LIMIT",
             defaults.get_repo_concurrency_limit
         );
+        let verify_cids: bool = cfg!("VERIFY_CIDS", defaults.verify_cids);
         let only_index_links: bool = cfg!("ONLY_INDEX_LINKS", defaults.only_index_links);
         let max_pds_added_per_day = parse_new_host_limit(defaults.new_host_limit);
 
@@ -347,6 +348,7 @@ impl Config {
             filter_excludes,
             enable_backlinks,
             get_repo_concurrency_limit,
+            verify_cids,
             only_index_links,
             new_host_limit: max_pds_added_per_day,
             offline_host_retry_interval: offline_retry_interval,

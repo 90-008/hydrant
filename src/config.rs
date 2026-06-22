@@ -115,6 +115,10 @@ pub struct Config {
     /// set via `HYDRANT_GET_REPO_CONCURRENCY_LIMIT`; defaults to 2.
     pub get_repo_concurrency_limit: usize,
 
+    /// if `true`, cryptographically verifies that all imported block content matches their claimed CIDs.
+    /// set via `HYDRANT_VERIFY_CIDS=true`.
+    pub verify_cids: bool,
+
     /// if `true`, record blocks are not stored; only the index (records, counts, events) is kept.
     /// `getRecord`, `listRecords`, and `getRepo` will return errors when this is enabled.
     /// event stream still functions but create/update events will not include record values.
@@ -280,6 +284,7 @@ impl Default for Config {
             filter_excludes: None,
             enable_backlinks: false,
             get_repo_concurrency_limit: 2,
+            verify_cids: false,
             only_index_links: false,
             new_host_limit: Some(50),
             offline_host_retry_interval: Some(Duration::from_secs(30 * 60)),
