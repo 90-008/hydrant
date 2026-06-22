@@ -100,7 +100,9 @@ pub fn is_status_their_fault(status: u16) -> bool {
             | 436 // some stupid ass error code idk, some domain park uses this i think???
             | 403 // FORBIDDEN: sob
             | 401 // UNAUTHORIZED: sob
-            | 410 // GONE: sob
+            // note: 410 GONE is intentionally excluded — it has explicit application-level meaning
+            // (repo deleted/tombstoned) and is handled as NoSignal in the crawler. including it
+            // here would throttle the whole PDS for a single deleted repo.
         )
 }
 
