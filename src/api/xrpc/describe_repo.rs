@@ -55,16 +55,9 @@ pub async fn handle(
     ExtractXrpc(req): ExtractXrpc<DescribeRepo>,
 ) -> XrpcResult<Json<DescribeRepoOutput<'static>>> {
     let nsid = DescribeRepoResponse::NSID;
-    let doc = super::resolve_mini_doc::resolve_mini_doc(&hydrant, &req.identifier, nsid);
-    let did = hydrant
-        .state
-        .resolver
-        .resolve_did(&req.identifier)
-        .await
-        .map_err(|e| internal_error(nsid, format!("can't resolve identifier: {e}")))?;
-    let repo = hydrant.repos.get(&did);
-    let collections = repo.collections().map_err(|e| internal_error(nsid, e));
-    let (doc, collections) = tokio::try_join!(doc, collections)?;
+    let doc = super::resolve_mini_doc::resolve_mini_doc(&hydrant, &req.identifier, nsid).await?;
+    let repo = hydrant.repos.get(&doc.did);
+    let collections = repo.collections().map_err(|e| internal_error(nsid, e)).await?;
 
     Ok(Json(DescribeRepoOutput {
         did: doc.did,
