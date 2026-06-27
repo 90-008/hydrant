@@ -301,17 +301,25 @@ impl FirehoseIngestor {
                                     let accounts = self.state.db.get_count(&count_key).await;
                                     #[cfg(feature = "firehose-diagnostics")]
                                     let throttle_started = Instant::now();
-                                    tokio::select! {
-                                        _ = self.throttle.wait_for_allow(accounts, &tier) => {
-                                            #[cfg(feature = "firehose-diagnostics")]
-                                            self.stats.record_throttle_wait(throttle_started.elapsed());
-                                        }
-                                        _ = self.enabled.changed() => {
-                                            if !*self.enabled.borrow() {
-                                                info!("firehose disabled, disconnecting");
-                                                break Ok(());
+                                    let mut disabled = false;
+                                    loop {
+                                        tokio::select! {
+                                            _ = self.throttle.wait_for_allow(accounts, &tier) => {
+                                                #[cfg(feature = "firehose-diagnostics")]
+                                                self.stats.record_throttle_wait(throttle_started.elapsed());
+                                                break;
+                                            }
+                                            res = self.enabled.changed() => {
+                                                if res.is_err() || !*self.enabled.borrow() {
+                                                    disabled = true;
+                                                    break;
+                                                }
                                             }
                                         }
+                                    }
+                                    if disabled {
+                                        info!("firehose disabled, disconnecting");
+                                        break Ok(());
                                     }
                                 }
                                 self.handle_message(msg).await;
