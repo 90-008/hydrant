@@ -86,7 +86,14 @@ async fn seed_one(
     let mut total = 0usize;
     let mut added = 0usize;
 
+    let mut page_count = 0;
     loop {
+        page_count += 1;
+        if page_count > 100 {
+            warn!("listHosts pagination limit (100) reached, stopping");
+            break;
+        }
+
         let url = list_hosts_url(seed_url, cursor.as_deref());
         let resp = match http.get(url.clone()).send().await {
             Ok(r) => r,
@@ -96,14 +103,17 @@ async fn seed_one(
             }
         };
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp
-                .bytes()
-                .await
-                .ok()
-                .map(|bytes| body_preview(&bytes))
-                .unwrap_or_else(|| "<failed to read body>".to_string());
+        let status = resp.status();
+        let bytes = match read_limited_response(resp, 10 * 1024 * 1024).await {
+            Ok(b) => b,
+            Err(e) => {
+                warn!(url = %url, err = %e, "failed to read listHosts response, stopping");
+                break;
+            }
+        };
+
+        if !status.is_success() {
+            let body = body_preview(&bytes);
             warn!(
                 url = %url,
                 status = %status,
@@ -112,14 +122,6 @@ async fn seed_one(
             );
             break;
         }
-
-        let bytes = match resp.bytes().await {
-            Ok(b) => b,
-            Err(e) => {
-                warn!(url = %url, err = %e, "failed to read listHosts response, stopping");
-                break;
-            }
-        };
 
         let body: ListHostsOutput<'_> = match serde_json::from_slice(&bytes) {
             Ok(b) => b,
@@ -154,6 +156,12 @@ async fn seed_one(
                 // since the firehose ingestor handles reconnection for transiently-unavailable hosts
                 if matches!(host.status, Some(HostStatus::Banned)) {
                     banned += 1;
+                    continue;
+                }
+
+                if !is_safe_seed_host(&host.hostname) {
+                    invalid += 1;
+                    warn!(hostname = %host.hostname, "unsafe/private hostname in listHosts response, skipping");
                     continue;
                 }
 
@@ -442,3 +450,44 @@ mod tests {
         Ok(())
     }
 }
+
+async fn read_limited_response(resp: reqwest::Response, limit: usize) -> miette::Result<bytes::Bytes> {
+    use bytes::BytesMut;
+    use futures::StreamExt as _;
+    let mut stream = resp.bytes_stream();
+    let mut buf = BytesMut::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.into_diagnostic().context("failed to read response chunk")?;
+        if buf.len() + chunk.len() > limit {
+            miette::bail!("response body too large (exceeds {limit} bytes)");
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf.freeze())
+}
+
+fn is_private_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(ip) => ip.is_loopback() || ip.is_private() || ip.is_link_local() || ip.is_multicast() || ip.is_unspecified(),
+        std::net::IpAddr::V6(ip) => {
+            ip.is_loopback() || ip.is_multicast() || ip.is_unspecified() || {
+                let octets = ip.octets();
+                (octets[0] & 0xfe) == 0xfc || (octets[0] == 0xfe && (octets[1] & 0xc0) == 0x80)
+            }
+        }
+    }
+}
+
+fn is_safe_seed_host(host: &str) -> bool {
+    if host.is_empty() {
+        return false;
+    }
+    if host == "localhost" || host.ends_with(".local") || host.ends_with(".internal") {
+        return false;
+    }
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return !is_private_ip(ip);
+    }
+    true
+}
+
