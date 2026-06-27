@@ -80,11 +80,11 @@ impl ListReposProducer {
                 Ok(r) => r,
                 Err(RetryOutcome::Ratelimited) => {
                     warn!("rate limited by relay after retries");
-                    continue;
+                    miette::bail!("rate limited by relay after retries");
                 }
                 Err(RetryOutcome::Failed(e)) => {
                     error!(err = %e, "crawler failed to fetch listRepos");
-                    continue;
+                    return Err(e).into_diagnostic().wrap_err("crawler failed to fetch listRepos");
                 }
             };
 
@@ -92,7 +92,7 @@ impl ListReposProducer {
                 Ok(b) => b,
                 Err(e) => {
                     error!(err = %e, "cant read listRepos response");
-                    continue;
+                    return Err(e).into_diagnostic().wrap_err("cant read listRepos response");
                 }
             };
 

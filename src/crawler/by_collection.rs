@@ -110,11 +110,11 @@ impl ByCollectionProducer {
                 Ok(r) => r,
                 Err(RetryOutcome::Ratelimited) => {
                     warn!(%collection, "rate limited by collection index after retries");
-                    continue;
+                    miette::bail!("rate limited by collection index after retries");
                 }
                 Err(RetryOutcome::Failed(e)) => {
                     error!(err = %e, %collection, "by-collection fetch failed");
-                    continue;
+                    return Err(e).into_diagnostic().wrap_err("by-collection fetch failed");
                 }
             };
 
@@ -122,7 +122,7 @@ impl ByCollectionProducer {
                 Ok(b) => b,
                 Err(e) => {
                     error!(err = %e, "can't read listReposByCollection response");
-                    continue;
+                    return Err(e).into_diagnostic().wrap_err("can't read listReposByCollection response");
                 }
             };
 
