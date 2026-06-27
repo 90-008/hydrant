@@ -321,6 +321,11 @@ pub(crate) async fn process_did(
         "fetched car bytes"
     );
 
+    // TODO: enforce a max_car_body_bytes limit here before parsing to prevent a malicious
+    // or compromised PDS from returning an unbounded response and causing OOM.
+    // also apply to the sparse path in sparse.rs.
+    // (finding d87fbd22402c81919fceb9cdfee53cd4)
+
     // 3. import repo
     let start = Instant::now();
     let parsed = jacquard_repo::car::reader::parse_car_bytes(&car_bytes.body)
