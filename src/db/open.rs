@@ -192,9 +192,10 @@ impl Db {
             "records",
             opts()
                 // point reads might miss when using getRecord
-                // but we assume thats not going to happen often... (todo: should be a config option maybe?)
-                // and since this keyspace is big, turning off bloom filters will help a lot
-                .expect_point_read_hits(true)
+                // but we assume thats not going to happen often...
+                // since this keyspace is big, turning off bloom filters will help a lot with memory/disk space,
+                // but leaves point reads vulnerable to disk I/O misses under public query load
+                .expect_point_read_hits(!cfg.db_records_bloom_filters)
                 .max_memtable_size(mb(cfg.db_records_memtable_size_mb))
                 // its just did|col|rkey -> cid, very small (84 bytes for bsky post)
                 .data_block_size_policy(BlockSizePolicy::new([kb(8), kb(16)]))

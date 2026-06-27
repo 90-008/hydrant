@@ -162,6 +162,10 @@ impl Config {
             "DB_RECORDS_MEMTABLE_SIZE_MB",
             defaults.db_records_memtable_size_mb
         );
+        let db_records_bloom_filters: bool = cfg!(
+            "DB_RECORDS_BLOOM_FILTERS",
+            defaults.db_records_bloom_filters
+        );
         let db_repos_memtable_size_mb = cfg!(
             "DB_REPOS_MEMTABLE_SIZE_MB",
             defaults.db_repos_memtable_size_mb
@@ -363,6 +367,7 @@ impl Config {
             db_repos_memtable_size_mb,
             db_events_memtable_size_mb,
             db_records_memtable_size_mb,
+            db_records_bloom_filters,
             stream_replay_chunk_size,
             stream_replay_chunk_pause,
             stream_pending_event_limit,

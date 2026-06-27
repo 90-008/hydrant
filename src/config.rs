@@ -204,6 +204,11 @@ pub struct Config {
     /// in-memory write buffer (memtable) size for the records keyspace in MB.
     /// set via `HYDRANT_DB_RECORDS_MEMTABLE_SIZE_MB`.
     pub db_records_memtable_size_mb: u64,
+    /// db internals, tune only if you know what you're doing.
+    ///
+    /// whether bloom filters are enabled for the records keyspace.
+    /// set via `HYDRANT_DB_RECORDS_BLOOM_FILTERS`.
+    pub db_records_bloom_filters: bool,
 
     /// replay batch size.
     ///
@@ -307,6 +312,7 @@ impl Default for Config {
             db_repos_memtable_size_mb: BASE_MEMTABLE_MB / 2,
             db_events_memtable_size_mb: BASE_MEMTABLE_MB,
             db_records_memtable_size_mb: BASE_MEMTABLE_MB / 3 * 2,
+            db_records_bloom_filters: false,
             stream_replay_chunk_size: 0,
             stream_replay_chunk_pause: Duration::ZERO,
             stream_pending_event_limit: 4096,
@@ -415,6 +421,11 @@ impl fmt::Display for Config {
             f,
             "db records memtable",
             format_args!("{} mb", self.db_records_memtable_size_mb)
+        )?;
+        config_line!(
+            f,
+            "db records bloom filters",
+            self.db_records_bloom_filters
         )?;
         let replay_chunk = if self.stream_replay_chunk_size == 0 {
             "auto".to_owned()
