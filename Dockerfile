@@ -39,6 +39,7 @@ RUN useradd --system --no-create-home --shell /usr/sbin/nologin hydrant
 COPY --from=builder /build/target/release/hydrant /usr/local/bin/hydrant
 
 # data volume for the fjall database
+RUN mkdir -p /data && chown -R hydrant:hydrant /data
 VOLUME ["/data"]
 WORKDIR /data
 
