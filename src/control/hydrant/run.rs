@@ -402,6 +402,7 @@ impl Hydrant {
                         checker: checker.clone(),
                         in_flight: in_flight.clone(),
                         tx: tx.clone(),
+                        enabled: state.crawler_enabled.subscribe(),
                     }
                     .run(),
                 );

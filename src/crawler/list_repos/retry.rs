@@ -13,6 +13,7 @@ use super::super::InFlight;
 use super::super::worker::CrawlerBatch;
 use super::checker::{MAX_RETRY_ATTEMPTS, RetryState, SignalChecker};
 use crate::db::keys;
+use crate::util::WatchEnabledExt;
 
 const MAX_RETRY_BATCH: usize = 1000;
 
@@ -21,11 +22,13 @@ pub(crate) struct RetryProducer {
     pub(crate) checker: SignalChecker,
     pub(crate) in_flight: InFlight,
     pub(crate) tx: mpsc::Sender<CrawlerBatch>,
+    pub(crate) enabled: tokio::sync::watch::Receiver<bool>,
 }
 
 impl RetryProducer {
-    pub(crate) async fn run(self) {
+    pub(crate) async fn run(mut self) {
         loop {
+            self.enabled.wait_enabled("crawler retry").await;
             match self.process_queue().await {
                 Ok(Some(dur)) => tokio::time::sleep(dur.max(Duration::from_secs(1))).await,
                 Ok(None) => tokio::time::sleep(Duration::from_secs(60)).await,
@@ -75,8 +78,9 @@ impl RetryProducer {
                         .as_seconds_f64()
                         .mul(rng.random_range(0.01..0.07)) as i64,
                 );
-                if state.after + backoff > now {
-                    let wake = (state.after - now).to_std().unwrap_or(Duration::ZERO);
+                let ready_at = state.after + backoff;
+                if ready_at > now {
+                    let wake = (ready_at - now).to_std().unwrap_or(Duration::ZERO);
                     next_wake = Some(next_wake.map(|w| w.min(wake)).unwrap_or(wake));
                     continue;
                 }
