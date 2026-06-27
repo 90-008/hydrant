@@ -18,6 +18,7 @@ pub(crate) struct OldRepoState<'i> {
     pub status: RepoStatus, // from v2, old is same as new
     pub rev: Option<DbTid>,
     pub data: Option<IpldCid>,
+    #[serde(default)]
     pub last_message_time: Option<i64>,
     pub last_updated_at: i64,
     pub tracked: bool,
