@@ -49,17 +49,19 @@ pub async fn handle(
             };
 
             let status = repo_status_to_api(state.status);
-            repos.push(Repo {
+            let repo = Repo {
                 active: Some(state.active),
                 did: did.clone(),
                 head: Cid::Str(CowStr::Owned(commit_cid.to_smolstr())),
                 rev: atp_commit.rev,
                 status,
                 extra_data: None,
-            });
+            };
 
-            if repos.len() >= limit {
-                next_cursor = Some(did);
+            if repos.len() < limit {
+                repos.push(repo);
+            } else {
+                next_cursor = repos.last().map(|r| r.did.clone());
                 break;
             }
         }
