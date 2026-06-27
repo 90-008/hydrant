@@ -55,8 +55,4 @@ impl Hydrant {
 
         RelayEventStream(rx)
     }
-
-    pub(crate) fn stream_send_timeout(&self) -> std::time::Duration {
-        self.config.stream_send_timeout
-    }
 }

@@ -61,6 +61,10 @@ impl Hydrant {
         &self.state.resolver
     }
 
+    pub(crate) fn stream_send_timeout(&self) -> std::time::Duration {
+        self.config.stream_send_timeout
+    }
+
     /// open the database and configure hydrant from `config`.
     ///
     /// this sets up the database, applies any filter configuration from `config`, and

@@ -94,10 +94,6 @@ impl Hydrant {
         EventStream(rx)
     }
 
-    pub(crate) fn stream_send_timeout(&self) -> std::time::Duration {
-        self.config.stream_send_timeout
-    }
-
     #[cfg(feature = "indexer_stream")]
     #[doc(hidden)]
     pub fn seed_events_for_bench(&self, count: usize) -> usize {
