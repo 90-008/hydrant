@@ -81,7 +81,7 @@ def fetch-relay-host-status [relay_base: string, host: string, timeout_secs: int
             relay_http: $http_code,
             relay_status: ($payload.status? | default null),
             relay_seq: ($payload.seq? | default null),
-            relay_account_count: ($payload.account_count? | default null),
+            relay_account_count: ($payload.accountCount? | default null),
             relay_error: null
         }
     } else {
