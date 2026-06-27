@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "hydrant",
+  "project_id": "1b77944f-487d-44d9-8a53-aac4128040a9"
+}
