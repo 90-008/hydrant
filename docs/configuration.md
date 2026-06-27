@@ -60,7 +60,7 @@ hydrant is configured via environment variables, all prefixed with `HYDRANT_` (e
 | `REPO_FETCH_TIMEOUT` | `5min` | timeout for fetching a repository |
 | `VERIFY_SIGNATURES` | `full` | signature verification level: `full`, `backfill-only`, or `none` |
 | `PLC_URL` | `https://plc.wtf`, `https://plc.directory` (full network) | base URL(s) of the PLC directory, comma-separated |
-| `IDENTITY_CACHE_SIZE` | `100000` | number of identity entries to cache in memory |
+| `IDENTITY_CACHE_SIZE` | `1000000` | number of identity entries to cache in memory |
 
 ## performance
 
