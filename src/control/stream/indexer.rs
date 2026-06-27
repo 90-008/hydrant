@@ -210,10 +210,20 @@ pub(crate) fn stored_to_event(
             live,
             did: did.to_did(),
             rev: rev.to_tid(),
-            collection: Nsid::new_cow(collection.clone().into_static())
-                .expect("that collection is already validated"),
-            rkey: Rkey::new_cow(CowStr::Owned(rkey.to_smolstr()))
-                .expect("that rkey is already validated"),
+            collection: match Nsid::new_cow(collection.clone().into_static()) {
+                Ok(nsid) => nsid,
+                Err(e) => {
+                    error!(err = %e, ?collection, "stored event has invalid collection NSID");
+                    return None;
+                }
+            },
+            rkey: match Rkey::new_cow(CowStr::Owned(rkey.to_smolstr())) {
+                Ok(rk) => rk,
+                Err(e) => {
+                    error!(err = %e, ?rkey, "stored event has invalid rkey");
+                    return None;
+                }
+            },
             action: CowStr::Borrowed(action.as_str()),
             record,
             cid,

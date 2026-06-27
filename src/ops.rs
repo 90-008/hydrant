@@ -461,5 +461,13 @@ pub fn parse_path(path: &str) -> Result<(&str, &str)> {
     let mut parts = path.splitn(2, '/');
     let collection = parts.next().wrap_err("missing collection")?;
     let rkey = parts.next().wrap_err("missing rkey")?;
+    
+    if collection.is_empty() || jacquard_common::types::nsid::Nsid::new(collection).is_err() {
+        miette::bail!("invalid collection NSID: {collection}");
+    }
+    if rkey.is_empty() || jacquard_common::types::string::Rkey::new(rkey).is_err() {
+        miette::bail!("invalid record key (rkey): {rkey}");
+    }
+    
     Ok((collection, rkey))
 }
