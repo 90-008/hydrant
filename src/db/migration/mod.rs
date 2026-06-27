@@ -43,6 +43,8 @@ const MIGRATIONS: &[(&str, MigrationFn)] = &[
     ("migrate_excludes_and_pds_keys", v9::migrate_v9),
 ];
 
+pub(crate) const LATEST_VERSION: u64 = MIGRATIONS.len() as u64;
+
 fn read_version(db: &Db) -> Result<u64> {
     db.counts
         .get(VERSIONING_KEY)

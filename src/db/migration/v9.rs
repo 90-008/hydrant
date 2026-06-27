@@ -63,3 +63,80 @@ pub(crate) fn migrate_v9(db: &Db, batch: &mut OwnedWriteBatch) -> Result<()> {
 pub(crate) fn migrate_v9(_db: &Db, _batch: &mut OwnedWriteBatch) -> Result<()> {
     Ok(())
 }
+
+#[cfg(all(test, feature = "indexer"))]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+    use crate::config::Config;
+
+    fn test_config(path: &std::path::Path) -> Config {
+        Config {
+            database_path: path.to_path_buf(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_migration_v9() -> Result<()> {
+        let tmp = tempdir().into_diagnostic()?;
+        let cfg = test_config(tmp.path());
+
+        let did = "did:plc:yk4q3id7id6p5z3bypvshc64";
+
+        // 1. Prepare DB with legacy keys under version 8
+        {
+            let db = Db::open(&cfg)?;
+            let mut batch = db.inner.batch();
+
+            // Legacy exclude
+            let legacy_exclude_key = format!("x|{}", did);
+            batch.insert(&db.filter, legacy_exclude_key.as_bytes(), []);
+
+            // Legacy PDS status & tier
+            let legacy_status_key = "example.com|status";
+            let status = crate::pds_meta::HostStatus::Offline;
+            batch.insert(&db.filter, legacy_status_key.as_bytes(), rmp_serde::to_vec(&status).into_diagnostic()?);
+
+            let legacy_tier_key = "example.com|tier";
+            batch.insert(&db.filter, legacy_tier_key.as_bytes(), b"tier1");
+
+            batch.insert(&db.counts, crate::db::keys::VERSIONING_KEY, 8_u64.to_be_bytes());
+            batch.commit().into_diagnostic()?;
+            db.persist()?;
+        }
+
+        // 2. Open DB again, which triggers v9 migration
+        let db = Db::open(&cfg)?;
+
+        // Verify version key is 9
+        let version_bytes = db
+            .counts
+            .get(crate::db::keys::VERSIONING_KEY)
+            .into_diagnostic()?
+            .expect("db version should be set");
+        assert_eq!(
+            u64::from_be_bytes(version_bytes.as_ref().try_into().into_diagnostic()?),
+            crate::db::migration::LATEST_VERSION
+        );
+
+        // Verify excludes migrated
+        let legacy_exclude_key = format!("x|{}", did);
+        assert!(!db.filter.contains_key(legacy_exclude_key.as_bytes()).into_diagnostic()?);
+
+        let new_exclude_key = crate::db::filter::exclude_key(did)?;
+        assert!(db.filter.contains_key(&new_exclude_key).into_diagnostic()?);
+
+        // Verify PDS status and tier migrated
+        assert!(!db.filter.contains_key(b"example.com|status").into_diagnostic()?);
+        assert!(!db.filter.contains_key(b"example.com|tier").into_diagnostic()?);
+
+        let new_status_key = crate::db::pds_meta::pds_status_key("example.com");
+        assert!(db.filter.contains_key(&new_status_key).into_diagnostic()?);
+
+        let new_tier_key = crate::db::pds_meta::pds_tier_key("example.com");
+        assert!(db.filter.contains_key(&new_tier_key).into_diagnostic()?);
+
+        Ok(())
+    }
+}

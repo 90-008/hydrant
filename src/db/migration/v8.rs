@@ -251,7 +251,7 @@ mod tests {
                 .expect("db version should be set");
             assert_eq!(
                 u64::from_be_bytes(version_bytes.as_ref().try_into().into_diagnostic()?),
-                8
+                crate::db::migration::LATEST_VERSION
             );
 
             let synced_state = db
