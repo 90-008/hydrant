@@ -185,21 +185,19 @@ impl FilterPatch {
 
     /// add multiple signals without disturbing existing ones.
     pub fn append_signals(mut self, signals: impl IntoIterator<Item = impl Into<String>>) -> Self {
-        self.signals = Some(SetUpdate::Patch(
-            signals.into_iter().map(|s| (s.into(), true)).collect(),
-        ));
+        merge_set_update_append(&mut self.signals, signals.into_iter().map(Into::into));
         self
     }
 
     /// add a single signal. no-op if already present.
     pub fn add_signal(mut self, signal: impl Into<String>) -> Self {
-        self.signals = Some(SetUpdate::Patch([(signal.into(), true)].into()));
+        merge_set_update_add(&mut self.signals, signal.into());
         self
     }
 
     /// remove a single signal. no-op if not present.
     pub fn remove_signal(mut self, signal: impl Into<String>) -> Self {
-        self.signals = Some(SetUpdate::Patch([(signal.into(), false)].into()));
+        merge_set_update_remove(&mut self.signals, signal.into());
         self
     }
 
@@ -219,21 +217,19 @@ impl FilterPatch {
         mut self,
         collections: impl IntoIterator<Item = impl Into<String>>,
     ) -> Self {
-        self.collections = Some(SetUpdate::Patch(
-            collections.into_iter().map(|c| (c.into(), true)).collect(),
-        ));
+        merge_set_update_append(&mut self.collections, collections.into_iter().map(Into::into));
         self
     }
 
     /// add a single collection filter. no-op if already present.
     pub fn add_collection(mut self, collection: impl Into<String>) -> Self {
-        self.collections = Some(SetUpdate::Patch([(collection.into(), true)].into()));
+        merge_set_update_add(&mut self.collections, collection.into());
         self
     }
 
     /// remove a single collection filter. no-op if not present.
     pub fn remove_collection(mut self, collection: impl Into<String>) -> Self {
-        self.collections = Some(SetUpdate::Patch([(collection.into(), false)].into()));
+        merge_set_update_remove(&mut self.collections, collection.into());
         self
     }
 
@@ -250,21 +246,19 @@ impl FilterPatch {
         mut self,
         excludes: impl IntoIterator<Item = impl Into<String>>,
     ) -> Self {
-        self.excludes = Some(SetUpdate::Patch(
-            excludes.into_iter().map(|d| (d.into(), true)).collect(),
-        ));
+        merge_set_update_append(&mut self.excludes, excludes.into_iter().map(Into::into));
         self
     }
 
     /// add a single DID to the excludes set. no-op if already excluded.
     pub fn add_exclude(mut self, did: impl Into<String>) -> Self {
-        self.excludes = Some(SetUpdate::Patch([(did.into(), true)].into()));
+        merge_set_update_add(&mut self.excludes, did.into());
         self
     }
 
     /// remove a single DID from the excludes set. no-op if not present.
     pub fn remove_exclude(mut self, did: impl Into<String>) -> Self {
-        self.excludes = Some(SetUpdate::Patch([(did.into(), false)].into()));
+        merge_set_update_remove(&mut self.excludes, did.into());
         self
     }
 
@@ -316,5 +310,60 @@ impl FilterPatch {
 
         filter_handle.store(Arc::new(new_filter));
         Ok(snapshot)
+    }
+}
+
+fn merge_set_update_append(opt: &mut Option<SetUpdate>, items: impl IntoIterator<Item = String>) {
+    let new_items: Vec<String> = items.into_iter().collect();
+    if new_items.is_empty() {
+        return;
+    }
+    match opt {
+        Some(SetUpdate::Set(vec)) => {
+            for item in new_items {
+                if !vec.contains(&item) {
+                    vec.push(item);
+                }
+            }
+        }
+        Some(SetUpdate::Patch(map)) => {
+            for item in new_items {
+                map.insert(item, true);
+            }
+        }
+        None => {
+            let map = new_items.into_iter().map(|item| (item, true)).collect();
+            *opt = Some(SetUpdate::Patch(map));
+        }
+    }
+}
+
+fn merge_set_update_add(opt: &mut Option<SetUpdate>, item: String) {
+    match opt {
+        Some(SetUpdate::Set(vec)) => {
+            if !vec.contains(&item) {
+                vec.push(item);
+            }
+        }
+        Some(SetUpdate::Patch(map)) => {
+            map.insert(item, true);
+        }
+        None => {
+            *opt = Some(SetUpdate::Patch([(item, true)].into()));
+        }
+    }
+}
+
+fn merge_set_update_remove(opt: &mut Option<SetUpdate>, item: String) {
+    match opt {
+        Some(SetUpdate::Set(vec)) => {
+            vec.retain(|x| x != &item);
+        }
+        Some(SetUpdate::Patch(map)) => {
+            map.insert(item, false);
+        }
+        None => {
+            *opt = Some(SetUpdate::Patch([(item, false)].into()));
+        }
     }
 }
