@@ -163,6 +163,62 @@ def check-car [hydrant_url: string, pds_url: string, did: string] {
     true
 }
 
+# verify listRecords pagination using cursor
+def check-list-records-pagination [hydrant_url: string, did: string] {
+    print "verifying listRecords pagination..."
+    let collection = "app.bsky.feed.post"
+    let limit = 2
+    
+    # 1. get first page with limit=2
+    let page1 = (http get $"($hydrant_url)/xrpc/com.atproto.repo.listRecords?repo=($did)&collection=($collection)&limit=($limit)")
+    let page1_records = $page1.records
+    let cursor = ($page1 | get --optional cursor)
+    
+    if ($page1_records | length) < $limit {
+        print "  skipping listRecords pagination test: not enough posts in repo"
+        return true
+    }
+    
+    if ($cursor | is-empty) {
+        print "  mismatch: expected a cursor for next page"
+        return false
+    }
+    
+    # 2. get second page with cursor
+    let page2 = (http get $"($hydrant_url)/xrpc/com.atproto.repo.listRecords?repo=($did)&collection=($collection)&limit=($limit)&cursor=($cursor | url encode)")
+    let page2_records = $page2.records
+    
+    if ($page2_records | is-empty) {
+        print $"  mismatch: expected records on second page with cursor ($cursor)"
+        return false
+    }
+    
+    let first_page1_rkey = ($page1_records | first).uri | split row "/" | last
+    let last_page1_rkey = ($page1_records | last).uri | split row "/" | last
+    let first_page2_rkey = ($page2_records | first).uri | split row "/" | last
+    
+    print $"  page1 range: ($first_page1_rkey) .. ($last_page1_rkey)"
+    print $"  page2 first rkey: ($first_page2_rkey)"
+    print $"  cursor is: ($cursor)"
+    
+    if $first_page1_rkey == $first_page2_rkey {
+        print "  mismatch: page2 first rkey should not be the same as page1 first rkey"
+        return false
+    }
+    
+    if $cursor > $last_page1_rkey {
+        print $"  mismatch: cursor ($cursor) should be <= last page1 rkey ($last_page1_rkey)"
+        return false
+    }
+    if $first_page2_rkey >= $cursor {
+        print $"  mismatch: first page 2 rkey ($first_page2_rkey) should be < cursor ($cursor)"
+        return false
+    }
+    
+    print "  listRecords pagination verification passed!"
+    true
+}
+
 def main [] {
     let did = ($env | get --optional REPO_SYNC_INTEGRITY_DID | default "did:plc:ewvi7nxzyoun6zhxrhs64oiz")
     let pds = ($env | get --optional REPO_SYNC_INTEGRITY_PDS | default (resolve-pds $did))
@@ -193,12 +249,13 @@ def main [] {
             let commit = (check-latest-commit $url $pds $did)
             let commit_passed = $commit != null
             let car_passed = if $commit_passed { check-car $url $pds $did } else { false }
+            let pagination_passed = (check-list-records-pagination $url $did)
 
-            if $integrity_passed and $count_passed and $commit_passed and $car_passed {
+            if $integrity_passed and $count_passed and $commit_passed and $car_passed and $pagination_passed {
                 print "all integrity checks passed!"
                 $success = true
             } else {
-                print $"integrity checks failed. consistency: ($integrity_passed), count: ($count_passed), commit: ($commit_passed), car: ($car_passed)"
+                print $"integrity checks failed. consistency: ($integrity_passed), count: ($count_passed), commit: ($commit_passed), car: ($car_passed), pagination: ($pagination_passed)"
             }
         } else {
             print "backfill failed or timed out."

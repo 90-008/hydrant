@@ -388,7 +388,8 @@ impl<'i> RepoHandle<'i> {
 
                 let end_key = if let Some(cursor) = &cursor {
                     let mut k = prefix.clone();
-                    k.extend_from_slice(cursor.as_bytes());
+                    let rkey = DbRkey::new(cursor);
+                    keys::write_rkey(&mut k, &rkey);
                     k
                 } else {
                     end_prefix
@@ -404,7 +405,8 @@ impl<'i> RepoHandle<'i> {
             } else {
                 let start_key = if let Some(cursor) = &cursor {
                     let mut k = prefix.clone();
-                    k.extend_from_slice(cursor.as_bytes());
+                    let rkey = DbRkey::new(cursor);
+                    keys::write_rkey(&mut k, &rkey);
                     k.push(0);
                     k
                 } else {
