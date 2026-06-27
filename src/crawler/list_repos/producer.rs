@@ -109,16 +109,13 @@ impl ListReposProducer {
                 let filter_ks = db.filter.clone();
                 let crawler_ks = db.crawler.clone();
 
-                tokio::time::timeout(
+                match tokio::time::timeout(
                     BLOCKING_TASK_TIMEOUT,
                     tokio::task::spawn_blocking(move || -> Result<Option<ParseResult>> {
-                        let output = match serde_json::from_slice::<ListReposOutput>(&bytes) {
-                            Ok(out) => out.into_static(),
-                            Err(e) => {
-                                error!(err = %e, "failed to parse listRepos response");
-                                return Ok(None);
-                            }
-                        };
+                        let output = serde_json::from_slice::<ListReposOutput>(&bytes)
+                            .into_diagnostic()
+                            .wrap_err("failed to parse listRepos response")?
+                            .into_static();
                         if output.repos.is_empty() {
                             return Ok(None);
                         }
@@ -147,15 +144,19 @@ impl ListReposProducer {
                     }),
                 )
                 .await
-            }
-            .into_diagnostic()?
-            .map_err(|_| {
-                error!(
-                    "spawn_blocking task for parsing listRepos timed out after {}s",
-                    BLOCKING_TASK_TIMEOUT.as_secs()
-                );
-                miette::miette!("spawn_blocking task for parsing listRepos timed out")
-            })?;
+                {
+                    Ok(res) => res
+                        .into_diagnostic()
+                        .wrap_err("blocking task failed to parse listRepos")?,
+                    Err(_) => {
+                        error!(
+                            "spawn_blocking task for parsing listRepos timed out after {}s",
+                            BLOCKING_TASK_TIMEOUT.as_secs()
+                        );
+                        miette::bail!("spawn_blocking task for parsing listRepos timed out");
+                    }
+                }
+            };
 
             let ParseResult {
                 unknown_dids,
@@ -215,9 +216,7 @@ impl ListReposProducer {
                 )
                 .await
                 .into_diagnostic()?
-                .map_err(|_| miette::miette!("retry state commit timed out"))?
-                .inspect_err(|e| error!(err = ?e, "retry state commit failed"))
-                .ok();
+                .map_err(|_| miette::miette!("retry state commit timed out"))??;
                 confirmed
             } else {
                 in_flight
