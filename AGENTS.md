@@ -163,10 +163,14 @@ Hydrant uses multiple `fjall` keyspaces:
 Commits should be brief and descriptive, following the format:
 `[module] brief description`
 
+Important rules:
+- Commit issues separately (one commit per issue or logical fix). Do not bundle multiple issue fixes into a single giant commit.
+
 Examples:
 - `[ingest] implement backfill buffer replay`
 - `[api] add accurate count parameter to stats`
 - `[db] migrate block storage to msgpack`
+
 
 
 <!-- headroom:rtk-instructions -->
