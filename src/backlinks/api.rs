@@ -71,6 +71,9 @@ pub async fn handle_get_backlinks(
         .fetch(params.subject)
         .limit(limit)
         .reverse(reverse);
+    if !params.did.is_empty() {
+        fetch = fetch.dids(params.did);
+    }
     if let Some(ref src) = params.source {
         fetch = fetch.source(src);
     }
@@ -106,6 +109,9 @@ pub async fn handle_get_backlinks_count(
     axum::extract::Query(params): axum::extract::Query<GetBacklinksCountParams>,
 ) -> Result<Json<GetBacklinksCountOutput>, StatusCode> {
     let mut count_q = hydrant.backlinks.count(params.subject);
+    if !params.did.is_empty() {
+        count_q = count_q.dids(params.did);
+    }
     if let Some(ref src) = params.source {
         count_q = count_q.source(src);
     }
