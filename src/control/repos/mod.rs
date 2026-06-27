@@ -311,6 +311,9 @@ impl<'i> RepoHandle<'i> {
             let prefix = keys::did_collection_prefix(&did);
             let mut res = HashMap::new();
             for item in state.db.counts.prefix(&prefix) {
+                if res.len() >= 1000 {
+                    break;
+                }
                 let (k, v) = item.into_inner().into_diagnostic()?;
                 let col = k
                     .strip_prefix(prefix.as_slice())
