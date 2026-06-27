@@ -115,7 +115,7 @@ fn is_throttle_worthy(e: &reqwest::Error) -> bool {
     e.status().is_some_and(|s| {
         // lets not consider internal server errors for throttling
         // a server might be having a hard time on one request, but not on the rest
-        s.as_u16() != 500 && is_status_their_fault(s.as_u16())
+        s.as_u16() != 500 && s.as_u16() != 404 && is_status_their_fault(s.as_u16())
     })
 }
 
@@ -251,7 +251,7 @@ impl SignalChecker {
                 }
             };
 
-            let bytes = match resp.bytes().await {
+            let bytes = match crate::util::read_limited_bytes(resp, 2 * 1024 * 1024).await {
                 Ok(b) => b,
                 Err(e) => {
                     error!(err = %e, "failed to read describeRepo response");
