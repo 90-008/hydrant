@@ -301,12 +301,21 @@ impl FirehoseWorker {
     // don't retry commit or sync on key fetch errors
     // since we'll just try again later if we get commit or sync again
     fn check_if_retriable_failure(e: &IngestError) -> bool {
-        matches!(
-            e,
-            IngestError::Generic(_)
-                | IngestError::Resolver(ResolverError::Ratelimited)
-                | IngestError::Resolver(ResolverError::Transport(_))
-        )
+        match e {
+            IngestError::Commit(_) | IngestError::NoSigningKey(_) => false,
+            IngestError::Generic(report) => {
+                if report.downcast_ref::<jacquard_repo::error::CommitError>().is_some()
+                    || report.downcast_ref::<crate::resolver::NoSigningKeyError>().is_some()
+                {
+                    false
+                } else {
+                    true
+                }
+            }
+            IngestError::Resolver(ResolverError::Ratelimited) => true,
+            IngestError::Resolver(ResolverError::Transport(_)) => true,
+            _ => false,
+        }
     }
 
     fn handle_commit<'s, 'c>(
