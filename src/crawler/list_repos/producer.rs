@@ -84,7 +84,9 @@ impl ListReposProducer {
                 }
                 Err(RetryOutcome::Failed(e)) => {
                     error!(err = %e, "crawler failed to fetch listRepos");
-                    return Err(e).into_diagnostic().wrap_err("crawler failed to fetch listRepos");
+                    return Err(e)
+                        .into_diagnostic()
+                        .wrap_err("crawler failed to fetch listRepos");
                 }
             };
 
@@ -92,7 +94,9 @@ impl ListReposProducer {
                 Ok(b) => b,
                 Err(e) => {
                     error!(err = %e, "cant read listRepos response");
-                    return Err(e).into_diagnostic().wrap_err("cant read listRepos response");
+                    return Err(e)
+                        .into_diagnostic()
+                        .wrap_err("cant read listRepos response");
                 }
             };
 

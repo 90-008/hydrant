@@ -269,9 +269,9 @@ fn frame_for_event(
     }
 
     if compress {
-        let compressed = ZSTD_COMPRESSOR.with(|c| {
-            c.borrow_mut().compress(json)
-        }).map_err(|e| e.to_string())?;
+        let compressed = ZSTD_COMPRESSOR
+            .with(|c| c.borrow_mut().compress(json))
+            .map_err(|e| e.to_string())?;
 
         if exceeds_max(compressed.len(), options) {
             return Ok(None);
@@ -347,10 +347,9 @@ mod tests {
     fn test_frame_for_event_size_limits() {
         let json = b"{\"hello\": \"world\"}";
         // options with max size 5
-        let options = JetstreamFilter::new(
-            JetstreamSubscriberOptions::parse(&[], &[], 5, &[]).unwrap()
-        );
-        
+        let options =
+            JetstreamFilter::new(JetstreamSubscriberOptions::parse(&[], &[], 5, &[]).unwrap());
+
         // Uncompressed exceeds limit
         let res = frame_for_event(json, false, &options).unwrap();
         assert!(res.is_none());
@@ -360,13 +359,16 @@ mod tests {
         assert!(res.is_none());
 
         // Fits within limit
-        let options_large = JetstreamFilter::new(
-            JetstreamSubscriberOptions::parse(&[], &[], 100, &[]).unwrap()
-        );
-        let res_uncompressed = frame_for_event(json, false, &options_large).unwrap().unwrap();
+        let options_large =
+            JetstreamFilter::new(JetstreamSubscriberOptions::parse(&[], &[], 100, &[]).unwrap());
+        let res_uncompressed = frame_for_event(json, false, &options_large)
+            .unwrap()
+            .unwrap();
         assert!(res_uncompressed.is_text());
 
-        let res_compressed = frame_for_event(json, true, &options_large).unwrap().unwrap();
+        let res_compressed = frame_for_event(json, true, &options_large)
+            .unwrap()
+            .unwrap();
         assert!(res_compressed.is_binary());
     }
 }

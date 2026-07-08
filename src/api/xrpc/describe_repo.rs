@@ -57,7 +57,10 @@ pub async fn handle(
     let nsid = DescribeRepoResponse::NSID;
     let doc = super::resolve_mini_doc::resolve_mini_doc(&hydrant, &req.identifier, nsid).await?;
     let repo = hydrant.repos.get(&doc.did);
-    let collections = repo.collections().map_err(|e| internal_error(nsid, e)).await?;
+    let collections = repo
+        .collections()
+        .map_err(|e| internal_error(nsid, e))
+        .await?;
 
     Ok(Json(DescribeRepoOutput {
         did: doc.did,

@@ -428,11 +428,7 @@ impl fmt::Display for Config {
             "db records memtable",
             format_args!("{} mb", self.db_records_memtable_size_mb)
         )?;
-        config_line!(
-            f,
-            "db records bloom filters",
-            self.db_records_bloom_filters
-        )?;
+        config_line!(f, "db records bloom filters", self.db_records_bloom_filters)?;
         let replay_chunk = if self.stream_replay_chunk_size == 0 {
             "auto".to_owned()
         } else {

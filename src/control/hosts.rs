@@ -314,9 +314,21 @@ mod host_listing_tests {
         {
             let state = hydrant.state.clone();
             tokio::task::spawn_blocking(move || -> Result<()> {
-                state.db.cursors.insert(keys::firehose_cursor_key("host2"), 2_i64.to_be_bytes()).into_diagnostic()?;
-                state.db.cursors.insert(keys::firehose_cursor_key("host4"), 4_i64.to_be_bytes()).into_diagnostic()?;
-                state.db.cursors.insert(keys::firehose_cursor_key("host6"), 6_i64.to_be_bytes()).into_diagnostic()?;
+                state
+                    .db
+                    .cursors
+                    .insert(keys::firehose_cursor_key("host2"), 2_i64.to_be_bytes())
+                    .into_diagnostic()?;
+                state
+                    .db
+                    .cursors
+                    .insert(keys::firehose_cursor_key("host4"), 4_i64.to_be_bytes())
+                    .into_diagnostic()?;
+                state
+                    .db
+                    .cursors
+                    .insert(keys::firehose_cursor_key("host6"), 6_i64.to_be_bytes())
+                    .into_diagnostic()?;
                 state.db.persist()
             })
             .await

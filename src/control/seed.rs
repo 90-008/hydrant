@@ -451,13 +451,18 @@ mod tests {
     }
 }
 
-async fn read_limited_response(resp: reqwest::Response, limit: usize) -> miette::Result<bytes::Bytes> {
+async fn read_limited_response(
+    resp: reqwest::Response,
+    limit: usize,
+) -> miette::Result<bytes::Bytes> {
     use bytes::BytesMut;
     use futures::StreamExt as _;
     let mut stream = resp.bytes_stream();
     let mut buf = BytesMut::new();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.into_diagnostic().context("failed to read response chunk")?;
+        let chunk = chunk
+            .into_diagnostic()
+            .context("failed to read response chunk")?;
         if buf.len() + chunk.len() > limit {
             miette::bail!("response body too large (exceeds {limit} bytes)");
         }
@@ -468,7 +473,13 @@ async fn read_limited_response(resp: reqwest::Response, limit: usize) -> miette:
 
 fn is_private_ip(ip: std::net::IpAddr) -> bool {
     match ip {
-        std::net::IpAddr::V4(ip) => ip.is_loopback() || ip.is_private() || ip.is_link_local() || ip.is_multicast() || ip.is_unspecified(),
+        std::net::IpAddr::V4(ip) => {
+            ip.is_loopback()
+                || ip.is_private()
+                || ip.is_link_local()
+                || ip.is_multicast()
+                || ip.is_unspecified()
+        }
         std::net::IpAddr::V6(ip) => {
             ip.is_loopback() || ip.is_multicast() || ip.is_unspecified() || {
                 let octets = ip.octets();
@@ -490,4 +501,3 @@ fn is_safe_seed_host(host: &str) -> bool {
     }
     true
 }
-

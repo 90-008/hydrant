@@ -217,7 +217,10 @@ impl FilterPatch {
         mut self,
         collections: impl IntoIterator<Item = impl Into<String>>,
     ) -> Self {
-        merge_set_update_append(&mut self.collections, collections.into_iter().map(Into::into));
+        merge_set_update_append(
+            &mut self.collections,
+            collections.into_iter().map(Into::into),
+        );
         self
     }
 

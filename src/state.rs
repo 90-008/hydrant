@@ -7,7 +7,7 @@ use miette::Result;
 use smol_str::SmolStr;
 #[cfg(feature = "indexer")]
 use tokio::sync::Notify;
-use tokio::sync::{watch, Semaphore};
+use tokio::sync::{Semaphore, watch};
 use url::Url;
 
 #[cfg(feature = "firehose-diagnostics")]

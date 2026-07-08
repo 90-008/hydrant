@@ -4,11 +4,7 @@ use miette::Result;
 use crate::db::Db;
 
 #[cfg(feature = "indexer")]
-use {
-    crate::db::types::TrimmedDid,
-    jacquard_common::types::did::Did,
-    miette::IntoDiagnostic,
-};
+use {crate::db::types::TrimmedDid, jacquard_common::types::did::Did, miette::IntoDiagnostic};
 
 #[cfg(feature = "indexer")]
 pub(crate) fn migrate_v9(db: &Db, batch: &mut OwnedWriteBatch) -> Result<()> {
@@ -67,8 +63,8 @@ pub(crate) fn migrate_v9(_db: &Db, _batch: &mut OwnedWriteBatch) -> Result<()> {
 #[cfg(all(test, feature = "indexer"))]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
     use crate::config::Config;
+    use tempfile::tempdir;
 
     fn test_config(path: &std::path::Path) -> Config {
         Config {
@@ -96,12 +92,20 @@ mod tests {
             // Legacy PDS status & tier
             let legacy_status_key = "example.com|status";
             let status = crate::pds_meta::HostStatus::Offline;
-            batch.insert(&db.filter, legacy_status_key.as_bytes(), rmp_serde::to_vec(&status).into_diagnostic()?);
+            batch.insert(
+                &db.filter,
+                legacy_status_key.as_bytes(),
+                rmp_serde::to_vec(&status).into_diagnostic()?,
+            );
 
             let legacy_tier_key = "example.com|tier";
             batch.insert(&db.filter, legacy_tier_key.as_bytes(), b"tier1");
 
-            batch.insert(&db.counts, crate::db::keys::VERSIONING_KEY, 8_u64.to_be_bytes());
+            batch.insert(
+                &db.counts,
+                crate::db::keys::VERSIONING_KEY,
+                8_u64.to_be_bytes(),
+            );
             batch.commit().into_diagnostic()?;
             db.persist()?;
         }
@@ -122,14 +126,26 @@ mod tests {
 
         // Verify excludes migrated
         let legacy_exclude_key = format!("x|{}", did);
-        assert!(!db.filter.contains_key(legacy_exclude_key.as_bytes()).into_diagnostic()?);
+        assert!(
+            !db.filter
+                .contains_key(legacy_exclude_key.as_bytes())
+                .into_diagnostic()?
+        );
 
         let new_exclude_key = crate::db::filter::exclude_key(did)?;
         assert!(db.filter.contains_key(&new_exclude_key).into_diagnostic()?);
 
         // Verify PDS status and tier migrated
-        assert!(!db.filter.contains_key(b"example.com|status").into_diagnostic()?);
-        assert!(!db.filter.contains_key(b"example.com|tier").into_diagnostic()?);
+        assert!(
+            !db.filter
+                .contains_key(b"example.com|status")
+                .into_diagnostic()?
+        );
+        assert!(
+            !db.filter
+                .contains_key(b"example.com|tier")
+                .into_diagnostic()?
+        );
 
         let new_status_key = crate::db::pds_meta::pds_status_key("example.com");
         assert!(db.filter.contains_key(&new_status_key).into_diagnostic()?);

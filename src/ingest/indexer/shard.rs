@@ -304,8 +304,12 @@ impl FirehoseWorker {
         match e {
             IngestError::Commit(_) | IngestError::NoSigningKey(_) => false,
             IngestError::Generic(report) => {
-                if report.downcast_ref::<jacquard_repo::error::CommitError>().is_some()
-                    || report.downcast_ref::<crate::resolver::NoSigningKeyError>().is_some()
+                if report
+                    .downcast_ref::<jacquard_repo::error::CommitError>()
+                    .is_some()
+                    || report
+                        .downcast_ref::<crate::resolver::NoSigningKeyError>()
+                        .is_some()
                 {
                     false
                 } else {

@@ -291,7 +291,10 @@ pub fn hash<T: Hash>(val: &T) -> u64 {
     hasher.finish()
 }
 
-pub async fn read_limited_bytes(resp: reqwest::Response, limit: usize) -> miette::Result<bytes::Bytes> {
+pub async fn read_limited_bytes(
+    resp: reqwest::Response,
+    limit: usize,
+) -> miette::Result<bytes::Bytes> {
     use bytes::BytesMut;
     use futures::StreamExt as _;
     use miette::Context as _;
@@ -299,7 +302,9 @@ pub async fn read_limited_bytes(resp: reqwest::Response, limit: usize) -> miette
     let mut stream = resp.bytes_stream();
     let mut buf = BytesMut::new();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.into_diagnostic().context("failed to read response chunk")?;
+        let chunk = chunk
+            .into_diagnostic()
+            .context("failed to read response chunk")?;
         if buf.len() + chunk.len() > limit {
             miette::bail!("response body too large (exceeds {limit} bytes)");
         }
