@@ -79,6 +79,7 @@ impl Resolver {
     pub fn new(plc_urls: Vec<Url>, identity_cache_size: u64) -> Self {
         let http = reqwest::Client::builder()
             .redirect(Policy::none())
+            .timeout(Duration::from_secs(20))
             .build()
             .expect("resolver HTTP client configuration should be valid");
         let mut jacquards = Vec::with_capacity(plc_urls.len());
