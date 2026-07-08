@@ -15,6 +15,12 @@ pub use types::{
     SignatureVerification,
 };
 
+pub const DEFAULT_RATETIER: RateTier = if cfg!(feature = "indexer") {
+    RateTier::trusted()
+} else {
+    RateTier::default_tier()
+};
+
 #[derive(Debug, Clone)]
 pub struct Config {
     /// path to the database folder. set via `HYDRANT_DATABASE_PATH`.
@@ -296,7 +302,7 @@ impl Default for Config {
             tier_rules: vec![],
             tier_policy: {
                 let mut tiers = HashMap::new();
-                tiers.insert(SmolStr::new("default"), RateTier::default_tier());
+                tiers.insert(SmolStr::new("default"), DEFAULT_RATETIER);
                 tiers.insert(SmolStr::new("trusted"), RateTier::trusted());
                 TierPolicy {
                     tiers,

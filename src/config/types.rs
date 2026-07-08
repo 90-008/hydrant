@@ -25,7 +25,7 @@ pub struct RateTier {
 
 impl RateTier {
     /// built-in "trusted" tier: high limits for well-behaved PDS operators.
-    pub fn trusted() -> Self {
+    pub const fn trusted() -> Self {
         Self {
             per_second_base: 5000,
             per_second_account_mul: 10.0,
@@ -36,7 +36,7 @@ impl RateTier {
     }
 
     /// built-in "default" tier: conservative limits for unknown PDS operators.
-    pub fn default_tier() -> Self {
+    pub const fn default_tier() -> Self {
         Self {
             per_second_base: 50,
             per_second_account_mul: 0.5,
@@ -45,7 +45,6 @@ impl RateTier {
             account_limit: Some(100),
         }
     }
-
     /// parse `base/mul/hourly/daily[/account_limit]` format used by `HYDRANT_RATE_TIERS`.
     pub(crate) fn parse(s: &str) -> Option<Self> {
         let parts: Vec<&str> = s.split('/').collect();

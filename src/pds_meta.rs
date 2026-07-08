@@ -136,7 +136,7 @@ impl TierPolicy {
             .tiers
             .get("default")
             .copied()
-            .unwrap_or_else(RateTier::default_tier);
+            .unwrap_or(crate::config::DEFAULT_RATETIER);
 
         if let Some(name) = override_name {
             let tier = self.tiers.get(name).copied().unwrap_or(default);

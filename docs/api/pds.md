@@ -2,7 +2,7 @@
 title: PDS management
 ---
 
-hydrant rate-limits firehose events per PDS. each PDS is assigned to a named rate tier that controls how aggressively hydrant limits events from it. two built-in tiers are always present: `default` (conservative limits for unknown operators) and `trusted` (higher limits for well-behaved operators). additional tiers can be defined via `RATE_TIERS`.
+hydrant rate-limits firehose events per PDS. each PDS is assigned to a named rate tier that controls how aggressively hydrant limits events from it. two built-in tiers are always present: `default` (conservative limits for unknown operators; defaults to trusted in indexer mode) and `trusted` (higher limits for well-behaved operators). additional tiers can be defined via `RATE_TIERS`.
 
 the per-second limit scales with the number of active accounts on the PDS: `max(per_second_base, accounts × per_second_account_mul)`.
 
@@ -14,6 +14,8 @@ the built-in tiers are:
 | :--- | :--- | :--- | :--- | :--- | :--- |
 | `default` | 50 | +0.5 | 3,600,000 | 86,400,000 | 100 |
 | `trusted` | 5000 | +10.0 | 18,000,000 | 432,000,000 | 10,000,000 |
+
+*note: in indexer mode, the default tier defaults to the trusted tier limits.*
 
 tiers are resolved in this order: explicit API assignment (set via `PUT /pds/tiers`, stored in the database, survives restarts), then glob rules (from `TIER_RULES`, evaluated in order; first match wins), then the `default` tier (applied if nothing else matches).
 
