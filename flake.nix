@@ -7,13 +7,14 @@
   outputs =
     inp:
     inp.parts.lib.mkFlake { inputs = inp; } {
-      systems = [ "x86_64-linux" ];
+      systems = [ "x86_64-linux" "aarch64-darwin" ];
       imports = [inp.nci.flakeModule];
       perSystem =
         {
           pkgs,
           config,
           inputs',
+          system,
           ...
         }:
         let
@@ -68,9 +69,13 @@
               http-nu
               nushell
               clang
-              wild
-              psmisc
               rtk
+            ]
+            ++ lib.optionals (system == "x86_64-linux") [
+              psmisc
+              wild
+            ]
+            ++ [
               (pkgs.writeShellApplication {
                 name = "verbiage";
                 runtimeInputs = [ inputs'.verbiage.packages.default ];
