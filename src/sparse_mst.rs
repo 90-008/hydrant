@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use bytes::Bytes;
 use cid::Cid as IpldCid;
@@ -103,13 +103,54 @@ pub(crate) struct SparseScanOutput {
     pub(crate) node_bytes_seen: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NodeBounds {
+    lower: Option<SmolStr>,
+    upper: Option<SmolStr>,
+}
+
+impl NodeBounds {
+    fn unbounded() -> Self {
+        Self {
+            lower: None,
+            upper: None,
+        }
+    }
+
+    fn covers(&self, other: &Self) -> bool {
+        let lower_ok = match (&self.lower, &other.lower) {
+            (None, _) => true,
+            (Some(_), None) => false,
+            (Some(a), Some(b)) => a <= b,
+        };
+        let upper_ok = match (&self.upper, &other.upper) {
+            (None, _) => true,
+            (Some(_), None) => false,
+            (Some(a), Some(b)) => a >= b,
+        };
+        lower_ok && upper_ok
+    }
+
+    fn child(&self, lower_leaf: Option<&str>, upper_leaf: Option<&str>) -> Self {
+        let lower = match (self.lower.as_deref(), lower_leaf) {
+            (Some(a), Some(b)) => Some(SmolStr::new(a.max(b))),
+            (a, b) => a.or(b).map(SmolStr::new),
+        };
+        let upper = match (self.upper.as_deref(), upper_leaf) {
+            (Some(a), Some(b)) => Some(SmolStr::new(a.min(b))),
+            (a, b) => a.or(b).map(SmolStr::new),
+        };
+        Self { lower, upper }
+    }
+}
+
 pub(crate) struct SparseScanner {
     ranges: Vec<KeyRange>,
     blocks: BTreeMap<IpldCid, Bytes>,
     root: Option<IpldCid>,
-    pending_missing: BTreeSet<IpldCid>,
-    visited: BTreeSet<IpldCid>,
-    leaves: Vec<(SmolStr, IpldCid)>,
+    pending_missing: BTreeMap<IpldCid, Vec<NodeBounds>>,
+    visited: BTreeMap<IpldCid, Vec<NodeBounds>>,
+    leaves: BTreeMap<SmolStr, IpldCid>,
     stats: ScanStats,
 }
 
@@ -119,9 +160,9 @@ impl SparseScanner {
             ranges,
             blocks,
             root: None,
-            pending_missing: BTreeSet::new(),
-            visited: BTreeSet::new(),
-            leaves: Vec::new(),
+            pending_missing: BTreeMap::new(),
+            visited: BTreeMap::new(),
+            leaves: BTreeMap::new(),
             stats: ScanStats::default(),
         }
     }
@@ -139,28 +180,34 @@ impl SparseScanner {
             }
         } else {
             self.root = Some(root);
-            self.scan_node(root)?;
+            self.scan_node(root, NodeBounds::unbounded())?;
         }
 
         let ready = self
             .pending_missing
             .iter()
-            .filter(|cid| self.blocks.contains_key(cid))
-            .copied()
+            .filter(|(cid, _)| self.blocks.contains_key(cid))
+            .map(|(cid, bounds)| (*cid, bounds.clone()))
             .collect::<Vec<_>>();
-        for cid in ready {
+        for (cid, bounds_list) in ready {
             self.pending_missing.remove(&cid);
-            self.scan_node(cid)?;
+            for bounds in bounds_list {
+                self.scan_node(cid, bounds)?;
+            }
         }
 
         if self.pending_missing.is_empty() {
             Ok(Ok(SparseScanOutput {
-                leaves: self.leaves.clone(),
+                leaves: self
+                    .leaves
+                    .iter()
+                    .map(|(key, cid)| (key.clone(), *cid))
+                    .collect(),
                 node_blocks_seen: self.stats.node_blocks_seen,
                 node_bytes_seen: self.stats.node_bytes_seen,
             }))
         } else {
-            Ok(Err(self.pending_missing.iter().copied().collect()))
+            Ok(Err(self.pending_missing.keys().copied().collect()))
         }
     }
 
@@ -168,19 +215,29 @@ impl SparseScanner {
         self.blocks
     }
 
-    fn scan_node(&mut self, cid: IpldCid) -> Result<()> {
-        if self.visited.contains(&cid) {
+    fn scan_node(&mut self, cid: IpldCid, bounds: NodeBounds) -> Result<()> {
+        if self
+            .visited
+            .get(&cid)
+            .is_some_and(|seen| seen.iter().any(|prior| prior.covers(&bounds)))
+        {
             return Ok(());
         }
 
         let Some(bytes) = self.blocks.get(&cid) else {
-            self.pending_missing.insert(cid);
+            let pending = self.pending_missing.entry(cid).or_default();
+            if !pending.iter().any(|prior| prior.covers(&bounds)) {
+                pending.push(bounds);
+            }
             return Ok(());
         };
 
-        self.visited.insert(cid);
-        self.stats.node_blocks_seen += 1;
-        self.stats.node_bytes_seen += bytes.len();
+        let seen = self.visited.entry(cid).or_default();
+        if seen.is_empty() {
+            self.stats.node_blocks_seen += 1;
+            self.stats.node_bytes_seen += bytes.len();
+        }
+        seen.push(bounds.clone());
 
         let node: NodeData = serde_ipld_dagcbor::from_slice(bytes)
             .into_diagnostic()
@@ -191,18 +248,16 @@ impl SparseScanner {
             match &entries[idx] {
                 FlatEntry::Leaf { key, cid } => {
                     if self.ranges.iter().any(|range| range.contains(key)) {
-                        self.leaves.push((key.clone(), *cid));
+                        self.leaves.insert(key.clone(), *cid);
                     }
                 }
                 FlatEntry::Tree { cid } => {
-                    let lower = previous_leaf(&entries, idx);
-                    let upper = next_leaf(&entries, idx);
-                    if self
-                        .ranges
-                        .iter()
-                        .any(|range| range.intersects_subtree(lower, upper))
-                    {
-                        self.scan_node(*cid)?;
+                    let child =
+                        bounds.child(previous_leaf(&entries, idx), next_leaf(&entries, idx));
+                    if self.ranges.iter().any(|range| {
+                        range.intersects_subtree(child.lower.as_deref(), child.upper.as_deref())
+                    }) {
+                        self.scan_node(*cid, child)?;
                     }
                 }
             }
@@ -394,5 +449,88 @@ mod tests {
             mst_node_layer(&bytes).unwrap(),
             Some(layer_for_key("sh.tangled.repo/1"))
         );
+    }
+
+    fn car_bytes(node: &NodeData) -> Bytes {
+        serde_ipld_dagcbor::to_vec(node).unwrap().into()
+    }
+
+    #[test]
+    fn ancestor_bounds_prune_out_of_range_boundary_subtrees() {
+        // two disjoint ranges; the fetched middle subtree's leftmost child sits
+        // entirely between them once the ancestor lower bound is applied.
+        let wanted = sparse_ranges(&[SmolStr::new("aa.x"), SmolStr::new("zz.y")]);
+        let boundary_child = cid(1);
+        let middle = cid(2);
+        let root = cid(3);
+        let root_node = node(
+            vec![
+                ("aa.x/1", cid(4), None),
+                ("bb.q/1", cid(5), Some(middle)),
+                ("zz.y/5", cid(6), None),
+            ],
+            None,
+        );
+        // boundary_child spans ("bb.q/1", "mm.a/1") given the ancestor bound,
+        // which intersects neither range; without the bound its interval is
+        // (-inf, "mm.a/1"), which falsely intersects the aa.x range.
+        let middle_node = node(
+            vec![("mm.a/1", cid(7), None), ("zz.y/1", cid(8), None)],
+            Some(boundary_child),
+        );
+        let mut scanner =
+            SparseScanner::new(wanted, BTreeMap::from([(root, car_bytes(&root_node))]));
+
+        assert_eq!(scanner.scan(root).unwrap().unwrap_err(), vec![middle]);
+
+        scanner.insert_blocks(BTreeMap::from([(middle, car_bytes(&middle_node))]));
+        let scan = scanner.scan(root).unwrap().unwrap();
+
+        assert_eq!(
+            scan.leaves,
+            vec![
+                (SmolStr::new("aa.x/1"), cid(4)),
+                (SmolStr::new("zz.y/1"), cid(8)),
+                (SmolStr::new("zz.y/5"), cid(6)),
+            ]
+        );
+    }
+
+    #[test]
+    fn duplicate_pending_cids_fetch_once_and_scan_deterministically() {
+        // the same missing child CID is referenced from two positions with
+        // different ancestor bounds; it must appear once in the missing list
+        // and both contexts must be scanned after a single insert.
+        let wanted = sparse_ranges(&[SmolStr::new("aa.x"), SmolStr::new("zz.y")]);
+        let shared = cid(1);
+        let root = cid(2);
+        let root_node = node(
+            vec![
+                ("aa.w/1", cid(3), Some(shared)),
+                ("bb.q/1", cid(4), None),
+                ("zz.x/1", cid(5), Some(shared)),
+            ],
+            None,
+        );
+        let shared_node = node(
+            vec![("aa.x/1", cid(6), None), ("zz.y/1", cid(7), None)],
+            None,
+        );
+        let mut scanner =
+            SparseScanner::new(wanted, BTreeMap::from([(root, car_bytes(&root_node))]));
+
+        assert_eq!(scanner.scan(root).unwrap().unwrap_err(), vec![shared]);
+
+        scanner.insert_blocks(BTreeMap::from([(shared, car_bytes(&shared_node))]));
+        let scan = scanner.scan(root).unwrap().unwrap();
+
+        assert_eq!(
+            scan.leaves,
+            vec![
+                (SmolStr::new("aa.x/1"), cid(6)),
+                (SmolStr::new("zz.y/1"), cid(7)),
+            ]
+        );
+        assert_eq!(scan.node_blocks_seen, 2);
     }
 }
