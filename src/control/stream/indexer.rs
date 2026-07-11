@@ -23,14 +23,14 @@ pub(crate) fn event_stream_thread(
     opts: StreamOptions,
 ) {
     let db = &state.db;
-    let event_rx = db.event_tx.subscribe();
-    let ks = db.events.clone();
+    let event_rx = db.stream.event_tx.subscribe();
+    let ks = db.stream.events.clone();
     let current_id = match cursor {
         Some(c) => c.checked_sub(1),
-        None => db.next_event_id.load(Ordering::SeqCst).checked_sub(1),
+        None => db.stream.next_event_id.load(Ordering::SeqCst).checked_sub(1),
     };
     let catch_up_target = cursor
-        .and_then(|_| db.next_event_id.load(Ordering::SeqCst).checked_sub(1))
+        .and_then(|_| db.stream.next_event_id.load(Ordering::SeqCst).checked_sub(1))
         .filter(|target| stream_seq_after(*target, current_id));
     let replay_state = state.clone();
 
@@ -157,7 +157,7 @@ pub(crate) fn stored_to_event(
             } else {
                 let block = state
                     .db
-                    .blocks
+                    .indexer.blocks
                     .get(keys::block_key(collection.as_str(), &cid.to_bytes()));
                 match block {
                     Ok(Some(bytes)) => {

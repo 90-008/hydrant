@@ -115,7 +115,7 @@ impl Hydrant {
         let collection = CowStr::Borrowed("app.bsky.feed.post").into_static();
 
         for i in 0..count {
-            let event_id = db.next_event_id.fetch_add(1, Ordering::SeqCst);
+            let event_id = db.stream.next_event_id.fetch_add(1, Ordering::SeqCst);
             let rkey = DbRkey::Str(smol_str::format_smolstr!("r{i}"));
             let evt = StoredEvent {
                 live: false,
@@ -128,7 +128,7 @@ impl Hydrant {
             };
             let bytes = rmp_serde::to_vec(&evt).expect("msgpack serialization cannot fail");
             total_bytes += bytes.len();
-            batch.insert(&db.events, keys::event_key(event_id), bytes);
+            batch.insert(&db.stream.events, keys::event_key(event_id), bytes);
         }
 
         batch.commit().expect("failed to commit events batch");

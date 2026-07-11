@@ -1,20 +1,12 @@
 use crate::types::{RepoMetadata, RepoState};
 
-#[cfg(feature = "indexer_stream")]
-use crate::types::BroadcastEvent;
-#[cfg(feature = "jetstream")]
-use crate::types::JetstreamBroadcast;
-#[cfg(feature = "relay")]
-use crate::types::RelayBroadcast;
-
 use fjall::{Database, Keyspace, PersistMode, Slice};
 use miette::{Context, IntoDiagnostic, Result};
 use scc::HashMap;
 use smol_str::SmolStr;
 
 use std::collections::BTreeSet;
-#[cfg(feature = "jetstream")]
-use std::sync::atomic::AtomicI64;
+
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
 use url::Url;
@@ -33,16 +25,25 @@ pub mod migration;
 pub mod pds_meta;
 pub mod types;
 
+pub mod keyspaces;
 mod open;
 mod train;
+
+#[cfg(feature = "indexer")]
+pub use keyspaces::IndexerDb;
+#[cfg(feature = "jetstream")]
+pub(crate) use keyspaces::JetstreamDb;
+#[cfg(feature = "relay")]
+pub(crate) use keyspaces::RelayDb;
+#[cfg(feature = "indexer_stream")]
+pub use keyspaces::StreamDb;
 
 #[cfg(feature = "indexer")]
 pub(crate) use lifecycle_counts::LifecycleCountBatch;
 
 use tracing::error;
 
-#[cfg(any(feature = "indexer_stream", feature = "relay"))]
-use tokio::sync::broadcast;
+
 
 pub struct Db {
     pub inner: Arc<Database>,
@@ -54,46 +55,20 @@ pub struct Db {
     pub filter: Keyspace,
     pub crawler: Keyspace,
     #[cfg(feature = "indexer")]
-    pub records: Keyspace,
-    #[cfg(feature = "indexer")]
-    pub blocks: Keyspace,
-    #[cfg(feature = "indexer")]
-    pub pending: Keyspace,
-    #[cfg(feature = "indexer")]
-    pub resync: Keyspace,
-    #[cfg(feature = "indexer")]
-    pub resync_buffer: Keyspace,
+    pub indexer: IndexerDb,
     #[cfg(feature = "indexer_stream")]
-    pub events: Keyspace,
+    pub stream: StreamDb,
     #[cfg(feature = "jetstream")]
-    pub(crate) jetstream_events: Keyspace,
+    pub(crate) jetstream: JetstreamDb,
+    #[cfg(feature = "relay")]
+    pub(crate) relay: RelayDb,
     #[cfg(feature = "backlinks")]
     pub backlinks: Keyspace,
-    #[cfg(feature = "indexer_stream")]
-    pub(crate) event_tx: broadcast::Sender<BroadcastEvent>,
-    #[cfg(feature = "indexer_stream")]
-    pub next_event_id: Arc<AtomicU64>,
-    #[cfg(feature = "jetstream")]
-    pub(crate) jetstream_tx: broadcast::Sender<JetstreamBroadcast>,
-    #[cfg(feature = "jetstream")]
-    pub(crate) next_jetstream_id: Arc<AtomicU64>,
-    #[cfg(feature = "jetstream")]
-    pub(crate) last_jetstream_time_us: Arc<AtomicI64>,
-    #[cfg(all(feature = "jetstream", feature = "relay"))]
-    pub(crate) jetstream_lock: Arc<parking_lot::Mutex<()>>,
-    #[cfg(feature = "relay")]
-    pub(crate) relay_events: Keyspace,
-    #[cfg(feature = "relay")]
-    pub(crate) next_relay_seq: Arc<AtomicU64>,
-    #[cfg(feature = "relay")]
-    pub(crate) relay_broadcast_tx: broadcast::Sender<RelayBroadcast>,
     pub counts_map: HashMap<SmolStr, u64>,
     next_count_delta_id: Arc<AtomicU64>,
     count_delta_checkpoint_watermark: Arc<AtomicU64>,
     count_delta_gc_watermark: Arc<AtomicU64>,
     count_delta_in_flight: Arc<Mutex<BTreeSet<u64>>>,
-    #[cfg(feature = "indexer")]
-    lifecycle_count_lock: Arc<Mutex<()>>,
     pub(crate) compaction_running: Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -130,7 +105,16 @@ impl Db {
                 .into_diagnostic()?
         };
 
-        #[cfg_attr(not(any(feature = "indexer", feature = "indexer_stream", feature = "jetstream", feature = "relay", feature = "backlinks")), allow(unused_mut))]
+        #[cfg_attr(
+            not(any(
+                feature = "indexer",
+                feature = "indexer_stream",
+                feature = "jetstream",
+                feature = "relay",
+                feature = "backlinks"
+            )),
+            allow(unused_mut)
+        )]
         let mut tasks = vec![
             compact(self.repos.clone()),
             compact(self.cursors.clone()),
@@ -141,22 +125,13 @@ impl Db {
         ];
 
         #[cfg(feature = "indexer")]
-        {
-            tasks.push(compact(self.records.clone()));
-            tasks.push(compact(self.blocks.clone()));
-            tasks.push(compact(self.pending.clone()));
-            tasks.push(compact(self.resync.clone()));
-            tasks.push(compact(self.resync_buffer.clone()));
-        }
+        tasks.extend(self.indexer.keyspaces().map(&compact));
         #[cfg(feature = "indexer_stream")]
-        tasks.push(compact(self.events.clone()));
-
+        tasks.extend(self.stream.keyspaces().map(&compact));
         #[cfg(feature = "jetstream")]
-        tasks.push(compact(self.jetstream_events.clone()));
-
+        tasks.extend(self.jetstream.keyspaces().map(&compact));
         #[cfg(feature = "relay")]
-        tasks.push(compact(self.relay_events.clone()));
-
+        tasks.extend(self.relay.keyspaces().map(&compact));
         #[cfg(feature = "backlinks")]
         tasks.push(compact(self.backlinks.clone()));
 

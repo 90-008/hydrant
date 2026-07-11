@@ -31,7 +31,7 @@ pub(crate) fn stage_event(
     event: StoredJetstreamEvent<'_>,
     ephemeral: Option<JetstreamEphemeral>,
 ) -> Result<JetstreamBroadcast> {
-    let id = db.next_jetstream_id.fetch_add(1, Ordering::SeqCst);
+    let id = db.jetstream.next_id.fetch_add(1, Ordering::SeqCst);
     let time_us = next_time_us(db);
     let ephemeral = ephemeral.and_then(|data| {
         let json_event = crate::control::stream::JetstreamEvent {
@@ -54,7 +54,7 @@ pub(crate) fn stage_event(
     let event = event.into_static();
     let bytes = rmp_serde::to_vec(&event).into_diagnostic()?;
     batch.insert(
-        &db.jetstream_events,
+        &db.jetstream.events,
         keys::jetstream_event_key(time_us as u64, id),
         bytes,
     );
@@ -68,11 +68,11 @@ pub(crate) fn stage_event(
 
 fn next_time_us(db: &Db) -> i64 {
     loop {
-        let last = db.last_jetstream_time_us.load(Ordering::SeqCst);
+        let last = db.jetstream.last_time_us.load(Ordering::SeqCst);
         let now = chrono::Utc::now().timestamp_micros();
         let next = now.max(last.saturating_add(1));
         if db
-            .last_jetstream_time_us
+            .jetstream.last_time_us
             .compare_exchange(last, next, Ordering::SeqCst, Ordering::SeqCst)
             .is_ok()
         {

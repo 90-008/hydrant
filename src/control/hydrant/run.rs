@@ -178,9 +178,9 @@ impl Hydrant {
                 let state = state.clone();
                 let get_id = |state: &AppState| {
                     #[cfg(feature = "indexer_stream")]
-                    let id = state.db.next_event_id.load(Ordering::Relaxed);
+                    let id = state.db.stream.next_event_id.load(Ordering::Relaxed);
                     #[cfg(feature = "relay")]
-                    let id = state.db.next_relay_seq.load(Ordering::Relaxed);
+                    let id = state.db.relay.next_seq.load(Ordering::Relaxed);
                     id
                 };
                 let mut last_id = get_id(&state);

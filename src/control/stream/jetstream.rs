@@ -29,7 +29,7 @@ pub(crate) fn jetstream_stream_thread(
     filter: JetstreamFilter,
     opts: StreamOptions,
 ) {
-    let mut event_rx = state.db.jetstream_tx.subscribe();
+    let mut event_rx = state.db.jetstream.tx.subscribe();
     let head = latest_jetstream_head(&state);
 
     let replay = cursor
@@ -93,7 +93,7 @@ pub(crate) fn jetstream_stream_thread(
 }
 
 fn latest_jetstream_head(state: &AppState) -> Option<(u64, u64)> {
-    let guard = state.db.jetstream_events.iter().next_back()?;
+    let guard = state.db.jetstream.events.iter().next_back()?;
     let key = match guard.key() {
         Ok(key) => key,
         Err(e) => {
@@ -211,7 +211,7 @@ fn read_jetstream_replay_chunk(
     let end_key = keys::jetstream_event_key(target_time_us, u64::MAX);
     let mut events = Vec::with_capacity(chunk_size);
     let mut exhausted = false;
-    let mut iter = state.db.jetstream_events.range(start_key..=&end_key[..]);
+    let mut iter = state.db.jetstream.events.range(start_key..=&end_key[..]);
 
     while events.len() < chunk_size {
         let Some(item) = iter.next() else {
@@ -330,7 +330,7 @@ fn jetstream_event_to_bytes(
     match &event.event {
         #[cfg(feature = "indexer_stream")]
         StoredJetstreamEvent::Commit { event_id, live, .. } => {
-            let bytes = state.db.events.get(keys::event_key(*event_id)).ok()??;
+            let bytes = state.db.stream.events.get(keys::event_key(*event_id)).ok()??;
             let stored: StoredEvent = rmp_serde::from_slice(&bytes).ok()?;
             let evt = stored_to_event(state, *event_id, stored, None)?;
             let rec = evt.record?;
@@ -363,7 +363,7 @@ fn jetstream_event_to_bytes(
         } => {
             let frame = state
                 .db
-                .relay_events
+                .relay.events
                 .get(keys::relay_event_key(*relay_seq))
                 .ok()??;
             let SubscribeReposMessage::Commit(commit) = decode_frame(frame.as_ref()).ok()? else {
@@ -411,7 +411,7 @@ fn jetstream_event_to_bytes(
         StoredJetstreamEvent::RelayAccount { relay_seq, .. } => {
             let frame = state
                 .db
-                .relay_events
+                .relay.events
                 .get(keys::relay_event_key(*relay_seq))
                 .ok()??;
             let SubscribeReposMessage::Account(account) = decode_frame(frame.as_ref()).ok()? else {
@@ -442,7 +442,7 @@ fn jetstream_event_to_bytes(
         StoredJetstreamEvent::RelayIdentity { relay_seq, .. } => {
             let frame = state
                 .db
-                .relay_events
+                .relay.events
                 .get(keys::relay_event_key(*relay_seq))
                 .ok()??;
             let SubscribeReposMessage::Identity(identity) = decode_frame(frame.as_ref()).ok()?

@@ -15,7 +15,7 @@ pub fn queue_gone_backfills(state: &Arc<AppState>) -> Result<()> {
     let mut batch = state.db.inner.batch();
     let mut lifecycle_counts = state.db.lifecycle_counts();
 
-    for guard in state.db.resync.iter() {
+    for guard in state.db.indexer.resync.iter() {
         let (key, val) = guard.into_inner().into_diagnostic()?;
         let did = match TrimmedDid::try_from(key.as_ref()) {
             Ok(did) => did.to_did(),
@@ -48,12 +48,12 @@ pub fn queue_gone_backfills(state: &Arc<AppState>) -> Result<()> {
             let mut metadata = crate::db::deser_repo_meta(&metadata_bytes)?;
 
             // move from resync back into pending
-            batch.remove(&state.db.resync, key.clone());
+            batch.remove(&state.db.indexer.resync, key.clone());
             let old_pending = keys::pending_key(metadata.index_id);
-            batch.remove(&state.db.pending, old_pending);
+            batch.remove(&state.db.indexer.pending, old_pending);
             metadata.index_id = rand::random::<u64>();
             batch.insert(
-                &state.db.pending,
+                &state.db.indexer.pending,
                 keys::pending_key(metadata.index_id),
                 key.clone(),
             );
@@ -95,7 +95,7 @@ pub fn retry_worker(state: Arc<AppState>) {
         let mut batch = state.db.inner.batch();
         let mut lifecycle_counts = state.db.lifecycle_counts();
 
-        for guard in db.resync.iter() {
+        for guard in db.indexer.resync.iter() {
             let (key, value) = match guard.into_inner() {
                 Ok(t) => t,
                 Err(e) => {
@@ -186,9 +186,9 @@ pub fn retry_worker(state: Arc<AppState>) {
                         }
 
                         // move from resync back into pending
-                        batch.remove(&state.db.resync, key.clone());
-                        batch.remove(&state.db.pending, old_pending);
-                        batch.insert(&state.db.pending, new_pending, key.clone());
+                        batch.remove(&state.db.indexer.resync, key.clone());
+                        batch.remove(&state.db.indexer.pending, old_pending);
+                        batch.insert(&state.db.indexer.pending, new_pending, key.clone());
                         batch.insert(&state.db.repo_metadata, &metadata_key, serialized_metadata);
                         transitions += 1;
                     }

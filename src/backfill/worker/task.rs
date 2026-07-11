@@ -53,9 +53,9 @@ pub(crate) async fn did_task(
                         pending_key.as_ref(),
                         GaugeState::Synced,
                     )?;
-                    batch.remove(&db.pending, pending_key.clone());
+                    batch.remove(&db.indexer.pending, pending_key.clone());
                     if applied {
-                        batch.remove(&db.resync, &did_key);
+                        batch.remove(&db.indexer.resync, &did_key);
                     }
                     let lifecycle_reservation = lifecycle_counts.stage(&mut batch);
                     batch.commit().into_diagnostic()?;
@@ -106,7 +106,7 @@ pub(crate) async fn did_task(
                         pending_key.as_ref(),
                         GaugeState::Synced,
                     )?;
-                    batch.remove(&db.pending, pending_key);
+                    batch.remove(&db.indexer.pending, pending_key);
                     let lifecycle_reservation = lifecycle_counts.stage(&mut batch);
                     batch.commit().into_diagnostic()?;
                     db.apply_lifecycle_counts(lifecycle_reservation);
@@ -143,7 +143,7 @@ pub(crate) async fn did_task(
             let did_key = keys::repo_key(did);
 
             // 1. get current retry count
-            let existing_state = Db::get(db.resync.clone(), &did_key).await.and_then(|b| {
+            let existing_state = Db::get(db.indexer.resync.clone(), &did_key).await.and_then(|b| {
                 b.map(|b| rmp_serde::from_slice::<ResyncState>(&b).into_diagnostic())
                     .transpose()
             })?;
@@ -200,9 +200,9 @@ pub(crate) async fn did_task(
                         pending_key.as_ref(),
                         GaugeState::Resync(Some(error_kind)),
                     )?;
-                    batch.remove(&state.db.pending, pending_key.clone());
+                    batch.remove(&state.db.indexer.pending, pending_key.clone());
                     if applied {
-                        batch.insert(&state.db.resync, &did_key, serialized_resync_state);
+                        batch.insert(&state.db.indexer.resync, &did_key, serialized_resync_state);
                         if let Some(state_bytes) = serialized_repo_state {
                             batch.insert(&state.db.repos, &did_key, state_bytes);
                         }

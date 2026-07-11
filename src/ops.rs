@@ -33,7 +33,7 @@ use crate::types::{JetstreamBroadcast, StoredJetstreamEvent};
 pub fn persist_to_resync_buffer(db: &Db, did: &Did, commit: &Commit) -> Result<()> {
     let key = keys::resync_buffer_key(did, DbTid::from(&commit.rev));
     let value = rmp_serde::to_vec_named(commit).into_diagnostic()?;
-    db.resync_buffer.insert(key, value).into_diagnostic()?;
+    db.indexer.resync_buffer.insert(key, value).into_diagnostic()?;
     debug!(
         did = %did,
         seq = commit.seq,
@@ -46,7 +46,7 @@ pub fn persist_to_resync_buffer(db: &Db, did: &Did, commit: &Commit) -> Result<(
 // we dont replay these, consumers can just fetch identity themselves if they need it
 #[cfg(feature = "indexer_stream")]
 pub fn make_identity_event(db: &Db, evt: IdentityEvt<'static>) -> BroadcastEvent {
-    let event_id = db.next_event_id.fetch_add(1, Ordering::SeqCst);
+    let event_id = db.stream.next_event_id.fetch_add(1, Ordering::SeqCst);
     let marshallable = MarshallableEvt {
         id: event_id,
         kind: crate::types::EventType::Identity,
@@ -59,7 +59,7 @@ pub fn make_identity_event(db: &Db, evt: IdentityEvt<'static>) -> BroadcastEvent
 
 #[cfg(feature = "indexer_stream")]
 pub fn make_account_event(db: &Db, evt: AccountEvt<'static>) -> BroadcastEvent {
-    let event_id = db.next_event_id.fetch_add(1, Ordering::SeqCst);
+    let event_id = db.stream.next_event_id.fetch_add(1, Ordering::SeqCst);
     let marshallable = MarshallableEvt {
         id: event_id,
         kind: crate::types::EventType::Account,
@@ -84,28 +84,28 @@ pub fn delete_repo(
     let metadata_bytes = db.repo_metadata.get(&metadata_key).into_diagnostic()?;
     if let Some(metadata_bytes) = metadata_bytes {
         let metadata = db::deser_repo_meta(&metadata_bytes)?;
-        batch.remove(&db.pending, keys::pending_key(metadata.index_id));
+        batch.remove(&db.indexer.pending, keys::pending_key(metadata.index_id));
     }
 
     // we don't delete from repos, relay uses it as a tombstone
     // todo: we should still delete it after some time
-    batch.remove(&db.resync, &repo_key);
+    batch.remove(&db.indexer.resync, &repo_key);
     batch.remove(&db.repo_metadata, &metadata_key);
 
     // 2. delete from resync buffer
     let resync_prefix = keys::resync_buffer_prefix(did);
-    for guard in db.resync_buffer.prefix(&resync_prefix) {
+    for guard in db.indexer.resync_buffer.prefix(&resync_prefix) {
         let k = guard.key().into_diagnostic()?;
-        batch.remove(&db.resync_buffer, k);
+        batch.remove(&db.indexer.resync_buffer, k);
     }
 
     // 3. delete from records
     // todo: figure out how we want to handle the blocks associated with these records
     //       without delving too much into gc madness we had before
     let records_prefix = keys::record_prefix_did(did);
-    for guard in db.records.prefix(&records_prefix) {
+    for guard in db.indexer.records.prefix(&records_prefix) {
         let (k, _cid_bytes) = guard.into_inner().into_diagnostic()?;
-        batch.remove(&db.records, k);
+        batch.remove(&db.indexer.records, k);
     }
 
     // 4. reset collection counts
@@ -149,7 +149,7 @@ pub fn transition_repo<'s>(
         match &new_status {
             RepoStatus::Synced => {
                 lifecycle_transitions.push((did.clone().into_static(), GaugeState::Synced));
-                batch.remove(&db.pending, pending_key.as_slice());
+                batch.remove(&db.indexer.pending, pending_key.as_slice());
                 // we dont have to remove from resync here because it has to transition resync -> pending first
             }
             RepoStatus::Error(msg) => {
@@ -158,7 +158,7 @@ pub fn transition_repo<'s>(
                     did.clone().into_static(),
                     GaugeState::Resync(Some(ResyncErrorKind::Generic)),
                 ));
-                batch.remove(&db.pending, pending_key.as_slice());
+                batch.remove(&db.indexer.pending, pending_key.as_slice());
                 // TODO: we need to make errors have kind instead of "message" in repo status
                 // and then pass it to resync error kind
                 let resync_state = crate::types::ResyncState::Error {
@@ -167,7 +167,7 @@ pub fn transition_repo<'s>(
                     next_retry: chrono::Utc::now().timestamp(),
                 };
                 batch.insert(
-                    &db.resync,
+                    &db.indexer.resync,
                     &repo_key,
                     rmp_serde::to_vec(&resync_state).into_diagnostic()?,
                 );
@@ -180,7 +180,7 @@ pub fn transition_repo<'s>(
                     status: new_status.clone(),
                 };
                 batch.insert(
-                    &db.resync,
+                    &db.indexer.resync,
                     &repo_key,
                     rmp_serde::to_vec(&resync_state).into_diagnostic()?,
                 );
@@ -188,8 +188,8 @@ pub fn transition_repo<'s>(
             RepoStatus::Deleted => {
                 lifecycle_transitions.push((did.clone().into_static(), GaugeState::Synced));
                 // terminal state: remove from queues, no resync entry needed
-                batch.remove(&db.pending, pending_key.as_slice());
-                batch.remove(&db.resync, &repo_key);
+                batch.remove(&db.indexer.pending, pending_key.as_slice());
+                batch.remove(&db.indexer.resync, &repo_key);
             }
             RepoStatus::Desynchronized | RepoStatus::Throttled => {
                 lifecycle_transitions.push((
@@ -197,14 +197,14 @@ pub fn transition_repo<'s>(
                     GaugeState::Resync(Some(ResyncErrorKind::Generic)),
                 ));
                 // like an error: remove from pending and schedule a resync attempt
-                batch.remove(&db.pending, pending_key.as_slice());
+                batch.remove(&db.indexer.pending, pending_key.as_slice());
                 let resync_state = crate::types::ResyncState::Error {
                     kind: crate::types::ResyncErrorKind::Generic,
                     retry_count: 0,
                     next_retry: chrono::Utc::now().timestamp(),
                 };
                 batch.insert(
-                    &db.resync,
+                    &db.indexer.resync,
                     &repo_key,
                     rmp_serde::to_vec(&resync_state).into_diagnostic()?,
                 );
@@ -257,13 +257,13 @@ pub fn apply_commit<'s>(
     let rev = DbTid::from(&commit.rev);
 
     #[cfg(feature = "indexer_stream")]
-    let should_broadcast_live = db.event_tx.receiver_count() > 0;
+    let should_broadcast_live = db.stream.event_tx.receiver_count() > 0;
     #[cfg(feature = "indexer_stream")]
     let mut live_events = Vec::new();
     #[cfg(feature = "indexer_stream")]
     let mut last_event_id = None;
     #[cfg(feature = "jetstream")]
-    let should_stage_jetstream = db.jetstream_tx.receiver_count() > 0;
+    let should_stage_jetstream = db.jetstream.tx.receiver_count() > 0;
     #[cfg(feature = "jetstream")]
     let mut jetstream_events = Vec::new();
 
@@ -311,9 +311,9 @@ pub fn apply_commit<'s>(
                 blocks_count += 1;
                 if !ephemeral {
                     if !only_index_links {
-                        batch.insert(&db.blocks, block_key.clone(), bytes.as_ref());
+                        batch.insert(&db.indexer.blocks, block_key.clone(), bytes.as_ref());
                     }
-                    batch.insert(&db.records, db_key.clone(), cid_raw);
+                    batch.insert(&db.indexer.records, db_key.clone(), cid_raw);
                     // accumulate counts
                     if action == DbAction::Create {
                         records_delta += 1;
@@ -345,7 +345,7 @@ pub fn apply_commit<'s>(
             }
             DbAction::Delete => {
                 if !ephemeral {
-                    batch.remove(&db.records, db_key);
+                    batch.remove(&db.indexer.records, db_key);
 
                     // accumulate counts
                     records_delta -= 1;
@@ -375,7 +375,7 @@ pub fn apply_commit<'s>(
                 })
                 .unwrap_or(StoredData::Nothing);
 
-            let event_id = db.next_event_id.fetch_add(1, Ordering::SeqCst);
+            let event_id = db.stream.next_event_id.fetch_add(1, Ordering::SeqCst);
             last_event_id = Some(event_id);
             let did_trimmed = TrimmedDid::from(did);
             let collection = CowStr::Borrowed(collection);
@@ -390,7 +390,7 @@ pub fn apply_commit<'s>(
                 data: data.clone(),
             };
             let bytes = rmp_serde::to_vec(&evt).into_diagnostic()?;
-            batch.insert(&db.events, keys::event_key(event_id), bytes);
+            batch.insert(&db.stream.events, keys::event_key(event_id), bytes);
 
             #[cfg(feature = "jetstream")]
             {

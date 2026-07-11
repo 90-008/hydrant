@@ -27,7 +27,7 @@ impl Db {
         LifecycleCountBatch {
             db: self,
             _lock: self
-                .lifecycle_count_lock
+                .indexer.lifecycle_count_lock
                 .lock()
                 .expect("lifecycle count lock poisoned"),
             deltas: CountDeltas::default(),
@@ -112,7 +112,7 @@ impl<'a> LifecycleCountBatch<'a> {
             if let Some(index_id) = index_id {
                 if self
                     .db
-                    .pending
+                    .indexer.pending
                     .get(keys::pending_key(index_id))
                     .into_diagnostic()?
                     .is_some()
@@ -123,7 +123,7 @@ impl<'a> LifecycleCountBatch<'a> {
 
             let gauge = if is_pending {
                 GaugeState::Pending
-            } else if let Some(resync_bytes) = self.db.resync.get(did_key).into_diagnostic()? {
+            } else if let Some(resync_bytes) = self.db.indexer.resync.get(did_key).into_diagnostic()? {
                 gauge_from_resync(&resync_bytes)
             } else {
                 GaugeState::Synced
@@ -141,7 +141,7 @@ impl<'a> LifecycleCountBatch<'a> {
         };
 
         Ok(current.as_slice() == pending_key
-            && self.db.pending.get(current).into_diagnostic()?.is_some())
+            && self.db.indexer.pending.get(current).into_diagnostic()?.is_some())
     }
 
     fn stage_membership(
@@ -232,7 +232,7 @@ mod tests {
         let mut batch = db.inner.batch();
         batch.insert(&db.repos, &did_key, ser_repo_state(&state)?);
         batch.insert(&db.repo_metadata, metadata_key, ser_repo_meta(&metadata)?);
-        batch.insert(&db.pending, pending_key, did_key);
+        batch.insert(&db.indexer.pending, pending_key, did_key);
         let mut lifecycle = db.lifecycle_counts();
         lifecycle.transition(&mut batch, did, GaugeState::Pending)?;
         let lifecycle_reservation = lifecycle.stage(&mut batch);
@@ -251,7 +251,7 @@ mod tests {
             GaugeState::Synced,
         )?;
         if applied {
-            batch.remove(&db.pending, pending_key);
+            batch.remove(&db.indexer.pending, pending_key);
         }
         let lifecycle_reservation = lifecycle.stage(&mut batch);
         batch.commit().into_diagnostic()?;
@@ -289,8 +289,8 @@ mod tests {
         let mut metadata = RepoMetadata::backfilling(2);
         metadata.tracked = true;
         let mut batch = db.inner.batch();
-        batch.remove(&db.pending, stale_pending);
-        batch.insert(&db.pending, current_pending, &did_key);
+        batch.remove(&db.indexer.pending, stale_pending);
+        batch.insert(&db.indexer.pending, current_pending, &did_key);
         batch.insert(&db.repo_metadata, metadata_key, ser_repo_meta(&metadata)?);
         let mut lifecycle = db.lifecycle_counts();
         lifecycle.transition(&mut batch, &did, GaugeState::Pending)?;
@@ -301,7 +301,7 @@ mod tests {
         assert_eq!(db.get_count_sync("pending"), 1);
         assert!(!complete_pending(&db, &did, stale_pending)?);
         assert_eq!(db.get_count_sync("pending"), 1);
-        assert!(db.pending.get(current_pending).into_diagnostic()?.is_some());
+        assert!(db.indexer.pending.get(current_pending).into_diagnostic()?.is_some());
 
         Ok(())
     }
@@ -326,7 +326,7 @@ mod tests {
                 GaugeState::Synced,
             )?;
             assert!(applied);
-            batch.remove(&db.pending, pending_key);
+            batch.remove(&db.indexer.pending, pending_key);
             let lifecycle_reservation = lifecycle.stage(&mut batch);
             batch.commit().into_diagnostic()?;
             db.persist()?;
@@ -337,7 +337,7 @@ mod tests {
             let db = Db::open(&cfg)?;
             assert_eq!(db.get_count_sync("pending"), 0);
             assert!(
-                db.pending
+                db.indexer.pending
                     .get(keys::pending_key(1))
                     .into_diagnostic()?
                     .is_none()

@@ -436,7 +436,7 @@ async fn persist_sparse_backfill(
         let mut existing_cids: HashMap<(SmolStr, DbRkey), SmolStr> = HashMap::new();
 
         if !ephemeral {
-            for guard in app_state.db.records.prefix(&prefix) {
+            for guard in app_state.db.indexer.records.prefix(&prefix) {
                 let (key, cid_bytes) = guard.into_inner().into_diagnostic()?;
                 let mut remaining = key[prefix.len()..].splitn(2, |b| keys::SEP.eq(b));
                 let collection_raw = remaining
@@ -503,9 +503,9 @@ async fn persist_sparse_backfill(
             let block_key = Slice::from(keys::block_key(collection, &cid_raw));
             if !ephemeral {
                 if !only_index_links {
-                    batch.insert(&app_state.db.blocks, block_key.clone(), val.as_ref());
+                    batch.insert(&app_state.db.indexer.blocks, block_key.clone(), val.as_ref());
                 }
-                batch.insert(&app_state.db.records, db_key, cid_raw);
+                batch.insert(&app_state.db.indexer.records, db_key, cid_raw);
                 #[cfg(feature = "backlinks")]
                 if let Ok(value) =
                     serde_ipld_dagcbor::from_slice::<jacquard_common::Data>(val.as_ref())
@@ -528,7 +528,7 @@ async fn persist_sparse_backfill(
 
             #[cfg(feature = "indexer_stream")]
             {
-                let event_id = app_state.db.next_event_id.fetch_add(1, Ordering::SeqCst);
+                let event_id = app_state.db.stream.next_event_id.fetch_add(1, Ordering::SeqCst);
                 let evt = StoredEvent {
                     live: false,
                     did: TrimmedDid::from(&did),
@@ -545,7 +545,7 @@ async fn persist_sparse_backfill(
                     },
                 };
                 let bytes = rmp_serde::to_vec(&evt).into_diagnostic()?;
-                batch.insert(&app_state.db.events, keys::event_key(event_id), bytes);
+                batch.insert(&app_state.db.stream.events, keys::event_key(event_id), bytes);
 
                 #[cfg(feature = "jetstream")]
                 {
@@ -566,7 +566,7 @@ async fn persist_sparse_backfill(
             trace!(collection = %collection, rkey = %rkey, cid = %cid, "remove sparse-stale record");
 
             batch.remove(
-                &app_state.db.records,
+                &app_state.db.indexer.records,
                 keys::record_key(&did, &collection, &rkey),
             );
             #[cfg(feature = "backlinks")]
@@ -580,7 +580,7 @@ async fn persist_sparse_backfill(
 
             #[cfg(feature = "indexer_stream")]
             {
-                let event_id = app_state.db.next_event_id.fetch_add(1, Ordering::SeqCst);
+                let event_id = app_state.db.stream.next_event_id.fetch_add(1, Ordering::SeqCst);
                 let evt = StoredEvent {
                     live: false,
                     did: TrimmedDid::from(&did),
@@ -591,7 +591,7 @@ async fn persist_sparse_backfill(
                     data: StoredData::Nothing,
                 };
                 let bytes = rmp_serde::to_vec(&evt).into_diagnostic()?;
-                batch.insert(&app_state.db.events, keys::event_key(event_id), bytes);
+                batch.insert(&app_state.db.stream.events, keys::event_key(event_id), bytes);
 
                 #[cfg(feature = "jetstream")]
                 {

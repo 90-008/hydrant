@@ -51,17 +51,17 @@ impl Hydrant {
             .collect();
 
         #[cfg(feature = "indexer_stream")]
-        counts.insert("events", state.db.events.approximate_len() as u64);
+        counts.insert("events", state.db.stream.events.approximate_len() as u64);
 
         #[cfg(feature = "relay")]
         counts.insert(
             "relay_events",
-            state.db.relay_events.approximate_len() as u64,
+            state.db.relay.events.approximate_len() as u64,
         );
         #[cfg(feature = "jetstream")]
         counts.insert(
             "jetstream_events",
-            state.db.jetstream_events.approximate_len() as u64,
+            state.db.jetstream.events.approximate_len() as u64,
         );
 
         let sizes = tokio::task::spawn_blocking(move || {
@@ -74,19 +74,19 @@ impl Hydrant {
 
             #[cfg(feature = "indexer")]
             {
-                s.insert("records", state.db.records.disk_space());
-                s.insert("blocks", state.db.blocks.disk_space());
-                s.insert("pending", state.db.pending.disk_space());
-                s.insert("resync", state.db.resync.disk_space());
-                s.insert("resync_buffer", state.db.resync_buffer.disk_space());
+                s.insert("records", state.db.indexer.records.disk_space());
+                s.insert("blocks", state.db.indexer.blocks.disk_space());
+                s.insert("pending", state.db.indexer.pending.disk_space());
+                s.insert("resync", state.db.indexer.resync.disk_space());
+                s.insert("resync_buffer", state.db.indexer.resync_buffer.disk_space());
             }
             #[cfg(feature = "indexer_stream")]
-            s.insert("events", state.db.events.disk_space());
+            s.insert("events", state.db.stream.events.disk_space());
 
             #[cfg(feature = "relay")]
-            s.insert("relay_events", state.db.relay_events.disk_space());
+            s.insert("relay_events", state.db.relay.events.disk_space());
             #[cfg(feature = "jetstream")]
-            s.insert("jetstream_events", state.db.jetstream_events.disk_space());
+            s.insert("jetstream_events", state.db.jetstream.events.disk_space());
 
             #[cfg(feature = "backlinks")]
             s.insert("backlinks", state.db.backlinks.disk_space());

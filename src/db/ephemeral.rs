@@ -41,26 +41,26 @@ pub fn relay_events_ttl_worker(state: Arc<crate::state::AppState>) {
 
 #[cfg(feature = "indexer_stream")]
 pub fn ephemeral_ttl_tick(db: &Db, ttl: &Duration) -> miette::Result<()> {
-    let current_seq = db.next_event_id.load(Ordering::SeqCst);
+    let current_seq = db.stream.next_event_id.load(Ordering::SeqCst);
     ttl_tick_inner(
         db,
         ttl,
         keys::EVENT_WATERMARK_PREFIX,
         keys::event_watermark_key,
-        &db.events,
+        &db.stream.events,
         current_seq,
     )
 }
 
 #[cfg(feature = "relay")]
 pub fn relay_events_ttl_tick(db: &Db, ttl: &Duration) -> miette::Result<()> {
-    let current_seq = db.next_relay_seq.load(Ordering::SeqCst);
+    let current_seq = db.relay.next_seq.load(Ordering::SeqCst);
     ttl_tick_inner(
         db,
         ttl,
         keys::RELAY_EVENT_WATERMARK_PREFIX,
         keys::relay_event_watermark_key,
-        &db.relay_events,
+        &db.relay.events,
         current_seq,
     )
 }
@@ -71,19 +71,19 @@ pub fn jetstream_events_ttl_tick(db: &Db, ttl: &Duration) -> miette::Result<()> 
     let cutoff_ts = now.saturating_sub(ttl.as_secs());
     let cutoff_us = cutoff_ts.saturating_mul(1_000_000);
 
-    db.jetstream_events
+    db.jetstream.events
         .rotate_memtable_and_wait()
         .into_diagnostic()
         .wrap_err("failed to rotate memtable before Jetstream TTL range drop")?;
 
-    let before_space = db.jetstream_events.disk_space();
-    let before_tables = db.jetstream_events.table_count();
-    db.jetstream_events
+    let before_space = db.jetstream.events.disk_space();
+    let before_tables = db.jetstream.events.table_count();
+    db.jetstream.events
         .drop_range(..keys::jetstream_event_key(cutoff_us, 0))
         .into_diagnostic()
         .wrap_err("failed Jetstream TTL range drop for old events")?;
-    let after_space = db.jetstream_events.disk_space();
-    let after_tables = db.jetstream_events.table_count();
+    let after_space = db.jetstream.events.disk_space();
+    let after_tables = db.jetstream.events.table_count();
 
     info!(
         cutoff_us,
@@ -231,7 +231,7 @@ mod tests {
     }
 
     fn first_relay_seq(db: &crate::db::Db) -> miette::Result<u64> {
-        let Some(guard) = db.relay_events.iter().next() else {
+        let Some(guard) = db.relay.events.iter().next() else {
             miette::bail!("expected at least one relay event");
         };
         let key = guard.key().into_diagnostic()?;
@@ -262,10 +262,10 @@ mod tests {
     ) -> miette::Result<()> {
         let mut batch = db.inner.batch();
         for seq in start_seq..start_seq + count {
-            batch.insert(&db.relay_events, keys::relay_event_key(seq), payload);
+            batch.insert(&db.relay.events, keys::relay_event_key(seq), payload);
         }
         batch.commit().into_diagnostic()?;
-        db.next_relay_seq.store(start_seq + count, Ordering::SeqCst);
+        db.relay.next_seq.store(start_seq + count, Ordering::SeqCst);
         Ok(())
     }
 
@@ -276,7 +276,7 @@ mod tests {
         payload: &[u8],
     ) -> miette::Result<()> {
         insert_relay_events(db, start_seq, count, payload)?;
-        db.relay_events
+        db.relay.events
             .rotate_memtable_and_wait()
             .into_diagnostic()?;
         Ok(())
@@ -288,7 +288,7 @@ mod tests {
         payload: &[u8],
     ) -> miette::Result<()> {
         seed_relay_event_table(db, 0, count, payload)?;
-        db.relay_events.major_compact().into_diagnostic()?;
+        db.relay.events.major_compact().into_diagnostic()?;
         Ok(())
     }
 
@@ -303,14 +303,14 @@ mod tests {
     }
 
     fn compact_relay_events_once(db: &crate::db::Db) -> miette::Result<()> {
-        db.relay_events
+        db.relay.events
             .compact(Arc::new(fjall::compaction::Leveled::default()))
             .into_diagnostic()
     }
 
     fn wait_for_relay_table_count(db: &crate::db::Db, min_tables: usize) -> miette::Result<()> {
         for _ in 0..200 {
-            if db.relay_events.table_count() >= min_tables {
+            if db.relay.events.table_count() >= min_tables {
                 return Ok(());
             }
             std::thread::sleep(Duration::from_millis(10));
@@ -318,7 +318,7 @@ mod tests {
 
         miette::bail!(
             "timed out waiting for at least {min_tables} relay event tables, saw {}",
-            db.relay_events.table_count()
+            db.relay.events.table_count()
         );
     }
 
@@ -328,10 +328,10 @@ mod tests {
     ) -> miette::Result<()> {
         let mut batch = db.inner.batch();
         for seq in 0..cutoff_seq {
-            batch.remove(&db.relay_events, keys::relay_event_key(seq));
+            batch.remove(&db.relay.events, keys::relay_event_key(seq));
         }
         batch.commit().into_diagnostic()?;
-        db.relay_events
+        db.relay.events
             .rotate_memtable_and_wait()
             .into_diagnostic()?;
         Ok(())
@@ -353,17 +353,17 @@ mod tests {
             start_seq += events_per_table;
         }
 
-        let before_prune = db.relay_events.disk_space();
-        let before_tables = db.relay_events.table_count();
+        let before_prune = db.relay.events.disk_space();
+        let before_tables = db.relay.events.table_count();
         seed_past_relay_watermark(&db, old_count)?;
 
         relay_events_ttl_tick(&db, &Duration::from_secs(60 * 60))?;
 
-        let after_prune = db.relay_events.disk_space();
-        let after_tables = db.relay_events.table_count();
+        let after_prune = db.relay.events.disk_space();
+        let after_tables = db.relay.events.table_count();
         assert_eq!(
             retained_count as usize,
-            db.relay_events.iter().count(),
+            db.relay.events.iter().count(),
             "TTL should keep the tables at or after the cutoff sequence"
         );
         assert!(
@@ -394,12 +394,12 @@ mod tests {
             start_seq += events_per_table;
         }
 
-        let before_tables = db.relay_events.table_count();
+        let before_tables = db.relay.events.table_count();
         seed_past_relay_watermark(&db, cutoff_seq)?;
 
         relay_events_ttl_tick(&db, &Duration::from_secs(60 * 60))?;
 
-        let after_tables = db.relay_events.table_count();
+        let after_tables = db.relay.events.table_count();
         assert!(
             after_tables <= before_tables.saturating_sub(fully_expired_tables as usize),
             "drop_range should drop tables fully below the cutoff; before={before_tables}, after={after_tables}"
@@ -411,7 +411,7 @@ mod tests {
         );
         assert_eq!(
             ((table_count - fully_expired_tables) * events_per_table) as usize,
-            db.relay_events.iter().count(),
+            db.relay.events.iter().count(),
             "only the boundary table and newer tables should remain"
         );
 
@@ -433,8 +433,8 @@ mod tests {
         }
 
         let cutoff_seq = events_per_second * ttl_seconds;
-        let before_space = db.relay_events.disk_space();
-        let before_tables = db.relay_events.table_count();
+        let before_space = db.relay.events.disk_space();
+        let before_tables = db.relay.events.table_count();
         assert!(
             before_tables >= total_seconds as usize,
             "sustained writes should have produced multiple SSTs; tables={before_tables}"
@@ -443,10 +443,10 @@ mod tests {
         seed_past_relay_watermark(&db, cutoff_seq)?;
         relay_events_ttl_tick(&db, &Duration::from_secs(60 * 60))?;
 
-        let after_space = db.relay_events.disk_space();
-        let after_tables = db.relay_events.table_count();
+        let after_space = db.relay.events.disk_space();
+        let after_tables = db.relay.events.table_count();
         let first_seq = first_relay_seq(&db)?;
-        let remaining_events = db.relay_events.iter().count() as u64;
+        let remaining_events = db.relay.events.iter().count() as u64;
 
         assert!(
             after_tables < before_tables,
@@ -480,18 +480,18 @@ mod tests {
         let payload = vec![0x42; 8 * 1024];
 
         seed_compacted_relay_events(&db, old_count + retained_count, &payload)?;
-        let before_prune = db.relay_events.disk_space();
+        let before_prune = db.relay.events.disk_space();
         prune_prefix_with_per_key_tombstones(&db, old_count)?;
-        let after_delete = db.relay_events.disk_space();
+        let after_delete = db.relay.events.disk_space();
 
         for _ in 0..16 {
-            db.relay_events
+            db.relay.events
                 .compact(Arc::new(fjall::compaction::Leveled::default()))
                 .into_diagnostic()?;
         }
 
-        let after_leveled = db.relay_events.disk_space();
-        assert_eq!(retained_count as usize, db.relay_events.iter().count());
+        let after_leveled = db.relay.events.disk_space();
+        assert_eq!(retained_count as usize, db.relay.events.iter().count());
         assert!(
             after_leveled >= before_prune * 9 / 10,
             "leveled compaction should not be expected to reclaim prefix tombstones quickly; before={before_prune}, after_delete={after_delete}, after_leveled={after_leveled}"

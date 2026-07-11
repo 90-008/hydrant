@@ -63,7 +63,7 @@ pub async fn handle_debug_count(
         .map_err(|_| StatusCode::BAD_REQUEST)?;
 
     let db = &state.db;
-    let ks = db.records.clone();
+    let ks = db.indexer.records.clone();
 
     // {TrimmedDid}|{collection}|
     let prefix = keys::record_prefix_collection(&did, &req.collection);
@@ -287,19 +287,19 @@ fn get_keyspace_by_name(db: &crate::db::Db, name: &str) -> Result<fjall::Keyspac
         "counts" => Ok(db.counts.clone()),
         "cursors" => Ok(db.cursors.clone()),
         #[cfg(feature = "indexer")]
-        "blocks" => Ok(db.blocks.clone()),
+        "blocks" => Ok(db.indexer.blocks.clone()),
         #[cfg(feature = "indexer")]
-        "pending" => Ok(db.pending.clone()),
+        "pending" => Ok(db.indexer.pending.clone()),
         #[cfg(feature = "indexer")]
-        "resync" => Ok(db.resync.clone()),
+        "resync" => Ok(db.indexer.resync.clone()),
         #[cfg(feature = "indexer_stream")]
-        "events" => Ok(db.events.clone()),
+        "events" => Ok(db.stream.events.clone()),
         #[cfg(feature = "jetstream")]
-        "jetstream_events" => Ok(db.jetstream_events.clone()),
+        "jetstream_events" => Ok(db.jetstream.events.clone()),
         #[cfg(feature = "relay")]
-        "relay_events" => Ok(db.relay_events.clone()),
+        "relay_events" => Ok(db.relay.events.clone()),
         #[cfg(feature = "indexer")]
-        "records" => Ok(db.records.clone()),
+        "records" => Ok(db.indexer.records.clone()),
         _ => Err(StatusCode::BAD_REQUEST),
     }
 }
@@ -413,9 +413,9 @@ pub async fn handle_debug_seed_events(
                 for _ in 0..req.count {
                     let seq = state
                         .db
-                        .next_event_id
+                        .stream.next_event_id
                         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    batch.insert(&state.db.events, crate::db::keys::event_key(seq), b"dummy");
+                    batch.insert(&state.db.stream.events, crate::db::keys::event_key(seq), b"dummy");
                 }
             }
         } else if req.partition == "relay_events" {
@@ -424,10 +424,10 @@ pub async fn handle_debug_seed_events(
                 for _ in 0..req.count {
                     let seq = state
                         .db
-                        .next_relay_seq
+                        .relay.next_seq
                         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     batch.insert(
-                        &state.db.relay_events,
+                        &state.db.relay.events,
                         crate::db::keys::relay_event_key(seq),
                         b"dummy",
                     );

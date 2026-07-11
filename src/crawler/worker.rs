@@ -167,7 +167,7 @@ impl CrawlerWorker {
                     );
                     #[cfg(feature = "indexer")]
                     batch.insert(
-                        &app_state.db.pending,
+                        &app_state.db.indexer.pending,
                         keys::pending_key(metadata.index_id),
                         &did_key,
                     );

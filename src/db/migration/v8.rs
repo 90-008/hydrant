@@ -80,7 +80,7 @@ fn primary_lifecycle_gauge(db: &Db, repo_key: &[u8]) -> Result<GaugeState> {
         let metadata = deser_repo_meta(metadata_bytes.as_ref())
             .wrap_err("invalid repo metadata during lifecycle count rebuild")?;
         if db
-            .pending
+            .indexer.pending
             .get(keys::pending_key(metadata.index_id))
             .into_diagnostic()?
             .is_some()
@@ -89,7 +89,7 @@ fn primary_lifecycle_gauge(db: &Db, repo_key: &[u8]) -> Result<GaugeState> {
         }
     }
 
-    db.resync
+    db.indexer.resync
         .get(repo_key)
         .into_diagnostic()?
         .map(|bytes| crate::db::lifecycle_counts::gauge_from_resync(bytes.as_ref()))
@@ -187,12 +187,12 @@ mod tests {
                 insert_repo(&db, &mut batch, &synced_did, 40)?;
 
                 batch.insert(
-                    &db.pending,
+                    &db.indexer.pending,
                     keys::pending_key(10),
                     keys::repo_key(&pending_did),
                 );
                 batch.insert(
-                    &db.resync,
+                    &db.indexer.resync,
                     keys::repo_key(&ratelimited_did),
                     rmp_serde::to_vec(&ResyncState::Error {
                         kind: ResyncErrorKind::Ratelimited,
@@ -202,7 +202,7 @@ mod tests {
                     .into_diagnostic()?,
                 );
                 batch.insert(
-                    &db.resync,
+                    &db.indexer.resync,
                     keys::repo_key(&gone_did),
                     rmp_serde::to_vec(&ResyncState::Gone {
                         status: RepoStatus::Deactivated,

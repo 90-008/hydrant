@@ -359,7 +359,7 @@ impl<'i> RepoHandle<'i> {
                 let metadata = crate::db::deser_repo_meta(metadata_bytes.as_ref())?;
                 Ok(app_state
                     .db
-                    .pending
+                    .indexer.pending
                     .get(crate::db::keys::pending_key(metadata.index_id))
                     .into_diagnostic()?
                     .is_some())

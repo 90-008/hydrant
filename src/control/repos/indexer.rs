@@ -21,7 +21,7 @@ impl ReposControl {
         let state = self.0.clone();
         self.0
             .db
-            .pending
+            .indexer.pending
             .range((start_bound, std::ops::Bound::Unbounded))
             .map(move |g| {
                 let (id_raw, did_key) = g.into_inner().into_diagnostic()?;
@@ -71,7 +71,7 @@ impl ReposControl {
         let state = self.0.clone();
         self.0
             .db
-            .resync
+            .indexer.resync
             .range((start_bound, std::ops::Bound::Unbounded))
             .map(move |g| {
                 let did_key = g.key().into_diagnostic()?;
@@ -124,7 +124,7 @@ impl ReposControl {
 
             // skip if already in pending queue
             let is_pending = db
-                .pending
+                .indexer.pending
                 .get(keys::pending_key(metadata.index_id))
                 .into_diagnostic()?
                 .is_some();
@@ -132,10 +132,10 @@ impl ReposControl {
                 metadata.tracked = true;
                 // insert into pending with new index_id
                 let old_pending = keys::pending_key(metadata.index_id);
-                batch.remove(&db.pending, old_pending);
+                batch.remove(&db.indexer.pending, old_pending);
                 metadata.index_id = rand::Rng::next_u64(&mut rand::rng());
-                batch.insert(&db.pending, keys::pending_key(metadata.index_id), &did_key);
-                batch.remove(&db.resync, &did_key);
+                batch.insert(&db.indexer.pending, keys::pending_key(metadata.index_id), &did_key);
+                batch.remove(&db.indexer.resync, &did_key);
                 batch.insert(
                     &db.repo_metadata,
                     &metadata_key,
@@ -234,7 +234,7 @@ impl ReposControl {
                         &metadata_key,
                         crate::db::ser_repo_meta(&metadata)?,
                     );
-                    batch.insert(&db.pending, keys::pending_key(metadata.index_id), &did_key);
+                    batch.insert(&db.indexer.pending, keys::pending_key(metadata.index_id), &did_key);
                     count_deltas.add_repos(1);
                     lifecycle_counts.transition(&mut batch, &did, GaugeState::Pending)?;
                     queued.push(did);
@@ -297,8 +297,8 @@ impl ReposControl {
                             &metadata_key,
                             crate::db::ser_repo_meta(&metadata)?,
                         );
-                        batch.remove(&db.pending, keys::pending_key(metadata.index_id));
-                        batch.remove(&db.resync, &did_key);
+                        batch.remove(&db.indexer.pending, keys::pending_key(metadata.index_id));
+                        batch.remove(&db.indexer.resync, &did_key);
                         lifecycle_counts.transition(&mut batch, &did, GaugeState::Synced)?;
                         untracked.push(did);
                     }
@@ -332,14 +332,14 @@ impl<'i> RepoHandle<'i> {
         tokio::task::spawn_blocking(move || {
             use miette::WrapErr;
 
-            let cid_bytes = state.db.records.get(db_key).into_diagnostic()?;
+            let cid_bytes = state.db.indexer.records.get(db_key).into_diagnostic()?;
             let Some(cid_bytes) = cid_bytes else {
                 return Ok(None);
             };
 
             // lookup block using col|cid key
             let block_key = keys::block_key(&collection, &cid_bytes);
-            let Some(block_bytes) = state.db.blocks.get(block_key).into_diagnostic()? else {
+            let Some(block_bytes) = state.db.indexer.blocks.get(block_key).into_diagnostic()? else {
                 miette::bail!("block {cid_bytes:?} not found, this is a bug!!");
             };
 
@@ -398,7 +398,7 @@ impl<'i> RepoHandle<'i> {
                 Box::new(
                     state
                         .db
-                        .records
+                        .indexer.records
                         .range(prefix.as_slice()..end_key.as_slice())
                         .rev(),
                 )
@@ -413,7 +413,7 @@ impl<'i> RepoHandle<'i> {
                     prefix.clone()
                 };
 
-                Box::new(state.db.records.range(start_key.as_slice()..))
+                Box::new(state.db.indexer.records.range(start_key.as_slice()..))
             };
 
             for item in iter {
@@ -432,7 +432,7 @@ impl<'i> RepoHandle<'i> {
                 // look up using col|cid key built from collection and binary cid bytes
                 if let Ok(Some(block_bytes)) = state
                     .db
-                    .blocks
+                    .indexer.blocks
                     .get(keys::block_key(collection.as_str(), &cid_bytes))
                 {
                     let value: Data =
@@ -509,7 +509,7 @@ impl<'i> RepoHandle<'i> {
             let mut mst = mst;
             let prefix = keys::record_prefix_did(&did);
 
-            for guard in app_state.db.records.prefix(&prefix) {
+            for guard in app_state.db.indexer.records.prefix(&prefix) {
                 let (key, cid_bytes) = guard.into_inner().into_diagnostic()?;
 
                 let rest = &key[prefix.len()..];
@@ -534,7 +534,7 @@ impl<'i> RepoHandle<'i> {
                 let block_key = keys::block_key(collection, cid_bytes.as_ref());
                 let block_bytes = app_state
                     .db
-                    .blocks
+                    .indexer.blocks
                     .get(&block_key)
                     .into_diagnostic()?
                     .ok_or_else(|| miette::miette!("block missing for record {mst_key}"))?;

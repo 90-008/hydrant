@@ -16,14 +16,14 @@ pub(crate) fn relay_stream_thread(
     cursor: Option<u64>,
     opts: StreamOptions,
 ) {
-    let relay_rx = state.db.relay_broadcast_tx.subscribe();
-    let ks = state.db.relay_events.clone();
+    let relay_rx = state.db.relay.broadcast_tx.subscribe();
+    let ks = state.db.relay.events.clone();
     let current_seq = match cursor {
         Some(c) => Some(c.saturating_sub(1)),
         None => Some(
             state
                 .db
-                .next_relay_seq
+                .relay.next_seq
                 .load(Ordering::SeqCst)
                 .saturating_sub(1),
         ),
@@ -32,7 +32,7 @@ pub(crate) fn relay_stream_thread(
         .and_then(|_| {
             state
                 .db
-                .next_relay_seq
+                .relay.next_seq
                 .load(Ordering::SeqCst)
                 .checked_sub(1)
         })

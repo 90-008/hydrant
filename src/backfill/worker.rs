@@ -91,7 +91,7 @@ impl BackfillWorker {
             self.enabled.wait_enabled("backfill").await;
             let mut spawned = 0;
 
-            for guard in self.state.db.pending.iter() {
+            for guard in self.state.db.indexer.pending.iter() {
                 let (key, value) = match guard.into_inner() {
                     Ok(kv) => kv,
                     Err(e) => {

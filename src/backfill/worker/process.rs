@@ -91,7 +91,7 @@ pub(crate) async fn process_did(
                 .then_some(None)
                 .unwrap_or_else(|| Some(status.into())),
         };
-        let _ = app_state.db.event_tx.send(ops::make_account_event(db, evt));
+        let _ = app_state.db.stream.event_tx.send(ops::make_account_event(db, evt));
     };
 
     if strategy != BackfillStrategy::Full {
@@ -151,7 +151,7 @@ pub(crate) async fn process_did(
                             pending_key.as_ref(),
                             GaugeState::Synced,
                         )?;
-                        batch.remove(&app_state_clone.db.pending, pending_key.clone());
+                        batch.remove(&app_state_clone.db.indexer.pending, pending_key.clone());
                         if applied {
                             batch.remove(&app_state_clone.db.repos, &did_key);
                             batch.remove(&app_state_clone.db.repo_metadata, &metadata_key);
@@ -234,7 +234,7 @@ pub(crate) async fn process_did(
                     pending_key.as_ref(),
                     GaugeState::Synced,
                 )?;
-                batch.remove(&db.pending, pending_key.clone());
+                batch.remove(&db.indexer.pending, pending_key.clone());
                 if applied {
                     if let Err(e) = crate::ops::delete_repo(&mut batch, db, did, &state) {
                         error!(err = %e, "failed to wipe repo during backfill");
@@ -278,7 +278,7 @@ pub(crate) async fn process_did(
                         pending_key.as_ref(),
                         GaugeState::Resync(None),
                     )?;
-                    batch.remove(&db.pending, pending_key.clone());
+                    batch.remove(&db.indexer.pending, pending_key.clone());
                     if applied {
                         Db::update_repo_state(
                             &mut batch,
@@ -287,7 +287,7 @@ pub(crate) async fn process_did(
                             move |state, (key, batch)| {
                                 state.active = false;
                                 state.status = status;
-                                batch.insert(&db.resync, key, resync_bytes);
+                                batch.insert(&db.indexer.resync, key, resync_bytes);
                                 Ok((true, ()))
                             },
                         )?;
@@ -409,7 +409,7 @@ pub(crate) async fn process_did(
             let mut existing_cids: HashMap<(SmolStr, DbRkey), SmolStr> = HashMap::new();
 
             if !ephemeral {
-                for guard in app_state.db.records.prefix(&prefix) {
+                for guard in app_state.db.indexer.records.prefix(&prefix) {
                     let (key, cid_bytes) = guard.into_inner().into_diagnostic()?;
                     // key is did|collection|rkey
                     // skip did|
@@ -480,9 +480,9 @@ pub(crate) async fn process_did(
                     let block_key = Slice::from(keys::block_key(collection, &cid_raw));
                     if !ephemeral {
                         if !only_index_links {
-                            batch.insert(&app_state.db.blocks, block_key.clone(), val.as_ref());
+                            batch.insert(&app_state.db.indexer.blocks, block_key.clone(), val.as_ref());
                         }
-                        batch.insert(&app_state.db.records, db_key, cid_raw);
+                        batch.insert(&app_state.db.indexer.records, db_key, cid_raw);
                         #[cfg(feature = "backlinks")]
                         if let Ok(value) = serde_ipld_dagcbor::from_slice::<jacquard_common::Data>(val.as_ref()) {
                             crate::backlinks::store::index_record(
@@ -503,7 +503,7 @@ pub(crate) async fn process_did(
 
                     #[cfg(feature = "indexer_stream")]
                     {
-                        let event_id = app_state.db.next_event_id.fetch_add(1, Ordering::SeqCst);
+                        let event_id = app_state.db.stream.next_event_id.fetch_add(1, Ordering::SeqCst);
                         let evt = StoredEvent {
                             live: false,
                             did: TrimmedDid::from(&did),
@@ -520,7 +520,7 @@ pub(crate) async fn process_did(
                             },
                         };
                         let bytes = rmp_serde::to_vec(&evt).into_diagnostic()?;
-                        batch.insert(&app_state.db.events, keys::event_key(event_id), bytes);
+                        batch.insert(&app_state.db.stream.events, keys::event_key(event_id), bytes);
 
                         #[cfg(feature = "jetstream")]
                         {
@@ -549,7 +549,7 @@ pub(crate) async fn process_did(
                 // we dont have to put if ephemeral around here since
                 // existing_cids will be empty anyway
                 batch.remove(
-                    &app_state.db.records,
+                    &app_state.db.indexer.records,
                     keys::record_key(&did, &collection, &rkey),
                 );
                 #[cfg(feature = "backlinks")]
@@ -563,7 +563,7 @@ pub(crate) async fn process_did(
 
                 #[cfg(feature = "indexer_stream")]
                 {
-                    let event_id = app_state.db.next_event_id.fetch_add(1, Ordering::SeqCst);
+                    let event_id = app_state.db.stream.next_event_id.fetch_add(1, Ordering::SeqCst);
                     let evt = StoredEvent {
                         live: false,
                         did: TrimmedDid::from(&did),
@@ -574,7 +574,7 @@ pub(crate) async fn process_did(
                         data: StoredData::Nothing,
                     };
                     let bytes = rmp_serde::to_vec(&evt).into_diagnostic()?;
-                    batch.insert(&app_state.db.events, keys::event_key(event_id), bytes);
+                    batch.insert(&app_state.db.stream.events, keys::event_key(event_id), bytes);
 
                     #[cfg(feature = "jetstream")]
                     {
@@ -667,7 +667,7 @@ pub(crate) async fn process_did(
                 backfill_pending_key.as_ref(),
                 GaugeState::Synced,
             )?;
-            batch.remove(&app_state.db.pending, backfill_pending_key.clone());
+            batch.remove(&app_state.db.indexer.pending, backfill_pending_key.clone());
             if applied {
                 batch.remove(&app_state.db.repos, &did_key);
                 batch.remove(&app_state.db.repo_metadata, &metadata_key);
@@ -693,8 +693,8 @@ pub(crate) async fn process_did(
     );
 
     #[cfg(feature = "indexer_stream")]
-    let _ = db.event_tx.send(BroadcastEvent::Persisted(
-        db.next_event_id.load(Ordering::SeqCst) - 1,
+    let _ = db.stream.event_tx.send(BroadcastEvent::Persisted(
+        db.stream.next_event_id.load(Ordering::SeqCst) - 1,
     ));
 
     trace!("complete");

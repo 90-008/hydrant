@@ -75,9 +75,9 @@ impl EventSink {
         let started = crate::ingest::firehose_stats::StatsInstant::now();
         let result = (|| {
             let db = &state.db;
-            let seq = db.next_relay_seq.fetch_add(1, Ordering::SeqCst);
+            let seq = db.relay.next_seq.fetch_add(1, Ordering::SeqCst);
             let frame = make_frame(seq as i64)?;
-            batch.insert(&db.relay_events, keys::relay_event_key(seq), frame.as_ref());
+            batch.insert(&db.relay.events, keys::relay_event_key(seq), frame.as_ref());
             self.broadcasts.push(RelayBroadcast::Ephemeral(seq, frame));
             self.broadcasts.push(RelayBroadcast::Persisted(seq));
             Ok(seq)
@@ -118,7 +118,7 @@ impl EventSink {
         {
             // skip car parse and record materialization when no jetstream subscribers are
             // connected — the stream thread re-reads from relay_events as a fallback.
-            let has_subscribers = state.db.jetstream_tx.receiver_count() > 0;
+            let has_subscribers = state.db.jetstream.tx.receiver_count() > 0;
             for (op_index, collection) in &jetstream_ops {
                 let ephemeral = has_subscribers
                     .then(|| build_relay_commit_ephemeral(&commit, *op_index, collection, &parsed_blocks))
@@ -210,7 +210,7 @@ impl EventSink {
         {
             let mut batch = batch;
             let mut jetstream_broadcasts = Vec::new();
-            let _lock = state.db.jetstream_lock.lock();
+            let _lock = state.db.jetstream.lock.lock();
             for (event, ephemeral) in self.jetstream_events.drain(..) {
                 jetstream_broadcasts.push(crate::jetstream::stage_event(
                     &mut batch, &state.db, event, ephemeral,
@@ -231,11 +231,11 @@ impl EventSink {
 
     pub(crate) fn flush(&mut self, state: &AppState, staged: Staged) {
         for broadcast in self.broadcasts.drain(..) {
-            let _ = state.db.relay_broadcast_tx.send(broadcast);
+            let _ = state.db.relay.broadcast_tx.send(broadcast);
         }
         #[cfg(feature = "jetstream")]
         for broadcast in staged.jetstream_broadcasts {
-            let _ = state.db.jetstream_tx.send(broadcast);
+            let _ = state.db.jetstream.tx.send(broadcast);
         }
         #[cfg(not(feature = "jetstream"))]
         let _ = staged;

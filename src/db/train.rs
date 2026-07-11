@@ -14,11 +14,11 @@ impl Db {
     pub fn train_dict(&self, ks_name: &str) -> Result<()> {
         let ks = match ks_name {
             #[cfg(feature = "indexer")]
-            "blocks" => &self.blocks,
+            "blocks" => &self.indexer.blocks,
             #[cfg(feature = "indexer_stream")]
-            "events" => &self.events,
+            "events" => &self.stream.events,
             #[cfg(feature = "jetstream")]
-            "jetstream_events" => &self.jetstream_events,
+            "jetstream_events" => &self.jetstream.events,
             "repos" => &self.repos,
             #[cfg(feature = "backlinks")]
             "backlinks" => &self.backlinks,

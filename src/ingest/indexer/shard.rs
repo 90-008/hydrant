@@ -287,11 +287,11 @@ impl FirehoseWorker {
             drop(reservation);
             #[cfg(feature = "indexer_stream")]
             for evt in broadcast_events.drain(..) {
-                let _ = state.db.event_tx.send(evt);
+                let _ = state.db.stream.event_tx.send(evt);
             }
             #[cfg(feature = "jetstream")]
             for evt in jetstream_events.drain(..) {
-                let _ = state.db.jetstream_tx.send(evt);
+                let _ = state.db.jetstream.tx.send(evt);
             }
 
             // state.db.inner.persist(fjall::PersistMode::Buffer).ok();
@@ -337,7 +337,7 @@ impl FirehoseWorker {
         let metadata_bytes = db.repo_metadata.get(&metadata_key).into_diagnostic()?;
         let is_backfilling = if let Some(metadata_bytes) = metadata_bytes {
             let metadata = crate::db::deser_repo_meta(metadata_bytes.as_ref())?;
-            db.pending
+            db.indexer.pending
                 .get(keys::pending_key(metadata.index_id))
                 .into_diagnostic()?
                 .is_some()
@@ -509,7 +509,7 @@ impl FirehoseWorker {
         let db = &ctx.state.db;
         let prefix = keys::resync_buffer_prefix(did);
 
-        for guard in db.resync_buffer.prefix(&prefix) {
+        for guard in db.indexer.resync_buffer.prefix(&prefix) {
             let (key, value) = guard.into_inner().into_diagnostic()?;
             let commit: Commit = rmp_serde::from_slice(&value).into_diagnostic()?;
 
@@ -525,14 +525,14 @@ impl FirehoseWorker {
                 Ok(r) => r,
                 Err(e) => {
                     if !Self::check_if_retriable_failure(&e) {
-                        ctx.batch.remove(&db.resync_buffer, key);
+                        ctx.batch.remove(&db.indexer.resync_buffer, key);
                     }
                     return Err(e);
                 }
             };
             match res {
                 RepoProcessResult::Ok(rs) => {
-                    ctx.batch.remove(&db.resync_buffer, key);
+                    ctx.batch.remove(&db.indexer.resync_buffer, key);
                     repo_state = rs;
                 }
                 RepoProcessResult::NeedsBackfill(_) => {
@@ -540,7 +540,7 @@ impl FirehoseWorker {
                     return Ok(RepoProcessResult::NeedsBackfill(None));
                 }
                 RepoProcessResult::Deleted => {
-                    ctx.batch.remove(&db.resync_buffer, key);
+                    ctx.batch.remove(&db.indexer.resync_buffer, key);
                     return Ok(RepoProcessResult::Deleted);
                 }
             }
@@ -575,18 +575,18 @@ impl FirehoseWorker {
         let old_pkey = keys::pending_key(metadata.index_id);
         let was_pending = had_metadata
             && db
-                .pending
+                .indexer.pending
                 .get(old_pkey.as_slice())
                 .into_diagnostic()?
                 .is_some();
         // remove old pending entry and insert new one with fresh index_id
         if had_metadata {
             // only remove if we had one so we dont delete a random entry
-            batch.remove(&db.pending, old_pkey);
+            batch.remove(&db.indexer.pending, old_pkey);
         }
 
         metadata.index_id = rand::random::<u64>();
-        batch.insert(&db.pending, keys::pending_key(metadata.index_id), &repo_key);
+        batch.insert(&db.indexer.pending, keys::pending_key(metadata.index_id), &repo_key);
         batch.insert(&db.repo_metadata, &meta_key, ser_repo_meta(&metadata)?);
         if !was_pending {
             lifecycle_counts.transition(&mut batch, did, GaugeState::Pending)?;
