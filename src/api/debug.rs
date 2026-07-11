@@ -282,26 +282,7 @@ pub async fn handle_debug_iter(
 }
 
 fn get_keyspace_by_name(db: &crate::db::Db, name: &str) -> Result<fjall::Keyspace, StatusCode> {
-    match name {
-        "repos" => Ok(db.repos.clone()),
-        "counts" => Ok(db.counts.clone()),
-        "cursors" => Ok(db.cursors.clone()),
-        #[cfg(feature = "indexer")]
-        "blocks" => Ok(db.indexer.blocks.clone()),
-        #[cfg(feature = "indexer")]
-        "pending" => Ok(db.indexer.pending.clone()),
-        #[cfg(feature = "indexer")]
-        "resync" => Ok(db.indexer.resync.clone()),
-        #[cfg(feature = "indexer_stream")]
-        "events" => Ok(db.stream.events.clone()),
-        #[cfg(feature = "jetstream")]
-        "jetstream_events" => Ok(db.jetstream.events.clone()),
-        #[cfg(feature = "relay")]
-        "relay_events" => Ok(db.relay.events.clone()),
-        #[cfg(feature = "indexer")]
-        "records" => Ok(db.indexer.records.clone()),
-        _ => Err(StatusCode::BAD_REQUEST),
-    }
+    db.keyspace_by_name(name).ok_or(StatusCode::BAD_REQUEST)
 }
 
 #[derive(Deserialize)]

@@ -51,6 +51,46 @@ impl OpenCx<'_> {
     }
 }
 
+impl super::Db {
+    /// look up any open keyspace by its on-disk name. the mode groups each
+    /// contribute their keyspaces, so this stays in sync with the table above.
+    pub fn keyspace_by_name(&self, name: &str) -> Option<Keyspace> {
+        match name {
+            "repos" => return Some(self.repos.clone()),
+            "repo_metadata" => return Some(self.repo_metadata.clone()),
+            "counts" => return Some(self.counts.clone()),
+            "cursors" => return Some(self.cursors.clone()),
+            "filter" => return Some(self.filter.clone()),
+            "crawler" => return Some(self.crawler.clone()),
+            #[cfg(feature = "backlinks")]
+            "backlinks" => return Some(self.backlinks.clone()),
+            _ => {}
+        }
+        #[cfg(feature = "indexer")]
+        match name {
+            "records" => return Some(self.indexer.records.clone()),
+            "blocks" => return Some(self.indexer.blocks.clone()),
+            "pending" => return Some(self.indexer.pending.clone()),
+            "resync" => return Some(self.indexer.resync.clone()),
+            "resync_buffer" => return Some(self.indexer.resync_buffer.clone()),
+            _ => {}
+        }
+        #[cfg(feature = "indexer_stream")]
+        if name == "events" {
+            return Some(self.stream.events.clone());
+        }
+        #[cfg(feature = "jetstream")]
+        if name == "jetstream_events" {
+            return Some(self.jetstream.events.clone());
+        }
+        #[cfg(feature = "relay")]
+        if name == "relay_events" {
+            return Some(self.relay.events.clone());
+        }
+        None
+    }
+}
+
 #[cfg(feature = "indexer")]
 pub struct IndexerDb {
     /// maps `{DID}|{COL}|{RKey}` -> record CID
