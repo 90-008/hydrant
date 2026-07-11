@@ -119,7 +119,6 @@ fn classify_websocket_error(err: &tokio_websockets::Error) -> FirehoseFailure {
     }
 }
 
-#[cfg(feature = "firehose-diagnostics")]
 fn message_stats(msg: &SubscribeReposMessage<'_>) -> (&'static str, Option<i64>) {
     match msg {
         SubscribeReposMessage::Commit(commit) => ("commit", Some(commit.seq)),
@@ -149,7 +148,6 @@ pub struct FirehoseIngestor {
     _verify_signatures: bool,
     throttle: ThrottleHandle,
     max_failures: usize,
-    #[cfg(feature = "firehose-diagnostics")]
     stats: Arc<crate::ingest::firehose_stats::FirehoseSourceStats>,
 }
 
@@ -165,7 +163,6 @@ impl FirehoseIngestor {
         max_failures: usize,
     ) -> Self {
         let throttle = state.throttler.get_handle(&relay_host).await;
-        #[cfg(feature = "firehose-diagnostics")]
         let stats = state.firehose_stats.handle(&relay_host).await;
         Self {
             state,
@@ -177,7 +174,6 @@ impl FirehoseIngestor {
             _verify_signatures: verify_signatures,
             throttle,
             max_failures,
-            #[cfg(feature = "firehose-diagnostics")]
             stats,
         }
     }
@@ -208,7 +204,6 @@ impl FirehoseIngestor {
                 Some(c) => info!(cursor = %c, "resuming from cursor"),
                 None => info!("no cursor found, live tailing"),
             }
-            #[cfg(feature = "firehose-diagnostics")]
             self.stats.record_connect_attempt(start_cursor);
 
             let host_status = self.is_pds.then(|| {
@@ -229,7 +224,6 @@ impl FirehoseIngestor {
                     Ok(s) => s,
                     Err(e) => {
                         let failure = classify_firehose_error(&e);
-                        #[cfg(feature = "firehose-diagnostics")]
                         self.stats.record_connect_error(failure.kind);
                         let secs = match self.on_failure(&failure).await {
                             Some(secs) => secs,
@@ -265,7 +259,6 @@ impl FirehoseIngestor {
                 elapsed_ms = connect_started.elapsed().as_millis(),
                 "firehose connected"
             );
-            #[cfg(feature = "firehose-diagnostics")]
             self.stats.record_connected(connect_started.elapsed());
             let mut marked_active = false;
             let active_sleep_secs = if cfg!(debug_assertions) { 1 } else { 60 };
@@ -279,15 +272,11 @@ impl FirehoseIngestor {
                             Ok(b) => b,
                             Err(e) => break Err(e),
                         };
-                        #[cfg(feature = "firehose-diagnostics")]
                         self.stats.record_frame(bytes.len());
                         match decode_frame(&bytes) {
                             Ok(msg) => {
-                                #[cfg(feature = "firehose-diagnostics")]
-                                {
-                                    let (kind, seq) = message_stats(&msg);
-                                    self.stats.record_decoded(kind, seq);
-                                }
+                                let (kind, seq) = message_stats(&msg);
+                                self.stats.record_decoded(kind, seq);
                                 if self.is_pds {
                                     let tier = {
                                         let meta = self.state.pds_meta.load();
@@ -299,13 +288,11 @@ impl FirehoseIngestor {
                                         self.state.tier_policy.resolve(host, override_name)
                                     };
                                     let accounts = self.state.db.get_count(&count_key).await;
-                                    #[cfg(feature = "firehose-diagnostics")]
-                                    let throttle_started = Instant::now();
+                                    let throttle_started = crate::ingest::firehose_stats::StatsInstant::now();
                                     let mut disabled = false;
                                     loop {
                                         tokio::select! {
                                             _ = self.throttle.wait_for_allow(accounts, &tier) => {
-                                                #[cfg(feature = "firehose-diagnostics")]
                                                 self.stats.record_throttle_wait(throttle_started.elapsed());
                                                 break;
                                             }
@@ -389,13 +376,11 @@ impl FirehoseIngestor {
                 // reconnect quickly. a malicious source could abuse this but they could equally
                 // just drop the TCP connection, which would hit the normal backoff path anyway.
                 Err(FirehoseError::StreamClosed { code: 1001, reason }) => {
-                    #[cfg(feature = "firehose-diagnostics")]
                     self.stats.record_stream_error("stream_closed");
                     debug!(reason = %reason, "host gone away");
                     tokio::time::sleep(Duration::from_secs(1)).await;
                 }
                 Err(FirehoseError::FutureCursor) => {
-                    #[cfg(feature = "firehose-diagnostics")]
                     self.stats.record_stream_error("future_cursor");
                     if self.is_pds
                         && let Err(e) = self.set_host_status(HostStatus::Idle)
@@ -414,7 +399,6 @@ impl FirehoseIngestor {
                         .map_or(Cow::Borrowed("<no message>"), Cow::Borrowed);
                     let failure =
                         FirehoseFailure::new("relay_error", format!("{error}: {message}"));
-                    #[cfg(feature = "firehose-diagnostics")]
                     self.stats.record_stream_error(failure.kind);
                     error!(err = %error, "relay sent error: {message}");
                     let secs = match self.on_failure(&failure).await {
@@ -444,7 +428,6 @@ impl FirehoseIngestor {
                 }
                 Err(e) => {
                     let failure = classify_firehose_error(&e);
-                    #[cfg(feature = "firehose-diagnostics")]
                     self.stats.record_stream_error(failure.kind);
                     let secs = match self.on_failure(&failure).await {
                         Some(secs) => secs,
@@ -542,26 +525,22 @@ impl FirehoseIngestor {
             _ => return,
         };
 
-        #[cfg(feature = "firehose-diagnostics")]
-        let should_process_started = Instant::now();
+        let should_process_started = crate::ingest::firehose_stats::StatsInstant::now();
         let process = self
             .should_process(did)
             .await
             .inspect_err(|e| error!(did = %did, err = %e, "failed to check if we should process"))
             .unwrap_or(false);
-        #[cfg(feature = "firehose-diagnostics")]
         self.stats
             .record_should_process(should_process_started.elapsed());
         if !process {
-            #[cfg(feature = "firehose-diagnostics")]
             self.stats.record_skipped();
             trace!(did = %did, "skipping: not in filter");
             return;
         }
         trace!(did = %did, "forwarding message to ingest buffer");
 
-        #[cfg(feature = "firehose-diagnostics")]
-        let send_started = Instant::now();
+        let send_started = crate::ingest::firehose_stats::StatsInstant::now();
         let res = self
             .buffer_tx
             .send(IngestMessage::Firehose {
@@ -570,7 +549,6 @@ impl FirehoseIngestor {
                 msg: msg.into_static(),
             })
             .await;
-        #[cfg(feature = "firehose-diagnostics")]
         {
             let elapsed = send_started.elapsed();
             if res.is_ok() {

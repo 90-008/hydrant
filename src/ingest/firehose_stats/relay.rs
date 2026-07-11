@@ -5,38 +5,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::Duration;
 
-use super::{add_duration, add_duration_with_max, nonzero_i64, now_ts};
-
-#[derive(Clone, Copy, Debug)]
-pub enum RelayMessageKind {
-    Commit,
-    Sync,
-    Identity,
-    Account,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub enum RepoStateLoadOutcome {
-    Hit,
-    Miss,
-    Drop,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub enum HostAuthorityStatsOutcome {
-    Authorized,
-    WasStale,
-    WrongHost,
-    Error,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub enum ValidationStatsOutcome {
-    Accepted,
-    Stale,
-    SigFailure,
-    Rejected,
-}
+use super::{
+    HostAuthorityStatsOutcome, RelayMessageKind, RelayShardTimings, RepoStateLoadOutcome,
+    ValidationStatsOutcome, add_duration, add_duration_with_max, nonzero_i64, now_ts,
+};
 
 #[derive(Default)]
 pub struct RelayWorkerStats {
@@ -396,17 +368,6 @@ impl RelayShardStats {
             max_seq: nonzero_i64(&self.max_seq),
         }
     }
-}
-
-#[derive(Default)]
-pub struct RelayShardTimings {
-    pub process_message: Duration,
-    pub stage_counts: Duration,
-    pub stage_and_commit: Duration,
-    pub apply_counts: Duration,
-    pub broadcast: Duration,
-    pub cursor: Duration,
-    pub total: Duration,
 }
 
 #[derive(Debug, Clone, Serialize)]

@@ -1,8 +1,7 @@
 use std::sync::Arc;
 #[cfg(feature = "relay")]
 use std::sync::atomic::Ordering;
-#[cfg(feature = "firehose-diagnostics")]
-use std::time::Instant;
+use crate::ingest::firehose_stats::StatsInstant;
 
 use miette::{IntoDiagnostic, Result};
 use tokio::runtime::Handle;
@@ -17,7 +16,6 @@ use crate::state::AppState;
 
 use super::{AuthorityOutcome, WorkerContext};
 
-#[cfg(feature = "firehose-diagnostics")]
 use super::relay_message_kind;
 
 pub struct WorkerMessage {
@@ -120,7 +118,6 @@ impl RelayWorker {
         let span = info_span!("worker_shard", shard = id);
         let _entered = span.clone().entered();
         debug!("relay shard started");
-        #[cfg(feature = "firehose-diagnostics")]
         let shard_stats = state.firehose_stats.relay_shard(id);
 
         let mut ctx = WorkerContext {
@@ -129,7 +126,6 @@ impl RelayWorker {
             vctx: crate::ingest::validation::ValidationContext {
                 opts: &validation_opts,
             },
-            #[cfg(feature = "firehose-diagnostics")]
             stats: shard_stats.clone(),
             batch: state.db.inner.batch(),
             count_deltas: CountDeltas::default(),
@@ -147,11 +143,9 @@ impl RelayWorker {
         };
 
         while let Some(msg) = rx.blocking_recv() {
-            #[cfg(feature = "firehose-diagnostics")]
-            let message_started = Instant::now();
+            let message_started = StatsInstant::now();
             let IngestMessage::Firehose { url, is_pds, msg } = msg;
             if let SubscribeReposMessage::Info(inf) = msg {
-                #[cfg(feature = "firehose-diagnostics")]
                 shard_stats.record_info();
                 match inf.name {
                     InfoName::OutdatedCursor => {}
@@ -179,37 +173,30 @@ impl RelayWorker {
                 SubscribeReposMessage::Sync(s) => (s.did.clone(), s.seq),
                 _ => continue,
             };
-            #[cfg(feature = "firehose-diagnostics")]
             shard_stats.record_received(seq);
 
             let firehose = msg.firehose.clone();
             let _span = info_span!("relay", did = %did, firehose = %firehose, seq = %seq).entered();
 
-            #[cfg(feature = "firehose-diagnostics")]
-            let process_started = Instant::now();
+            let process_started = StatsInstant::now();
             if let Err(e) = Self::process_message(&mut ctx, msg) {
-                #[cfg(feature = "firehose-diagnostics")]
                 shard_stats.record_process_error();
                 error!(did = %did, err = %e, "relay shard: error processing message");
             }
-            #[cfg(feature = "firehose-diagnostics")]
             let process_message = process_started.elapsed();
 
             let mut batch = std::mem::replace(&mut ctx.batch, ctx.state.db.inner.batch());
-            #[cfg(feature = "firehose-diagnostics")]
-            let stage_counts_started = Instant::now();
+            let stage_counts_started = StatsInstant::now();
             let reservation = ctx
                 .state
                 .db
                 .stage_count_deltas(&mut batch, &ctx.count_deltas);
-            #[cfg(feature = "firehose-diagnostics")]
             let stage_counts = stage_counts_started.elapsed();
 
             #[cfg(all(feature = "relay", feature = "jetstream"))]
             let mut jetstream_broadcasts = Vec::new();
 
-            #[cfg(feature = "firehose-diagnostics")]
-            let stage_and_commit_started = Instant::now();
+            let stage_and_commit_started = StatsInstant::now();
             #[cfg(all(feature = "relay", feature = "jetstream"))]
             let res = {
                 let _lock = ctx.state.db.jetstream_lock.lock();
@@ -229,25 +216,20 @@ impl RelayWorker {
 
             #[cfg(not(all(feature = "relay", feature = "jetstream")))]
             let res = batch.commit();
-            #[cfg(feature = "firehose-diagnostics")]
             let stage_and_commit = stage_and_commit_started.elapsed();
 
             if let Err(e) = res {
-                #[cfg(feature = "firehose-diagnostics")]
                 shard_stats.record_commit_error();
                 error!(shard = id, err = %e, "relay shard: failed to commit batch");
                 drop(reservation);
                 continue;
             }
-            #[cfg(feature = "firehose-diagnostics")]
-            let apply_counts_started = Instant::now();
+            let apply_counts_started = StatsInstant::now();
             ctx.state.db.apply_count_deltas(&ctx.count_deltas);
             drop(reservation);
-            #[cfg(feature = "firehose-diagnostics")]
             let apply_counts = apply_counts_started.elapsed();
 
-            #[cfg(feature = "firehose-diagnostics")]
-            let broadcast_started = Instant::now();
+            let broadcast_started = StatsInstant::now();
             #[cfg(feature = "relay")]
             for broadcast in ctx.pending_broadcasts.drain(..) {
                 let _ = state.db.relay_broadcast_tx.send(broadcast);
@@ -260,20 +242,17 @@ impl RelayWorker {
             for msg in ctx.pending_hook_messages.drain(..) {
                 let _ = ctx.hook.blocking_send(msg);
             }
-            #[cfg(feature = "firehose-diagnostics")]
             let broadcast = broadcast_started.elapsed();
 
             // advance cursor for this firehose only if we are the terminal consumer (relay mode)
             // in events mode, FirehoseWorker will advance the cursor after processing
-            #[cfg(feature = "firehose-diagnostics")]
-            let cursor_started = Instant::now();
+            let cursor_started = StatsInstant::now();
             #[cfg(feature = "relay")]
             {
                 ctx.state
                     .firehose_cursors
                     .peek_with(&firehose, |_, c| c.store(seq, Ordering::SeqCst));
             }
-            #[cfg(feature = "firehose-diagnostics")]
             shard_stats.record_processed(crate::ingest::firehose_stats::RelayShardTimings {
                 process_message,
                 stage_counts,
@@ -287,15 +266,12 @@ impl RelayWorker {
     }
 
     fn process_message(ctx: &mut WorkerContext, msg: WorkerMessage) -> Result<()> {
-        #[cfg(feature = "firehose-diagnostics")]
         if let Some(kind) = relay_message_kind(&msg.msg) {
             ctx.stats.record_message_kind(kind);
         }
 
-        #[cfg(feature = "firehose-diagnostics")]
-        let load_started = Instant::now();
+        let load_started = StatsInstant::now();
         let repo_state_result = ctx.load_repo_state(&msg);
-        #[cfg(feature = "firehose-diagnostics")]
         ctx.stats.record_repo_state_load(load_started.elapsed());
         let Some(mut repo_state) = repo_state_result? else {
             return Ok(());
@@ -305,10 +281,8 @@ impl RelayWorker {
         if let Some(host) = msg.firehose.host_str()
             && msg.is_pds
         {
-            #[cfg(feature = "firehose-diagnostics")]
-            let authority_started = Instant::now();
+            let authority_started = StatsInstant::now();
             let outcome_result = ctx.check_host_authority(did, &mut repo_state, host);
-            #[cfg(feature = "firehose-diagnostics")]
             ctx.stats.record_host_authority(
                 authority_started.elapsed(),
                 match &outcome_result {
@@ -337,10 +311,8 @@ impl RelayWorker {
         match msg.msg {
             SubscribeReposMessage::Commit(commit) => {
                 trace!("processing commit");
-                #[cfg(feature = "firehose-diagnostics")]
-                let started = Instant::now();
+                let started = StatsInstant::now();
                 let result = Self::handle_commit(ctx, &mut repo_state, &msg.firehose, *commit);
-                #[cfg(feature = "firehose-diagnostics")]
                 ctx.stats.record_handle_message(
                     crate::ingest::firehose_stats::RelayMessageKind::Commit,
                     started.elapsed(),
@@ -349,10 +321,8 @@ impl RelayWorker {
             }
             SubscribeReposMessage::Sync(sync) => {
                 debug!("processing sync");
-                #[cfg(feature = "firehose-diagnostics")]
-                let started = Instant::now();
+                let started = StatsInstant::now();
                 let result = Self::handle_sync(ctx, &mut repo_state, &msg.firehose, *sync);
-                #[cfg(feature = "firehose-diagnostics")]
                 ctx.stats.record_handle_message(
                     crate::ingest::firehose_stats::RelayMessageKind::Sync,
                     started.elapsed(),
@@ -361,8 +331,7 @@ impl RelayWorker {
             }
             SubscribeReposMessage::Identity(identity) => {
                 debug!("processing identity");
-                #[cfg(feature = "firehose-diagnostics")]
-                let started = Instant::now();
+                let started = StatsInstant::now();
                 let result = Self::handle_identity(
                     ctx,
                     &mut repo_state,
@@ -370,7 +339,6 @@ impl RelayWorker {
                     *identity,
                     msg.is_pds,
                 );
-                #[cfg(feature = "firehose-diagnostics")]
                 ctx.stats.record_handle_message(
                     crate::ingest::firehose_stats::RelayMessageKind::Identity,
                     started.elapsed(),
@@ -379,11 +347,9 @@ impl RelayWorker {
             }
             SubscribeReposMessage::Account(account) => {
                 debug!("processing account");
-                #[cfg(feature = "firehose-diagnostics")]
-                let started = Instant::now();
+                let started = StatsInstant::now();
                 let result =
                     Self::handle_account(ctx, &mut repo_state, &msg.firehose, *account, msg.is_pds);
-                #[cfg(feature = "firehose-diagnostics")]
                 ctx.stats.record_handle_message(
                     crate::ingest::firehose_stats::RelayMessageKind::Account,
                     started.elapsed(),

@@ -5,11 +5,8 @@ use jacquard_api::com_atproto::sync::get_repo_status::{
 };
 use smol_str::SmolStr;
 
-#[cfg(feature = "firehose-diagnostics")]
 use crate::ingest::firehose_stats::{RelayMessageKind, ValidationStatsOutcome};
-#[cfg(feature = "firehose-diagnostics")]
 use crate::ingest::stream::SubscribeReposMessage;
-#[cfg(feature = "firehose-diagnostics")]
 use crate::ingest::validation::{
     CommitValidationError, SyncValidationError, ValidatedCommit, ValidatedSync,
 };
@@ -50,7 +47,6 @@ pub(crate) fn map_repo_status_probe(
     Some(repo_state)
 }
 
-#[cfg(feature = "firehose-diagnostics")]
 pub(crate) fn relay_message_kind(msg: &SubscribeReposMessage<'_>) -> Option<RelayMessageKind> {
     match msg {
         SubscribeReposMessage::Commit(_) => Some(RelayMessageKind::Commit),
@@ -61,7 +57,6 @@ pub(crate) fn relay_message_kind(msg: &SubscribeReposMessage<'_>) -> Option<Rela
     }
 }
 
-#[cfg(feature = "firehose-diagnostics")]
 pub(crate) fn commit_validation_outcome(
     res: &std::result::Result<ValidatedCommit<'_>, CommitValidationError>,
 ) -> ValidationStatsOutcome {
@@ -73,7 +68,6 @@ pub(crate) fn commit_validation_outcome(
     }
 }
 
-#[cfg(feature = "firehose-diagnostics")]
 pub(crate) fn sync_validation_outcome(
     res: &std::result::Result<ValidatedSync, SyncValidationError>,
 ) -> ValidationStatsOutcome {

@@ -211,10 +211,8 @@ impl RelayWorker {
         // or if there is no handle specified
         if is_pds || identity.handle.is_none() {
             ctx.state.resolver.invalidate_sync(&identity.did);
-            #[cfg(feature = "firehose-diagnostics")]
-            let resolve_started = std::time::Instant::now();
+            let resolve_started = crate::ingest::firehose_stats::StatsInstant::now();
             let doc = Handle::current().block_on(ctx.state.resolver.resolve_doc(&identity.did));
-            #[cfg(feature = "firehose-diagnostics")]
             ctx.stats.record_resolve_doc(resolve_started.elapsed());
             match doc {
                 Ok(doc) => {

@@ -10,7 +10,6 @@ use tokio::sync::Notify;
 use tokio::sync::{Semaphore, watch};
 use url::Url;
 
-#[cfg(feature = "firehose-diagnostics")]
 use crate::ingest::firehose_stats::FirehoseStats;
 #[cfg(feature = "relay")]
 use crate::pds_daily_limit::PdsDailyLimit;
@@ -33,7 +32,6 @@ pub struct AppState {
     pub(crate) pds_daily_limit: PdsDailyLimit,
     pub(crate) tier_policy: TierPolicy,
     pub firehose_cursors: scc::HashIndex<Url, AtomicI64>,
-    #[cfg(feature = "firehose-diagnostics")]
     pub(crate) firehose_stats: FirehoseStats,
     pub firehose_enabled: watch::Sender<bool>,
     #[cfg(feature = "indexer")]
@@ -114,7 +112,6 @@ impl AppState {
             pds_meta,
             tier_policy: config.tier_policy.clone(),
             firehose_cursors: relay_cursors,
-            #[cfg(feature = "firehose-diagnostics")]
             firehose_stats: FirehoseStats::default(),
             #[cfg(feature = "indexer")]
             backfill_notify: Notify::new(),

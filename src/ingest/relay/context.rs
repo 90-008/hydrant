@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-#[cfg(feature = "firehose-diagnostics")]
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -35,14 +34,13 @@ use crate::types::RelayBroadcast;
 #[cfg(feature = "relay")]
 use std::sync::atomic::Ordering;
 
-#[cfg(feature = "firehose-diagnostics")]
 use super::{commit_validation_outcome, sync_validation_outcome};
+use crate::ingest::firehose_stats::StatsInstant;
 
 pub(crate) struct WorkerContext<'a> {
     pub(crate) verify_signatures: bool,
     pub(crate) state: &'a AppState,
     pub(crate) vctx: ValidationContext<'a>,
-    #[cfg(feature = "firehose-diagnostics")]
     pub(crate) stats: Arc<crate::ingest::firehose_stats::RelayShardStats>,
     pub(crate) batch: OwnedWriteBatch,
     pub(crate) count_deltas: CountDeltas,
@@ -146,17 +144,14 @@ impl WorkerContext<'_> {
     }
 
     pub(crate) fn refresh_doc(&mut self, did: &Did, repo_state: &mut RepoState) -> Result<()> {
-        #[cfg(feature = "firehose-diagnostics")]
-        let refresh_started = Instant::now();
+        let refresh_started = StatsInstant::now();
         let result = (|| {
             let db = &self.state.db;
             self.state.resolver.invalidate_sync(did);
-            #[cfg(feature = "firehose-diagnostics")]
-            let resolve_started = Instant::now();
+            let resolve_started = StatsInstant::now();
             let doc = Handle::current()
                 .block_on(self.state.resolver.resolve_doc(did))
                 .map_err(|e| miette::miette!("{e}"));
-            #[cfg(feature = "firehose-diagnostics")]
             self.stats.record_resolve_doc(resolve_started.elapsed());
             let doc = doc?;
             repo_state.update_from_doc(doc);
@@ -169,7 +164,6 @@ impl WorkerContext<'_> {
             );
             Ok(())
         })();
-        #[cfg(feature = "firehose-diagnostics")]
         self.stats.record_refresh_doc(refresh_started.elapsed());
         result
     }
@@ -181,10 +175,8 @@ impl WorkerContext<'_> {
     ) -> Result<Option<ValidatedCommit<'c>>> {
         let did = &commit.repo;
         let key = self.fetch_key(did)?;
-        #[cfg(feature = "firehose-diagnostics")]
-        let validate_started = Instant::now();
+        let validate_started = StatsInstant::now();
         let validation = self.vctx.validate_commit(commit, repo_state, key.as_ref());
-        #[cfg(feature = "firehose-diagnostics")]
         self.stats.record_validate_commit(
             validate_started.elapsed(),
             commit_validation_outcome(&validation),
@@ -204,10 +196,8 @@ impl WorkerContext<'_> {
 
         self.refresh_doc(did, repo_state)?;
         let key = self.fetch_key(did)?;
-        #[cfg(feature = "firehose-diagnostics")]
-        let validate_started = Instant::now();
+        let validate_started = StatsInstant::now();
         let validation = self.vctx.validate_commit(commit, repo_state, key.as_ref());
-        #[cfg(feature = "firehose-diagnostics")]
         self.stats.record_validate_commit(
             validate_started.elapsed(),
             commit_validation_outcome(&validation),
@@ -228,10 +218,8 @@ impl WorkerContext<'_> {
     ) -> Result<Option<ValidatedSync>> {
         let did = &sync.did;
         let key = self.fetch_key(did)?;
-        #[cfg(feature = "firehose-diagnostics")]
-        let validate_started = Instant::now();
+        let validate_started = StatsInstant::now();
         let validation = self.vctx.validate_sync(sync, key.as_ref());
-        #[cfg(feature = "firehose-diagnostics")]
         self.stats.record_validate_sync(
             validate_started.elapsed(),
             sync_validation_outcome(&validation),
@@ -247,10 +235,8 @@ impl WorkerContext<'_> {
 
         self.refresh_doc(did, repo_state)?;
         let key = self.fetch_key(did)?;
-        #[cfg(feature = "firehose-diagnostics")]
-        let validate_started = Instant::now();
+        let validate_started = StatsInstant::now();
         let validation = self.vctx.validate_sync(sync, key.as_ref());
-        #[cfg(feature = "firehose-diagnostics")]
         self.stats.record_validate_sync(
             validate_started.elapsed(),
             sync_validation_outcome(&validation),
@@ -265,8 +251,7 @@ impl WorkerContext<'_> {
     }
 
     fn fetch_key(&self, did: &Did) -> Result<Option<PublicKey<'static>>> {
-        #[cfg(feature = "firehose-diagnostics")]
-        let started = Instant::now();
+        let started = StatsInstant::now();
         let result = if self.verify_signatures {
             Handle::current()
                 .block_on(self.state.resolver.resolve_signing_key(did))
@@ -275,7 +260,6 @@ impl WorkerContext<'_> {
         } else {
             Ok(None)
         };
-        #[cfg(feature = "firehose-diagnostics")]
         self.stats.record_fetch_key(started.elapsed());
         result
     }
@@ -356,7 +340,6 @@ impl WorkerContext<'_> {
 
         if metadata.is_some_and(|m| !m.tracked) {
             trace!(did = %did, "ignoring message, repo is explicitly untracked");
-            #[cfg(feature = "firehose-diagnostics")]
             self.stats.record_repo_state_outcome(
                 crate::ingest::firehose_stats::RepoStateLoadOutcome::Drop,
             );
@@ -371,7 +354,6 @@ impl WorkerContext<'_> {
             .transpose()?;
 
         if let Some(repo_state) = repo_state_opt {
-            #[cfg(feature = "firehose-diagnostics")]
             self.stats.record_repo_state_outcome(
                 crate::ingest::firehose_stats::RepoStateLoadOutcome::Hit,
             );
@@ -385,7 +367,6 @@ impl WorkerContext<'_> {
                 let commit = match &msg.msg {
                     SubscribeReposMessage::Commit(c) => c,
                     _ => {
-                        #[cfg(feature = "firehose-diagnostics")]
                         self.stats.record_repo_state_outcome(
                             crate::ingest::firehose_stats::RepoStateLoadOutcome::Drop,
                         );
@@ -408,7 +389,6 @@ impl WorkerContext<'_> {
                 });
                 if !touches_signal {
                     trace!(did = %did, "dropping commit, no signal-matching ops");
-                    #[cfg(feature = "firehose-diagnostics")]
                     self.stats.record_repo_state_outcome(
                         crate::ingest::firehose_stats::RepoStateLoadOutcome::Drop,
                     );
@@ -418,17 +398,14 @@ impl WorkerContext<'_> {
         }
 
         debug!(did = %did, "discovered new account from firehose, queueing backfill");
-        #[cfg(feature = "firehose-diagnostics")]
-        let new_account_started = Instant::now();
+        let new_account_started = StatsInstant::now();
 
         // resolve doc to initialize repo state
         self.state.resolver.invalidate_sync(did);
-        #[cfg(feature = "firehose-diagnostics")]
-        let resolve_started = Instant::now();
+        let resolve_started = StatsInstant::now();
         let doc = tokio::runtime::Handle::current()
             .block_on(self.state.resolver.resolve_doc(did))
             .into_diagnostic();
-        #[cfg(feature = "firehose-diagnostics")]
         self.stats.record_resolve_doc(resolve_started.elapsed());
         let doc = doc?;
 
@@ -437,7 +414,6 @@ impl WorkerContext<'_> {
             let pds_host = doc.pds.host_str().map(|h| h.to_string());
             if pds_host.as_deref() != msg.firehose.host_str() {
                 warn!(did = %did, got = ?pds_host, expected = ?msg.firehose.host_str(), "message rejected: wrong host for new account");
-                #[cfg(feature = "firehose-diagnostics")]
                 self.stats.record_repo_state_outcome(
                     crate::ingest::firehose_stats::RepoStateLoadOutcome::Drop,
                 );
@@ -451,7 +427,6 @@ impl WorkerContext<'_> {
                     .get_count_sync(&keys::pds_account_count_key(host));
                 if self.state.is_over_account_limit(host, count) {
                     warn!(did = %did, host, count, "account limit reached for host, dropping new account");
-                    #[cfg(feature = "firehose-diagnostics")]
                     self.stats.record_repo_state_outcome(
                         crate::ingest::firehose_stats::RepoStateLoadOutcome::Drop,
                     );
@@ -463,11 +438,9 @@ impl WorkerContext<'_> {
         #[cfg(any(not(feature = "relay"), feature = "indexer"))]
         let mut repo_state = {
             // try to get upstream status
-            #[cfg(feature = "firehose-diagnostics")]
-            let probe_started = Instant::now();
+            let probe_started = StatsInstant::now();
             let repo_state =
                 tokio::runtime::Handle::current().block_on(self.check_repo_status(did, &doc.pds));
-            #[cfg(feature = "firehose-diagnostics")]
             self.stats.record_repo_status_probe(probe_started.elapsed());
             repo_state
                 .ok()
@@ -503,13 +476,10 @@ impl WorkerContext<'_> {
 
         self.count_deltas.add_repos(1);
 
-        #[cfg(feature = "firehose-diagnostics")]
-        {
-            self.stats.record_repo_state_outcome(
-                crate::ingest::firehose_stats::RepoStateLoadOutcome::Miss,
-            );
-            self.stats.record_new_account(new_account_started.elapsed());
-        }
+        self.stats.record_repo_state_outcome(
+            crate::ingest::firehose_stats::RepoStateLoadOutcome::Miss,
+        );
+        self.stats.record_new_account(new_account_started.elapsed());
 
         Ok(Some(repo_state))
     }
@@ -519,8 +489,7 @@ impl WorkerContext<'_> {
         &mut self,
         make_frame: impl FnOnce(i64) -> Result<bytes::Bytes>,
     ) -> Result<u64> {
-        #[cfg(feature = "firehose-diagnostics")]
-        let started = Instant::now();
+        let started = StatsInstant::now();
         let result = (|| {
             let db = &self.state.db;
             let seq = db.next_relay_seq.fetch_add(1, Ordering::SeqCst);
@@ -532,7 +501,6 @@ impl WorkerContext<'_> {
             self.pending_broadcasts.push(RelayBroadcast::Persisted(seq));
             Ok(seq)
         })();
-        #[cfg(feature = "firehose-diagnostics")]
         self.stats.record_queue_emit(started.elapsed());
         result
     }

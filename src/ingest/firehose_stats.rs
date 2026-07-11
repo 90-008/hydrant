@@ -1,40 +1,56 @@
+mod kinds;
+#[cfg(not(feature = "firehose-diagnostics"))]
+mod noop;
+#[cfg(feature = "firehose-diagnostics")]
 mod relay;
+#[cfg(feature = "firehose-diagnostics")]
 mod source;
 
+pub use kinds::*;
+#[cfg(not(feature = "firehose-diagnostics"))]
+pub use noop::*;
+#[cfg(feature = "firehose-diagnostics")]
 pub use relay::{
-    HostAuthorityStatsOutcome, RelayMessageKind, RelayShardStats, RelayShardTimings,
-    RelayWorkerStats, RelayWorkerStatsSnapshot, RepoStateLoadOutcome, ValidationStatsOutcome,
+    RelayShardStats, RelayWorkerStats, RelayWorkerStatsSnapshot,
 };
+#[cfg(feature = "firehose-diagnostics")]
 pub use source::{FirehoseSourceStats, FirehoseStats, FirehoseStatsSnapshot};
 
+#[cfg(feature = "firehose-diagnostics")]
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+#[cfg(feature = "firehose-diagnostics")]
 use std::time::Duration;
 
+#[cfg(feature = "firehose-diagnostics")]
 fn now_ts() -> i64 {
     chrono::Utc::now().timestamp()
 }
 
+#[cfg(feature = "firehose-diagnostics")]
 fn duration_micros(duration: Duration) -> u64 {
     duration.as_micros().try_into().unwrap_or(u64::MAX)
 }
 
+#[cfg(feature = "firehose-diagnostics")]
 fn add_duration(total: &AtomicU64, duration: Duration) {
     let micros = duration_micros(duration);
     total.fetch_add(micros, Ordering::Relaxed);
 }
 
+#[cfg(feature = "firehose-diagnostics")]
 fn add_duration_with_max(total: &AtomicU64, max: &AtomicU64, duration: Duration) {
     let micros = duration_micros(duration);
     total.fetch_add(micros, Ordering::Relaxed);
     max.fetch_max(micros, Ordering::Relaxed);
 }
 
+#[cfg(feature = "firehose-diagnostics")]
 fn nonzero_i64(atomic: &AtomicI64) -> Option<i64> {
     let value = atomic.load(Ordering::Relaxed);
     (value != 0).then_some(value)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "firehose-diagnostics"))]
 mod tests {
     use super::*;
 
