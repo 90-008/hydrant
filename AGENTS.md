@@ -75,6 +75,14 @@ See `examples/statusphere.rs` for a usage example.
 - Use the type system to encode correctness constraints.
 - Prefer compile-time guarantees over runtime checks where possible.
 
+### Feature gating
+Modes (`indexer`, `relay`) are compile-time choices and mutually exclusive (enforced by `compile_error!` in `src/lib.rs`). Keep cfg at composition roots, never inline in shared logic:
+- **Parallel per-mode modules with an identical interface, selected by one cfg pair** — e.g. `config::mode_defaults`, `ingest/relay/sink/{indexer,relay,none}.rs`, `ops/record_events.rs`. Shared code calls the interface unconditionally.
+- **Zero-cost facades for optional instrumentation** — `ingest/firehose_stats` compiles to ZST no-op recorders (and `StatsInstant` to a zero-`Duration` stub) when `firehose-diagnostics` is off, so hot-path call sites carry no cfg.
+- **Per-mode state groups declared in one table** — mode keyspaces live in `db/keyspaces.rs` (`Db.indexer`, `Db.stream`, `Db.jetstream`, `Db.relay`); add new mode keyspaces there, including `keyspace_by_name`.
+- **Gate at the declaration site only.** Never use inner `#![cfg]` module attributes — they silently erase the module and break sibling imports under other combos.
+- After touching any `#[cfg(feature = ...)]` gate or shared-module item, run `nu tests/feature_matrix.nu`.
+
 ### Error handling
 - **Typed Errors**: Define custom error enums (e.g. `ResolverError`, `IngestError`) when callers need to handle specific cases (like rate limits or retries).
 - **Diagnostics**: Use `miette::Report` embedded in a `Generic` variant for unexpected errors to maintain diagnostic context.
