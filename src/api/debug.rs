@@ -1,20 +1,17 @@
 use crate::api::AppState;
+#[cfg(feature = "indexer")]
 use crate::db::keys;
-#[cfg(feature = "indexer_stream")]
-use crate::types::StoredEvent;
-use crate::types::{RepoState, ResyncState};
+use crate::db::registry;
 use axum::routing::{get, post};
 use axum::{
     Json,
     extract::{Query, State},
     http::StatusCode,
 };
-use jacquard_common::types::cid::Cid;
 #[cfg(feature = "indexer")]
 use jacquard_common::types::ident::AtIdentifier;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::str::FromStr;
 use std::sync::Arc;
 
 #[cfg(feature = "indexer")]
@@ -94,78 +91,19 @@ pub struct DebugGetResponse {
     pub value: Option<Value>,
 }
 
-fn deserialize_value(partition: &str, value: &[u8]) -> Value {
-    match partition {
-        "repos" => {
-            if let Ok(state) = rmp_serde::from_slice::<RepoState>(value) {
-                return serde_json::to_value(state).unwrap_or(Value::Null);
-            }
-        }
-        "resync" => {
-            if let Ok(state) = rmp_serde::from_slice::<ResyncState>(value) {
-                return serde_json::to_value(state).unwrap_or(Value::Null);
-            }
-        }
-        #[cfg(feature = "indexer_stream")]
-        "events" => {
-            if let Ok(event) = rmp_serde::from_slice::<StoredEvent>(value) {
-                return serde_json::to_value(event).unwrap_or(Value::Null);
-            }
-        }
-        #[cfg(feature = "jetstream")]
-        "jetstream_events" => {
-            if let Ok(event) = rmp_serde::from_slice::<crate::types::StoredJetstreamEvent>(value) {
-                return serde_json::to_value(event).unwrap_or(Value::Null);
-            }
-        }
-        "records" => {
-            if let Ok(s) = String::from_utf8(value.to_vec()) {
-                match Cid::from_str(&s) {
-                    Ok(cid) => return serde_json::to_value(cid).unwrap_or(Value::String(s)),
-                    Err(_) => return Value::String(s),
-                }
-            }
-        }
-        "counts" | "cursors" => {
-            if let Ok(arr) = value.try_into() {
-                return Value::Number(u64::from_be_bytes(arr).into());
-            }
-            if let Ok(s) = String::from_utf8(value.to_vec()) {
-                return Value::String(s);
-            }
-        }
-        "blocks" => {
-            if let Ok(val) = serde_ipld_dagcbor::from_slice::<Value>(value) {
-                return val;
-            }
-        }
-        "pending" => return Value::Null,
-        _ => {}
-    }
-    Value::String(hex::encode(value))
-}
-
 pub async fn handle_debug_get(
     State(state): State<Arc<AppState>>,
     Query(req): Query<DebugGetRequest>,
 ) -> Result<Json<DebugGetResponse>, StatusCode> {
     let ks = get_keyspace_by_name(&state.db, &req.partition)?;
 
-    let key = if req.partition == "events" {
-        let id = req
-            .key
-            .parse::<u64>()
-            .map_err(|_| StatusCode::BAD_REQUEST)?;
-        id.to_be_bytes().to_vec()
-    } else {
-        req.key.into_bytes()
-    };
+    let key = registry::debug_parse_key(&req.partition, &req.key).ok_or(StatusCode::BAD_REQUEST)?;
 
     let partition = req.partition.clone();
     let value = crate::db::Db::get(ks, key)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-        .map(|v| deserialize_value(&partition, &v));
+        .map(|v| registry::debug_value(&partition, &v));
 
     Ok(Json(DebugGetResponse { value }))
 }
@@ -189,21 +127,11 @@ pub async fn handle_debug_iter(
     Query(req): Query<DebugIterRequest>,
 ) -> Result<Json<DebugIterResponse>, StatusCode> {
     let ks = get_keyspace_by_name(&state.db, &req.partition)?;
-    let is_events = req.partition == "events" || req.partition == "relay_events";
     let partition = req.partition.clone();
 
     let parse_bound = |s: Option<String>| -> Result<Option<Vec<u8>>, StatusCode> {
-        match s {
-            Some(s) => {
-                if is_events {
-                    let id = s.parse::<u64>().map_err(|_| StatusCode::BAD_REQUEST)?;
-                    Ok(Some(id.to_be_bytes().to_vec()))
-                } else {
-                    Ok(Some(s.into_bytes()))
-                }
-            }
-            None => Ok(None),
-        }
+        s.map(|s| registry::debug_parse_key(&partition, &s).ok_or(StatusCode::BAD_REQUEST))
+            .transpose()
     };
 
     let start = parse_bound(req.start)?;
@@ -219,28 +147,9 @@ pub async fn handle_debug_iter(
                     .into_inner()
                     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-                let key_str = if is_events {
-                    if let Ok(arr) = k.as_ref().try_into() {
-                        u64::from_be_bytes(arr).to_string()
-                    } else {
-                        "invalid_u64".to_string()
-                    }
-                } else if partition == "blocks" {
-                    // key is col|cid_bytes, show as "col|<cid_str>"
-                    if let Some(sep) = k.iter().position(|&b| b == keys::SEP) {
-                        let col = String::from_utf8_lossy(&k[..sep]);
-                        match cid::Cid::read_bytes(&k[sep + 1..]) {
-                            Ok(cid) => format!("{col}|{cid}"),
-                            Err(_) => String::from_utf8_lossy(&k).into_owned(),
-                        }
-                    } else {
-                        String::from_utf8_lossy(&k).into_owned()
-                    }
-                } else {
-                    String::from_utf8_lossy(&k).into_owned()
-                };
+                let key_str = registry::debug_render_key(&partition, &k);
 
-                items.push((key_str, deserialize_value(&partition, &v)));
+                items.push((key_str, registry::debug_value(&partition, &v)));
             }
             Ok::<_, StatusCode>(items)
         };

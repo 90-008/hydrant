@@ -73,7 +73,7 @@ impl ByCollectionProducer {
         let cursor_key = by_collection_cursor_key(self.index_url.as_str(), collection);
 
         // resume from any persisted cursor, so a restart mid-pass doesn't rescan from scratch.
-        let mut cursor: Option<SmolStr> = Db::get(db.cursors.clone(), &cursor_key)
+        let mut cursor: Option<SmolStr> = Db::get(db.cursors.keyspace(), &cursor_key)
             .await
             .ok()
             .flatten()

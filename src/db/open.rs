@@ -1,12 +1,9 @@
-use fjall::{
-    CompressionType, Database, KeyspaceCreateOptions,
-    config::{BlockSizePolicy, CompressionPolicy, RestartIntervalPolicy},
-};
+use fjall::{CompressionType, Database};
 use lsm_tree::compaction::Factory;
 use miette::{Context, IntoDiagnostic, Result};
 use scc::HashMap;
 use smol_str::SmolStr;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap as StdHashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -15,15 +12,9 @@ use crate::config::{Compression, Config};
 use super::compaction::CountsGcFilterFactory;
 use super::counts::{load_count_delta_watermark, read_u64_counter, replay_count_deltas};
 use super::keys;
-use super::keyspaces::{OpenCx, mb};
-use super::{Db, migration};
-
-const fn kb(v: u32) -> u32 {
-    v * 1024
-}
-fn default_opts() -> KeyspaceCreateOptions {
-    KeyspaceCreateOptions::default()
-}
+use super::keyspaces::OpenCx;
+use super::schema::{Ks, mb};
+use super::{Db, migration, registry, schema};
 
 impl Db {
     pub fn open(cfg: &Config) -> Result<Self> {
@@ -54,8 +45,6 @@ impl Db {
             .into_diagnostic()?;
         let db = Arc::new(db);
 
-        let opts = default_opts;
-
         let load_dict = |name: &str| -> Option<Arc<[u8]>> {
             let path = cfg.database_path.join(format!("dict_{name}.bin"));
             if path.exists()
@@ -69,9 +58,9 @@ impl Db {
             }
             None
         };
-        let dicts = ["repos", "blocks", "events", "jetstream_events", "backlinks"]
+        let dicts = registry::trainable()
             .into_iter()
-            .fold(std::collections::HashMap::new(), |mut acc, name| {
+            .fold(StdHashMap::new(), |mut acc, (name, _)| {
                 let Some(dict) = load_dict(name) else {
                     return acc;
                 };
@@ -93,123 +82,37 @@ impl Db {
             db: &db,
             cfg,
             compression: &get_compression,
+            opened: std::cell::RefCell::new(Vec::new()),
         };
-        let open_ks = |name: &str, opts: KeyspaceCreateOptions| cx.open_ks(name, opts);
 
-        let repos = open_ks(
-            "repos",
-            opts()
-                // crawler checks if a repo doesn't exist
-                .expect_point_read_hits(false)
-                .max_memtable_size(mb(cfg.db_repos_memtable_size_mb))
-                // did -> repo state, not gonna be compressable well because dids are random
-                // and repo state doesnt have repeats really..
-                // these block sizes work fine since we insert into repos constantly anyway
-                // whenever we update anything related to a repo, so the repos that arent
-                // being updated will be compacted away!
-                .data_block_size_policy(BlockSizePolicy::new([kb(4), kb(4), kb(16), kb(64)]))
-                .data_block_compression_policy(CompressionPolicy::new([
-                    CompressionType::None,
-                    CompressionType::None,
-                    get_compression("repos", 3),
-                    get_compression("repos", 5),
-                ]))
-                // did plc are random so the interval wont rlly matter
-                .data_block_restart_interval_policy(RestartIntervalPolicy::new([2, 4])),
-        )?;
-        let repo_metadata = open_ks(
-            "repo_metadata",
-            opts()
-                .expect_point_read_hits(true)
-                .max_memtable_size(mb(cfg.db_repos_memtable_size_mb / 2))
-                // its did -> random u64 id + bool, not much to compress, very small
-                .data_block_size_policy(BlockSizePolicy::new([kb(2), kb(4), kb(8)]))
-                .data_block_compression_policy(CompressionPolicy::new([
-                    CompressionType::None,
-                    CompressionType::None,
-                    get_compression("repos", 3),
-                ]))
-                // did plc are random so the interval wont rlly matter
-                .data_block_restart_interval_policy(RestartIntervalPolicy::new([2, 4])),
-        )?;
+        let repos = Ks::<schema::Repos>::open(&cx)?;
+        let repo_metadata = Ks::<schema::RepoMetadata>::open(&cx)?;
+        let cursors = Ks::<schema::Cursors>::open(&cx)?;
+        let counts = Ks::<schema::Counts>::open(&cx)?;
+        let filter = Ks::<schema::Filter>::open(&cx)?;
+        let crawler = Ks::<schema::Crawler>::open(&cx)?;
+        #[cfg(feature = "backlinks")]
+        let backlinks = Ks::<schema::Backlinks>::open(&cx)?;
         #[cfg(feature = "indexer")]
         let indexer = super::keyspaces::IndexerDb::open(&cx)?;
         #[cfg(feature = "indexer_stream")]
         let stream = super::keyspaces::StreamDb::open(&cx)?;
-        let cursors = open_ks(
-            "cursors",
-            opts()
-                // cursor point reads hit almost 100% of the time
-                .expect_point_read_hits(true)
-                .max_memtable_size(mb(4))
-                // its just cursors...
-                .data_block_size_policy(BlockSizePolicy::all(kb(1)))
-                .data_block_compression_policy(CompressionPolicy::disabled())
-                .data_block_restart_interval_policy(RestartIntervalPolicy::all(1)),
-        )?;
-
         #[cfg(feature = "jetstream")]
         let jetstream = super::keyspaces::JetstreamDb::open(&cx)?;
-        let counts = open_ks(
-            "counts",
-            opts()
-                // count increments hit because counters are mostly pre-initialized
-                .expect_point_read_hits(true)
-                .max_memtable_size(mb(16))
-                // the data is very small
-                // this is at worst did|col -> u64, so its tiny (40 bytes)
-                .data_block_size_policy(BlockSizePolicy::all(kb(2)))
-                .data_block_compression_policy(CompressionPolicy::disabled())
-                .data_block_restart_interval_policy(RestartIntervalPolicy::all(7)),
-        )?;
-
-        // filter handles high-volume point reads (repo excludes) so it needs the bloom filter
-        let filter = open_ks(
-            "filter",
-            opts()
-                .max_memtable_size(mb(16))
-                // dids arent compressable so this is fine, and we have nothing as the value
-                .data_block_size_policy(BlockSizePolicy::all(kb(1)))
-                .data_block_compression_policy(CompressionPolicy::disabled())
-                .data_block_restart_interval_policy(RestartIntervalPolicy::all(2)),
-        )?;
-
-        let crawler = open_ks(
-            "crawler",
-            opts()
-                // only iterators are used here
-                .expect_point_read_hits(true)
-                .max_memtable_size(mb(8))
-                // did -> failed state, not very compressable
-                .data_block_size_policy(BlockSizePolicy::all(kb(2)))
-                .data_block_compression_policy(CompressionPolicy::disabled())
-                .data_block_restart_interval_policy(RestartIntervalPolicy::all(2)),
-        )?;
-
         #[cfg(feature = "relay")]
         let relay = super::keyspaces::RelayDb::open(&cx)?;
 
-        #[cfg(feature = "backlinks")]
-        let backlinks = open_ks(
-            "backlinks",
-            opts()
-                // lets assume we hit backlinks, getBacklinks will use iterator anyway
-                // so we can disable bloom filter okay
-                .expect_point_read_hits(true)
-                .max_memtable_size(mb(cfg.db_records_memtable_size_mb))
-                // same as records basically
-                .data_block_size_policy(BlockSizePolicy::new([kb(16), kb(32)]))
-                .data_block_compression_policy(CompressionPolicy::new([
-                    CompressionType::None,
-                    get_compression("backlinks", 3),
-                ]))
-                .data_block_restart_interval_policy(RestartIntervalPolicy::new([16, 32])),
-        )?;
-
-        // when adding new keyspaces, make sure to add them to the /stats endpoint
-        // and also update any relevant /debug/* endpoints
-
-
+        // every opened keyspace must have a registry row and vice versa, so the
+        // by-name, /stats, /debug, and training tables cannot silently drift.
+        let opened: BTreeSet<&'static str> = cx.opened.borrow().iter().copied().collect();
+        let registered: BTreeSet<&'static str> = registry::names().into_iter().collect();
+        if opened != registered {
+            let missing: Vec<_> = registered.difference(&opened).collect();
+            let unregistered: Vec<_> = opened.difference(&registered).collect();
+            miette::bail!(
+                "keyspace registry drift: registered but not opened: {missing:?}, opened but not registered: {unregistered:?}"
+            );
+        }
 
         let this = Self {
             inner: db,

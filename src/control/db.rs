@@ -24,7 +24,8 @@ impl DbControl {
             .await
     }
 
-    /// train zstd compression dictionaries for the `repos`, `blocks`, and `events` keyspaces.
+    /// train zstd compression dictionaries for every trainable keyspace
+    /// (see `db::schema`: `repos`, `blocks`, `events`, and mode-dependent ones).
     ///
     /// dictionaries are written to `dict_{name}.bin` files inside the database folder.
     /// a restart is required to apply them. training samples data blocks from the
@@ -38,7 +39,13 @@ impl DbControl {
                     tokio::task::spawn_blocking(move || state.db.train_dict(name))
                         .map(|res: Result<_, _>| res.into_diagnostic().flatten())
                 };
-                tokio::try_join!(train("repos"), train("blocks"), train("events")).map(|_| ())
+                futures::future::try_join_all(
+                    crate::db::registry::trainable()
+                        .into_iter()
+                        .map(|(name, _)| train(name)),
+                )
+                .await
+                .map(|_| ())
             })
             .await
     }

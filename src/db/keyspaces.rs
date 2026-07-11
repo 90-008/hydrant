@@ -1,108 +1,65 @@
 //! per-mode keyspace groups. this is the single place where mode-specific
 //! database state is declared: each feature contributes one group struct,
 //! opened and initialized here, and `Db` embeds each group behind one cfg.
+//!
+//! keyspace names, tuning, and debug rendering live in `db::schema`; the
+//! by-name and enumeration tables are generated in `db::registry`.
 
 use fjall::{CompressionType, Database, Keyspace, KeyspaceCreateOptions};
 use miette::{IntoDiagnostic, Result};
+use std::cell::RefCell;
 use std::sync::Arc;
 
 use crate::config::Config;
+
+#[cfg(any(
+    feature = "indexer",
+    feature = "indexer_stream",
+    feature = "jetstream",
+    feature = "relay"
+))]
+use super::schema::{self, Ks};
 
 #[cfg(any(feature = "indexer_stream", feature = "jetstream", feature = "relay"))]
 use miette::Context;
 #[cfg(any(feature = "indexer_stream", feature = "jetstream", feature = "relay"))]
 use std::sync::atomic::AtomicU64;
 
-#[cfg_attr(
-    not(any(
-        feature = "indexer",
-        feature = "indexer_stream",
-        feature = "jetstream",
-        feature = "relay"
-    )),
-    allow(dead_code)
-)]
-const fn kb(v: u32) -> u32 {
-    v * 1024
-}
-pub(super) const fn mb(v: u64) -> u64 {
-    v * 1024 * 1024
-}
-
-/// everything a mode group needs to open its keyspaces.
-#[cfg_attr(
-    not(any(
-        feature = "indexer",
-        feature = "indexer_stream",
-        feature = "jetstream",
-        feature = "relay"
-    )),
-    allow(dead_code)
-)]
-pub(super) struct OpenCx<'a> {
+/// everything a keyspace needs to open itself.
+///
+/// nameable so `Schema::options` can reference it in its signature, but all
+/// fields and methods are `pub(super)`: it cannot be constructed or used
+/// outside `db`.
+pub struct OpenCx<'a> {
     pub(super) db: &'a Arc<Database>,
     pub(super) cfg: &'a Config,
     pub(super) compression: &'a dyn Fn(&str, i32) -> CompressionType,
+    /// names opened so far, checked against the registry at the end of open.
+    pub(super) opened: RefCell<Vec<&'static str>>,
 }
 
 impl OpenCx<'_> {
     pub(super) fn open_ks(&self, name: &str, opts: KeyspaceCreateOptions) -> Result<Keyspace> {
         self.db.keyspace(name, move || opts).into_diagnostic()
     }
-}
 
-impl super::Db {
-    /// look up any open keyspace by its on-disk name. the mode groups each
-    /// contribute their keyspaces, so this stays in sync with the table above.
-    pub fn keyspace_by_name(&self, name: &str) -> Option<Keyspace> {
-        match name {
-            "repos" => return Some(self.repos.clone()),
-            "repo_metadata" => return Some(self.repo_metadata.clone()),
-            "counts" => return Some(self.counts.clone()),
-            "cursors" => return Some(self.cursors.clone()),
-            "filter" => return Some(self.filter.clone()),
-            "crawler" => return Some(self.crawler.clone()),
-            #[cfg(feature = "backlinks")]
-            "backlinks" => return Some(self.backlinks.clone()),
-            _ => {}
-        }
-        #[cfg(feature = "indexer")]
-        match name {
-            "records" => return Some(self.indexer.records.clone()),
-            "blocks" => return Some(self.indexer.blocks.clone()),
-            "pending" => return Some(self.indexer.pending.clone()),
-            "resync" => return Some(self.indexer.resync.clone()),
-            "resync_buffer" => return Some(self.indexer.resync_buffer.clone()),
-            _ => {}
-        }
-        #[cfg(feature = "indexer_stream")]
-        if name == "events" {
-            return Some(self.stream.events.clone());
-        }
-        #[cfg(feature = "jetstream")]
-        if name == "jetstream_events" {
-            return Some(self.jetstream.events.clone());
-        }
-        #[cfg(feature = "relay")]
-        if name == "relay_events" {
-            return Some(self.relay.events.clone());
-        }
-        None
+    pub(super) fn record_opened(&self, name: &'static str) {
+        self.opened.borrow_mut().push(name);
     }
 }
 
 #[cfg(feature = "indexer")]
 pub struct IndexerDb {
     /// maps `{DID}|{COL}|{RKey}` -> record CID
-    pub records: Keyspace,
+    pub records: Ks<schema::Records>,
     /// content-addressable storage of raw DAG-CBOR blocks
-    pub blocks: Keyspace,
+    pub blocks: Ks<schema::Blocks>,
     /// backfill queue of `{ID}` -> empty
-    pub pending: Keyspace,
+    pub pending: Ks<schema::Pending>,
     /// per-repo resync/retry state
-    pub resync: Keyspace,
+    pub resync: Ks<schema::Resync>,
     /// live events buffered during backfill
-    pub resync_buffer: Keyspace,
+    pub resync_buffer: Ks<schema::ResyncBuffer>,
     /// serializes lifecycle count rebuilds
     pub(crate) lifecycle_count_lock: Arc<std::sync::Mutex<()>>,
 }
@@ -110,113 +67,21 @@ pub struct IndexerDb {
 #[cfg(feature = "indexer")]
 impl IndexerDb {
     pub(super) fn open(cx: &OpenCx) -> Result<Self> {
-        use fjall::config::{BlockSizePolicy, CompressionPolicy, RestartIntervalPolicy};
-
-        let opts = KeyspaceCreateOptions::default;
-        let pending = cx.open_ks(
-            "pending",
-            opts()
-                // iterated over as a queue, no point reads are used so bloom filters are disabled
-                .expect_point_read_hits(true)
-                .max_memtable_size(mb(8))
-                // its just index of id (int) -> did, and dids arent compressable (especially with the ids being random)
-                .data_block_size_policy(BlockSizePolicy::all(kb(8)))
-                // and we'll transition from pending to synced anyway, no point trying to compress
-                .data_block_compression_policy(CompressionPolicy::disabled())
-                // ids are sequential and share prefix so we can use large interval to save space
-                .data_block_restart_interval_policy(RestartIntervalPolicy::all(64)),
-        )?;
-        let resync = cx.open_ks(
-            "resync",
-            opts()
-                // we only point read in backfill when we check for existing resync state
-                // ...and also in repos api. so we can disable bloom filters
-                .expect_point_read_hits(true)
-                .max_memtable_size(mb(8))
-                // did -> error state, so its gonna be basically random, cant compress well
-                .data_block_size_policy(BlockSizePolicy::all(kb(4)))
-                // and we arent going to have many of these anyway, no point trying
-                .data_block_compression_policy(CompressionPolicy::disabled())
-                .data_block_restart_interval_policy(RestartIntervalPolicy::all(4)),
-        )?;
-        // this is used in non-ephemeral mode
-        let blocks = cx.open_ks(
-            "blocks",
-            opts()
-                // point reads are used a lot by stream, we know the blocks exist though
-                .expect_point_read_hits(true)
-                .max_memtable_size(mb(cx.cfg.db_blocks_memtable_size_mb))
-                // 16 - 128 kb, as the newer blocks will be in the first level (or memtable)
-                // and any consumers will probably be streaming the newer events...
-                // and blocks are pretty big-ish like around 5kb...
-                // replaying will hit later levels so it will be slower but thats honestly
-                // an acceptable tradeoff to save more space...
-                // todo: we can probably decrease these when we get zstd dict compression?
-                .data_block_size_policy(BlockSizePolicy::new([kb(16), kb(64), kb(128)]))
-                // lets not compress first level so the reads for new blocks are faster
-                // since we will be streaming them to consumers
-                .data_block_compression_policy(CompressionPolicy::new([
-                    CompressionType::None,
-                    (cx.compression)("blocks", 3),
-                    (cx.compression)("blocks", 3),
-                    (cx.compression)("blocks", 5),
-                ]))
-                .data_block_restart_interval_policy(RestartIntervalPolicy::new([8, 16, 32])),
-        )?;
-        let records = cx.open_ks(
-            "records",
-            opts()
-                // point reads might miss when using getRecord
-                // but we assume thats not going to happen often...
-                // since this keyspace is big, turning off bloom filters will help a lot with memory/disk space,
-                // but leaves point reads vulnerable to disk I/O misses under public query load
-                .expect_point_read_hits(!cx.cfg.db_records_bloom_filters)
-                .max_memtable_size(mb(cx.cfg.db_records_memtable_size_mb))
-                // its just did|col|rkey -> cid, very small (84 bytes for bsky post)
-                .data_block_size_policy(BlockSizePolicy::new([kb(8), kb(16)]))
-                // cids arent compressable, most rkeys are TIDs so they will get compressed
-                // by prefix truncation anyway
-                .data_block_compression_policy(CompressionPolicy::disabled())
-                .data_block_restart_interval_policy(RestartIntervalPolicy::new([16, 32])),
-        )?;
-        let resync_buffer = cx.open_ks(
-            "resync_buffer",
-            opts()
-                // iterated during backfill, no point reads
-                .expect_point_read_hits(true)
-                .max_memtable_size(mb(16))
-                .data_block_size_policy(BlockSizePolicy::all(kb(32)))
-                // dont have to compress here since resync buffer will be emptied at some point anyway
-                .data_block_compression_policy(CompressionPolicy::disabled())
-                .data_block_restart_interval_policy(RestartIntervalPolicy::all(16)),
-        )?;
-
         Ok(Self {
-            records,
-            blocks,
-            pending,
-            resync,
-            resync_buffer,
+            records: Ks::open(cx)?,
+            blocks: Ks::open(cx)?,
+            pending: Ks::open(cx)?,
+            resync: Ks::open(cx)?,
+            resync_buffer: Ks::open(cx)?,
             lifecycle_count_lock: Arc::new(std::sync::Mutex::new(())),
         })
-    }
-
-    pub(super) fn keyspaces(&self) -> impl Iterator<Item = Keyspace> {
-        [
-            self.records.clone(),
-            self.blocks.clone(),
-            self.pending.clone(),
-            self.resync.clone(),
-            self.resync_buffer.clone(),
-        ]
-        .into_iter()
     }
 }
 
 #[cfg(feature = "indexer_stream")]
 pub struct StreamDb {
     /// maps `{ID}` (u64 BE) -> `StoredEvent`, the source for the json stream api
-    pub events: Keyspace,
+    pub events: Ks<schema::Events>,
     pub(crate) event_tx: tokio::sync::broadcast::Sender<crate::types::BroadcastEvent>,
     pub next_event_id: Arc<AtomicU64>,
 }
@@ -224,51 +89,10 @@ pub struct StreamDb {
 #[cfg(feature = "indexer_stream")]
 impl StreamDb {
     pub(super) fn open(cx: &OpenCx) -> Result<Self> {
-        use fjall::config::{BlockSizePolicy, CompressionPolicy, RestartIntervalPolicy};
-
-        let events = cx.open_ks(
-            "events",
-            KeyspaceCreateOptions::default()
-                // only iterators are used here, no point reads
-                .expect_point_read_hits(true)
-                .max_memtable_size(mb(cx.cfg.db_events_memtable_size_mb))
-                // the compression here wont be quite as good since events are quite random
-                // eg. by many different repos and different records etc.
-                // since its sequential we should still go with bigger block size though
-                // backfills will be sequential though...
-                .data_block_size_policy(
-                    cx.cfg
-                        .ephemeral
-                        .then(|| BlockSizePolicy::new([kb(64), kb(128), kb(256)]))
-                        .unwrap_or_else(|| BlockSizePolicy::new([kb(16), kb(64)])),
-                )
-                // we are streaming the new events to consumers so we dont want to compress them
-                .data_block_compression_policy(
-                    cx.cfg
-                        .ephemeral
-                        .then(|| {
-                            CompressionPolicy::new([
-                                CompressionType::None,
-                                (cx.compression)("events", 3),
-                            ])
-                        })
-                        .unwrap_or_else(|| {
-                            CompressionPolicy::new([
-                                CompressionType::None,
-                                (cx.compression)("events", 3),
-                                (cx.compression)("events", 3),
-                                (cx.compression)("events", 5),
-                            ])
-                        }),
-                )
-                // ids are int, we can prefix truncate a lot
-                .data_block_restart_interval_policy(RestartIntervalPolicy::new([64, 128])),
-        )?;
-
         let (event_tx, _) = tokio::sync::broadcast::channel(512);
 
         Ok(Self {
-            events,
+            events: Ks::open(cx)?,
             event_tx,
             next_event_id: Arc::new(AtomicU64::new(0)),
         })
@@ -291,16 +115,12 @@ impl StreamDb {
             .store(last_id + 1, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
-
-    pub(super) fn keyspaces(&self) -> impl Iterator<Item = Keyspace> {
-        [self.events.clone()].into_iter()
-    }
 }
 
 #[cfg(feature = "jetstream")]
 pub(crate) struct JetstreamDb {
     /// maps `{time_us}|{ID}` (16 bytes) -> jetstream event data
-    pub(crate) events: Keyspace,
+    pub(crate) events: Ks<schema::JetstreamEvents>,
     pub(crate) tx: tokio::sync::broadcast::Sender<crate::types::JetstreamBroadcast>,
     pub(crate) next_id: Arc<AtomicU64>,
     pub(crate) last_time_us: Arc<std::sync::atomic::AtomicI64>,
@@ -312,27 +132,10 @@ pub(crate) struct JetstreamDb {
 #[cfg(feature = "jetstream")]
 impl JetstreamDb {
     pub(super) fn open(cx: &OpenCx) -> Result<Self> {
-        use fjall::config::{BlockSizePolicy, CompressionPolicy, RestartIntervalPolicy};
-
-        let events = cx.open_ks(
-            "jetstream_events",
-            KeyspaceCreateOptions::default()
-                // time-ordered append-only stream metadata, only iterated for replay.
-                .expect_point_read_hits(true)
-                .max_memtable_size(mb(cx.cfg.db_events_memtable_size_mb))
-                .data_block_size_policy(BlockSizePolicy::new([kb(16), kb(64), kb(128)]))
-                .data_block_compression_policy(CompressionPolicy::new([
-                    CompressionType::None,
-                    (cx.compression)("jetstream_events", 3),
-                    (cx.compression)("jetstream_events", 5),
-                ]))
-                .data_block_restart_interval_policy(RestartIntervalPolicy::new([64, 128])),
-        )?;
-
         let (tx, _) = tokio::sync::broadcast::channel(512);
 
         Ok(Self {
-            events,
+            events: Ks::open(cx)?,
             tx,
             next_id: Arc::new(AtomicU64::new(0)),
             last_time_us: Arc::new(std::sync::atomic::AtomicI64::new(0)),
@@ -357,16 +160,12 @@ impl JetstreamDb {
             .store(last_time_us as i64, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
-
-    pub(super) fn keyspaces(&self) -> impl Iterator<Item = Keyspace> {
-        [self.events.clone()].into_iter()
-    }
 }
 
 #[cfg(feature = "relay")]
 pub(crate) struct RelayDb {
     /// maps `{SEQ}` (u64 BE) -> re-encoded relay frame
-    pub(crate) events: Keyspace,
+    pub(crate) events: Ks<schema::RelayEvents>,
     pub(crate) next_seq: Arc<AtomicU64>,
     pub(crate) broadcast_tx: tokio::sync::broadcast::Sender<crate::types::RelayBroadcast>,
 }
@@ -374,28 +173,10 @@ pub(crate) struct RelayDb {
 #[cfg(feature = "relay")]
 impl RelayDb {
     pub(super) fn open(cx: &OpenCx) -> Result<Self> {
-        use fjall::config::{BlockSizePolicy, CompressionPolicy, RestartIntervalPolicy};
-
-        let events = cx.open_ks(
-            "relay_events",
-            KeyspaceCreateOptions::default()
-                // only iterated for cursor replay
-                .expect_point_read_hits(true)
-                .max_memtable_size(mb(cx.cfg.db_events_memtable_size_mb))
-                .data_block_size_policy(BlockSizePolicy::new([kb(64), kb(128), kb(256)]))
-                .data_block_compression_policy(CompressionPolicy::new([
-                    CompressionType::None,
-                    (cx.compression)("events", 3),
-                    (cx.compression)("events", 3),
-                    (cx.compression)("events", 5),
-                ]))
-                .data_block_restart_interval_policy(RestartIntervalPolicy::new([64, 128])),
-        )?;
-
         let (broadcast_tx, _) = tokio::sync::broadcast::channel(512);
 
         Ok(Self {
-            events,
+            events: Ks::open(cx)?,
             next_seq: Arc::new(AtomicU64::new(0)),
             broadcast_tx,
         })
@@ -416,9 +197,5 @@ impl RelayDb {
         self.next_seq
             .store(last_relay_seq + 1, std::sync::atomic::Ordering::Relaxed);
         Ok(())
-    }
-
-    pub(super) fn keyspaces(&self) -> impl Iterator<Item = Keyspace> {
-        [self.events.clone()].into_iter()
     }
 }

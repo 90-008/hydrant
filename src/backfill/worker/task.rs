@@ -143,7 +143,7 @@ pub(crate) async fn did_task(
             let did_key = keys::repo_key(did);
 
             // 1. get current retry count
-            let existing_state = Db::get(db.indexer.resync.clone(), &did_key).await.and_then(|b| {
+            let existing_state = Db::get(db.indexer.resync.keyspace(), &did_key).await.and_then(|b| {
                 b.map(|b| rmp_serde::from_slice::<ResyncState>(&b).into_diagnostic())
                     .transpose()
             })?;

@@ -42,7 +42,7 @@ impl ListReposProducer {
 
     async fn get_cursor(&self) -> Result<Option<SmolStr>> {
         let key = crawler_cursor_key(self.url.as_str());
-        let cursor_bytes = Db::get(self.checker.state.db.cursors.clone(), &key).await?;
+        let cursor_bytes = Db::get(self.checker.state.db.cursors.keyspace(), &key).await?;
         Ok(cursor_bytes
             .as_deref()
             .and_then(|b| rmp_serde::from_slice::<SmolStr>(b).ok()))
@@ -251,7 +251,7 @@ impl ListReposProducer {
 
 pub(crate) async fn cursor_display(state: &AppState, relay_host: &Url) -> SmolStr {
     let key = crawler_cursor_key(relay_host.as_str());
-    let cursor_bytes = match Db::get(state.db.cursors.clone(), &key).await {
+    let cursor_bytes = match Db::get(state.db.cursors.keyspace(), &key).await {
         Ok(b) => b,
         Err(e) => return e.to_smolstr(),
     };

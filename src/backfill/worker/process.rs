@@ -52,7 +52,7 @@ pub(crate) async fn process_did(
 
     let db = &app_state.db;
     let did_key = keys::repo_key(did);
-    let Some(state_bytes) = Db::get(db.repos.clone(), did_key).await? else {
+    let Some(state_bytes) = Db::get(db.repos.keyspace(), did_key).await? else {
         return Err(BackfillError::Deleted);
     };
     let mut state: RepoState<'static> = rmp_serde::from_slice::<RepoState>(&state_bytes)

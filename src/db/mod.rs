@@ -26,6 +26,8 @@ pub mod pds_meta;
 pub mod types;
 
 pub mod keyspaces;
+pub mod registry;
+pub mod schema;
 mod open;
 mod train;
 
@@ -38,6 +40,8 @@ pub(crate) use keyspaces::RelayDb;
 #[cfg(feature = "indexer_stream")]
 pub use keyspaces::StreamDb;
 
+pub use schema::Ks;
+
 #[cfg(feature = "indexer")]
 pub(crate) use lifecycle_counts::LifecycleCountBatch;
 
@@ -48,12 +52,12 @@ use tracing::error;
 pub struct Db {
     pub inner: Arc<Database>,
     pub path: std::path::PathBuf,
-    pub repos: Keyspace,
-    pub repo_metadata: Keyspace,
-    pub cursors: Keyspace,
-    pub counts: Keyspace,
-    pub filter: Keyspace,
-    pub crawler: Keyspace,
+    pub repos: Ks<schema::Repos>,
+    pub repo_metadata: Ks<schema::RepoMetadata>,
+    pub cursors: Ks<schema::Cursors>,
+    pub counts: Ks<schema::Counts>,
+    pub filter: Ks<schema::Filter>,
+    pub crawler: Ks<schema::Crawler>,
     #[cfg(feature = "indexer")]
     pub indexer: IndexerDb,
     #[cfg(feature = "indexer_stream")]
@@ -63,7 +67,7 @@ pub struct Db {
     #[cfg(feature = "relay")]
     pub(crate) relay: RelayDb,
     #[cfg(feature = "backlinks")]
-    pub backlinks: Keyspace,
+    pub backlinks: Ks<schema::Backlinks>,
     pub counts_map: HashMap<SmolStr, u64>,
     next_count_delta_id: Arc<AtomicU64>,
     count_delta_checkpoint_watermark: Arc<AtomicU64>,
@@ -105,35 +109,11 @@ impl Db {
                 .into_diagnostic()?
         };
 
-        #[cfg_attr(
-            not(any(
-                feature = "indexer",
-                feature = "indexer_stream",
-                feature = "jetstream",
-                feature = "relay",
-                feature = "backlinks"
-            )),
-            allow(unused_mut)
-        )]
-        let mut tasks = vec![
-            compact(self.repos.clone()),
-            compact(self.cursors.clone()),
-            compact(self.repo_metadata.clone()),
-            compact(self.counts.clone()),
-            compact(self.filter.clone()),
-            compact(self.crawler.clone()),
-        ];
-
-        #[cfg(feature = "indexer")]
-        tasks.extend(self.indexer.keyspaces().map(&compact));
-        #[cfg(feature = "indexer_stream")]
-        tasks.extend(self.stream.keyspaces().map(&compact));
-        #[cfg(feature = "jetstream")]
-        tasks.extend(self.jetstream.keyspaces().map(&compact));
-        #[cfg(feature = "relay")]
-        tasks.extend(self.relay.keyspaces().map(&compact));
-        #[cfg(feature = "backlinks")]
-        tasks.push(compact(self.backlinks.clone()));
+        let tasks: Vec<_> = self
+            .all_keyspaces()
+            .into_iter()
+            .map(|(_, ks)| compact(ks))
+            .collect();
 
         futures::future::try_join_all(tasks).await?;
 
@@ -200,7 +180,7 @@ pub fn set_firehose_cursor(db: &Db, relay: &Url, cursor: i64) -> Result<()> {
 
 pub async fn get_firehose_cursor(db: &Db, relay: &Url) -> Result<Option<i64>> {
     let key = keys::firehose_cursor_key_from_url(relay);
-    Db::get(db.cursors.clone(), key)
+    Db::get(db.cursors.keyspace(), key)
         .await?
         .map(|v: Slice| {
             Ok(i64::from_be_bytes(

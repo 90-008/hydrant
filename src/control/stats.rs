@@ -65,33 +65,12 @@ impl Hydrant {
         );
 
         let sizes = tokio::task::spawn_blocking(move || {
-            let mut s = BTreeMap::new();
-            s.insert("repos", state.db.repos.disk_space());
-            s.insert("cursors", state.db.cursors.disk_space());
-            s.insert("counts", state.db.counts.disk_space());
-            s.insert("filter", state.db.filter.disk_space());
-            s.insert("crawler", state.db.crawler.disk_space());
-
-            #[cfg(feature = "indexer")]
-            {
-                s.insert("records", state.db.indexer.records.disk_space());
-                s.insert("blocks", state.db.indexer.blocks.disk_space());
-                s.insert("pending", state.db.indexer.pending.disk_space());
-                s.insert("resync", state.db.indexer.resync.disk_space());
-                s.insert("resync_buffer", state.db.indexer.resync_buffer.disk_space());
-            }
-            #[cfg(feature = "indexer_stream")]
-            s.insert("events", state.db.stream.events.disk_space());
-
-            #[cfg(feature = "relay")]
-            s.insert("relay_events", state.db.relay.events.disk_space());
-            #[cfg(feature = "jetstream")]
-            s.insert("jetstream_events", state.db.jetstream.events.disk_space());
-
-            #[cfg(feature = "backlinks")]
-            s.insert("backlinks", state.db.backlinks.disk_space());
-
-            s
+            state
+                .db
+                .all_keyspaces()
+                .into_iter()
+                .map(|(name, ks)| (name, ks.disk_space()))
+                .collect::<BTreeMap<_, _>>()
         })
         .await
         .into_diagnostic()?;

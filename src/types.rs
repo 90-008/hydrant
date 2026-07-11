@@ -3,6 +3,7 @@ use std::fmt::Display;
 use jacquard_common::types::string::Did;
 use jacquard_common::{CowStr, IntoStatic};
 use jacquard_repo::commit::Commit as AtpCommit;
+#[cfg(feature = "indexer")]
 use serde::{Deserialize, Serialize};
 use smol_str::ToSmolStr;
 
@@ -63,7 +64,6 @@ impl Display for RepoStatus {
     }
 }
 
-impl RepoMetadata {}
 
 #[cfg(feature = "indexer")]
 mod indexer {
@@ -205,6 +205,7 @@ impl<'i> IntoStatic for RepoState<'i> {
     }
 }
 
+#[cfg(feature = "indexer")]
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) enum ResyncErrorKind {
     Ratelimited,
@@ -212,6 +213,7 @@ pub(crate) enum ResyncErrorKind {
     Generic,
 }
 
+#[cfg(feature = "indexer")]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) enum ResyncState {
     Error {
