@@ -1,6 +1,5 @@
 use std::sync::Arc;
-#[cfg(feature = "relay")]
-use std::sync::atomic::Ordering;
+
 use crate::ingest::firehose_stats::StatsInstant;
 
 use miette::{IntoDiagnostic, Result};
@@ -14,9 +13,8 @@ use crate::ingest::validation::ValidationOptions;
 use crate::ingest::{BufferRx, BufferTx, IngestMessage};
 use crate::state::AppState;
 
-use super::{AuthorityOutcome, WorkerContext};
-
-use super::relay_message_kind;
+use super::sink::{EventSink, SinkSeed};
+use super::{AuthorityOutcome, WorkerContext, relay_message_kind};
 
 pub struct WorkerMessage {
     pub(crate) is_pds: bool,
@@ -27,8 +25,7 @@ pub struct WorkerMessage {
 pub struct RelayWorker {
     pub(crate) state: Arc<AppState>,
     pub(crate) rxs: Vec<BufferRx>,
-    #[cfg(feature = "indexer")]
-    pub(crate) hook: crate::ingest::indexer::IndexerTx,
+    pub(crate) seed: SinkSeed,
     pub(crate) verify_signatures: bool,
     pub(crate) num_shards: usize,
     pub(crate) validation_opts: Arc<ValidationOptions>,
@@ -38,7 +35,7 @@ pub struct RelayWorker {
 impl RelayWorker {
     pub fn new(
         state: Arc<AppState>,
-        #[cfg(feature = "indexer")] hook: crate::ingest::indexer::IndexerTx,
+        seed: SinkSeed,
         verify_signatures: bool,
         num_shards: usize,
         validation_opts: ValidationOptions,
@@ -49,8 +46,7 @@ impl RelayWorker {
             Self {
                 state,
                 rxs,
-                #[cfg(feature = "indexer")]
-                hook,
+                seed,
                 verify_signatures,
                 num_shards,
                 validation_opts: Arc::new(validation_opts),
@@ -64,8 +60,7 @@ impl RelayWorker {
 
         for (i, rx) in self.rxs.into_iter().enumerate() {
             let state = Arc::clone(&self.state);
-            #[cfg(feature = "indexer")]
-            let hook = self.hook.clone();
+            let seed = self.seed.clone();
             let verify = self.verify_signatures;
             let h = handle.clone();
             let opts = self.validation_opts.clone();
@@ -80,8 +75,7 @@ impl RelayWorker {
                             i,
                             rx,
                             state,
-                            #[cfg(feature = "indexer")]
-                            hook,
+                            seed,
                             verify,
                             h,
                             opts,
@@ -108,7 +102,7 @@ impl RelayWorker {
         id: usize,
         mut rx: BufferRx,
         state: Arc<AppState>,
-        #[cfg(feature = "indexer")] hook: crate::ingest::indexer::IndexerTx,
+        seed: SinkSeed,
         verify_signatures: bool,
         handle: Handle,
         validation_opts: Arc<ValidationOptions>,
@@ -129,14 +123,7 @@ impl RelayWorker {
             stats: shard_stats.clone(),
             batch: state.db.inner.batch(),
             count_deltas: CountDeltas::default(),
-            #[cfg(feature = "relay")]
-            pending_broadcasts: Vec::with_capacity(2),
-            #[cfg(all(feature = "relay", feature = "jetstream"))]
-            pending_jetstream_events: Vec::with_capacity(2),
-            #[cfg(feature = "indexer")]
-            pending_hook_messages: Vec::with_capacity(2),
-            #[cfg(feature = "indexer")]
-            hook,
+            sink: EventSink::new(&seed, shard_stats.clone()),
             http,
             error_counts: Default::default(),
             wrong_host_authority: Default::default(),
@@ -193,66 +180,30 @@ impl RelayWorker {
                 .stage_count_deltas(&mut batch, &ctx.count_deltas);
             let stage_counts = stage_counts_started.elapsed();
 
-            #[cfg(all(feature = "relay", feature = "jetstream"))]
-            let mut jetstream_broadcasts = Vec::new();
-
             let stage_and_commit_started = StatsInstant::now();
-            #[cfg(all(feature = "relay", feature = "jetstream"))]
-            let res = {
-                let _lock = ctx.state.db.jetstream_lock.lock();
-                let mut stage_res = Ok(());
-                for (event, ephemeral) in ctx.pending_jetstream_events.drain(..) {
-                    match crate::jetstream::stage_event(&mut batch, &ctx.state.db, event, ephemeral)
-                    {
-                        Ok(broadcast) => jetstream_broadcasts.push(broadcast),
-                        Err(e) => {
-                            stage_res = Err(e);
-                            break;
-                        }
-                    }
+            let staged = match ctx.sink.commit_batch(&state, batch) {
+                Ok(staged) => staged,
+                Err(e) => {
+                    shard_stats.record_commit_error();
+                    error!(shard = id, err = %e, "relay shard: failed to commit batch");
+                    drop(reservation);
+                    continue;
                 }
-                stage_res.and_then(|_| batch.commit().into_diagnostic())
             };
-
-            #[cfg(not(all(feature = "relay", feature = "jetstream")))]
-            let res = batch.commit();
             let stage_and_commit = stage_and_commit_started.elapsed();
-
-            if let Err(e) = res {
-                shard_stats.record_commit_error();
-                error!(shard = id, err = %e, "relay shard: failed to commit batch");
-                drop(reservation);
-                continue;
-            }
             let apply_counts_started = StatsInstant::now();
             ctx.state.db.apply_count_deltas(&ctx.count_deltas);
             drop(reservation);
             let apply_counts = apply_counts_started.elapsed();
 
             let broadcast_started = StatsInstant::now();
-            #[cfg(feature = "relay")]
-            for broadcast in ctx.pending_broadcasts.drain(..) {
-                let _ = state.db.relay_broadcast_tx.send(broadcast);
-            }
-            #[cfg(all(feature = "relay", feature = "jetstream"))]
-            for broadcast in jetstream_broadcasts {
-                let _ = state.db.jetstream_tx.send(broadcast);
-            }
-            #[cfg(feature = "indexer")]
-            for msg in ctx.pending_hook_messages.drain(..) {
-                let _ = ctx.hook.blocking_send(msg);
-            }
+            ctx.sink.flush(&state, staged);
             let broadcast = broadcast_started.elapsed();
 
             // advance cursor for this firehose only if we are the terminal consumer (relay mode)
             // in events mode, FirehoseWorker will advance the cursor after processing
             let cursor_started = StatsInstant::now();
-            #[cfg(feature = "relay")]
-            {
-                ctx.state
-                    .firehose_cursors
-                    .peek_with(&firehose, |_, c| c.store(seq, Ordering::SeqCst));
-            }
+            ctx.sink.advance_cursor(&state, &firehose, seq);
             shard_stats.record_processed(crate::ingest::firehose_stats::RelayShardTimings {
                 process_message,
                 stage_counts,

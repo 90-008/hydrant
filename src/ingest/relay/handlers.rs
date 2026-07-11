@@ -1,7 +1,5 @@
 use miette::Result;
 use smol_str::SmolStr;
-#[cfg(all(feature = "relay", feature = "jetstream"))]
-use smol_str::ToSmolStr;
 use tokio::runtime::Handle;
 use tracing::{debug, warn};
 use url::Url;
@@ -9,18 +7,8 @@ use url::Url;
 use crate::db::{self, keys};
 use crate::types::{RepoState, RepoStatus};
 
-#[cfg(all(feature = "relay", feature = "jetstream"))]
-use crate::db::types::TrimmedDid;
-#[cfg(feature = "relay")]
-use crate::ingest::stream::encode_frame;
 use crate::ingest::stream::{Account, AccountStatus, Commit, Identity, Sync};
 use crate::ingest::validation::ValidatedCommit;
-#[cfg(feature = "indexer")]
-use jacquard_common::IntoStatic;
-#[cfg(all(feature = "relay", feature = "jetstream"))]
-use crate::types::StoredJetstreamEvent;
-#[cfg(all(feature = "relay", feature = "jetstream"))]
-use jacquard_common::CowStr;
 
 use super::{RelayWorker, WorkerContext};
 
@@ -28,8 +16,8 @@ impl RelayWorker {
     pub(crate) fn handle_commit(
         ctx: &mut WorkerContext,
         repo_state: &mut RepoState,
-        #[allow(unused_variables)] firehose: &Url,
-        #[allow(unused_mut)] mut commit: Commit<'static>,
+        firehose: &Url,
+        commit: Commit<'static>,
     ) -> Result<()> {
         if !repo_state.active {
             return Ok(());
@@ -47,9 +35,6 @@ impl RelayWorker {
             ..
         } = validated;
 
-        #[cfg(not(feature = "indexer"))]
-        let _ = parsed_blocks;
-
         if chain_break.is_broken() {
             // chain breaks are not grounds for blocking when acting as a relay
             debug!(broken = ?chain_break, "chain break, forwarding anyway");
@@ -57,72 +42,14 @@ impl RelayWorker {
 
         let repo_key = keys::repo_key(&commit.repo);
 
-        #[cfg(feature = "indexer")]
-        {
-            ctx.pending_hook_messages
-                .push(crate::ingest::indexer::IndexerMessage::Event(Box::new(
-                    crate::ingest::indexer::IndexerEvent {
-                        seq: commit.seq,
-                        firehose: firehose.clone(),
-                        data: crate::ingest::indexer::IndexerEventData::Commit(
-                            crate::ingest::indexer::IndexerCommitData {
-                                commit,
-                                chain_break: chain_break.is_broken(),
-                                parsed_blocks,
-                            },
-                        ),
-                    },
-                )));
-        }
-        #[cfg(feature = "relay")]
-        {
-            #[cfg(feature = "jetstream")]
-            let jetstream_ops = commit
-                .ops
-                .iter()
-                .enumerate()
-                .filter_map(|(idx, op)| {
-                    matches!(op.action.as_str(), "create" | "update" | "delete")
-                        .then(|| split_collection(&op.path).map(|col| (idx as u32, col)))
-                        .flatten()
-                })
-                .collect::<Vec<_>>();
-            #[cfg(feature = "jetstream")]
-            let jetstream_did = TrimmedDid::from(&commit.repo).into_static();
-
-            let _relay_seq = ctx.queue_emit(|seq| {
-                commit.seq = seq;
-                encode_frame("#commit", &commit)
-            })?;
-            #[cfg(feature = "jetstream")]
-            {
-                // skip car parse and record materialization when no jetstream subscribers are
-                // connected — the stream thread re-reads from relay_events as a fallback.
-                let parsed_car = (ctx.state.db.jetstream_tx.receiver_count() > 0)
-                    .then(|| {
-                        tokio::runtime::Handle::current()
-                            .block_on(jacquard_repo::car::reader::parse_car_bytes(
-                                commit.blocks.as_ref(),
-                            ))
-                            .ok()
-                    })
-                    .flatten();
-                for (op_index, collection) in &jetstream_ops {
-                    let ephemeral = parsed_car.as_ref().and_then(|car| {
-                        build_relay_commit_ephemeral(&commit, *op_index, collection, car)
-                    });
-                    ctx.pending_jetstream_events.push((
-                        StoredJetstreamEvent::RelayCommit {
-                            did: jetstream_did.clone(),
-                            collection: collection.clone(),
-                            relay_seq: _relay_seq,
-                            op_index: *op_index,
-                        },
-                        ephemeral,
-                    ));
-                }
-            }
-        }
+        ctx.sink.commit(
+            ctx.state,
+            &mut ctx.batch,
+            firehose,
+            commit,
+            chain_break.is_broken(),
+            parsed_blocks,
+        )?;
 
         repo_state.root = Some(commit_obj.into());
         repo_state.touch();
@@ -138,8 +65,8 @@ impl RelayWorker {
     pub(crate) fn handle_sync(
         ctx: &mut WorkerContext,
         repo_state: &mut RepoState,
-        #[allow(unused_variables)] firehose: &Url,
-        #[allow(unused_mut)] mut sync: Sync<'static>,
+        firehose: &Url,
+        sync: Sync<'static>,
     ) -> Result<()> {
         if !repo_state.active {
             return Ok(());
@@ -153,26 +80,7 @@ impl RelayWorker {
 
         let repo_key = keys::repo_key(&sync.did);
 
-        #[cfg(feature = "indexer")]
-        {
-            ctx.pending_hook_messages
-                .push(crate::ingest::indexer::IndexerMessage::Event(Box::new(
-                    crate::ingest::indexer::IndexerEvent {
-                        seq: sync.seq,
-                        firehose: firehose.clone(),
-                        data: crate::ingest::indexer::IndexerEventData::Sync(
-                            sync.did.into_static(),
-                        ),
-                    },
-                )));
-        }
-        #[cfg(feature = "relay")]
-        {
-            ctx.queue_emit(|seq| {
-                sync.seq = seq;
-                encode_frame("#sync", &sync)
-            })?;
-        }
+        ctx.sink.sync(ctx.state, &mut ctx.batch, firehose, sync)?;
 
         repo_state.root = Some(validated.commit_obj.into());
         repo_state.touch();
@@ -188,7 +96,7 @@ impl RelayWorker {
     pub(crate) fn handle_identity(
         ctx: &mut WorkerContext,
         repo_state: &mut RepoState,
-        #[allow(unused_variables)] firehose: &Url,
+        firehose: &Url,
         mut identity: Identity<'static>,
         is_pds: bool,
     ) -> Result<()> {
@@ -200,12 +108,7 @@ impl RelayWorker {
         repo_state.advance_identity_time(event_ms);
         let was_active = repo_state.active;
         let was_pds_host = Self::pds_host(repo_state.pds.as_deref());
-
-        #[cfg(feature = "indexer")]
-        let (was_handle, was_signing_key) = (
-            repo_state.handle.clone().map(IntoStatic::into_static),
-            repo_state.signing_key.clone().map(IntoStatic::into_static),
-        );
+        let snapshot = ctx.sink.identity_snapshot(repo_state);
 
         // refresh did doc if a pds sent this event
         // or if there is no handle specified
@@ -239,36 +142,8 @@ impl RelayWorker {
 
         let repo_key = keys::repo_key(&identity.did);
 
-        #[cfg(feature = "indexer")]
-        {
-            let changed =
-                repo_state.handle != was_handle || repo_state.signing_key != was_signing_key;
-            ctx.pending_hook_messages
-                .push(crate::ingest::indexer::IndexerMessage::Event(Box::new(
-                    crate::ingest::indexer::IndexerEvent {
-                        seq: identity.seq,
-                        firehose: firehose.clone(),
-                        data: crate::ingest::indexer::IndexerEventData::Identity(
-                            crate::ingest::indexer::IndexerIdentityData { identity, changed },
-                        ),
-                    },
-                )));
-        }
-        #[cfg(feature = "relay")]
-        {
-            let _relay_seq = ctx.queue_emit(|seq| {
-                identity.seq = seq;
-                encode_frame("#identity", &identity)
-            })?;
-            #[cfg(feature = "jetstream")]
-            ctx.pending_jetstream_events.push((
-                StoredJetstreamEvent::RelayIdentity {
-                    did: TrimmedDid::from(&identity.did).into_static(),
-                    relay_seq: _relay_seq,
-                },
-                None,
-            ));
-        }
+        ctx.sink
+            .identity(ctx.state, &mut ctx.batch, firehose, identity, repo_state, snapshot)?;
 
         ctx.batch.insert(
             &ctx.state.db.repos,
@@ -282,8 +157,8 @@ impl RelayWorker {
     pub(crate) fn handle_account(
         ctx: &mut WorkerContext,
         repo_state: &mut RepoState,
-        #[allow(unused_variables)] firehose: &Url,
-        #[allow(unused_mut)] mut account: Account<'static>,
+        firehose: &Url,
+        account: Account<'static>,
         _is_pds: bool,
     ) -> Result<()> {
         let event_ms = account.time.0.timestamp_millis();
@@ -297,8 +172,7 @@ impl RelayWorker {
         // always capture was_active for count tracking, not just in indexer mode
         let was_active = repo_state.active;
         let was_pds_host = Self::pds_host(repo_state.pds.as_deref());
-        #[cfg(feature = "indexer")]
-        let was_status = repo_state.status.clone();
+        let snapshot = ctx.sink.account_snapshot(repo_state);
 
         repo_state.active = account.active;
         if !account.active {
@@ -334,39 +208,15 @@ impl RelayWorker {
 
         let repo_key = keys::repo_key(&account.did);
 
-        #[cfg(feature = "indexer")]
-        {
-            let changed = repo_state.active != was_active || repo_state.status != was_status;
-            ctx.pending_hook_messages
-                .push(crate::ingest::indexer::IndexerMessage::Event(Box::new(
-                    crate::ingest::indexer::IndexerEvent {
-                        seq: account.seq,
-                        firehose: firehose.clone(),
-                        data: crate::ingest::indexer::IndexerEventData::Account(
-                            crate::ingest::indexer::IndexerAccountData {
-                                account,
-                                was_active,
-                                changed,
-                            },
-                        ),
-                    },
-                )));
-        }
-        #[cfg(feature = "relay")]
-        {
-            let _relay_seq = ctx.queue_emit(|seq| {
-                account.seq = seq;
-                encode_frame("#account", &account)
-            })?;
-            #[cfg(feature = "jetstream")]
-            ctx.pending_jetstream_events.push((
-                StoredJetstreamEvent::RelayAccount {
-                    did: TrimmedDid::from(&account.did).into_static(),
-                    relay_seq: _relay_seq,
-                },
-                None,
-            ));
-        }
+        ctx.sink.account(
+            ctx.state,
+            &mut ctx.batch,
+            firehose,
+            account,
+            repo_state,
+            snapshot,
+            was_active,
+        )?;
 
         repo_state.touch();
         ctx.batch.insert(
@@ -411,46 +261,4 @@ impl RelayWorker {
             update_host(host, 1);
         }
     }
-}
-
-#[cfg(all(feature = "relay", feature = "jetstream"))]
-fn split_collection(path: &str) -> Option<CowStr<'static>> {
-    path.split_once('/')
-        .map(|(collection, _)| CowStr::Owned(collection.to_smolstr()))
-}
-
-#[cfg(all(feature = "relay", feature = "jetstream"))]
-fn build_relay_commit_ephemeral(
-    commit: &crate::ingest::stream::Commit,
-    op_index: u32,
-    collection: &jacquard_common::CowStr<'static>,
-    car: &jacquard_repo::car::reader::ParsedCar,
-) -> Option<crate::jetstream::JetstreamEphemeral> {
-    let op = commit.ops.get(op_index as usize)?;
-    let (_, rkey) = op.path.split_once('/')?;
-    let action = op.action.as_str();
-
-    let (record, cid) = if matches!(action, "create" | "update") {
-        let cid_link = op.cid.as_ref()?;
-        let cid_ipld = cid_link.to_ipld().ok()?;
-        let block = car.blocks.get(&cid_ipld)?;
-        let val = serde_ipld_dagcbor::from_slice::<jacquard_common::RawData>(block).ok()?;
-        let record = serde_json::value::to_raw_value(&val)
-            .ok()
-            .map(std::sync::Arc::from);
-        (record, Some(cid_link.to_string()))
-    } else {
-        (None, None)
-    };
-
-    Some(crate::jetstream::JetstreamEphemeral {
-        did: commit.repo.as_str().to_string(),
-        rev: commit.rev.as_str().to_string(),
-        operation: action.to_string(),
-        collection: collection.as_str().to_string(),
-        rkey: rkey.to_string(),
-        record,
-        cid,
-        live: true,
-    })
 }

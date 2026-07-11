@@ -14,6 +14,7 @@ use crate::types::{RepoState, RepoStatus};
 
 pub mod context;
 pub mod handlers;
+pub(crate) mod sink;
 pub mod worker;
 
 pub(crate) use context::WorkerContext;

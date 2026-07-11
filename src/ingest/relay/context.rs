@@ -29,10 +29,6 @@ use crate::ingest::stream::SubscribeReposMessage;
 use crate::ingest::validation::{
     CommitValidationError, SyncValidationError, ValidatedCommit, ValidatedSync, ValidationContext,
 };
-#[cfg(feature = "relay")]
-use crate::types::RelayBroadcast;
-#[cfg(feature = "relay")]
-use std::sync::atomic::Ordering;
 
 use super::{commit_validation_outcome, sync_validation_outcome};
 use crate::ingest::firehose_stats::StatsInstant;
@@ -44,17 +40,7 @@ pub(crate) struct WorkerContext<'a> {
     pub(crate) stats: Arc<crate::ingest::firehose_stats::RelayShardStats>,
     pub(crate) batch: OwnedWriteBatch,
     pub(crate) count_deltas: CountDeltas,
-    #[cfg(feature = "relay")]
-    pub(crate) pending_broadcasts: Vec<RelayBroadcast>,
-    #[cfg(all(feature = "relay", feature = "jetstream"))]
-    pub(crate) pending_jetstream_events: Vec<(
-        crate::types::StoredJetstreamEvent<'static>,
-        Option<crate::jetstream::JetstreamEphemeral>,
-    )>,
-    #[cfg(feature = "indexer")]
-    pub(crate) pending_hook_messages: Vec<crate::ingest::indexer::IndexerMessage>,
-    #[cfg(feature = "indexer")]
-    pub(crate) hook: crate::ingest::indexer::IndexerTx,
+    pub(crate) sink: super::sink::EventSink,
     pub(crate) http: reqwest::Client,
     pub(crate) error_counts: HashMap<u64, u32, nohash_hasher::BuildNoHashHasher<u64>>,
     pub(crate) wrong_host_authority: HashMap<u64, Instant, nohash_hasher::BuildNoHashHasher<u64>>,
@@ -466,13 +452,7 @@ impl WorkerContext<'_> {
             crate::db::ser_repo_state(&repo_state)?,
         );
 
-        #[cfg(feature = "indexer")]
-        {
-            self.pending_hook_messages
-                .push(crate::ingest::indexer::IndexerMessage::NewRepo(
-                    did.clone().into_static(),
-                ));
-        }
+        self.sink.new_repo(did.clone().into_static());
 
         self.count_deltas.add_repos(1);
 
@@ -482,26 +462,5 @@ impl WorkerContext<'_> {
         self.stats.record_new_account(new_account_started.elapsed());
 
         Ok(Some(repo_state))
-    }
-
-    #[cfg(feature = "relay")]
-    pub(crate) fn queue_emit(
-        &mut self,
-        make_frame: impl FnOnce(i64) -> Result<bytes::Bytes>,
-    ) -> Result<u64> {
-        let started = StatsInstant::now();
-        let result = (|| {
-            let db = &self.state.db;
-            let seq = db.next_relay_seq.fetch_add(1, Ordering::SeqCst);
-            let frame = make_frame(seq as i64)?;
-            self.batch
-                .insert(&db.relay_events, keys::relay_event_key(seq), frame.as_ref());
-            self.pending_broadcasts
-                .push(RelayBroadcast::Ephemeral(seq, frame));
-            self.pending_broadcasts.push(RelayBroadcast::Persisted(seq));
-            Ok(seq)
-        })();
-        self.stats.record_queue_emit(started.elapsed());
-        result
     }
 }

@@ -49,11 +49,15 @@ impl Hydrant {
             let (indexer_tx, firehose_worker) =
                 FirehoseWorker::new(state.clone(), config.firehose_workers);
 
+            #[cfg(feature = "indexer")]
+            let sink_seed = crate::ingest::relay::sink::SinkSeed::new(indexer_tx.clone());
+            #[cfg(not(feature = "indexer"))]
+            let sink_seed = crate::ingest::relay::sink::SinkSeed::default();
+
             // raw firehose events from pds/relay to RelayWorker.
             let (buffer_tx, relay_worker) = crate::ingest::relay::RelayWorker::new(
                 state.clone(),
-                #[cfg(feature = "indexer")]
-                indexer_tx.clone(),
+                sink_seed,
                 matches!(config.verify_signatures, SignatureVerification::Full),
                 config.firehose_workers,
                 crate::ingest::validation::ValidationOptions {
