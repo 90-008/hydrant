@@ -219,6 +219,7 @@ fn payload_too_large<E: std::error::Error + IntoStatic>(
     }
 }
 
+#[cfg(any(feature = "indexer", feature = "relay"))]
 fn rate_limited<E: std::error::Error + IntoStatic>(
     nsid: &'static str,
     method: &'static str,

@@ -126,6 +126,7 @@ Hydrant uses multiple `fjall` keyspaces:
 
 ### Testing
 - `nu tests/run_all.nu` - Runs all tests in parallel with automatically assigned free ports. Pass `--skip-creds` to skip tests requiring `.env` credentials or external account fixtures, or `--only=[<name>...]` to run a subset.
+- `nu tests/feature_matrix.nu` - Checks every supported cargo feature combination compiles error- and warning-free (`--only [<name>...]` for a subset). Run this after touching any `#[cfg(feature = ...)]` gate or adding/removing items in shared modules. The supported matrix lives in the script: `indexer` and `relay` are mutually exclusive modes; `indexer_stream`/`backlinks` require `indexer`; `jetstream` requires `indexer_stream` or `relay`; the bare no-features core must also build.
 - `nu tests/api_crawler_sources.nu` - Tests `/crawler/sources` CRUD plus dynamic/configured source restart behavior.
 - `nu tests/api_firehose_sources.nu` - Tests `/firehose/sources` CRUD behavior.
 - `nu tests/api_pds_tiers.nu` - Tests PDS tier APIs, tier persistence, and custom rate tiers.

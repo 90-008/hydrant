@@ -61,6 +61,7 @@ impl Hydrant {
         &self.state.resolver
     }
 
+    #[cfg(any(feature = "indexer_stream", feature = "relay", feature = "jetstream"))]
     pub(crate) fn stream_send_timeout(&self) -> std::time::Duration {
         self.config.stream_send_timeout
     }

@@ -11,6 +11,7 @@ use std::collections::BTreeSet;
 use std::sync::atomic::AtomicI64;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+#[cfg(any(feature = "indexer_stream", feature = "relay", feature = "jetstream"))]
 use tokio::sync::broadcast;
 
 use crate::config::{Compression, Config};

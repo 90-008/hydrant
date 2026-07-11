@@ -222,6 +222,7 @@ impl AppState {
             .is_some_and(|l| count >= l)
     }
 
+    #[cfg(feature = "indexer")]
     pub(crate) fn resolve_pds_tier(&self, host: &str) -> crate::config::RateTier {
         let meta = self.pds_meta.load();
         let override_name = meta.hosts.get(host).and_then(|h| h.tier.as_ref());

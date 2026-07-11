@@ -1,5 +1,3 @@
-#![cfg(any(feature = "indexer_stream", feature = "relay", feature = "jetstream"))]
-
 use std::fmt;
 use std::num::NonZeroUsize;
 use std::time::{Duration, Instant};

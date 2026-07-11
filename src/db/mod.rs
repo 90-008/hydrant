@@ -130,6 +130,7 @@ impl Db {
                 .into_diagnostic()?
         };
 
+        #[cfg_attr(not(any(feature = "indexer", feature = "indexer_stream", feature = "jetstream", feature = "relay", feature = "backlinks")), allow(unused_mut))]
         let mut tasks = vec![
             compact(self.repos.clone()),
             compact(self.cursors.clone()),

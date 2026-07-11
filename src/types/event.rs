@@ -1,13 +1,26 @@
+#[cfg(feature = "indexer_stream")]
 use bytes::Bytes;
 #[cfg(feature = "jetstream")]
 use jacquard_common::IntoStatic;
+#[cfg(feature = "indexer_stream")]
 use jacquard_common::types::cid::IpldCid;
+#[cfg(feature = "indexer_stream")]
 use jacquard_common::types::nsid::Nsid;
+#[cfg(feature = "indexer_stream")]
 use jacquard_common::types::string::{Did, Rkey};
+#[cfg(feature = "indexer_stream")]
 use jacquard_common::types::tid::Tid;
+#[cfg(any(feature = "indexer_stream", feature = "jetstream"))]
 use jacquard_common::{CowStr, types::string::Handle};
-use serde::{Deserialize, Serialize, Serializer};
+#[cfg(any(feature = "indexer_stream", feature = "jetstream"))]
+use serde::Serialize;
+#[cfg(feature = "indexer_stream")]
+use serde::Serializer;
+#[cfg(any(feature = "indexer_stream", feature = "jetstream"))]
+use serde::Deserialize;
+#[cfg(feature = "indexer_stream")]
 use serde_json::value::RawValue;
+#[cfg(any(feature = "indexer_stream", feature = "jetstream"))]
 use std::fmt::Debug;
 
 #[cfg(any(feature = "indexer_stream", feature = "jetstream"))]
@@ -17,6 +30,7 @@ use crate::db::types::{DbAction, DbRkey, DbTid};
 #[cfg(feature = "jetstream")]
 use crate::ingest::stream::Datetime;
 
+#[cfg(feature = "indexer_stream")]
 #[derive(Debug, Serialize, Clone)]
 pub enum EventType {
     Record,
@@ -24,6 +38,7 @@ pub enum EventType {
     Account,
 }
 
+#[cfg(feature = "indexer_stream")]
 impl AsRef<str> for EventType {
     fn as_ref(&self) -> &str {
         match self {
@@ -34,10 +49,12 @@ impl AsRef<str> for EventType {
     }
 }
 
+#[cfg(feature = "indexer_stream")]
 fn event_type_ser_str<S: Serializer>(v: &EventType, s: S) -> Result<S::Ok, S::Error> {
     s.serialize_str(v.as_ref())
 }
 
+#[cfg(feature = "indexer_stream")]
 #[derive(Debug, Serialize, Clone)]
 pub struct MarshallableEvt<'i> {
     pub id: u64,
@@ -55,6 +72,7 @@ pub struct MarshallableEvt<'i> {
     pub account: Option<AccountEvt<'i>>,
 }
 
+#[cfg(feature = "indexer_stream")]
 #[derive(Debug, Serialize, Clone)]
 pub struct RecordEvt<'i> {
     pub live: bool,
@@ -71,6 +89,7 @@ pub struct RecordEvt<'i> {
     pub cid: Option<IpldCid>,
 }
 
+#[cfg(feature = "indexer_stream")]
 #[derive(Debug, Serialize, Clone)]
 pub struct IdentityEvt<'i> {
     #[serde(borrow)]
@@ -79,6 +98,7 @@ pub struct IdentityEvt<'i> {
     pub handle: Option<Handle<'i>>,
 }
 
+#[cfg(feature = "indexer_stream")]
 #[derive(Debug, Serialize, Clone)]
 pub struct AccountEvt<'i> {
     #[serde(borrow)]

@@ -25,6 +25,7 @@ use super::{
     WRONG_HOST_AUTHORITY_RECHECK_INTERVAL, WorkerMessage, map_repo_status_probe,
 };
 use crate::ingest::stream::AccountStatus;
+#[cfg(feature = "indexer")]
 use crate::ingest::stream::SubscribeReposMessage;
 use crate::ingest::validation::{
     CommitValidationError, SyncValidationError, ValidatedCommit, ValidatedSync, ValidationContext,

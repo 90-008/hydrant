@@ -1,7 +1,9 @@
 use crate::backfill::client::ThrottledHttpClient;
 use crate::backfill::error::BackfillError;
 use crate::config::{BackfillStrategy, RateTier};
-use crate::db::types::{DbAction, DbRkey, TrimmedDid};
+use crate::db::types::{DbAction, DbRkey};
+#[cfg(feature = "indexer_stream")]
+use crate::db::types::TrimmedDid;
 use crate::db::{self, CountDeltas, keys, ser_repo_state};
 use crate::filter::{FilterConfig, FilterMode};
 use crate::ops;
@@ -25,6 +27,7 @@ use reqwest::StatusCode;
 use smol_str::{SmolStr, ToSmolStr};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
+#[cfg(feature = "indexer_stream")]
 use std::sync::atomic::Ordering;
 use tracing::{debug, trace, warn};
 

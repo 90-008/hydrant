@@ -175,7 +175,7 @@ impl FirehoseSourceStats {
         *self.last_error_kind.lock() = Some(kind);
     }
 
-    fn snapshot(&self) -> FirehoseStatsSnapshot {
+    pub(super) fn snapshot(&self) -> FirehoseStatsSnapshot {
         FirehoseStatsSnapshot {
             connection_attempts: self.load_u64(&self.connection_attempts),
             successful_connections: self.load_u64(&self.successful_connections),

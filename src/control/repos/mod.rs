@@ -368,7 +368,7 @@ impl<'i> RepoHandle<'i> {
             .map_err(|e| MiniDocError::Other(miette::miette!(e)))?
             .map_err(MiniDocError::Other)?
         };
-        #[cfg(feature = "relay")]
+        #[cfg(not(feature = "indexer"))]
         let is_pending = false;
 
         if is_pending {

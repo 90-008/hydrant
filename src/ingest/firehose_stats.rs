@@ -2,11 +2,10 @@ mod relay;
 mod source;
 
 pub use relay::{
-    HostAuthorityStatsOutcome, RelayMessageKind, RelayShardStats, RelayShardStatsSnapshot,
-    RelayShardTimings, RelayWorkerStats, RelayWorkerStatsSnapshot, RepoStateLoadOutcome,
-    ValidationStatsOutcome,
+    HostAuthorityStatsOutcome, RelayMessageKind, RelayShardStats, RelayShardTimings,
+    RelayWorkerStats, RelayWorkerStatsSnapshot, RepoStateLoadOutcome, ValidationStatsOutcome,
 };
-pub use source::{FirehoseMessageStats, FirehoseSourceStats, FirehoseStats, FirehoseStatsSnapshot};
+pub use source::{FirehoseSourceStats, FirehoseStats, FirehoseStatsSnapshot};
 
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::Duration;

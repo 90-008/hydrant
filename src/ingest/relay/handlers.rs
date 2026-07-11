@@ -15,13 +15,12 @@ use crate::db::types::TrimmedDid;
 use crate::ingest::stream::encode_frame;
 use crate::ingest::stream::{Account, AccountStatus, Commit, Identity, Sync};
 use crate::ingest::validation::ValidatedCommit;
-#[cfg(feature = "relay")]
-use crate::types::RelayBroadcast;
+#[cfg(feature = "indexer")]
+use jacquard_common::IntoStatic;
 #[cfg(all(feature = "relay", feature = "jetstream"))]
 use crate::types::StoredJetstreamEvent;
 #[cfg(all(feature = "relay", feature = "jetstream"))]
 use jacquard_common::CowStr;
-use jacquard_common::IntoStatic;
 
 use super::{RelayWorker, WorkerContext};
 

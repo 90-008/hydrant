@@ -1,4 +1,6 @@
+#[cfg(any(feature = "indexer_stream", feature = "relay", feature = "jetstream"))]
 pub(crate) mod engine;
+#[cfg(any(feature = "indexer_stream", feature = "relay", feature = "jetstream"))]
 pub(crate) mod types;
 
 #[cfg(feature = "indexer_stream")]
@@ -20,5 +22,7 @@ pub(crate) use jetstream::{
     JetstreamAccount, JetstreamCommit, JetstreamEvent, JetstreamIdentity, JetstreamPayload,
 };
 
+#[cfg(any(feature = "indexer_stream", feature = "relay", feature = "jetstream"))]
 pub(crate) use engine::*;
+#[cfg(any(feature = "indexer_stream", feature = "relay", feature = "jetstream"))]
 pub(crate) use types::*;

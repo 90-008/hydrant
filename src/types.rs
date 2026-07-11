@@ -9,11 +9,13 @@ use smol_str::ToSmolStr;
 use crate::db::types::DbTid;
 use crate::resolver::MiniDoc;
 
+#[cfg(any(feature = "indexer_stream", feature = "relay", feature = "jetstream"))]
 pub(crate) mod event;
 pub(crate) mod v2;
 pub(crate) mod v4;
 pub(crate) mod v7;
 
+#[cfg(any(feature = "indexer_stream", feature = "relay", feature = "jetstream"))]
 pub(crate) use event::*;
 pub(crate) use v7::*;
 
@@ -136,6 +138,7 @@ impl<'i> RepoState<'i> {
         }
     }
 
+    #[cfg(any(test, feature = "relay"))]
     pub fn synced() -> Self {
         Self {
             status: RepoStatus::Synced,

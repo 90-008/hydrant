@@ -123,6 +123,7 @@ fn is_lifecycle_count(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "indexer")]
     use super::*;
 
     #[cfg(feature = "indexer")]

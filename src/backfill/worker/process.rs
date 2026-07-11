@@ -19,7 +19,9 @@ use crate::backfill::client::ThrottledHttpClient;
 use crate::backfill::error::BackfillError;
 use crate::backfill::sparse::{SparseBackfillResult, process_did_sparse};
 use crate::config::BackfillStrategy;
-use crate::db::types::{DbAction, DbRkey, TrimmedDid};
+use crate::db::types::{DbAction, DbRkey};
+#[cfg(feature = "indexer_stream")]
+use crate::db::types::TrimmedDid;
 use crate::db::{self, CountDeltas, Db, keys, ser_repo_state};
 use crate::filter::FilterMode;
 use crate::ops;
