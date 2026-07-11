@@ -31,6 +31,18 @@ impl Db {
     }
 }
 
+pub(crate) fn delete_repo_records(
+    batch: &mut OwnedWriteBatch,
+    db: &Db,
+    did: &Did<'_>,
+) -> Result<()> {
+    for guard in db.indexer.records.prefix(keys::record_prefix_did(did)) {
+        let (key, _) = guard.into_inner().into_diagnostic()?;
+        batch.remove(&db.indexer.records, key);
+    }
+    Ok(())
+}
+
 pub fn set_record_count(
     batch: &mut OwnedWriteBatch,
     db: &Db,

@@ -2,21 +2,16 @@ use crate::backfill::client::ThrottledHttpClient;
 use crate::backfill::error::BackfillError;
 use crate::config::{BackfillStrategy, RateTier};
 use crate::db::types::{DbAction, DbRkey};
-#[cfg(feature = "indexer_stream")]
-use crate::db::types::TrimmedDid;
-use crate::db::{self, CountDeltas, keys, ser_repo_state};
+use crate::db::{self, Txn as DbTxn, keys};
 use crate::filter::{FilterConfig, FilterMode};
 use crate::ops;
 use crate::sparse_mst::{SparseScanner, mst_node_layer, sparse_probe_collection, sparse_ranges};
 use crate::state::AppState;
 use crate::types::{Commit, RepoState};
 
-use fjall::Slice;
 use futures::{StreamExt, stream};
 use jacquard_api::com_atproto::sync::get_blocks::GetBlocksError;
 use jacquard_api::com_atproto::sync::get_record::{GetRecord, GetRecordError};
-#[cfg(feature = "jetstream")]
-use jacquard_common::IntoStatic;
 use jacquard_common::types::cid::{Cid as AtCid, IpldCid};
 use jacquard_common::types::did::Did;
 use jacquard_common::types::string::{Nsid, RecordKey};
@@ -27,16 +22,10 @@ use reqwest::StatusCode;
 use smol_str::{SmolStr, ToSmolStr};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
-#[cfg(feature = "indexer_stream")]
-use std::sync::atomic::Ordering;
 use tracing::{debug, trace, warn};
 
-#[cfg(feature = "indexer_stream")]
-use crate::types::{StoredData, StoredEvent};
 use crate::util::throttle::ThrottleHandle;
 use crate::util::url_to_fluent_uri;
-#[cfg(feature = "indexer_stream")]
-use jacquard_common::CowStr;
 
 #[derive(Debug)]
 pub(crate) struct SparseBackfillSuccess {
@@ -425,18 +414,14 @@ async fn persist_sparse_backfill(
     tokio::task::spawn_blocking(move || {
         let filter = app_state.filter.load();
         let ephemeral = app_state.ephemeral;
-        let only_index_links = app_state.only_index_links;
         let mut count = 0;
-        let mut delta = 0;
-        let mut added_blocks = 0;
         let mut collection_counts: HashMap<SmolStr, u64> = HashMap::new();
-        let mut batch = app_state.db.inner.batch();
 
         let prefix = keys::record_prefix_did(&did);
         let mut existing_cids: HashMap<(SmolStr, DbRkey), SmolStr> = HashMap::new();
 
         if !ephemeral {
-            for guard in app_state.db.indexer.records.prefix(&prefix) {
+            for guard in app_state.db.indexer.record_prefix(&prefix) {
                 let (key, cid_bytes) = guard.into_inner().into_diagnostic()?;
                 let mut remaining = key[prefix.len()..].splitn(2, |b| keys::SEP.eq(b));
                 let collection_raw = remaining
@@ -463,6 +448,8 @@ async fn persist_sparse_backfill(
         }
 
         let mut signal_seen = filter.mode == FilterMode::Full || filter.signals.is_empty();
+        let mut txn = DbTxn::new(&app_state.db);
+        let mut record_txn = txn.backfill_records(&app_state, &root_commit.rev, &did);
 
         for (key, cid) in leaves {
             let (collection, rkey) = ops::parse_path(&key)?;
@@ -471,7 +458,7 @@ async fn persist_sparse_backfill(
                 continue;
             }
 
-            let Some(val) = blocks.get(&cid).cloned() else {
+            let Some(val) = blocks.get(&cid) else {
                 return Err(miette::miette!("missing sparse record block {cid}").into());
             };
 
@@ -498,114 +485,13 @@ async fn persist_sparse_backfill(
             };
             trace!(collection = %collection, rkey = %rkey, cid = %cid, ?action, "action sparse record");
 
-            let db_key = keys::record_key(&did, collection, &rkey);
-            let cid_raw = cid.to_bytes();
-            let block_key = Slice::from(keys::block_key(collection, &cid_raw));
-            if !ephemeral {
-                if !only_index_links {
-                    batch.insert(&app_state.db.indexer.blocks, block_key.clone(), val.as_ref());
-                }
-                batch.insert(&app_state.db.indexer.records, db_key, cid_raw);
-                #[cfg(feature = "backlinks")]
-                if let Ok(value) =
-                    serde_ipld_dagcbor::from_slice::<jacquard_common::Data>(val.as_ref())
-                {
-                    crate::backlinks::store::index_record(
-                        &mut batch,
-                        &app_state.db.backlinks,
-                        did.as_str(),
-                        collection,
-                        &rkey.to_smolstr(),
-                        &value,
-                    )?;
-                }
-            }
-
-            added_blocks += 1;
-            if action == DbAction::Create {
-                delta += 1;
-            }
-
-            #[cfg(feature = "indexer_stream")]
-            {
-                let event_id = app_state.db.stream.next_event_id.fetch_add(1, Ordering::SeqCst);
-                let evt = StoredEvent {
-                    live: false,
-                    did: TrimmedDid::from(&did),
-                    rev: root_commit.rev,
-                    collection: CowStr::Borrowed(collection),
-                    rkey,
-                    action,
-                    data: if ephemeral {
-                        StoredData::Block(val)
-                    } else if only_index_links {
-                        StoredData::Nothing
-                    } else {
-                        StoredData::Ptr(cid_obj.to_ipld().expect("valid cid"))
-                    },
-                };
-                let bytes = rmp_serde::to_vec(&evt).into_diagnostic()?;
-                batch.insert(&app_state.db.stream.events, keys::event_key(event_id), bytes);
-
-                #[cfg(feature = "jetstream")]
-                {
-                    let jetstream = crate::types::StoredJetstreamEvent::Commit {
-                        did: TrimmedDid::from(&did).into_static(),
-                        collection: CowStr::Borrowed(collection).into_static(),
-                        event_id,
-                        live: false,
-                    };
-                    crate::jetstream::stage_event(&mut batch, &app_state.db, jetstream, None)?;
-                }
-            }
-
+            record_txn.put_record(collection, &rkey, cid, val, action)?;
             count += 1;
         }
 
         for ((collection, rkey), cid) in existing_cids {
             trace!(collection = %collection, rkey = %rkey, cid = %cid, "remove sparse-stale record");
-
-            batch.remove(
-                &app_state.db.indexer.records,
-                keys::record_key(&did, &collection, &rkey),
-            );
-            #[cfg(feature = "backlinks")]
-            crate::backlinks::store::delete_record(
-                &mut batch,
-                &app_state.db.backlinks,
-                did.as_str(),
-                &collection,
-                &rkey.to_smolstr(),
-            )?;
-
-            #[cfg(feature = "indexer_stream")]
-            {
-                let event_id = app_state.db.stream.next_event_id.fetch_add(1, Ordering::SeqCst);
-                let evt = StoredEvent {
-                    live: false,
-                    did: TrimmedDid::from(&did),
-                    rev: root_commit.rev,
-                    collection: CowStr::Borrowed(&collection),
-                    rkey,
-                    action: DbAction::Delete,
-                    data: StoredData::Nothing,
-                };
-                let bytes = rmp_serde::to_vec(&evt).into_diagnostic()?;
-                batch.insert(&app_state.db.stream.events, keys::event_key(event_id), bytes);
-
-                #[cfg(feature = "jetstream")]
-                {
-                    let jetstream = crate::types::StoredJetstreamEvent::Commit {
-                        did: TrimmedDid::from(&did).into_static(),
-                        collection: CowStr::Borrowed(&collection).into_static(),
-                        event_id,
-                        live: false,
-                    };
-                    crate::jetstream::stage_event(&mut batch, &app_state.db, jetstream, None)?;
-                }
-            }
-
-            delta -= 1;
+            record_txn.delete_record(&collection, &rkey)?;
             count += 1;
         }
 
@@ -616,12 +502,8 @@ async fn persist_sparse_backfill(
 
         state.root = Some(root_commit);
         state.touch();
-
-        batch.insert(
-            &app_state.db.repos,
-            keys::repo_key(&did),
-            ser_repo_state(&state)?,
-        );
+        record_txn.update_repo_state(&state)?;
+        let _events = record_txn.finish()?;
 
         let metadata_key = keys::repo_metadata_key(&did);
         let metadata_bytes = app_state
@@ -632,7 +514,7 @@ async fn persist_sparse_backfill(
             .ok_or_else(|| miette::miette!("repo metadata not found for {}", did))?;
         let mut metadata = crate::db::deser_repo_meta(&metadata_bytes)?;
         metadata.tracked = true;
-        batch.insert(
+        txn.batch.insert(
             &app_state.db.repo_metadata,
             &metadata_key,
             crate::db::ser_repo_meta(&metadata)?,
@@ -640,7 +522,7 @@ async fn persist_sparse_backfill(
 
         if !ephemeral {
             db::replace_record_counts_matching(
-                &mut batch,
+                &mut txn.batch,
                 &app_state.db,
                 &did,
                 |collection| filter.matches_collection(collection),
@@ -648,17 +530,7 @@ async fn persist_sparse_backfill(
             )?;
         }
 
-        let mut count_deltas = CountDeltas::default();
-        if delta != 0 {
-            count_deltas.add_records(delta);
-        }
-        if added_blocks > 0 {
-            count_deltas.add_blocks(added_blocks);
-        }
-        let reservation = app_state.db.stage_count_deltas(&mut batch, &count_deltas);
-        batch.commit().into_diagnostic()?;
-        app_state.db.apply_count_deltas(&count_deltas);
-        drop(reservation);
+        txn.commit()?;
 
         Ok::<_, miette::Report>(Some((count, state)))
     })

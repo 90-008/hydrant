@@ -17,7 +17,6 @@ mod enabled {
 
     use crate::db::types::{DbAction, DbRkey, DbTid, TrimmedDid};
     use crate::db::{Db, keys};
-    use crate::ingest::stream::Commit;
     use crate::state::AppState;
     use crate::types::{LiveRecordEvent, StoredData, StoredEvent};
 
@@ -33,10 +32,17 @@ mod enabled {
         pub(crate) block: Option<&'a Bytes>,
     }
 
+    #[derive(Clone, Copy)]
+    pub(crate) enum RecordEventOrigin {
+        Live,
+        Backfill,
+    }
+
     pub(crate) struct RecordEmitter {
         rev: DbTid,
         ephemeral: bool,
         only_index_links: bool,
+        live: bool,
         should_broadcast_live: bool,
         live_events: Vec<LiveRecordEvent>,
         last_event_id: Option<u64>,
@@ -47,16 +53,18 @@ mod enabled {
     }
 
     impl RecordEmitter {
-        pub(crate) fn new(state: &AppState, commit: &Commit) -> Self {
+        pub(crate) fn new(state: &AppState, commit_rev: &DbTid, origin: RecordEventOrigin) -> Self {
+            let live = matches!(origin, RecordEventOrigin::Live);
             Self {
-                rev: DbTid::from(&commit.rev),
+                rev: *commit_rev,
                 ephemeral: state.ephemeral,
                 only_index_links: state.only_index_links,
-                should_broadcast_live: state.db.stream.event_tx.receiver_count() > 0,
+                live,
+                should_broadcast_live: live && state.db.stream.event_tx.receiver_count() > 0,
                 live_events: Vec::new(),
                 last_event_id: None,
                 #[cfg(feature = "jetstream")]
-                should_stage_jetstream: state.db.jetstream.tx.receiver_count() > 0,
+                should_stage_jetstream: live && state.db.jetstream.tx.receiver_count() > 0,
                 #[cfg(feature = "jetstream")]
                 jetstream_events: Vec::new(),
             }
@@ -69,15 +77,12 @@ mod enabled {
             op: EmitOp<'_>,
         ) -> Result<()> {
             // in ephemeral mode, the event payload is the only place we persist the record.
-            let block_inline_for_event = (self.ephemeral)
-                .then(|| op.block.cloned())
-                .flatten();
+            let block_inline_for_event = (self.ephemeral).then(|| op.block.cloned()).flatten();
             // inline record bytes for live tailing so we don't have to load from blocks.
-            let inline_block = (!self.ephemeral
-                && self.should_broadcast_live
-                && !self.only_index_links)
-                .then(|| op.block.cloned())
-                .flatten();
+            let inline_block =
+                (!self.ephemeral && self.should_broadcast_live && !self.only_index_links)
+                    .then(|| op.block.cloned())
+                    .flatten();
 
             let data = block_inline_for_event
                 .map(StoredData::Block)
@@ -94,7 +99,7 @@ mod enabled {
             let collection = CowStr::Borrowed(op.collection);
 
             let evt = StoredEvent {
-                live: true,
+                live: self.live,
                 did: did_trimmed.clone(),
                 rev: self.rev,
                 collection: collection.clone(),
@@ -103,7 +108,8 @@ mod enabled {
                 data: data.clone(),
             };
             let bytes = rmp_serde::to_vec(&evt).into_diagnostic()?;
-            batch.insert(&db.stream.events, keys::event_key(event_id), bytes);
+            db.stream
+                .stage_event(batch, keys::event_key(event_id), bytes);
 
             #[cfg(feature = "jetstream")]
             {
@@ -111,7 +117,7 @@ mod enabled {
                     did: did_trimmed.clone().into_static(),
                     collection: collection.clone().into_static(),
                     event_id,
-                    live: true,
+                    live: self.live,
                 };
                 let ephemeral = self
                     .should_stage_jetstream
@@ -124,13 +130,14 @@ mod enabled {
                             op.rkey.to_smolstr().as_str(),
                             &data,
                             inline_block.as_ref(),
-                            true,
+                            self.live,
                         )
                     })
                     .flatten();
-                self.jetstream_events.push(crate::jetstream::stage_event(
-                    batch, db, jetstream, ephemeral,
-                )?);
+                let broadcast = crate::jetstream::stage_event(batch, db, jetstream, ephemeral)?;
+                if self.live {
+                    self.jetstream_events.push(broadcast);
+                }
             }
 
             if self.should_broadcast_live {
@@ -184,8 +191,13 @@ mod noop {
 
     use crate::db::Db;
     use crate::db::types::{DbAction, DbRkey};
-    use crate::ingest::stream::Commit;
     use crate::state::AppState;
+
+    #[derive(Clone, Copy)]
+    pub(crate) enum RecordEventOrigin {
+        Live,
+        Backfill,
+    }
 
     #[allow(dead_code)]
     pub(crate) struct EmitOp<'a> {
@@ -201,7 +213,11 @@ mod noop {
 
     impl RecordEmitter {
         #[inline(always)]
-        pub(crate) fn new(_state: &AppState, _commit: &Commit) -> Self {
+        pub(crate) fn new(
+            _state: &AppState,
+            _commit_rev: &crate::db::types::DbTid,
+            _origin: RecordEventOrigin,
+        ) -> Self {
             Self
         }
 

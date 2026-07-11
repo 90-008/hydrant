@@ -51,7 +51,7 @@ impl Hydrant {
             .collect();
 
         #[cfg(feature = "indexer_stream")]
-        counts.insert("events", state.db.stream.events.approximate_len() as u64);
+        counts.insert("events", state.db.stream.approximate_event_count() as u64);
 
         #[cfg(feature = "relay")]
         counts.insert(

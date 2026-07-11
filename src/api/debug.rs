@@ -60,7 +60,9 @@ pub async fn handle_debug_count(
         .map_err(|_| StatusCode::BAD_REQUEST)?;
 
     let db = &state.db;
-    let ks = db.indexer.records.clone();
+    let ks = db
+        .keyspace_by_name("records")
+        .expect("records keyspace exists in indexer mode");
 
     // {TrimmedDid}|{collection}|
     let prefix = keys::record_prefix_collection(&did, &req.collection);
@@ -303,9 +305,14 @@ pub async fn handle_debug_seed_events(
                 for _ in 0..req.count {
                     let seq = state
                         .db
-                        .stream.next_event_id
+                        .stream
+                        .next_event_id
                         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    batch.insert(&state.db.stream.events, crate::db::keys::event_key(seq), b"dummy");
+                    state.db.stream.stage_event(
+                        &mut batch,
+                        crate::db::keys::event_key(seq),
+                        b"dummy",
+                    );
                 }
             }
         } else if req.partition == "relay_events" {
@@ -314,7 +321,8 @@ pub async fn handle_debug_seed_events(
                 for _ in 0..req.count {
                     let seq = state
                         .db
-                        .relay.next_seq
+                        .relay
+                        .next_seq
                         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     batch.insert(
                         &state.db.relay.events,

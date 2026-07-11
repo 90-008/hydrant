@@ -1,10 +1,8 @@
 use fjall::OwnedWriteBatch;
-use fjall::Slice;
 
 use jacquard_common::IntoStatic;
 use jacquard_common::types::did::Did;
 use miette::{Context, IntoDiagnostic, Result};
-use std::collections::HashMap;
 use tracing::debug;
 
 use crate::db::types::{DbAction, DbRkey, DbTid, TrimmedDid};
@@ -20,16 +18,18 @@ use {
     crate::types::{AccountEvt, BroadcastEvent, IdentityEvt, MarshallableEvt},
     std::sync::atomic::Ordering,
 };
+pub(crate) mod backlink_ops;
+use record_events::RecordEvents;
 
-mod backlink_ops;
-pub(crate) mod record_events;
-
-use record_events::{EmitOp, RecordEmitter, RecordEvents};
+pub mod record_events;
 
 pub fn persist_to_resync_buffer(db: &Db, did: &Did, commit: &Commit) -> Result<()> {
     let key = keys::resync_buffer_key(did, DbTid::from(&commit.rev));
     let value = rmp_serde::to_vec_named(commit).into_diagnostic()?;
-    db.indexer.resync_buffer.insert(key, value).into_diagnostic()?;
+    db.indexer
+        .resync_buffer
+        .insert(key, value)
+        .into_diagnostic()?;
     debug!(
         did = %did,
         seq = commit.seq,
@@ -98,11 +98,7 @@ pub fn delete_repo(
     // 3. delete from records
     // todo: figure out how we want to handle the blocks associated with these records
     //       without delving too much into gc madness we had before
-    let records_prefix = keys::record_prefix_did(did);
-    for guard in db.indexer.records.prefix(&records_prefix) {
-        let (k, _cid_bytes) = guard.into_inner().into_diagnostic()?;
-        batch.remove(&db.indexer.records, k);
-    }
+    db::delete_repo_records(batch, db, did)?;
 
     // 4. reset collection counts
     let mut count_prefix = Vec::new();
@@ -216,22 +212,17 @@ pub fn transition_repo<'s>(
 
 pub struct ApplyCommitResults<'s> {
     pub repo_state: RepoState<'s>,
-    pub records_delta: i64,
-    pub blocks_count: i64,
     #[cfg_attr(not(feature = "indexer_stream"), allow(dead_code))]
     pub events: RecordEvents,
 }
 
 pub fn apply_commit<'s>(
-    batch: &mut OwnedWriteBatch,
+    txn: &mut crate::db::Txn<'_>,
     state: &AppState,
     mut repo_state: RepoState<'s>,
     validated: ValidatedCommit<'_>,
     filter: &FilterConfig,
 ) -> Result<ApplyCommitResults<'s>> {
-    let db = &state.db;
-    let ephemeral = state.ephemeral;
-    let only_index_links = state.only_index_links;
     let commit = validated.commit;
     let parsed = validated.parsed_blocks;
     let did = &commit.repo;
@@ -240,11 +231,7 @@ pub fn apply_commit<'s>(
     repo_state.root = Some(validated.commit_obj.into());
     repo_state.touch();
 
-    // 2. iterate ops and update records index
-    let mut records_delta = 0;
-    let mut blocks_count = 0;
-    let mut collection_deltas: HashMap<&str, i64> = HashMap::new();
-    let mut emitter = RecordEmitter::new(state, &commit);
+    let mut record_txn = txn.records(state, &DbTid::from(&commit.rev), did);
 
     for op in &commit.ops {
         let (collection, rkey) = parse_path(&op.path)?;
@@ -254,12 +241,7 @@ pub fn apply_commit<'s>(
         }
 
         let rkey = DbRkey::new(rkey);
-        let db_key = keys::record_key(did, collection, &rkey);
-
         let action = DbAction::try_from(op.action.as_str())?;
-
-        let mut event_cid = None;
-        let mut event_block = None;
 
         match action {
             DbAction::Create | DbAction::Update => {
@@ -270,77 +252,23 @@ pub fn apply_commit<'s>(
                     .to_ipld()
                     .into_diagnostic()
                     .wrap_err("expected valid cid from relay")?;
-                event_cid = Some(cid_ipld);
                 let Some(bytes) = parsed.blocks.get(&cid_ipld) else {
                     return Err(miette::miette!(
                         "block {cid} not found in CAR for record {did}/{collection}/{rkey}"
                     ));
                 };
-                event_block = Some(bytes);
-                let cid_raw = cid_ipld.to_bytes();
-                let block_key = Slice::from(keys::block_key(collection, &cid_raw));
-
-                blocks_count += 1;
-                if !ephemeral {
-                    if !only_index_links {
-                        batch.insert(&db.indexer.blocks, block_key.clone(), bytes.as_ref());
-                    }
-                    batch.insert(&db.indexer.records, db_key.clone(), cid_raw);
-                    // accumulate counts
-                    if action == DbAction::Create {
-                        records_delta += 1;
-                        *collection_deltas.entry(collection).or_default() += 1;
-                    }
-                    backlink_ops::index_record(
-                        batch,
-                        db,
-                        did,
-                        collection,
-                        &rkey.to_smolstr(),
-                        bytes.as_ref(),
-                    )?;
-                }
+                record_txn.put_record(collection, &rkey, cid_ipld, bytes, action)?;
             }
             DbAction::Delete => {
-                if !ephemeral {
-                    batch.remove(&db.indexer.records, db_key);
-
-                    // accumulate counts
-                    records_delta -= 1;
-                    *collection_deltas.entry(collection).or_default() -= 1;
-
-                    backlink_ops::delete_record(batch, db, did, collection, &rkey.to_smolstr())?;
-                }
+                record_txn.delete_record(collection, &rkey)?;
             }
-        };
-
-        emitter.emit(
-            batch,
-            db,
-            EmitOp {
-                did,
-                collection,
-                rkey: &rkey,
-                action,
-                cid: event_cid,
-                block: event_block,
-            },
-        )?;
-    }
-
-    // update counts
-    if !ephemeral {
-        for (col, delta) in collection_deltas {
-            db::update_record_count(batch, db, did, col, delta)?;
         }
     }
 
-    Ok(ApplyCommitResults {
-        repo_state,
-        records_delta,
-        blocks_count,
-        events: emitter.finish(),
-    })
+    record_txn.update_repo_state(&repo_state)?;
+    let events = record_txn.finish()?;
+
+    Ok(ApplyCommitResults { repo_state, events })
 }
 
 pub fn parse_path(path: &str) -> Result<(&str, &str)> {

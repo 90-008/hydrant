@@ -128,7 +128,8 @@ impl Hydrant {
             };
             let bytes = rmp_serde::to_vec(&evt).expect("msgpack serialization cannot fail");
             total_bytes += bytes.len();
-            batch.insert(&db.stream.events, keys::event_key(event_id), bytes);
+            db.stream
+                .stage_event(&mut batch, keys::event_key(event_id), bytes);
         }
 
         batch.commit().expect("failed to commit events batch");

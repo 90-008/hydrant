@@ -26,10 +26,12 @@ pub mod pds_meta;
 pub mod types;
 
 pub mod keyspaces;
+mod open;
 pub mod registry;
 pub mod schema;
-mod open;
 mod train;
+#[cfg(feature = "indexer")]
+mod txn;
 
 #[cfg(feature = "indexer")]
 pub use keyspaces::IndexerDb;
@@ -44,10 +46,10 @@ pub use schema::Ks;
 
 #[cfg(feature = "indexer")]
 pub(crate) use lifecycle_counts::LifecycleCountBatch;
+#[cfg(feature = "indexer")]
+pub(crate) use txn::Txn;
 
 use tracing::error;
-
-
 
 pub struct Db {
     pub inner: Arc<Database>,
@@ -67,7 +69,7 @@ pub struct Db {
     #[cfg(feature = "relay")]
     pub(crate) relay: RelayDb,
     #[cfg(feature = "backlinks")]
-    pub backlinks: Ks<schema::Backlinks>,
+    pub(crate) backlinks: Ks<schema::Backlinks>,
     pub counts_map: HashMap<SmolStr, u64>,
     next_count_delta_id: Arc<AtomicU64>,
     count_delta_checkpoint_watermark: Arc<AtomicU64>,
@@ -123,9 +125,7 @@ impl Db {
     pub async fn get(ks: Keyspace, key: impl Into<Slice>) -> Result<Option<Slice>> {
         let key = key.into();
         tokio::task::spawn_blocking(move || {
-            ks.get(key)
-                .inspect_err(check_poisoned)
-                .into_diagnostic()
+            ks.get(key).inspect_err(check_poisoned).into_diagnostic()
         })
         .await
         .into_diagnostic()?

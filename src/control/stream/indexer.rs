@@ -24,13 +24,21 @@ pub(crate) fn event_stream_thread(
 ) {
     let db = &state.db;
     let event_rx = db.stream.event_tx.subscribe();
-    let ks = db.stream.events.clone();
     let current_id = match cursor {
         Some(c) => c.checked_sub(1),
-        None => db.stream.next_event_id.load(Ordering::SeqCst).checked_sub(1),
+        None => db
+            .stream
+            .next_event_id
+            .load(Ordering::SeqCst)
+            .checked_sub(1),
     };
     let catch_up_target = cursor
-        .and_then(|_| db.stream.next_event_id.load(Ordering::SeqCst).checked_sub(1))
+        .and_then(|_| {
+            db.stream
+                .next_event_id
+                .load(Ordering::SeqCst)
+                .checked_sub(1)
+        })
         .filter(|target| stream_seq_after(*target, current_id));
     let replay_state = state.clone();
 
@@ -41,7 +49,7 @@ pub(crate) fn event_stream_thread(
         catch_up_target,
         opts,
         move |current_id, target, chunk_size| {
-            read_event_replay_chunk(&replay_state, &ks, current_id, target, chunk_size)
+            read_event_replay_chunk(&replay_state, current_id, target, chunk_size)
         },
         move |event| broadcast_to_event(&state, event),
     );
@@ -49,7 +57,6 @@ pub(crate) fn event_stream_thread(
 
 fn read_event_replay_chunk(
     state: &AppState,
-    ks: &fjall::Keyspace,
     current_id: Option<u64>,
     target: u64,
     chunk_size: usize,
@@ -68,7 +75,10 @@ fn read_event_replay_chunk(
     let mut exhausted = false;
     let max_scanned = chunk_size.saturating_mul(4).max(chunk_size);
     let mut scanned = 0usize;
-    let mut iter = ks.range(keys::event_key(start)..=keys::event_key(target));
+    let mut iter = state
+        .db
+        .stream
+        .event_range(keys::event_key(start)..=keys::event_key(target));
 
     while events.len() < chunk_size && scanned < max_scanned {
         let Some(item) = iter.next() else {
@@ -157,8 +167,8 @@ pub(crate) fn stored_to_event(
             } else {
                 let block = state
                     .db
-                    .indexer.blocks
-                    .get(keys::block_key(collection.as_str(), &cid.to_bytes()));
+                    .indexer
+                    .block(keys::block_key(collection.as_str(), &cid.to_bytes()));
                 match block {
                     Ok(Some(bytes)) => {
                         match serde_ipld_dagcbor::from_slice::<RawData>(bytes.as_ref()) {

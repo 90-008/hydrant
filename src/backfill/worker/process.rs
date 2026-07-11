@@ -20,9 +20,7 @@ use crate::backfill::error::BackfillError;
 use crate::backfill::sparse::{SparseBackfillResult, process_did_sparse};
 use crate::config::BackfillStrategy;
 use crate::db::types::{DbAction, DbRkey};
-#[cfg(feature = "indexer_stream")]
-use crate::db::types::TrimmedDid;
-use crate::db::{self, CountDeltas, Db, keys, ser_repo_state};
+use crate::db::{self, CountDeltas, Db, Txn as DbTxn, keys};
 use crate::filter::FilterMode;
 use crate::ops;
 use crate::sparse_mst::sparse_probe_collection;
@@ -31,9 +29,7 @@ use crate::types::{Commit, GaugeState, RepoState, RepoStatus, ResyncState};
 use crate::util::url_to_fluent_uri;
 
 #[cfg(feature = "indexer_stream")]
-use crate::types::{AccountEvt, BroadcastEvent, StoredData, StoredEvent};
-#[cfg(feature = "indexer_stream")]
-use jacquard_common::CowStr;
+use crate::types::{AccountEvt, BroadcastEvent};
 #[cfg(feature = "indexer_stream")]
 use std::sync::atomic::Ordering;
 
@@ -91,7 +87,11 @@ pub(crate) async fn process_did(
                 .then_some(None)
                 .unwrap_or_else(|| Some(status.into())),
         };
-        let _ = app_state.db.stream.event_tx.send(ops::make_account_event(db, evt));
+        let _ = app_state
+            .db
+            .stream
+            .event_tx
+            .send(ops::make_account_event(db, evt));
     };
 
     if strategy != BackfillStrategy::Full {
@@ -387,18 +387,15 @@ pub(crate) async fn process_did(
     let result = {
         let app_state = app_state.clone();
         let did = did.clone();
-        #[cfg(feature = "indexer_stream")]
         let rev = root_commit.rev;
 
         tokio::task::spawn_blocking(move || {
             let filter = app_state.filter.load();
             let ephemeral = app_state.ephemeral;
-            let only_index_links = app_state.only_index_links;
             let mut count = 0;
-            let mut delta = 0;
-            let mut added_blocks = 0;
             let mut collection_counts: HashMap<SmolStr, u64> = HashMap::new();
-            let mut batch = app_state.db.inner.batch();
+            let mut txn = DbTxn::new(&app_state.db);
+            let mut record_txn = txn.backfill_records(&app_state, &rev, &did);
             // clone the Arc so we hold an independent reference to the block store,
             // allowing mst (and its entire loaded node tree) to be freed immediately
             // rather than surviving until the end of spawn_blocking.
@@ -409,7 +406,7 @@ pub(crate) async fn process_did(
             let mut existing_cids: HashMap<(SmolStr, DbRkey), SmolStr> = HashMap::new();
 
             if !ephemeral {
-                for guard in app_state.db.indexer.records.prefix(&prefix) {
+                for guard in app_state.db.indexer.record_prefix(&prefix) {
                     let (key, cid_bytes) = guard.into_inner().into_diagnostic()?;
                     // key is did|collection|rkey
                     // skip did|
@@ -473,66 +470,13 @@ pub(crate) async fn process_did(
                     };
                     trace!(collection = %collection, rkey = %rkey, cid = %cid, ?action, "action record");
 
-                    // key is did|collection|rkey
-                    let db_key = keys::record_key(&did, collection, &rkey);
-
-                    let cid_raw = cid.to_bytes();
-                    let block_key = Slice::from(keys::block_key(collection, &cid_raw));
-                    if !ephemeral {
-                        if !only_index_links {
-                            batch.insert(&app_state.db.indexer.blocks, block_key.clone(), val.as_ref());
-                        }
-                        batch.insert(&app_state.db.indexer.records, db_key, cid_raw);
-                        #[cfg(feature = "backlinks")]
-                        if let Ok(value) = serde_ipld_dagcbor::from_slice::<jacquard_common::Data>(val.as_ref()) {
-                            crate::backlinks::store::index_record(
-                                &mut batch,
-                                &app_state.db.backlinks,
-                                did.as_str(),
-                                collection,
-                                &rkey.to_smolstr(),
-                                &value,
-                            )?;
-                        }
-                    }
-
-                    added_blocks += 1;
-                    if action == DbAction::Create {
-                        delta += 1;
-                    }
-
-                    #[cfg(feature = "indexer_stream")]
-                    {
-                        let event_id = app_state.db.stream.next_event_id.fetch_add(1, Ordering::SeqCst);
-                        let evt = StoredEvent {
-                            live: false,
-                            did: TrimmedDid::from(&did),
-                            rev,
-                            collection: CowStr::Borrowed(collection),
-                            rkey,
-                            action,
-                            data: if ephemeral {
-                                StoredData::Block(val)
-                            } else if only_index_links {
-                                StoredData::Nothing
-                            } else {
-                                StoredData::Ptr(cid_obj.to_ipld().expect("valid cid"))
-                            },
-                        };
-                        let bytes = rmp_serde::to_vec(&evt).into_diagnostic()?;
-                        batch.insert(&app_state.db.stream.events, keys::event_key(event_id), bytes);
-
-                        #[cfg(feature = "jetstream")]
-                        {
-                            let jetstream = crate::types::StoredJetstreamEvent::Commit {
-                                did: TrimmedDid::from(&did).into_static(),
-                                collection: CowStr::Borrowed(collection).into_static(),
-                                event_id,
-                                live: false,
-                            };
-                            crate::jetstream::stage_event(&mut batch, &app_state.db, jetstream, None)?;
-                        }
-                    }
+                    record_txn.put_record(
+                        collection,
+                        &rkey,
+                        cid_obj.to_ipld().expect("valid cid"),
+                        &val,
+                        action,
+                    )?;
 
                     count += 1;
                 }
@@ -546,49 +490,8 @@ pub(crate) async fn process_did(
             for ((collection, rkey), cid) in existing_cids {
                 trace!(collection = %collection, rkey = %rkey, cid = %cid, "remove existing record");
 
-                // we dont have to put if ephemeral around here since
-                // existing_cids will be empty anyway
-                batch.remove(
-                    &app_state.db.indexer.records,
-                    keys::record_key(&did, &collection, &rkey),
-                );
-                #[cfg(feature = "backlinks")]
-                crate::backlinks::store::delete_record(
-                    &mut batch,
-                    &app_state.db.backlinks,
-                    did.as_str(),
-                    &collection,
-                    &rkey.to_smolstr(),
-                )?;
-
-                #[cfg(feature = "indexer_stream")]
-                {
-                    let event_id = app_state.db.stream.next_event_id.fetch_add(1, Ordering::SeqCst);
-                    let evt = StoredEvent {
-                        live: false,
-                        did: TrimmedDid::from(&did),
-                        rev,
-                        collection: CowStr::Borrowed(&collection),
-                        rkey,
-                        action: DbAction::Delete,
-                        data: StoredData::Nothing,
-                    };
-                    let bytes = rmp_serde::to_vec(&evt).into_diagnostic()?;
-                    batch.insert(&app_state.db.stream.events, keys::event_key(event_id), bytes);
-
-                    #[cfg(feature = "jetstream")]
-                    {
-                        let jetstream = crate::types::StoredJetstreamEvent::Commit {
-                            did: TrimmedDid::from(&did).into_static(),
-                            collection: CowStr::Borrowed(&collection).into_static(),
-                            event_id,
-                            live: false,
-                        };
-                        crate::jetstream::stage_event(&mut batch, &app_state.db, jetstream, None)?;
-                    }
-                }
-
-                delta -= 1;
+                // existing_cids is empty in ephemeral mode.
+                record_txn.delete_record(&collection, &rkey)?;
                 count += 1;
             }
 
@@ -596,16 +499,10 @@ pub(crate) async fn process_did(
                 trace!(signals = ?filter.signals, "no signal-matching records found, discarding repo");
                 return Ok::<_, miette::Report>(None);
             }
-
-            // 6. update data, status is updated in worker shard
             state.root = Some(root_commit);
             state.touch();
-
-            batch.insert(
-                &app_state.db.repos,
-                keys::repo_key(&did),
-                ser_repo_state(&state)?,
-            );
+            record_txn.update_repo_state(&state)?;
+            record_txn.finish()?;
 
             let metadata_key = keys::repo_metadata_key(&did);
             let metadata_bytes = app_state
@@ -616,7 +513,7 @@ pub(crate) async fn process_did(
                 .ok_or_else(|| miette::miette!("repo metadata not found for {}", did))?;
             let mut metadata = crate::db::deser_repo_meta(&metadata_bytes)?;
             metadata.tracked = true;
-            batch.insert(
+            txn.batch.insert(
                 &app_state.db.repo_metadata,
                 &metadata_key,
                 crate::db::ser_repo_meta(&metadata)?,
@@ -625,24 +522,14 @@ pub(crate) async fn process_did(
             // add the counts
             if !ephemeral {
                 db::replace_record_counts(
-                    &mut batch,
+                    &mut txn.batch,
                     &app_state.db,
                     &did,
                     collection_counts.iter().map(|(col, cnt)| (col.as_str(), *cnt)),
                 )?;
             }
 
-            let mut count_deltas = CountDeltas::default();
-            if delta != 0 {
-                count_deltas.add_records(delta);
-            }
-            if added_blocks > 0 {
-                count_deltas.add_blocks(added_blocks);
-            }
-            let reservation = app_state.db.stage_count_deltas(&mut batch, &count_deltas);
-            batch.commit().into_diagnostic()?;
-            app_state.db.apply_count_deltas(&count_deltas);
-            drop(reservation);
+            txn.commit()?;
 
             Ok::<_, miette::Report>(Some(count))
         })

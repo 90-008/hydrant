@@ -1,4 +1,3 @@
-use fjall::OwnedWriteBatch;
 use jacquard_common::IntoStatic;
 use jacquard_common::types::did::Did;
 use miette::{IntoDiagnostic, Result};
@@ -7,7 +6,7 @@ use std::sync::atomic::Ordering::SeqCst;
 use tokio::runtime::Handle as TokioHandle;
 use tracing::{debug, error, warn};
 
-use crate::db::{self, CountDeltas, keys, ser_repo_meta};
+use crate::db::{self, Txn, keys, ser_repo_meta};
 use crate::ingest::stream::types::AccountStatus;
 use crate::ingest::stream::{Account, Commit, Identity};
 use crate::ingest::validation;
@@ -35,11 +34,8 @@ use super::worker::{FirehoseWorker, IngestError, RepoProcessResult};
 
 struct WorkerContext<'a> {
     state: &'a AppState,
-    batch: OwnedWriteBatch,
+    txn: Txn<'a>,
     lifecycle_transitions: &'a mut Vec<(Did<'static>, GaugeState)>,
-    added_blocks: &'a mut i64,
-    records_delta: &'a mut i64,
-    count_deltas: &'a mut CountDeltas,
     #[cfg(feature = "indexer_stream")]
     broadcast_events: &'a mut Vec<BroadcastEvent>,
     #[cfg(feature = "jetstream")]
@@ -58,24 +54,17 @@ impl FirehoseWorker {
         let mut lifecycle_transitions = Vec::new();
 
         while let Some(msg) = rx.blocking_recv() {
-            let batch = state.db.inner.batch();
+            let txn = Txn::new(&state.db);
             #[cfg(feature = "indexer_stream")]
             broadcast_events.clear();
             #[cfg(feature = "jetstream")]
             jetstream_events.clear();
             lifecycle_transitions.clear();
 
-            let mut added_blocks = 0;
-            let mut records_delta = 0;
-            let mut count_deltas = CountDeltas::default();
-
             let mut ctx = WorkerContext {
                 state: &state,
-                batch,
+                txn,
                 lifecycle_transitions: &mut lifecycle_transitions,
-                added_blocks: &mut added_blocks,
-                records_delta: &mut records_delta,
-                count_deltas: &mut count_deltas,
                 #[cfg(feature = "indexer_stream")]
                 broadcast_events: &mut broadcast_events,
                 #[cfg(feature = "jetstream")]
@@ -96,7 +85,7 @@ impl FirehoseWorker {
                                 match Self::drain_resync_buffer(&mut ctx, &did, repo_state) {
                                     Ok(RepoProcessResult::Ok(s)) => {
                                         let res = ops::transition_repo(
-                                            &mut ctx.batch,
+                                            &mut ctx.txn.batch,
                                             &state.db,
                                             ctx.lifecycle_transitions,
                                             &did,
@@ -205,7 +194,7 @@ impl FirehoseWorker {
                             ) {
                                 Ok(RepoProcessResult::Ok(_)) => {}
                                 Ok(RepoProcessResult::Deleted) => {
-                                    ctx.count_deltas.add_repos(-1);
+                                    ctx.txn.counts.add_repos(-1);
                                 }
                                 Ok(RepoProcessResult::NeedsBackfill(Some(commit))) => {
                                     try_persist(commit);
@@ -255,36 +244,13 @@ impl FirehoseWorker {
                 }
             }
 
-            let mut batch = ctx.batch;
-            if added_blocks > 0 {
-                count_deltas.add_blocks(added_blocks);
+            for (did, gauge) in ctx.lifecycle_transitions.drain(..) {
+                ctx.txn.transition_lifecycle(&did, gauge);
             }
-            if records_delta != 0 {
-                count_deltas.add_records(records_delta);
-            }
-            let mut lifecycle_counts = state.db.lifecycle_counts();
-            let mut lifecycle_failed = false;
-            for (did, gauge) in lifecycle_transitions.drain(..) {
-                if let Err(e) = lifecycle_counts.transition(&mut batch, &did, gauge) {
-                    error!(did = %did, err = %e, "failed to stage lifecycle transition");
-                    lifecycle_failed = true;
-                    break;
-                }
-            }
-            if lifecycle_failed {
+            if let Err(e) = ctx.txn.commit() {
+                error!(shard = id, err = %e, "failed to commit transaction");
                 continue;
             }
-            let reservation = state.db.stage_count_deltas(&mut batch, &count_deltas);
-            let lifecycle_reservation = lifecycle_counts.stage(&mut batch);
-            if let Err(e) = batch.commit() {
-                error!(shard = id, err = %e, "failed to commit batch");
-                drop(lifecycle_reservation);
-                drop(reservation);
-                continue;
-            }
-            state.db.apply_lifecycle_counts(lifecycle_reservation);
-            state.db.apply_count_deltas(&count_deltas);
-            drop(reservation);
             #[cfg(feature = "indexer_stream")]
             for evt in broadcast_events.drain(..) {
                 let _ = state.db.stream.event_tx.send(evt);
@@ -337,7 +303,8 @@ impl FirehoseWorker {
         let metadata_bytes = db.repo_metadata.get(&metadata_key).into_diagnostic()?;
         let is_backfilling = if let Some(metadata_bytes) = metadata_bytes {
             let metadata = crate::db::deser_repo_meta(metadata_bytes.as_ref())?;
-            db.indexer.pending
+            db.indexer
+                .pending
                 .get(keys::pending_key(metadata.index_id))
                 .into_diagnostic()?
                 .is_some()
@@ -372,15 +339,13 @@ impl FirehoseWorker {
         };
 
         let res = ops::apply_commit(
-            &mut ctx.batch,
+            &mut ctx.txn,
             ctx.state,
             repo_state,
             validated,
             &ctx.state.filter.load(),
         )?;
         let repo_state = res.repo_state;
-        *ctx.added_blocks += res.blocks_count;
-        *ctx.records_delta += res.records_delta;
         #[cfg(feature = "indexer_stream")]
         {
             use std::sync::Arc;
@@ -414,7 +379,7 @@ impl FirehoseWorker {
             let did = &identity.did;
             #[cfg(feature = "jetstream")]
             ctx.jetstream_events.push(crate::jetstream::stage_event(
-                &mut ctx.batch,
+                &mut ctx.txn.batch,
                 db,
                 StoredJetstreamEvent::Identity {
                     did: TrimmedDid::from(did).into_static(),
@@ -455,7 +420,7 @@ impl FirehoseWorker {
         };
         #[cfg(feature = "jetstream")]
         ctx.jetstream_events.push(crate::jetstream::stage_event(
-            &mut ctx.batch,
+            &mut ctx.txn.batch,
             db,
             StoredJetstreamEvent::Account {
                 did: TrimmedDid::from(did).into_static(),
@@ -473,7 +438,7 @@ impl FirehoseWorker {
                     debug!("account deleted, wiping data");
                     ctx.lifecycle_transitions
                         .push((did.clone().into_static(), GaugeState::Synced));
-                    crate::ops::delete_repo(&mut ctx.batch, db, did, &repo_state)?;
+                    crate::ops::delete_repo(&mut ctx.txn.batch, db, did, &repo_state)?;
                     return Ok(RepoProcessResult::Deleted);
                 }
                 _ => {
@@ -525,14 +490,14 @@ impl FirehoseWorker {
                 Ok(r) => r,
                 Err(e) => {
                     if !Self::check_if_retriable_failure(&e) {
-                        ctx.batch.remove(&db.indexer.resync_buffer, key);
+                        ctx.txn.batch.remove(&db.indexer.resync_buffer, key);
                     }
                     return Err(e);
                 }
             };
             match res {
                 RepoProcessResult::Ok(rs) => {
-                    ctx.batch.remove(&db.indexer.resync_buffer, key);
+                    ctx.txn.batch.remove(&db.indexer.resync_buffer, key);
                     repo_state = rs;
                 }
                 RepoProcessResult::NeedsBackfill(_) => {
@@ -540,7 +505,7 @@ impl FirehoseWorker {
                     return Ok(RepoProcessResult::NeedsBackfill(None));
                 }
                 RepoProcessResult::Deleted => {
-                    ctx.batch.remove(&db.indexer.resync_buffer, key);
+                    ctx.txn.batch.remove(&db.indexer.resync_buffer, key);
                     return Ok(RepoProcessResult::Deleted);
                 }
             }
@@ -575,7 +540,8 @@ impl FirehoseWorker {
         let old_pkey = keys::pending_key(metadata.index_id);
         let was_pending = had_metadata
             && db
-                .indexer.pending
+                .indexer
+                .pending
                 .get(old_pkey.as_slice())
                 .into_diagnostic()?
                 .is_some();
@@ -586,7 +552,11 @@ impl FirehoseWorker {
         }
 
         metadata.index_id = rand::random::<u64>();
-        batch.insert(&db.indexer.pending, keys::pending_key(metadata.index_id), &repo_key);
+        batch.insert(
+            &db.indexer.pending,
+            keys::pending_key(metadata.index_id),
+            &repo_key,
+        );
         batch.insert(&db.repo_metadata, &meta_key, ser_repo_meta(&metadata)?);
         if !was_pending {
             lifecycle_counts.transition(&mut batch, did, GaugeState::Pending)?;

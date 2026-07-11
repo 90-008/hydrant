@@ -217,8 +217,8 @@ pub fn delete_repo(batch: &mut OwnedWriteBatch, backlinks_ks: &Keyspace, did: &D
 
 /// look up the CID string for a record from the records keyspace.
 /// returns `None` if the record is not found (e.g. deleted after backlink was written).
-pub fn lookup_cid_from_ks(
-    records: &Keyspace,
+pub fn lookup_cid(
+    indexer: &crate::db::IndexerDb,
     did: &str,
     collection: &str,
     rkey: &str,
@@ -226,7 +226,7 @@ pub fn lookup_cid_from_ks(
     let did = Did::new(did).ok()?;
     let db_rkey = DbRkey::new(rkey);
     let record_key = keys::record_key(&did, collection, &db_rkey);
-    let cid_bytes = records.get(record_key).ok()??;
+    let cid_bytes = indexer.record(record_key).ok()??;
     Cid::new(&cid_bytes).ok().map(|c| c.as_str().to_string())
 }
 

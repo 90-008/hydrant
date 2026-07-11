@@ -175,7 +175,7 @@ impl BacklinksFetch {
                     continue;
                 }
 
-                let Some(cid) = store::lookup_cid_from_ks(&db.indexer.records, did, col, rkey) else {
+                let Some(cid) = store::lookup_cid(&db.indexer, did, col, rkey) else {
                     // record deleted after backlink was written
                     continue;
                 };

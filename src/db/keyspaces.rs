@@ -51,9 +51,9 @@ impl OpenCx<'_> {
 #[cfg(feature = "indexer")]
 pub struct IndexerDb {
     /// maps `{DID}|{COL}|{RKey}` -> record CID
-    pub records: Ks<schema::Records>,
+    pub(super) records: Ks<schema::Records>,
     /// content-addressable storage of raw DAG-CBOR blocks
-    pub blocks: Ks<schema::Blocks>,
+    pub(super) blocks: Ks<schema::Blocks>,
     /// backfill queue of `{ID}` -> empty
     pub pending: Ks<schema::Pending>,
     /// per-repo resync/retry state
@@ -76,12 +76,31 @@ impl IndexerDb {
             lifecycle_count_lock: Arc::new(std::sync::Mutex::new(())),
         })
     }
+    pub(crate) fn record<K: AsRef<[u8]>>(&self, key: K) -> fjall::Result<Option<fjall::Slice>> {
+        self.records.get(key)
+    }
+
+    pub(crate) fn record_prefix<K: AsRef<[u8]>>(&self, prefix: K) -> fjall::Iter {
+        self.records.prefix(prefix)
+    }
+
+    pub(crate) fn record_range<K, R>(&self, range: R) -> fjall::Iter
+    where
+        K: AsRef<[u8]>,
+        R: std::ops::RangeBounds<K>,
+    {
+        self.records.range(range)
+    }
+
+    pub(crate) fn block<K: AsRef<[u8]>>(&self, key: K) -> fjall::Result<Option<fjall::Slice>> {
+        self.blocks.get(key)
+    }
 }
 
 #[cfg(feature = "indexer_stream")]
 pub struct StreamDb {
     /// maps `{ID}` (u64 BE) -> `StoredEvent`, the source for the json stream api
-    pub events: Ks<schema::Events>,
+    pub(super) events: Ks<schema::Events>,
     pub(crate) event_tx: tokio::sync::broadcast::Sender<crate::types::BroadcastEvent>,
     pub next_event_id: Arc<AtomicU64>,
 }
@@ -96,6 +115,31 @@ impl StreamDb {
             event_tx,
             next_event_id: Arc::new(AtomicU64::new(0)),
         })
+    }
+
+    #[cfg(feature = "jetstream")]
+    pub(crate) fn event<K: AsRef<[u8]>>(&self, key: K) -> fjall::Result<Option<fjall::Slice>> {
+        self.events.get(key)
+    }
+
+    pub(crate) fn event_range<K, R>(&self, range: R) -> fjall::Iter
+    where
+        K: AsRef<[u8]>,
+        R: std::ops::RangeBounds<K>,
+    {
+        self.events.range(range)
+    }
+
+    pub(crate) fn stage_event<K, V>(&self, batch: &mut fjall::OwnedWriteBatch, key: K, value: V)
+    where
+        K: Into<fjall::UserKey>,
+        V: Into<fjall::UserValue>,
+    {
+        batch.insert(&self.events, key, value);
+    }
+
+    pub(crate) fn approximate_event_count(&self) -> usize {
+        self.events.approximate_len()
     }
 
     /// resume event ids after the last stored event.

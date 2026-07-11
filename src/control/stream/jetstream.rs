@@ -330,7 +330,7 @@ fn jetstream_event_to_bytes(
     match &event.event {
         #[cfg(feature = "indexer_stream")]
         StoredJetstreamEvent::Commit { event_id, live, .. } => {
-            let bytes = state.db.stream.events.get(keys::event_key(*event_id)).ok()??;
+            let bytes = state.db.stream.event(keys::event_key(*event_id)).ok()??;
             let stored: StoredEvent = rmp_serde::from_slice(&bytes).ok()?;
             let evt = stored_to_event(state, *event_id, stored, None)?;
             let rec = evt.record?;
@@ -363,7 +363,8 @@ fn jetstream_event_to_bytes(
         } => {
             let frame = state
                 .db
-                .relay.events
+                .relay
+                .events
                 .get(keys::relay_event_key(*relay_seq))
                 .ok()??;
             let SubscribeReposMessage::Commit(commit) = decode_frame(frame.as_ref()).ok()? else {
@@ -411,7 +412,8 @@ fn jetstream_event_to_bytes(
         StoredJetstreamEvent::RelayAccount { relay_seq, .. } => {
             let frame = state
                 .db
-                .relay.events
+                .relay
+                .events
                 .get(keys::relay_event_key(*relay_seq))
                 .ok()??;
             let SubscribeReposMessage::Account(account) = decode_frame(frame.as_ref()).ok()? else {
@@ -442,7 +444,8 @@ fn jetstream_event_to_bytes(
         StoredJetstreamEvent::RelayIdentity { relay_seq, .. } => {
             let frame = state
                 .db
-                .relay.events
+                .relay
+                .events
                 .get(keys::relay_event_key(*relay_seq))
                 .ok()??;
             let SubscribeReposMessage::Identity(identity) = decode_frame(frame.as_ref()).ok()?
