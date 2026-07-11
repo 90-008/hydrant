@@ -2,7 +2,7 @@
 //! repo state but are not forwarded anywhere.
 
 use fjall::OwnedWriteBatch;
-use miette::{IntoDiagnostic, Result};
+use miette::Result;
 use url::Url;
 
 use crate::ingest::stream::{Account, Commit, Identity, Sync};
@@ -87,13 +87,13 @@ impl EventSink {
         Ok(())
     }
 
-    pub(crate) fn commit_batch(
+    pub(crate) fn commit_txn(
         &mut self,
         _state: &AppState,
-        batch: OwnedWriteBatch,
-    ) -> Result<Staged> {
-        batch.commit().into_diagnostic()?;
-        Ok(Staged)
+        txn: crate::db::Txn<'_>,
+    ) -> Result<(Staged, crate::db::TxnCommitTimings)> {
+        let (_, timings) = txn.commit_with(|_| Ok(()))?;
+        Ok((Staged, timings))
     }
 
     pub(crate) fn flush(&mut self, _state: &AppState, _staged: Staged) {}

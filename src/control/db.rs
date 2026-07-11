@@ -35,9 +35,7 @@ impl DbControl {
         state
             .with_ingestion_paused(async || {
                 let train = |name: &'static str| {
-                    let state = state.clone();
-                    tokio::task::spawn_blocking(move || state.db.train_dict(name))
-                        .map(|res: Result<_, _>| res.into_diagnostic().flatten())
+                    state.db.run(move |db| db.train_dict(name))
                 };
                 futures::future::try_join_all(
                     crate::db::registry::trainable()

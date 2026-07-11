@@ -1,16 +1,16 @@
 use fjall::OwnedWriteBatch;
 use jacquard_common::IntoStatic;
 use jacquard_common::types::string::Handle;
-use miette::{IntoDiagnostic, Result};
+use miette::Result;
 use url::Url;
 
+use crate::db::types::DidKey;
 use crate::ingest::indexer::{
     IndexerAccountData, IndexerCommitData, IndexerEvent, IndexerEventData, IndexerIdentityData,
     IndexerMessage, IndexerTx,
 };
 use crate::ingest::stream::{Account, Commit, Identity, Sync};
 use crate::state::AppState;
-use crate::db::types::DidKey;
 use crate::types::{RepoState, RepoStatus};
 
 /// per-worker seed from which each shard builds its sink.
@@ -79,15 +79,16 @@ impl EventSink {
         chain_break: bool,
         parsed_blocks: jacquard_repo::car::reader::ParsedCar,
     ) -> Result<()> {
-        self.pending.push(IndexerMessage::Event(Box::new(IndexerEvent {
-            seq: commit.seq,
-            firehose: firehose.clone(),
-            data: IndexerEventData::Commit(IndexerCommitData {
-                commit,
-                chain_break,
-                parsed_blocks,
-            }),
-        })));
+        self.pending
+            .push(IndexerMessage::Event(Box::new(IndexerEvent {
+                seq: commit.seq,
+                firehose: firehose.clone(),
+                data: IndexerEventData::Commit(IndexerCommitData {
+                    commit,
+                    chain_break,
+                    parsed_blocks,
+                }),
+            })));
         Ok(())
     }
 
@@ -98,11 +99,12 @@ impl EventSink {
         firehose: &Url,
         sync: Sync<'static>,
     ) -> Result<()> {
-        self.pending.push(IndexerMessage::Event(Box::new(IndexerEvent {
-            seq: sync.seq,
-            firehose: firehose.clone(),
-            data: IndexerEventData::Sync(sync.did.into_static()),
-        })));
+        self.pending
+            .push(IndexerMessage::Event(Box::new(IndexerEvent {
+                seq: sync.seq,
+                firehose: firehose.clone(),
+                data: IndexerEventData::Sync(sync.did.into_static()),
+            })));
         Ok(())
     }
 
@@ -115,13 +117,14 @@ impl EventSink {
         repo_state: &RepoState,
         snapshot: IdentitySnapshot,
     ) -> Result<()> {
-        let changed = repo_state.handle != snapshot.handle
-            || repo_state.signing_key != snapshot.signing_key;
-        self.pending.push(IndexerMessage::Event(Box::new(IndexerEvent {
-            seq: identity.seq,
-            firehose: firehose.clone(),
-            data: IndexerEventData::Identity(IndexerIdentityData { identity, changed }),
-        })));
+        let changed =
+            repo_state.handle != snapshot.handle || repo_state.signing_key != snapshot.signing_key;
+        self.pending
+            .push(IndexerMessage::Event(Box::new(IndexerEvent {
+                seq: identity.seq,
+                firehose: firehose.clone(),
+                data: IndexerEventData::Identity(IndexerIdentityData { identity, changed }),
+            })));
         Ok(())
     }
 
@@ -137,25 +140,26 @@ impl EventSink {
         was_active: bool,
     ) -> Result<()> {
         let changed = repo_state.active != was_active || repo_state.status != snapshot.status;
-        self.pending.push(IndexerMessage::Event(Box::new(IndexerEvent {
-            seq: account.seq,
-            firehose: firehose.clone(),
-            data: IndexerEventData::Account(IndexerAccountData {
-                account,
-                was_active,
-                changed,
-            }),
-        })));
+        self.pending
+            .push(IndexerMessage::Event(Box::new(IndexerEvent {
+                seq: account.seq,
+                firehose: firehose.clone(),
+                data: IndexerEventData::Account(IndexerAccountData {
+                    account,
+                    was_active,
+                    changed,
+                }),
+            })));
         Ok(())
     }
 
-    pub(crate) fn commit_batch(
+    pub(crate) fn commit_txn(
         &mut self,
         _state: &AppState,
-        batch: OwnedWriteBatch,
-    ) -> Result<Staged> {
-        batch.commit().into_diagnostic()?;
-        Ok(Staged)
+        txn: crate::db::Txn<'_>,
+    ) -> Result<(Staged, crate::db::TxnCommitTimings)> {
+        let (_, timings) = txn.commit_with(|_| Ok(()))?;
+        Ok((Staged, timings))
     }
 
     pub(crate) fn flush(&mut self, _state: &AppState, _staged: Staged) {

@@ -12,8 +12,7 @@ pub fn queue_gone_backfills(state: &Arc<AppState>) -> Result<()> {
     debug!("scanning for deactivated/takendown repos to retry...");
     let mut transitions = 0usize;
 
-    let mut batch = state.db.inner.batch();
-    let mut lifecycle_counts = state.db.lifecycle_counts();
+    let mut txn = db::Txn::new(&state.db);
 
     for guard in state.db.indexer.resync.iter() {
         let (key, val) = guard.into_inner().into_diagnostic()?;
@@ -48,22 +47,22 @@ pub fn queue_gone_backfills(state: &Arc<AppState>) -> Result<()> {
             let mut metadata = crate::db::deser_repo_meta(&metadata_bytes)?;
 
             // move from resync back into pending
-            batch.remove(&state.db.indexer.resync, key.clone());
+            txn.batch.remove(&state.db.indexer.resync, key.clone());
             let old_pending = keys::pending_key(metadata.index_id);
-            batch.remove(&state.db.indexer.pending, old_pending);
+            txn.batch.remove(&state.db.indexer.pending, old_pending);
             metadata.index_id = rand::random::<u64>();
-            batch.insert(
+            txn.batch.insert(
                 &state.db.indexer.pending,
                 keys::pending_key(metadata.index_id),
                 key.clone(),
             );
-            batch.insert(
+            txn.batch.insert(
                 &state.db.repo_metadata,
                 &metadata_key,
                 crate::db::ser_repo_meta(&metadata)?,
             );
 
-            lifecycle_counts.transition(&mut batch, &did, GaugeState::Pending)?;
+            txn.transition_lifecycle(&did, GaugeState::Pending)?;
             transitions += 1;
         }
     }
@@ -72,9 +71,7 @@ pub fn queue_gone_backfills(state: &Arc<AppState>) -> Result<()> {
         return Ok(());
     }
 
-    let lifecycle_reservation = lifecycle_counts.stage(&mut batch);
-    batch.commit().into_diagnostic()?;
-    state.db.apply_lifecycle_counts(lifecycle_reservation);
+    txn.commit()?;
 
     state.notify_backfill();
 
@@ -92,8 +89,7 @@ pub fn retry_worker(state: Arc<AppState>) {
         let now = chrono::Utc::now().timestamp();
         let mut transitions = 0usize;
 
-        let mut batch = state.db.inner.batch();
-        let mut lifecycle_counts = state.db.lifecycle_counts();
+        let mut txn = db::Txn::new(&state.db);
 
         for guard in db.indexer.resync.iter() {
             let (key, value) = match guard.into_inner() {
@@ -121,7 +117,7 @@ pub fn retry_worker(state: Arc<AppState>) {
                             if let Ok(repo_state) =
                                 rmp_serde::from_slice::<crate::types::RepoState>(&state_bytes)
                             {
-                                if let Some(ref pds_str) = repo_state.pds {
+                                if let Some(pds_str) = &repo_state.pds {
                                     if let Ok(pds_url) = url::Url::parse(pds_str.as_ref()) {
                                         let now_ts = chrono::Utc::now().timestamp();
                                         state.throttler.snapshot(&pds_url).is_throttled(now_ts)
@@ -178,18 +174,21 @@ pub fn retry_worker(state: Arc<AppState>) {
                                 continue;
                             }
                         };
-                        if let Err(e) =
-                            lifecycle_counts.transition(&mut batch, &did, GaugeState::Pending)
-                        {
-                            error!(did = %did, err = %e, "failed to stage lifecycle transition");
+                        if let Err(e) = txn.transition_lifecycle(&did, GaugeState::Pending) {
+                            error!(did = %did, err = %e, "failed to transition lifecycle");
                             continue;
                         }
 
                         // move from resync back into pending
-                        batch.remove(&state.db.indexer.resync, key.clone());
-                        batch.remove(&state.db.indexer.pending, old_pending);
-                        batch.insert(&state.db.indexer.pending, new_pending, key.clone());
-                        batch.insert(&state.db.repo_metadata, &metadata_key, serialized_metadata);
+                        txn.batch.remove(&state.db.indexer.resync, key.clone());
+                        txn.batch.remove(&state.db.indexer.pending, old_pending);
+                        txn.batch
+                            .insert(&state.db.indexer.pending, new_pending, key.clone());
+                        txn.batch.insert(
+                            &state.db.repo_metadata,
+                            &metadata_key,
+                            serialized_metadata,
+                        );
                         transitions += 1;
                     }
                 }
@@ -207,14 +206,11 @@ pub fn retry_worker(state: Arc<AppState>) {
             continue;
         }
 
-        let lifecycle_reservation = lifecycle_counts.stage(&mut batch);
-        if let Err(e) = batch.commit() {
+        if let Err(e) = txn.commit() {
             error!(err = %e, "failed to commit batch");
-            db::check_poisoned(&e);
-            drop(lifecycle_reservation);
+            db::check_poisoned_report(&e);
             continue;
         }
-        state.db.apply_lifecycle_counts(lifecycle_reservation);
         state.notify_backfill();
         info!(count = transitions, "queued retries");
     }

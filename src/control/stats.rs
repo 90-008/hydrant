@@ -64,16 +64,14 @@ impl Hydrant {
             state.db.jetstream.events.approximate_len() as u64,
         );
 
-        let sizes = tokio::task::spawn_blocking(move || {
-            state
-                .db
+        let sizes = state.db.run(move |db| {
+            Ok(db
                 .all_keyspaces()
                 .into_iter()
                 .map(|(name, ks)| (name, ks.disk_space()))
-                .collect::<BTreeMap<_, _>>()
+                .collect::<BTreeMap<_, _>>())
         })
-        .await
-        .into_diagnostic()?;
+        .await?;
 
         Ok(StatsResponse { counts, sizes })
     }

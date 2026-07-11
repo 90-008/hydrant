@@ -254,10 +254,9 @@ pub struct RepoHandle<'i> {
 impl<'i> RepoHandle<'i> {
     pub(crate) async fn state(&self) -> Result<Option<RepoState<'static>>> {
         let did_key = keys::repo_key(&self.did);
-        let app_state = self.state.clone();
 
-        tokio::task::spawn_blocking(move || {
-            let bytes = app_state.db.repos.get(&did_key).into_diagnostic()?;
+        self.state.db.run(move |db| {
+            let bytes = db.repos.get(&did_key).into_diagnostic()?;
             bytes
                 .as_deref()
                 .map(db::deser_repo_state)
@@ -265,7 +264,6 @@ impl<'i> RepoHandle<'i> {
                 .map(|opt| opt.map(IntoStatic::into_static))
         })
         .await
-        .into_diagnostic()?
     }
 
     /// fetch the current state of this repository.
@@ -275,18 +273,16 @@ impl<'i> RepoHandle<'i> {
         let did_key = keys::repo_key(&did);
         #[cfg(feature = "indexer")]
         let metadata_key = keys::repo_metadata_key(&did);
-        let app_state = self.state.clone();
 
-        tokio::task::spawn_blocking(move || {
-            let state_bytes = app_state.db.repos.get(&did_key).into_diagnostic()?;
+        self.state.db.run(move |db| {
+            let state_bytes = db.repos.get(&did_key).into_diagnostic()?;
             let Some(state_bytes) = state_bytes else {
                 return Ok(None);
             };
             let repo_state = crate::db::deser_repo_state(&state_bytes)?;
 
             #[cfg(feature = "indexer")]
-            let tracked = app_state
-                .db
+            let tracked = db
                 .repo_metadata
                 .get(&metadata_key)
                 .into_diagnostic()?
@@ -299,18 +295,16 @@ impl<'i> RepoHandle<'i> {
             Ok(Some(repo_state_to_info(did, repo_state, tracked)))
         })
         .await
-        .into_diagnostic()?
     }
 
     /// returns the collections of this repository and the number of records it has in each.
     pub async fn collections(&self) -> Result<HashMap<Nsid<'static>, u64>> {
         let did = self.did.clone().into_static();
-        let state = self.state.clone();
 
-        tokio::task::spawn_blocking(move || {
+        self.state.db.run(move |db| {
             let prefix = keys::did_collection_prefix(&did);
             let mut res = HashMap::new();
-            for item in state.db.counts.prefix(&prefix) {
+            for item in db.counts.prefix(&prefix) {
                 if res.len() >= 1000 {
                     break;
                 }
@@ -332,7 +326,6 @@ impl<'i> RepoHandle<'i> {
             Ok(res)
         })
         .await
-        .into_diagnostic()?
     }
 
     /// returns a bi-directionally validated mini doc.
@@ -345,27 +338,24 @@ impl<'i> RepoHandle<'i> {
         #[cfg(feature = "indexer")]
         let is_pending = {
             let metadata_key = keys::repo_metadata_key(&self.did);
-            let app_state = self.state.clone();
-            tokio::task::spawn_blocking(move || {
-                let metadata_bytes = app_state
-                    .db
+            self.state.db.run(move |db| {
+                let metadata_bytes = db
                     .repo_metadata
                     .get(&metadata_key)
                     .into_diagnostic()?;
                 let Some(metadata_bytes) = metadata_bytes else {
-                    return Ok::<_, miette::Report>(false);
+                    return Ok(false);
                 };
 
                 let metadata = crate::db::deser_repo_meta(metadata_bytes.as_ref())?;
-                Ok(app_state
-                    .db
-                    .indexer.pending
+                Ok(db
+                    .indexer
+                    .pending
                     .get(crate::db::keys::pending_key(metadata.index_id))
                     .into_diagnostic()?
                     .is_some())
             })
             .await
-            .map_err(|e| MiniDocError::Other(miette::miette!(e)))?
             .map_err(MiniDocError::Other)?
         };
         #[cfg(not(feature = "indexer"))]

@@ -72,7 +72,8 @@ fn next_time_us(db: &Db) -> i64 {
         let now = chrono::Utc::now().timestamp_micros();
         let next = now.max(last.saturating_add(1));
         if db
-            .jetstream.last_time_us
+            .jetstream
+            .last_time_us
             .compare_exchange(last, next, Ordering::SeqCst, Ordering::SeqCst)
             .is_ok()
         {

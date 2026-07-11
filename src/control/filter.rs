@@ -44,19 +44,19 @@ pub struct FilterControl(pub(super) Arc<AppState>);
 impl FilterControl {
     /// return the current filter configuration from the database.
     pub async fn get(&self) -> Result<FilterSnapshot> {
-        let filter_ks = self.0.db.filter.clone();
-        tokio::task::spawn_blocking(move || {
-            let hot = db_filter::load(&filter_ks)?;
-            let excludes = db_filter::read_set(&filter_ks, db_filter::EXCLUDE_PREFIX)?;
-            Ok(FilterSnapshot {
-                mode: hot.mode,
-                signals: hot.signals.iter().map(|s| s.to_string()).collect(),
-                collections: hot.collections.iter().map(|s| s.to_string()).collect(),
-                excludes,
+        self.0
+            .db
+            .run(move |db| {
+                let hot = db_filter::load(&db.filter)?;
+                let excludes = db_filter::read_set(&db.filter, db_filter::EXCLUDE_PREFIX)?;
+                Ok(FilterSnapshot {
+                    mode: hot.mode,
+                    signals: hot.signals.iter().map(|s| s.to_string()).collect(),
+                    collections: hot.collections.iter().map(|s| s.to_string()).collect(),
+                    excludes,
+                })
             })
-        })
-        .await
-        .into_diagnostic()?
+            .await
     }
 
     /// set the indexing mode. see [`FilterControl`] for mode semantics.
@@ -268,8 +268,6 @@ impl FilterPatch {
     /// commit the patch atomically to the database and update the in-memory filter.
     /// returns the updated [`FilterSnapshot`].
     pub async fn apply(self) -> Result<FilterSnapshot> {
-        let filter_ks = self.state.db.filter.clone();
-        let inner = self.state.db.inner.clone();
         let filter_handle = self.state.filter.clone();
         let state = self.state.clone();
         let mode = self.mode;
@@ -277,28 +275,27 @@ impl FilterPatch {
         let collections = self.collections;
         let excludes = self.excludes;
 
-        let new_filter = tokio::task::spawn_blocking(move || {
-            let mut batch = inner.batch();
-            db_filter::apply_patch(&mut batch, &filter_ks, mode, signals, collections, excludes)?;
-            batch.commit().into_diagnostic()?;
-            state.db.persist()?;
-            db_filter::load(&filter_ks)
-        })
-        .await
-        .into_diagnostic()?
-        .map_err(|e| {
-            error!(err = %e, "failed to apply filter patch");
-            e
-        })?;
-
-        let exclude_list = {
-            let filter_ks = self.state.db.filter.clone();
-            tokio::task::spawn_blocking(move || {
-                db_filter::read_set(&filter_ks, db_filter::EXCLUDE_PREFIX)
+        let new_filter = state
+            .db
+            .run(move |db| {
+                let mut batch = db.inner.batch();
+                db_filter::apply_patch(&mut batch, &db.filter, mode, signals, collections, excludes)?;
+                batch.commit().into_diagnostic()?;
+                db.persist()?;
+                db_filter::load(&db.filter)
             })
             .await
-            .into_diagnostic()??
-        };
+            .map_err(|e| {
+                error!(err = %e, "failed to apply filter patch");
+                e
+            })?;
+
+        let exclude_list = state
+            .db
+            .run(move |db| {
+                db_filter::read_set(&db.filter, db_filter::EXCLUDE_PREFIX)
+            })
+            .await?;
 
         let snapshot = FilterSnapshot {
             mode: new_filter.mode,

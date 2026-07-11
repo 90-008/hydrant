@@ -80,7 +80,8 @@ fn primary_lifecycle_gauge(db: &Db, repo_key: &[u8]) -> Result<GaugeState> {
         let metadata = deser_repo_meta(metadata_bytes.as_ref())
             .wrap_err("invalid repo metadata during lifecycle count rebuild")?;
         if db
-            .indexer.pending
+            .indexer
+            .pending
             .get(keys::pending_key(metadata.index_id))
             .into_diagnostic()?
             .is_some()
@@ -89,7 +90,8 @@ fn primary_lifecycle_gauge(db: &Db, repo_key: &[u8]) -> Result<GaugeState> {
         }
     }
 
-    db.indexer.resync
+    db.indexer
+        .resync
         .get(repo_key)
         .into_diagnostic()?
         .map(|bytes| crate::db::lifecycle_counts::gauge_from_resync(bytes.as_ref()))

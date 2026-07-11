@@ -411,7 +411,8 @@ async fn persist_sparse_backfill(
 ) -> Result<Option<(usize, RepoState<'static>)>, BackfillError> {
     let app_state = app_state.clone();
     let did = did.clone();
-    tokio::task::spawn_blocking(move || {
+    let db = app_state.db.clone();
+    db.run(move |db| {
         let filter = app_state.filter.load();
         let ephemeral = app_state.ephemeral;
         let mut count = 0;
@@ -421,7 +422,7 @@ async fn persist_sparse_backfill(
         let mut existing_cids: HashMap<(SmolStr, DbRkey), SmolStr> = HashMap::new();
 
         if !ephemeral {
-            for guard in app_state.db.indexer.record_prefix(&prefix) {
+            for guard in db.indexer.record_prefix(&prefix) {
                 let (key, cid_bytes) = guard.into_inner().into_diagnostic()?;
                 let mut remaining = key[prefix.len()..].splitn(2, |b| keys::SEP.eq(b));
                 let collection_raw = remaining
@@ -448,7 +449,7 @@ async fn persist_sparse_backfill(
         }
 
         let mut signal_seen = filter.mode == FilterMode::Full || filter.signals.is_empty();
-        let mut txn = DbTxn::new(&app_state.db);
+        let mut txn = DbTxn::new(db);
         let mut record_txn = txn.backfill_records(&app_state, &root_commit.rev, &did);
 
         for (key, cid) in leaves {
@@ -506,8 +507,7 @@ async fn persist_sparse_backfill(
         let _events = record_txn.finish()?;
 
         let metadata_key = keys::repo_metadata_key(&did);
-        let metadata_bytes = app_state
-            .db
+        let metadata_bytes = db
             .repo_metadata
             .get(&metadata_key)
             .into_diagnostic()?
@@ -515,7 +515,7 @@ async fn persist_sparse_backfill(
         let mut metadata = crate::db::deser_repo_meta(&metadata_bytes)?;
         metadata.tracked = true;
         txn.batch.insert(
-            &app_state.db.repo_metadata,
+            &db.repo_metadata,
             &metadata_key,
             crate::db::ser_repo_meta(&metadata)?,
         );
@@ -523,7 +523,7 @@ async fn persist_sparse_backfill(
         if !ephemeral {
             db::replace_record_counts_matching(
                 &mut txn.batch,
-                &app_state.db,
+                db,
                 &did,
                 |collection| filter.matches_collection(collection),
                 collection_counts.iter().map(|(col, cnt)| (col.as_str(), *cnt)),
@@ -535,7 +535,6 @@ async fn persist_sparse_backfill(
         Ok::<_, miette::Report>(Some((count, state)))
     })
     .await
-    .into_diagnostic()?
     .map_err(BackfillError::from)
 }
 

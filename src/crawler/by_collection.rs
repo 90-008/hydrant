@@ -73,7 +73,9 @@ impl ByCollectionProducer {
         let cursor_key = by_collection_cursor_key(self.index_url.as_str(), collection);
 
         // resume from any persisted cursor, so a restart mid-pass doesn't rescan from scratch.
-        let mut cursor: Option<SmolStr> = Db::get(db.cursors.keyspace(), &cursor_key)
+        let cursor_lookup_key = cursor_key.clone();
+        let mut cursor: Option<SmolStr> = db
+            .run(move |db| db.cursors.get(cursor_lookup_key).into_diagnostic())
             .await
             .ok()
             .flatten()
@@ -142,6 +144,7 @@ impl ByCollectionProducer {
 
                 tokio::time::timeout(
                     BLOCKING_TASK_TIMEOUT,
+                    // CPU-bound JSON parsing + read-only DB scan, stays on spawn_blocking
                     tokio::task::spawn_blocking(move || -> miette::Result<Option<PageResult>> {
                         let output =
                             match serde_json::from_slice::<ListReposByCollectionOutput>(&bytes) {

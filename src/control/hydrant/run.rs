@@ -90,12 +90,11 @@ impl Hydrant {
             // 6. re-queue any repos that lost their backfill state, then start the retry worker
             #[cfg(feature = "indexer")]
             {
-                if let Err(e) = tokio::task::spawn_blocking({
+                if let Err(e) = state.db.run({
                     let state = state.clone();
-                    move || crate::backfill::manager::queue_gone_backfills(&state)
+                    move |_db| crate::backfill::manager::queue_gone_backfills(&state)
                 })
                 .await
-                .into_diagnostic()?
                 {
                     error!(err = %e, "failed to queue gone backfills");
                     db::check_poisoned_report(&e);
@@ -262,12 +261,10 @@ impl Hydrant {
             }
 
             // add persisted hosts
-            let persisted_sources = tokio::task::spawn_blocking({
-                let state = state.clone();
-                move || load_persisted_firehose_sources(&state.db)
+            let persisted_sources = state.db.run({
+                move |db| load_persisted_firehose_sources(db)
             })
-            .await
-            .into_diagnostic()??;
+            .await?;
             for source in &persisted_sources {
                 let _ = firehose
                     .known_sources
@@ -442,12 +439,10 @@ impl Hydrant {
                     let _ = crawler.tasks.insert_async(source.url.clone(), handle).await;
                 }
 
-                let persisted_sources = tokio::task::spawn_blocking({
-                    let state = state.clone();
-                    move || load_persisted_crawler_sources(&state.db)
+                let persisted_sources = state.db.run({
+                    move |db| load_persisted_crawler_sources(db)
                 })
-                .await
-                .into_diagnostic()??;
+                .await?;
 
                 for source in &persisted_sources {
                     let _ = crawler.persisted.insert_async(source.url.clone()).await;

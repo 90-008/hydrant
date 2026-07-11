@@ -1,4 +1,4 @@
-use crate::db::{CountDeltas, keys, ser_repo_state};
+use crate::db::{keys, ser_repo_state};
 use crate::state::AppState;
 use crate::types::{RepoMetadata, RepoState};
 use miette::{IntoDiagnostic, Result};
@@ -140,17 +140,14 @@ impl CrawlerWorker {
         let app_state = self.state.clone();
         let surviving = tokio::time::timeout(
             BLOCKING_TASK_TIMEOUT,
-            tokio::task::spawn_blocking(move || -> Result<Vec<InFlightGuard>> {
+            app_state.db.run(move |db| {
                 let mut rng: SmallRng = rand::make_rng();
-                let mut batch = app_state.db.inner.batch();
+                let mut txn = crate::db::Txn::new(db);
                 let mut surviving = Vec::new();
-                let mut count_deltas = CountDeltas::default();
-                let mut lifecycle_counts = app_state.db.lifecycle_counts();
                 for guard in guards {
                     let did_key = keys::repo_key(&guard);
                     let metadata_key = keys::repo_metadata_key(&guard);
-                    if app_state
-                        .db
+                    if db
                         .repos
                         .contains_key(&did_key)
                         .into_diagnostic()?
@@ -159,45 +156,38 @@ impl CrawlerWorker {
                     }
                     let state = RepoState::backfilling();
                     let metadata = RepoMetadata::backfilling(rng.next_u64());
-                    batch.insert(&app_state.db.repos, &did_key, ser_repo_state(&state)?);
-                    batch.insert(
-                        &app_state.db.repo_metadata,
+                    txn.batch
+                        .insert(&db.repos, &did_key, ser_repo_state(&state)?);
+                    txn.batch.insert(
+                        &db.repo_metadata,
                         &metadata_key,
                         crate::db::ser_repo_meta(&metadata)?,
                     );
                     #[cfg(feature = "indexer")]
-                    batch.insert(
-                        &app_state.db.indexer.pending,
+                    txn.batch.insert(
+                        &db.indexer.pending,
                         keys::pending_key(metadata.index_id),
                         &did_key,
                     );
                     // clear any stale retry entry, this DID is confirmed and being enqueued
-                    batch.remove(&app_state.db.crawler, keys::crawler_retry_key(&guard));
+                    txn.batch
+                        .remove(&db.crawler, keys::crawler_retry_key(&guard));
                     trace!(did = %*guard, "enqueuing repo");
-                    count_deltas.add_repos(1);
+                    txn.counts.add_repos(1);
                     #[cfg(feature = "indexer")]
-                    lifecycle_counts.transition(
-                        &mut batch,
-                        &guard,
-                        crate::types::GaugeState::Pending,
-                    )?;
+                    txn.transition_lifecycle(&guard, crate::types::GaugeState::Pending)?;
                     surviving.push(guard);
                 }
                 if let Some(cursor) = cursor_update {
-                    batch.insert(&app_state.db.cursors, cursor.key, cursor.value);
+                    txn.batch
+                        .insert(&db.cursors, cursor.key, cursor.value);
                 }
-                let lifecycle_reservation = lifecycle_counts.stage(&mut batch);
-                let reservation = app_state.db.stage_count_deltas(&mut batch, &count_deltas);
                 // todo: repo state overwrites here are acceptable?
-                batch.commit().into_diagnostic()?;
-                app_state.db.apply_lifecycle_counts(lifecycle_reservation);
-                app_state.db.apply_count_deltas(&count_deltas);
-                drop(reservation);
+                txn.commit()?;
                 Ok(surviving)
             }),
         )
         .await
-        .into_diagnostic()?
         .map_err(|_| {
             error!("enqueue batch timed out after {BLOCKING_TASK_TIMEOUT:?}");
             miette::miette!("enqueue batch timed out")
@@ -222,14 +212,15 @@ impl CrawlerWorker {
         let state = self.state.clone();
         tokio::time::timeout(
             BLOCKING_TASK_TIMEOUT,
-            tokio::task::spawn_blocking(move || {
-                let mut batch = state.db.inner.batch();
-                batch.insert(&state.db.cursors, cursor.key, cursor.value);
-                batch.commit().into_diagnostic()
+            state.db.run(move |db| {
+                let mut txn = crate::db::Txn::new(db);
+                txn.batch
+                    .insert(&db.cursors, cursor.key, cursor.value);
+                txn.commit()
             }),
         )
         .await
-        .into_diagnostic()?
-        .map_err(|_| miette::miette!("cursor-only commit timed out"))?
+        .map_err(|_| miette::miette!("cursor-only commit timed out"))??;
+        Ok(())
     }
 }

@@ -88,8 +88,6 @@ impl Hydrant {
             || config.filter_collections.is_some()
             || config.filter_excludes.is_some()
         {
-            let filter_ks = state.db.filter.clone();
-            let inner = state.db.inner.clone();
             let mode = config.full_network.then_some(FilterMode::Full);
             let signals = config
                 .filter_signals
@@ -104,28 +102,27 @@ impl Hydrant {
                 .clone()
                 .map(crate::patch::SetUpdate::Set);
 
-            tokio::task::spawn_blocking(move || {
-                let mut batch = inner.batch();
-                db_filter::apply_patch(
-                    &mut batch,
-                    &filter_ks,
-                    mode,
-                    signals,
-                    collections,
-                    excludes,
-                )?;
-                batch.commit().into_diagnostic()
-            })
-            .await
-            .into_diagnostic()??;
+            state
+                .db
+                .run(move |db| {
+                    let mut batch = db.inner.batch();
+                    db_filter::apply_patch(
+                        &mut batch,
+                        &db.filter,
+                        mode,
+                        signals,
+                        collections,
+                        excludes,
+                    )?;
+                    batch.commit().into_diagnostic()
+                })
+                .await?;
 
             // 3. reload the live filter into the hot-path arc-swap
-            let new_filter = tokio::task::spawn_blocking({
-                let filter_ks = state.db.filter.clone();
-                move || db_filter::load(&filter_ks)
-            })
-            .await
-            .into_diagnostic()??;
+            let new_filter = state
+                .db
+                .run(move |db| db_filter::load(&db.filter))
+                .await?;
             state.filter.store(Arc::new(new_filter));
         }
 

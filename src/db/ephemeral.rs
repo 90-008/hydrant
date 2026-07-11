@@ -71,14 +71,16 @@ pub fn jetstream_events_ttl_tick(db: &Db, ttl: &Duration) -> miette::Result<()> 
     let cutoff_ts = now.saturating_sub(ttl.as_secs());
     let cutoff_us = cutoff_ts.saturating_mul(1_000_000);
 
-    db.jetstream.events
+    db.jetstream
+        .events
         .rotate_memtable_and_wait()
         .into_diagnostic()
         .wrap_err("failed to rotate memtable before Jetstream TTL range drop")?;
 
     let before_space = db.jetstream.events.disk_space();
     let before_tables = db.jetstream.events.table_count();
-    db.jetstream.events
+    db.jetstream
+        .events
         .drop_range(..keys::jetstream_event_key(cutoff_us, 0))
         .into_diagnostic()
         .wrap_err("failed Jetstream TTL range drop for old events")?;
@@ -276,7 +278,8 @@ mod tests {
         payload: &[u8],
     ) -> miette::Result<()> {
         insert_relay_events(db, start_seq, count, payload)?;
-        db.relay.events
+        db.relay
+            .events
             .rotate_memtable_and_wait()
             .into_diagnostic()?;
         Ok(())
@@ -303,7 +306,8 @@ mod tests {
     }
 
     fn compact_relay_events_once(db: &crate::db::Db) -> miette::Result<()> {
-        db.relay.events
+        db.relay
+            .events
             .compact(Arc::new(fjall::compaction::Leveled::default()))
             .into_diagnostic()
     }
@@ -331,7 +335,8 @@ mod tests {
             batch.remove(&db.relay.events, keys::relay_event_key(seq));
         }
         batch.commit().into_diagnostic()?;
-        db.relay.events
+        db.relay
+            .events
             .rotate_memtable_and_wait()
             .into_diagnostic()?;
         Ok(())
@@ -485,7 +490,8 @@ mod tests {
         let after_delete = db.relay.events.disk_space();
 
         for _ in 0..16 {
-            db.relay.events
+            db.relay
+                .events
                 .compact(Arc::new(fjall::compaction::Leveled::default()))
                 .into_diagnostic()?;
         }

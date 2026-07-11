@@ -2,7 +2,6 @@ use futures::{FutureExt, TryFutureExt};
 use rand::Rng;
 
 use super::*;
-use crate::db::LifecycleCountBatch;
 
 impl ReposControl {
     /// iterates through pending repositories, returning their state.
@@ -101,12 +100,7 @@ impl ReposControl {
             .filter_map(|b| b.transpose())
     }
 
-    pub(crate) fn _resync(
-        db: &Db,
-        did: &Did<'_>,
-        batch: &mut fjall::OwnedWriteBatch,
-        lifecycle_counts: &mut LifecycleCountBatch<'_>,
-    ) -> Result<bool> {
+    pub(crate) fn _resync(db: &Db, did: &Did<'_>, txn: &mut crate::db::Txn<'_>) -> Result<bool> {
         let did_key = keys::repo_key(did);
         let metadata_key = keys::repo_metadata_key(did);
 
@@ -135,20 +129,20 @@ impl ReposControl {
                 metadata.tracked = true;
                 // insert into pending with new index_id
                 let old_pending = keys::pending_key(metadata.index_id);
-                batch.remove(&db.indexer.pending, old_pending);
+                txn.batch.remove(&db.indexer.pending, old_pending);
                 metadata.index_id = rand::Rng::next_u64(&mut rand::rng());
-                batch.insert(
+                txn.batch.insert(
                     &db.indexer.pending,
                     keys::pending_key(metadata.index_id),
                     &did_key,
                 );
-                batch.remove(&db.indexer.resync, &did_key);
-                batch.insert(
+                txn.batch.remove(&db.indexer.resync, &did_key);
+                txn.batch.insert(
                     &db.repo_metadata,
                     &metadata_key,
                     crate::db::ser_repo_meta(&metadata)?,
                 );
-                lifecycle_counts.transition(batch, did, GaugeState::Pending)?;
+                txn.transition_lifecycle(did, GaugeState::Pending)?;
                 return Ok(true);
             }
         }
@@ -169,28 +163,23 @@ impl ReposControl {
         dids: impl IntoIterator<Item = Did<'_>>,
     ) -> Result<Vec<Did<'static>>> {
         let dids: Vec<Did<'static>> = dids.into_iter().map(|d| d.into_static()).collect();
-        let state = self.0.clone();
 
-        let queued = tokio::task::spawn_blocking(move || {
-            let db = &state.db;
-            let mut batch = db.inner.batch();
+        let queued = self.0.db.run(move |db| {
+            let mut txn = crate::db::Txn::new(db);
             let mut queued: Vec<Did<'static>> = Vec::new();
-            let mut lifecycle_counts = db.lifecycle_counts();
 
             for did in dids {
-                if Self::_resync(db, &did, &mut batch, &mut lifecycle_counts)? {
+                if Self::_resync(db, &did, &mut txn)? {
                     queued.push(did);
                 }
             }
 
-            let lifecycle_reservation = lifecycle_counts.stage(&mut batch);
-            batch.commit().into_diagnostic()?;
-            db.apply_lifecycle_counts(lifecycle_reservation);
-            state.db.persist()?;
-            Ok::<_, miette::Report>(queued)
+            txn.commit()?;
+            db.persist()?;
+            Ok(queued)
         })
-        .await
-        .into_diagnostic()??;
+        .await?;
+
         if !queued.is_empty() {
             self.0.notify_backfill();
         }
@@ -208,14 +197,10 @@ impl ReposControl {
         dids: impl IntoIterator<Item = Did<'_>>,
     ) -> Result<Vec<Did<'static>>> {
         let dids: Vec<Did<'static>> = dids.into_iter().map(|d| d.into_static()).collect();
-        let state = self.0.clone();
 
-        let queued = tokio::task::spawn_blocking(move || {
-            let db = &state.db;
-            let mut batch = db.inner.batch();
+        let queued = self.0.db.run(move |db| {
+            let mut txn = crate::db::Txn::new(db);
             let mut queued: Vec<Did<'static>> = Vec::new();
-            let mut count_deltas = crate::db::CountDeltas::default();
-            let mut lifecycle_counts = db.lifecycle_counts();
 
             for did in dids {
                 let did_key = keys::repo_key(&did);
@@ -227,42 +212,35 @@ impl ReposControl {
                     .transpose()?;
 
                 if let Some(metadata) = existing_metadata {
-                    if !metadata.tracked
-                        && Self::_resync(db, &did, &mut batch, &mut lifecycle_counts)?
-                    {
+                    if !metadata.tracked && Self::_resync(db, &did, &mut txn)? {
                         queued.push(did);
                     }
                 } else {
                     let repo_state = RepoState::backfilling();
                     let metadata = RepoMetadata::backfilling(rand::random());
-                    batch.insert(&db.repos, &did_key, crate::db::ser_repo_state(&repo_state)?);
-                    batch.insert(
+                    txn.batch
+                        .insert(&db.repos, &did_key, crate::db::ser_repo_state(&repo_state)?);
+                    txn.batch.insert(
                         &db.repo_metadata,
                         &metadata_key,
                         crate::db::ser_repo_meta(&metadata)?,
                     );
-                    batch.insert(
+                    txn.batch.insert(
                         &db.indexer.pending,
                         keys::pending_key(metadata.index_id),
                         &did_key,
                     );
-                    count_deltas.add_repos(1);
-                    lifecycle_counts.transition(&mut batch, &did, GaugeState::Pending)?;
+                    txn.counts.add_repos(1);
+                    txn.transition_lifecycle(&did, GaugeState::Pending)?;
                     queued.push(did);
                 }
             }
-
-            let lifecycle_reservation = lifecycle_counts.stage(&mut batch);
-            let reservation = db.stage_count_deltas(&mut batch, &count_deltas);
-            batch.commit().into_diagnostic()?;
-            db.apply_lifecycle_counts(lifecycle_reservation);
-            db.apply_count_deltas(&count_deltas);
-            drop(reservation);
-            state.db.persist()?;
-            Ok::<_, miette::Report>(queued)
+            txn.commit()?;
+            db.persist()?;
+            Ok(queued)
         })
-        .await
-        .into_diagnostic()??;
+        .await?;
+
         self.0.notify_backfill();
         Ok(queued)
     }
@@ -275,13 +253,10 @@ impl ReposControl {
         dids: impl IntoIterator<Item = Did<'_>>,
     ) -> Result<Vec<Did<'static>>> {
         let dids: Vec<Did<'static>> = dids.into_iter().map(|d| d.into_static()).collect();
-        let state = self.0.clone();
 
-        let untracked = tokio::task::spawn_blocking(move || {
-            let db = &state.db;
-            let mut batch = db.inner.batch();
+        let untracked = self.0.db.run(move |db| {
+            let mut txn = crate::db::Txn::new(db);
             let mut untracked: Vec<Did<'static>> = Vec::new();
-            let mut lifecycle_counts = db.lifecycle_counts();
 
             for did in dids {
                 let did_key = keys::repo_key(&did);
@@ -303,27 +278,26 @@ impl ReposControl {
                         && metadata.tracked
                     {
                         metadata.tracked = false;
-                        batch.insert(
+                        txn.batch.insert(
                             &db.repo_metadata,
                             &metadata_key,
                             crate::db::ser_repo_meta(&metadata)?,
                         );
-                        batch.remove(&db.indexer.pending, keys::pending_key(metadata.index_id));
-                        batch.remove(&db.indexer.resync, &did_key);
-                        lifecycle_counts.transition(&mut batch, &did, GaugeState::Synced)?;
+                        txn.batch
+                            .remove(&db.indexer.pending, keys::pending_key(metadata.index_id));
+                        txn.batch.remove(&db.indexer.resync, &did_key);
+                        txn.transition_lifecycle(&did, GaugeState::Synced)?;
                         untracked.push(did);
                     }
                 }
             }
 
-            let lifecycle_reservation = lifecycle_counts.stage(&mut batch);
-            batch.commit().into_diagnostic()?;
-            db.apply_lifecycle_counts(lifecycle_reservation);
-            state.db.persist()?;
-            Ok::<_, miette::Report>(untracked)
+            txn.commit()?;
+            db.persist()?;
+            Ok(untracked)
         })
-        .await
-        .into_diagnostic()??;
+        .await?;
+
         Ok(untracked)
     }
 }
@@ -339,18 +313,17 @@ impl<'i> RepoHandle<'i> {
         let db_key = keys::record_key(&did, collection, &DbRkey::new(rkey));
 
         let collection = collection.to_smolstr();
-        let state = self.state.clone();
-        tokio::task::spawn_blocking(move || {
+        self.state.db.run(move |db| {
             use miette::WrapErr;
 
-            let cid_bytes = state.db.indexer.record(db_key).into_diagnostic()?;
+            let cid_bytes = db.indexer.record(db_key).into_diagnostic()?;
             let Some(cid_bytes) = cid_bytes else {
                 return Ok(None);
             };
 
             // lookup block using col|cid key
             let block_key = keys::block_key(&collection, &cid_bytes);
-            let Some(block_bytes) = state.db.indexer.block(block_key).into_diagnostic()? else {
+            let Some(block_bytes) = db.indexer.block(block_key).into_diagnostic()? else {
                 miette::bail!("block {cid_bytes:?} not found, this is a bug!!");
             };
 
@@ -366,7 +339,6 @@ impl<'i> RepoHandle<'i> {
             Ok(Some(Record { did, cid, value }))
         })
         .await
-        .into_diagnostic()?
     }
 
     /// lists records from this repository.
@@ -382,12 +354,11 @@ impl<'i> RepoHandle<'i> {
         }
         let did = self.did.clone().into_static();
 
-        let state = self.state.clone();
         let prefix = keys::record_prefix_collection(&did, collection);
         let collection = collection.to_smolstr();
         let cursor = cursor.map(|c| c.to_smolstr());
 
-        tokio::task::spawn_blocking(move || {
+        self.state.db.run(move |db| {
             let mut results = Vec::new();
             let mut next_cursor = None;
 
@@ -407,8 +378,7 @@ impl<'i> RepoHandle<'i> {
                 };
 
                 Box::new(
-                    state
-                        .db
+                    db
                         .indexer
                         .record_range(prefix.as_slice()..end_key.as_slice())
                         .rev(),
@@ -424,7 +394,7 @@ impl<'i> RepoHandle<'i> {
                     prefix.clone()
                 };
 
-                Box::new(state.db.indexer.record_range(start_key.as_slice()..))
+                Box::new(db.indexer.record_range(start_key.as_slice()..))
             };
 
             for item in iter {
@@ -441,8 +411,7 @@ impl<'i> RepoHandle<'i> {
                 }
 
                 // look up using col|cid key built from collection and binary cid bytes
-                if let Ok(Some(block_bytes)) = state
-                    .db
+                if let Ok(Some(block_bytes)) = db
                     .indexer
                     .block(keys::block_key(collection.as_str(), &cid_bytes))
                 {
@@ -458,10 +427,9 @@ impl<'i> RepoHandle<'i> {
                     });
                 }
             }
-            Result::<_, miette::Report>::Ok((results, next_cursor))
+            Ok((results, next_cursor))
         })
         .await
-        .into_diagnostic()?
         .map(|(records, next_cursor)| RecordList {
             records,
             cursor: next_cursor.map(|rkey| {
@@ -614,10 +582,8 @@ impl<'i> RepoHandle<'i> {
     /// gets how many records of a collection this repository has.
     pub async fn count_records(&self, collection: &str) -> Result<u64> {
         let did = self.did.clone().into_static();
-        let state = self.state.clone();
         let collection = collection.to_string();
-        tokio::task::spawn_blocking(move || db::get_record_count(&state.db, &did, &collection))
+        self.state.db.run(move |db| db::get_record_count(db, &did, &collection))
             .await
-            .into_diagnostic()?
     }
 }

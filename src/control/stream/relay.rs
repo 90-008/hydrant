@@ -23,7 +23,8 @@ pub(crate) fn relay_stream_thread(
         None => Some(
             state
                 .db
-                .relay.next_seq
+                .relay
+                .next_seq
                 .load(Ordering::SeqCst)
                 .saturating_sub(1),
         ),
@@ -32,7 +33,8 @@ pub(crate) fn relay_stream_thread(
         .and_then(|_| {
             state
                 .db
-                .relay.next_seq
+                .relay
+                .next_seq
                 .load(Ordering::SeqCst)
                 .checked_sub(1)
         })

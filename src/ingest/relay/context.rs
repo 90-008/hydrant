@@ -456,9 +456,8 @@ impl WorkerContext<'_> {
 
         self.count_deltas.add_repos(1);
 
-        self.stats.record_repo_state_outcome(
-            crate::ingest::firehose_stats::RepoStateLoadOutcome::Miss,
-        );
+        self.stats
+            .record_repo_state_outcome(crate::ingest::firehose_stats::RepoStateLoadOutcome::Miss);
         self.stats.record_new_account(new_account_started.elapsed());
 
         Ok(Some(repo_state))

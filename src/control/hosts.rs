@@ -56,20 +56,21 @@ impl Hydrant {
         let state = self.state.clone();
         let hostname = hostname.to_smolstr();
 
-        tokio::task::spawn_blocking(move || {
+        let state_closure = state.clone();
+        state.db.run(move |db| {
             let key = keys::firehose_cursor_key(&hostname);
 
             let mut seq = 0;
-            if let Some(cursor_bytes) = state.db.cursors.get(&key).into_diagnostic()? {
+            if let Some(cursor_bytes) = db.cursors.get(&key).into_diagnostic()? {
                 seq = i64::from_be_bytes(cursor_bytes.as_ref().try_into().into_diagnostic()?);
             } else {
                 // if it has no cursor, check if it's explicitly tracked in hosts map
                 // or firehose tasks (recently added via API but no messages yet)
-                let meta = state.pds_meta.load();
+                let meta = state_closure.pds_meta.load();
                 if !meta.hosts.contains_key(hostname.as_str()) {
                     // we should also allow it if it's an active firehose ingestor
                     let mut found_in_cursors = false;
-                    state.firehose_cursors.iter_sync(|u, _| {
+                    state_closure.firehose_cursors.iter_sync(|u, _| {
                         if u.host_str() == Some(hostname.as_str()) {
                             found_in_cursors = true;
                         }
@@ -82,11 +83,9 @@ impl Hydrant {
                 }
             }
 
-            let account_count = state
-                .db
+            let account_count = db
                 .get_count_sync(&keys::pds_account_count_key(&hostname));
-            let status = state.pds_meta.load().status(&hostname);
-
+            let status = state_closure.pds_meta.load().status(&hostname);
             Ok(Some(Host {
                 name: hostname,
                 seq,
@@ -95,7 +94,6 @@ impl Hydrant {
             }))
         })
         .await
-        .into_diagnostic()?
     }
 
     /// enumerates all hosts hydrant is consuming from.
@@ -108,8 +106,9 @@ impl Hydrant {
     ) -> Result<(Vec<Host>, Option<SmolStr>)> {
         let state = self.state.clone();
         let cursor = cursor.map(str::to_string);
+        let state_closure = state.clone();
 
-        tokio::task::spawn_blocking(move || {
+        state.db.run(move |db| {
             let start_bound = match &cursor {
                 Some(after) => std::ops::Bound::Included(keys::firehose_cursor_key(after)),
                 None => std::ops::Bound::Included(keys::FIREHOSE_CURSOR_PREFIX.to_vec()),
@@ -123,7 +122,7 @@ impl Hydrant {
             let end_bound = std::ops::Bound::Excluded(prefix_end);
 
             let mut db_hosts = Vec::new();
-            for item in state.db.cursors.range((start_bound, end_bound)) {
+            for item in db.cursors.range((start_bound, end_bound)) {
                 let (k, _) = item.into_inner().into_diagnostic()?;
                 let hostname = std::str::from_utf8(&k[keys::FIREHOSE_CURSOR_PREFIX.len()..])
                     .into_diagnostic()
@@ -143,7 +142,7 @@ impl Hydrant {
 
             let mut meta_hosts = Vec::new();
             {
-                let meta = state.pds_meta.load();
+                let meta = state_closure.pds_meta.load();
                 for hostname in meta.hosts.keys() {
                     if let Some(after) = &cursor {
                         if hostname.as_str() <= after.as_str() {
@@ -168,8 +167,7 @@ impl Hydrant {
 
             let mut hosts: Vec<Host> = Vec::with_capacity(selected.len().min(limit));
             for hostname in selected.iter().take(limit) {
-                let seq = state
-                    .db
+                let seq = db
                     .cursors
                     .get(keys::firehose_cursor_key(hostname))
                     .into_diagnostic()?
@@ -182,10 +180,9 @@ impl Hydrant {
                     })
                     .transpose()?
                     .unwrap_or(0);
-                let account_count = state
-                    .db
+                let account_count = db
                     .get_count_sync(&keys::pds_account_count_key(hostname));
-                let status = state.pds_meta.load().status(hostname);
+                let status = state_closure.pds_meta.load().status(hostname);
                 hosts.push(Host {
                     name: hostname.clone(),
                     seq,
@@ -203,10 +200,8 @@ impl Hydrant {
             Ok((hosts, next_cursor))
         })
         .await
-        .into_diagnostic()?
     }
 }
-
 #[cfg(test)]
 mod host_listing_tests {
     use super::*;
@@ -228,34 +223,33 @@ mod host_listing_tests {
 
         {
             let state = hydrant.state.clone();
-            tokio::task::spawn_blocking(move || -> Result<()> {
-                let mut batch = state.db.inner.batch();
+            state.db.run(move |db| -> Result<()> {
+                let mut batch = db.inner.batch();
                 crate::db::pds_meta::set_status(
                     &mut batch,
-                    &state.db.filter,
+                    &db.filter,
                     "offline.example",
                     HostStatus::Offline,
                 )?;
                 crate::db::pds_meta::set_status(
                     &mut batch,
-                    &state.db.filter,
+                    &db.filter,
                     "active.example",
                     HostStatus::Active,
                 )?;
                 set_ks_count(
                     &mut batch,
-                    &state.db,
+                    db,
                     &keys::pds_account_count_key("offline.example"),
                     7,
                 );
                 set_ks_count(
                     &mut batch,
-                    &state.db,
+                    db,
                     &keys::pds_account_count_key("active.example"),
                     42,
                 );
-                state
-                    .db
+                db
                     .cursors
                     .insert(
                         keys::firehose_cursor_key("active.example"),
@@ -263,10 +257,9 @@ mod host_listing_tests {
                     )
                     .into_diagnostic()?;
                 batch.commit().into_diagnostic()?;
-                state.db.persist()
+                db.persist()
             })
-            .await
-            .into_diagnostic()??;
+            .await?;
 
             crate::pds_meta::PdsMeta::update_host(
                 &hydrant.state.pds_meta,
@@ -313,26 +306,22 @@ mod host_listing_tests {
         // Seed some in DB: host2, host4, host6
         {
             let state = hydrant.state.clone();
-            tokio::task::spawn_blocking(move || -> Result<()> {
-                state
-                    .db
+            state.db.run(move |db| -> Result<()> {
+                db
                     .cursors
                     .insert(keys::firehose_cursor_key("host2"), 2_i64.to_be_bytes())
                     .into_diagnostic()?;
-                state
-                    .db
+                db
                     .cursors
                     .insert(keys::firehose_cursor_key("host4"), 4_i64.to_be_bytes())
                     .into_diagnostic()?;
-                state
-                    .db
+                db
                     .cursors
                     .insert(keys::firehose_cursor_key("host6"), 6_i64.to_be_bytes())
                     .into_diagnostic()?;
-                state.db.persist()
+                db.persist()
             })
-            .await
-            .into_diagnostic()??;
+            .await?;
         }
 
         // Seed some in memory: host1, host3, host5

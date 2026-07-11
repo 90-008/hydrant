@@ -20,7 +20,7 @@ use crate::backfill::error::BackfillError;
 use crate::backfill::sparse::{SparseBackfillResult, process_did_sparse};
 use crate::config::BackfillStrategy;
 use crate::db::types::{DbAction, DbRkey};
-use crate::db::{self, CountDeltas, Db, Txn as DbTxn, keys};
+use crate::db::{self, Txn as DbTxn, keys};
 use crate::filter::FilterMode;
 use crate::ops;
 use crate::sparse_mst::sparse_probe_collection;
@@ -48,7 +48,18 @@ pub(crate) async fn process_did(
 
     let db = &app_state.db;
     let did_key = keys::repo_key(did);
-    let Some(state_bytes) = Db::get(db.repos.keyspace(), did_key).await? else {
+    let Some(state_bytes) = db
+        .run({
+            let did_key = did_key.clone();
+            move |db| {
+                db.repos
+                    .get(did_key)
+                    .inspect_err(crate::db::check_poisoned)
+                    .into_diagnostic()
+            }
+        })
+        .await?
+    else {
         return Err(BackfillError::Deleted);
     };
     let mut state: RepoState<'static> = rmp_serde::from_slice::<RepoState>(&state_bytes)
@@ -141,36 +152,24 @@ pub(crate) async fn process_did(
                     let app_state_clone = app_state.clone();
                     let did = did.clone();
                     let pending_key = pending_key.clone();
-                    tokio::task::spawn_blocking(move || {
-                        let mut batch = app_state_clone.db.inner.batch();
-                        let mut count_deltas = CountDeltas::default();
-                        let mut lifecycle_counts = app_state_clone.db.lifecycle_counts();
-                        let applied = lifecycle_counts.transition_pending_key(
-                            &mut batch,
+                    app_state_clone.db.run(move |db| {
+                        let mut txn = DbTxn::new(db);
+                        let applied = txn.transition_pending_key(
                             &did,
                             pending_key.as_ref(),
                             GaugeState::Synced,
                         )?;
-                        batch.remove(&app_state_clone.db.indexer.pending, pending_key.clone());
+                        txn.batch
+                            .remove(&db.indexer.pending, pending_key);
                         if applied {
-                            batch.remove(&app_state_clone.db.repos, &did_key);
-                            batch.remove(&app_state_clone.db.repo_metadata, &metadata_key);
-                            count_deltas.add_repos(-1);
+                            txn.batch.remove(&db.repos, &did_key);
+                            txn.batch
+                                .remove(&db.repo_metadata, &metadata_key);
+                            txn.counts.add_repos(-1);
                         }
-                        let lifecycle_reservation = lifecycle_counts.stage(&mut batch);
-                        let reservation = app_state_clone
-                            .db
-                            .stage_count_deltas(&mut batch, &count_deltas);
-                        batch.commit().into_diagnostic().inspect(|_| {
-                            app_state_clone
-                                .db
-                                .apply_lifecycle_counts(lifecycle_reservation);
-                            app_state_clone.db.apply_count_deltas(&count_deltas);
-                            drop(reservation);
-                        })
+                        txn.commit()
                     })
-                    .await
-                    .into_diagnostic()??;
+                    .await?;
 
                     return Ok(None);
                 }
@@ -226,23 +225,16 @@ pub(crate) async fn process_did(
         Err(XrpcError::Xrpc(e)) => {
             if matches!(e, GetRepoError::RepoNotFound(_)) {
                 warn!("repo not found, deleting");
-                let mut batch = db.inner.batch();
-                let mut lifecycle_counts = db.lifecycle_counts();
-                let applied = lifecycle_counts.transition_pending_key(
-                    &mut batch,
-                    did,
-                    pending_key.as_ref(),
-                    GaugeState::Synced,
-                )?;
-                batch.remove(&db.indexer.pending, pending_key.clone());
+                let mut txn = DbTxn::new(db);
+                let applied =
+                    txn.transition_pending_key(did, pending_key.as_ref(), GaugeState::Synced)?;
+                txn.batch.remove(&db.indexer.pending, pending_key.clone());
                 if applied {
-                    if let Err(e) = crate::ops::delete_repo(&mut batch, db, did, &state) {
+                    if let Err(e) = crate::ops::delete_repo(&mut txn.batch, db, did, &state) {
                         error!(err = %e, "failed to wipe repo during backfill");
                     }
                 }
-                let lifecycle_reservation = lifecycle_counts.stage(&mut batch);
-                batch.commit().into_diagnostic()?;
-                db.apply_lifecycle_counts(lifecycle_reservation);
+                txn.commit()?;
                 // return None so did_task skips sending BackfillFinished (nothing to drain for a deleted repo)
                 return Ok(None);
             }
@@ -268,20 +260,17 @@ pub(crate) async fn process_did(
                 let app_state_clone = app_state.clone();
                 let did = did.clone();
                 let pending_key = pending_key.clone();
-                tokio::task::spawn_blocking(move || {
-                    let db = &app_state_clone.db;
-                    let mut batch = db.inner.batch();
-                    let mut lifecycle_counts = db.lifecycle_counts();
-                    let applied = lifecycle_counts.transition_pending_key(
-                        &mut batch,
+                app_state_clone.db.run(move |db| {
+                    let mut txn = DbTxn::new(db);
+                    let applied = txn.transition_pending_key(
                         &did,
                         pending_key.as_ref(),
                         GaugeState::Resync(None),
                     )?;
-                    batch.remove(&db.indexer.pending, pending_key.clone());
+                    txn.batch.remove(&db.indexer.pending, pending_key.clone());
                     if applied {
-                        Db::update_repo_state(
-                            &mut batch,
+                        crate::db::Db::update_repo_state(
+                            &mut txn.batch,
                             &db.repos,
                             &did,
                             move |state, (key, batch)| {
@@ -292,13 +281,10 @@ pub(crate) async fn process_did(
                             },
                         )?;
                     }
-                    let lifecycle_reservation = lifecycle_counts.stage(&mut batch);
-                    batch.commit().into_diagnostic()?;
-                    db.apply_lifecycle_counts(lifecycle_reservation);
+                    txn.commit()?;
                     Ok::<_, miette::Report>(())
                 })
-                .await
-                .into_diagnostic()??;
+                .await?;
 
                 return Ok(None);
             }
@@ -544,32 +530,23 @@ pub(crate) async fn process_did(
         let backfill_pending_key = pending_key.clone();
         let app_state = app_state.clone();
         let did = did.clone();
-        tokio::task::spawn_blocking(move || {
-            let mut batch = app_state.db.inner.batch();
-            let mut count_deltas = CountDeltas::default();
-            let mut lifecycle_counts = app_state.db.lifecycle_counts();
-            let applied = lifecycle_counts.transition_pending_key(
-                &mut batch,
+        app_state.db.run(move |db| {
+            let mut txn = DbTxn::new(db);
+            let applied = txn.transition_pending_key(
                 &did,
                 backfill_pending_key.as_ref(),
                 GaugeState::Synced,
             )?;
-            batch.remove(&app_state.db.indexer.pending, backfill_pending_key.clone());
+            txn.batch
+                .remove(&db.indexer.pending, backfill_pending_key);
             if applied {
-                batch.remove(&app_state.db.repos, &did_key);
-                batch.remove(&app_state.db.repo_metadata, &metadata_key);
-                count_deltas.add_repos(-1);
+                txn.batch.remove(&db.repos, &did_key);
+                txn.batch.remove(&db.repo_metadata, &metadata_key);
+                txn.counts.add_repos(-1);
             }
-            let lifecycle_reservation = lifecycle_counts.stage(&mut batch);
-            let reservation = app_state.db.stage_count_deltas(&mut batch, &count_deltas);
-            batch.commit().into_diagnostic().inspect(|_| {
-                app_state.db.apply_lifecycle_counts(lifecycle_reservation);
-                app_state.db.apply_count_deltas(&count_deltas);
-                drop(reservation);
-            })
+            txn.commit()
         })
-        .await
-        .into_diagnostic()??;
+        .await?;
         return Ok(None);
     };
 

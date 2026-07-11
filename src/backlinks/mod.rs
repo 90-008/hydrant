@@ -117,8 +117,7 @@ impl BacklinksFetch {
 
     /// execute and return a page of backlink entries.
     pub async fn run(self) -> Result<BacklinksPage> {
-        tokio::task::spawn_blocking(move || {
-            let db = &self.state.db;
+        self.state.db.run(move |db| {
             let scan_prefix = store::reverse_scan_prefix(
                 &self.subject,
                 self.collection.as_deref(),
@@ -126,7 +125,7 @@ impl BacklinksFetch {
             );
 
             let iter: Box<dyn Iterator<Item = _>> = if !self.reverse {
-                if let Some(ref cursor_bytes) = self.cursor {
+                if let Some(cursor_bytes) = &self.cursor {
                     Box::new(db.backlinks.range::<&[u8], _>((
                         Bound::Excluded(cursor_bytes.as_slice()),
                         Bound::Unbounded,
@@ -137,7 +136,7 @@ impl BacklinksFetch {
             } else {
                 // for reverse scans, bound the end at the cursor (exclusive) or the
                 // prefix end (increment last byte to get an exclusive upper bound)
-                let end: Vec<u8> = if let Some(ref cursor_bytes) = self.cursor {
+                let end: Vec<u8> = if let Some(cursor_bytes) = &self.cursor {
                     cursor_bytes.clone()
                 } else {
                     let mut end = scan_prefix.clone();
@@ -192,7 +191,6 @@ impl BacklinksFetch {
             })
         })
         .await
-        .into_diagnostic()?
     }
 }
 
@@ -238,8 +236,7 @@ impl BacklinksCount {
 
     /// execute and return the total count of matching entries.
     pub async fn run(self) -> Result<u64> {
-        tokio::task::spawn_blocking(move || {
-            let db = &self.state.db;
+        self.state.db.run(move |db| {
             let scan_prefix = store::reverse_scan_prefix(
                 &self.subject,
                 self.collection.as_deref(),
@@ -264,6 +261,5 @@ impl BacklinksCount {
             }
         })
         .await
-        .into_diagnostic()?
     }
 }

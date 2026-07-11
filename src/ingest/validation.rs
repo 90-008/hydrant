@@ -1,10 +1,10 @@
 use jacquard_common::IntoStatic;
 use jacquard_common::types::crypto::PublicKey;
+use jacquard_repo::MemoryBlockStore;
 use jacquard_repo::Mst;
 use jacquard_repo::car::reader::{ParsedCar, parse_car_bytes};
 use jacquard_repo::commit::Commit as AtpCommit;
 use jacquard_repo::mst::VerifiedWriteOp;
-use jacquard_repo::MemoryBlockStore;
 use miette::IntoDiagnostic;
 use smol_str::ToSmolStr;
 use std::sync::Arc;

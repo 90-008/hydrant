@@ -51,15 +51,15 @@ impl PdsControl {
         F: FnOnce(&mut fjall::OwnedWriteBatch, &fjall::Keyspace) + Send + 'static,
         G: FnOnce(&mut PdsMeta),
     {
-        let state = self.0.clone();
-        tokio::task::spawn_blocking(move || -> Result<()> {
-            let mut batch = state.db.inner.batch();
-            db_op(&mut batch, &state.db.filter);
-            batch.commit().into_diagnostic()?;
-            state.db.persist()
-        })
-        .await
-        .into_diagnostic()??;
+        self.0
+            .db
+            .run(move |db| {
+                let mut batch = db.inner.batch();
+                db_op(&mut batch, &db.filter);
+                batch.commit().into_diagnostic()?;
+                db.persist()
+            })
+            .await?;
 
         let mut snapshot = (**self.0.pds_meta.load()).clone();
         mem_op(&mut snapshot);

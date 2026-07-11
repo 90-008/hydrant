@@ -1,6 +1,6 @@
 use crate::types::{RepoMetadata, RepoState};
 
-use fjall::{Database, Keyspace, PersistMode, Slice};
+use fjall::{Database, Keyspace, PersistMode};
 use miette::{Context, IntoDiagnostic, Result};
 use scc::HashMap;
 use smol_str::SmolStr;
@@ -14,7 +14,7 @@ use url::Url;
 pub mod compaction;
 pub mod counts;
 #[cfg(feature = "indexer")]
-pub(crate) use counts::CountDeltaReservation;
+use counts::CountDeltaReservation;
 pub use counts::{CountDeltas, load_count_delta_watermark, set_ks_count};
 pub mod ephemeral;
 pub mod filter;
@@ -30,7 +30,6 @@ mod open;
 pub mod registry;
 pub mod schema;
 mod train;
-#[cfg(feature = "indexer")]
 mod txn;
 
 #[cfg(feature = "indexer")]
@@ -45,12 +44,12 @@ pub use keyspaces::StreamDb;
 pub use schema::Ks;
 
 #[cfg(feature = "indexer")]
-pub(crate) use lifecycle_counts::LifecycleCountBatch;
-#[cfg(feature = "indexer")]
-pub(crate) use txn::Txn;
+use lifecycle_counts::LifecycleCountBatch;
+pub(crate) use txn::{Txn, TxnCommitTimings};
 
 use tracing::error;
 
+#[derive(Clone)]
 pub struct Db {
     pub inner: Arc<Database>,
     pub path: std::path::PathBuf,
@@ -70,7 +69,7 @@ pub struct Db {
     pub(crate) relay: RelayDb,
     #[cfg(feature = "backlinks")]
     pub(crate) backlinks: Ks<schema::Backlinks>,
-    pub counts_map: HashMap<SmolStr, u64>,
+    pub counts_map: Arc<HashMap<SmolStr, u64>>,
     next_count_delta_id: Arc<AtomicU64>,
     count_delta_checkpoint_watermark: Arc<AtomicU64>,
     count_delta_gc_watermark: Arc<AtomicU64>,
@@ -79,6 +78,18 @@ pub struct Db {
 }
 
 impl Db {
+    /// runs synchronous database work without blocking the async runtime.
+    pub async fn run<T, F>(&self, f: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&Db) -> Result<T> + Send + 'static,
+    {
+        let db = self.clone();
+        tokio::task::spawn_blocking(move || f(&db))
+            .await
+            .into_diagnostic()?
+    }
+
     pub fn persist(&self) -> Result<()> {
         #[cfg(not(feature = "__persist_sync_all"))]
         const MODE: PersistMode = PersistMode::Buffer;
@@ -121,15 +132,6 @@ impl Db {
 
         Ok(())
     }
-
-    pub async fn get(ks: Keyspace, key: impl Into<Slice>) -> Result<Option<Slice>> {
-        let key = key.into();
-        tokio::task::spawn_blocking(move || {
-            ks.get(key).inspect_err(check_poisoned).into_diagnostic()
-        })
-        .await
-        .into_diagnostic()?
-    }
 }
 
 #[cfg(feature = "indexer")]
@@ -155,9 +157,9 @@ pub fn set_firehose_cursor(db: &Db, relay: &Url, cursor: i64) -> Result<()> {
 
 pub async fn get_firehose_cursor(db: &Db, relay: &Url) -> Result<Option<i64>> {
     let key = keys::firehose_cursor_key_from_url(relay);
-    Db::get(db.cursors.keyspace(), key)
+    db.run(move |db| db.cursors.get(key).into_diagnostic())
         .await?
-        .map(|v: Slice| {
+        .map(|v| {
             Ok(i64::from_be_bytes(
                 v.as_ref()
                     .try_into()

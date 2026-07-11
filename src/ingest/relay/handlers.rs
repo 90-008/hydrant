@@ -142,8 +142,14 @@ impl RelayWorker {
 
         let repo_key = keys::repo_key(&identity.did);
 
-        ctx.sink
-            .identity(ctx.state, &mut ctx.batch, firehose, identity, repo_state, snapshot)?;
+        ctx.sink.identity(
+            ctx.state,
+            &mut ctx.batch,
+            firehose,
+            identity,
+            repo_state,
+            snapshot,
+        )?;
 
         ctx.batch.insert(
             &ctx.state.db.repos,

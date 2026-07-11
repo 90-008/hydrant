@@ -147,23 +147,23 @@ impl CrawlerHandle {
 
     /// delete all cursor entries associated with the given URL.
     pub async fn reset_cursor(&self, url: &str) -> Result<()> {
-        let state = self.state.clone();
         let point_keys = [keys::crawler_cursor_key(url)];
         let by_collection_prefix = keys::by_collection_cursor_prefix(url);
-        tokio::task::spawn_blocking(move || {
-            let mut batch = state.db.inner.batch();
-            for k in point_keys {
-                batch.remove(&state.db.cursors, k);
-            }
-            for entry in state.db.cursors.prefix(&by_collection_prefix) {
-                let k = entry.key().into_diagnostic()?;
-                batch.remove(&state.db.cursors, k);
-            }
-            batch.commit().into_diagnostic()?;
-            state.db.persist()
-        })
-        .await
-        .into_diagnostic()??;
+        self.state
+            .db
+            .run(move |db| {
+                let mut batch = db.inner.batch();
+                for k in point_keys {
+                    batch.remove(&db.cursors, k);
+                }
+                for entry in db.cursors.prefix(&by_collection_prefix) {
+                    let k = entry.key().into_diagnostic()?;
+                    batch.remove(&db.cursors, k);
+                }
+                batch.commit().into_diagnostic()?;
+                db.persist()
+            })
+            .await?;
         Ok(())
     }
 
@@ -196,15 +196,15 @@ impl CrawlerHandle {
             miette::bail!("crawler not yet started: call Hydrant::run() first");
         };
 
-        let state = self.state.clone();
         let key = keys::crawler_source_key(source.url.as_str());
         let val = rmp_serde::to_vec(&source.mode).into_diagnostic()?;
-        tokio::task::spawn_blocking(move || {
-            state.db.crawler.insert(key, val).into_diagnostic()?;
-            state.db.persist()
-        })
-        .await
-        .into_diagnostic()??;
+        self.state
+            .db
+            .run(move |db| {
+                db.crawler.insert(key, val).into_diagnostic()?;
+                db.persist()
+            })
+            .await?;
 
         let enabled_rx = self.state.crawler_enabled.subscribe();
         let handle = spawn_crawler_producer(
@@ -250,14 +250,14 @@ impl CrawlerHandle {
 
         // remove from DB if it was a persisted source
         if self.persisted.remove_async(url).await.is_some() {
-            let state = self.state.clone();
             let key = keys::crawler_source_key(url.as_str());
-            tokio::task::spawn_blocking(move || {
-                state.db.crawler.remove(key).into_diagnostic()?;
-                state.db.persist()
-            })
-            .await
-            .into_diagnostic()??;
+            self.state
+                .db
+                .run(move |db| {
+                    db.crawler.remove(key).into_diagnostic()?;
+                    db.persist()
+                })
+                .await?;
         }
 
         Ok(true)

@@ -26,51 +26,53 @@ pub async fn handle(
         .transpose()
         .map_err(|e| bad_request(nsid, e))?;
 
-    let (repos, next_cursor) = tokio::task::spawn_blocking(move || {
-        let mut repos: Vec<Repo<'static>> = Vec::new();
-        let mut next_cursor: Option<Did<'static>> = None;
+    let (repos, next_cursor) = hydrant
+        .state
+        .db
+        .run(move |_db| {
+            let mut repos: Vec<Repo<'static>> = Vec::new();
+            let mut next_cursor: Option<Did<'static>> = None;
 
-        for item in hydrant.repos.iter_states(cursor.as_ref()) {
-            let (did, state) = item?;
+            for item in hydrant.repos.iter_states(cursor.as_ref()) {
+                let (did, state) = item?;
 
-            // skip repos that haven't been synced at least once
-            let Some(commit) = state.root else {
-                continue;
-            };
+                // skip repos that haven't been synced at least once
+                let Some(commit) = state.root else {
+                    continue;
+                };
 
-            let Some(atp_commit) = commit.into_atp_commit(did.clone()) else {
-                tracing::warn!(did = %did, "repo needs migration");
-                continue;
-            };
+                let Some(atp_commit) = commit.into_atp_commit(did.clone()) else {
+                    tracing::warn!(did = %did, "repo needs migration");
+                    continue;
+                };
 
-            let Ok(commit_cid) = atp_commit.to_cid() else {
-                tracing::warn!(did = %did, "failed to compute commit CID");
-                continue;
-            };
+                let Ok(commit_cid) = atp_commit.to_cid() else {
+                    tracing::warn!(did = %did, "failed to compute commit CID");
+                    continue;
+                };
 
-            let status = repo_status_to_api(state.status);
-            let repo = Repo {
-                active: Some(state.active),
-                did: did.clone(),
-                head: Cid::Str(CowStr::Owned(commit_cid.to_smolstr())),
-                rev: atp_commit.rev,
-                status,
-                extra_data: None,
-            };
+                let status = repo_status_to_api(state.status);
+                let repo = Repo {
+                    active: Some(state.active),
+                    did: did.clone(),
+                    head: Cid::Str(CowStr::Owned(commit_cid.to_smolstr())),
+                    rev: atp_commit.rev,
+                    status,
+                    extra_data: None,
+                };
 
-            if repos.len() < limit {
-                repos.push(repo);
-            } else {
-                next_cursor = repos.last().map(|r| r.did.clone());
-                break;
+                if repos.len() < limit {
+                    repos.push(repo);
+                } else {
+                    next_cursor = repos.last().map(|r| r.did.clone());
+                    break;
+                }
             }
-        }
 
-        Ok::<_, miette::Report>((repos, next_cursor))
-    })
-    .await
-    .map_err(|e| internal_error(nsid, e))?
-    .map_err(|e| internal_error(nsid, e))?;
+            Ok::<_, miette::Report>((repos, next_cursor))
+        })
+        .await
+        .map_err(|e| internal_error(nsid, e))?;
 
     Ok(Json(ListReposOutput {
         cursor: next_cursor.map(|d| CowStr::Owned(d.as_str().to_smolstr())),

@@ -10,9 +10,7 @@ pub use kinds::*;
 #[cfg(not(feature = "firehose-diagnostics"))]
 pub use noop::*;
 #[cfg(feature = "firehose-diagnostics")]
-pub use relay::{
-    RelayShardStats, RelayWorkerStats, RelayWorkerStatsSnapshot,
-};
+pub use relay::{RelayShardStats, RelayWorkerStats, RelayWorkerStatsSnapshot};
 #[cfg(feature = "firehose-diagnostics")]
 pub use source::{FirehoseSourceStats, FirehoseStats, FirehoseStatsSnapshot};
 

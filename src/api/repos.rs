@@ -12,7 +12,6 @@ use axum::{
     routing::get,
 };
 use jacquard_common::types::did::Did;
-use miette::IntoDiagnostic;
 use serde::Deserialize;
 
 pub fn router() -> Router<Hydrant> {
@@ -54,17 +53,18 @@ pub async fn handle_get_repos(
         .transpose()
         .map_err(bad_request)?;
 
-    let items = tokio::task::spawn_blocking(move || {
-        hydrant
-            .repos
-            .iter(cursor.as_ref())
-            .take(limit)
-            .collect::<miette::Result<Vec<_>>>()
-    })
-    .await
-    .into_diagnostic()
-    .flatten()
-    .map_err(internal)?;
+    let items = hydrant
+        .state
+        .db
+        .run(move |_db| {
+            hydrant
+                .repos
+                .iter(cursor.as_ref())
+                .take(limit)
+                .collect::<miette::Result<Vec<_>>>()
+        })
+        .await
+        .map_err(internal)?;
 
     if prefers_json(&headers) {
         return Ok(Json(items).into_response());

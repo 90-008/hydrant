@@ -217,7 +217,7 @@ fn get_persisted_ks_count(db: &Db, name: &str) -> Result<u64> {
 }
 
 impl Db {
-    pub(crate) fn stage_count_deltas(
+    pub(super) fn stage_count_deltas(
         &self,
         batch: &mut OwnedWriteBatch,
         deltas: &CountDeltas,
@@ -248,7 +248,7 @@ impl Db {
         })
     }
 
-    pub(crate) fn apply_count_deltas(&self, deltas: &CountDeltas) {
+    pub(super) fn apply_count_deltas(&self, deltas: &CountDeltas) {
         for (key, delta) in deltas.iter() {
             self.update_count(key, *delta);
         }

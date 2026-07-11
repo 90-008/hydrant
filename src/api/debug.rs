@@ -10,6 +10,7 @@ use axum::{
 };
 #[cfg(feature = "indexer")]
 use jacquard_common::types::ident::AtIdentifier;
+use miette::IntoDiagnostic;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::Arc;
@@ -59,25 +60,25 @@ pub async fn handle_debug_count(
         .await
         .map_err(|_| StatusCode::BAD_REQUEST)?;
 
-    let db = &state.db;
-    let ks = db
-        .keyspace_by_name("records")
-        .expect("records keyspace exists in indexer mode");
-
-    // {TrimmedDid}|{collection}|
     let prefix = keys::record_prefix_collection(&did, &req.collection);
 
-    let count = tokio::task::spawn_blocking(move || {
-        let start_key = prefix.clone();
-        let mut end_key = prefix.clone();
-        if let Some(msg) = end_key.last_mut() {
-            *msg += 1;
-        }
+    let count = state
+        .db
+        .run(move |db| {
+            let ks = db
+                .keyspace_by_name("records")
+                .expect("records keyspace exists in indexer mode");
 
-        ks.range(start_key..end_key).count()
-    })
-    .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            let start_key = prefix.clone();
+            let mut end_key = prefix.clone();
+            if let Some(msg) = end_key.last_mut() {
+                *msg += 1;
+            }
+
+            Ok::<_, miette::Report>(ks.range(start_key..end_key).count())
+        })
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     Ok(Json(DebugCountResponse { count }))
 }
@@ -102,7 +103,13 @@ pub async fn handle_debug_get(
     let key = registry::debug_parse_key(&req.partition, &req.key).ok_or(StatusCode::BAD_REQUEST)?;
 
     let partition = req.partition.clone();
-    let value = crate::db::Db::get(ks, key)
+    let value = state
+        .db
+        .run(move |_| {
+            ks.get(key)
+                .inspect_err(crate::db::check_poisoned)
+                .into_diagnostic()
+        })
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .map(|v| registry::debug_value(&partition, &v));
@@ -128,7 +135,6 @@ pub async fn handle_debug_iter(
     State(state): State<Arc<AppState>>,
     Query(req): Query<DebugIterRequest>,
 ) -> Result<Json<DebugIterResponse>, StatusCode> {
-    let ks = get_keyspace_by_name(&state.db, &req.partition)?;
     let partition = req.partition.clone();
 
     let parse_bound = |s: Option<String>| -> Result<Option<Vec<u8>>, StatusCode> {
@@ -139,55 +145,59 @@ pub async fn handle_debug_iter(
     let start = parse_bound(req.start)?;
     let end = parse_bound(req.end)?;
 
-    let items = tokio::task::spawn_blocking(move || {
-        let limit = req.limit.unwrap_or(50);
+    let items = state
+        .db
+        .run(move |db| {
+            let ks = get_keyspace_by_name(db, &req.partition)
+                .map_err(|_| miette::miette!("bad request"))?;
+            let limit = req.limit.unwrap_or(50);
 
-        let collect = |iter: &mut dyn Iterator<Item = fjall::Guard>| {
-            let mut items = Vec::new();
-            for guard in iter.take(limit) {
-                let (k, v) = guard
-                    .into_inner()
-                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            let collect = |iter: &mut dyn Iterator<Item = fjall::Guard>| {
+                let mut items = Vec::new();
+                for guard in iter.take(limit) {
+                    let (k, v) = guard
+                        .into_inner()
+                        .map_err(|_| miette::miette!("internal error"))?;
 
-                let key_str = registry::debug_render_key(&partition, &k);
+                    let key_str = registry::debug_render_key(&partition, &k);
 
-                items.push((key_str, registry::debug_value(&partition, &v)));
-            }
-            Ok::<_, StatusCode>(items)
-        };
+                    items.push((key_str, registry::debug_value(&partition, &v)));
+                }
+                Ok::<_, miette::Report>(items)
+            };
 
-        let start_bound = if let Some(ref s) = start {
-            std::ops::Bound::Included(s.as_slice())
-        } else {
-            std::ops::Bound::Unbounded
-        };
+            let start_bound = if let Some(s) = &start {
+                std::ops::Bound::Included(s.as_slice())
+            } else {
+                std::ops::Bound::Unbounded
+            };
 
-        let end_bound = if let Some(ref e) = end {
-            std::ops::Bound::Included(e.as_slice())
-        } else {
-            std::ops::Bound::Unbounded
-        };
+            let end_bound = if let Some(e) = &end {
+                std::ops::Bound::Included(e.as_slice())
+            } else {
+                std::ops::Bound::Unbounded
+            };
 
-        if req.reverse == Some(true) {
-            collect(
-                &mut ks
-                    .range::<&[u8], (std::ops::Bound<&[u8]>, std::ops::Bound<&[u8]>)>((
+            if req.reverse == Some(true) {
+                collect(
+                    &mut ks
+                        .range::<&[u8], (std::ops::Bound<&[u8]>, std::ops::Bound<&[u8]>)>((
+                            start_bound,
+                            end_bound,
+                        ))
+                        .rev(),
+                )
+            } else {
+                collect(
+                    &mut ks.range::<&[u8], (std::ops::Bound<&[u8]>, std::ops::Bound<&[u8]>)>((
                         start_bound,
                         end_bound,
-                    ))
-                    .rev(),
-            )
-        } else {
-            collect(
-                &mut ks.range::<&[u8], (std::ops::Bound<&[u8]>, std::ops::Bound<&[u8]>)>((
-                    start_bound,
-                    end_bound,
-                )),
-            )
-        }
-    })
-    .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)??;
+                    )),
+                )
+            }
+        })
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     Ok(Json(DebugIterResponse { items }))
 }
@@ -205,18 +215,21 @@ pub async fn handle_debug_compact(
     State(state): State<Arc<AppState>>,
     Query(req): Query<DebugCompactRequest>,
 ) -> Result<StatusCode, StatusCode> {
-    let ks = get_keyspace_by_name(&state.db, &req.partition)?;
-    let state_clone = state.clone();
-
-    tokio::task::spawn_blocking(move || {
-        ks.remove(b"dummy_tombstone123")?;
-        state_clone.db.inner.persist(fjall::PersistMode::Buffer)?;
-        ks.rotate_memtable_and_wait()?;
-        ks.major_compact()
-    })
-    .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    state
+        .db
+        .run(move |db| {
+            let ks = get_keyspace_by_name(db, &req.partition)
+                .map_err(|_| miette::miette!("bad request"))?;
+            ks.remove(b"dummy_tombstone123").into_diagnostic()?;
+            db.inner
+                .persist(fjall::PersistMode::Buffer)
+                .into_diagnostic()?;
+            ks.rotate_memtable_and_wait().into_diagnostic()?;
+            ks.major_compact().into_diagnostic()?;
+            Ok::<_, miette::Report>(())
+        })
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     Ok(StatusCode::OK)
 }
@@ -225,18 +238,20 @@ pub async fn handle_debug_compact(
 pub async fn handle_debug_ephemeral_ttl_tick(
     State(state): State<Arc<AppState>>,
 ) -> Result<StatusCode, StatusCode> {
-    tokio::task::spawn_blocking(move || -> miette::Result<()> {
-        #[cfg(feature = "indexer_stream")]
-        crate::db::ephemeral::ephemeral_ttl_tick(&state.db, &state.ephemeral_ttl)?;
-        #[cfg(feature = "relay")]
-        crate::db::ephemeral::relay_events_ttl_tick(&state.db, &state.ephemeral_ttl)?;
-        #[cfg(feature = "jetstream")]
-        crate::db::ephemeral::jetstream_events_ttl_tick(&state.db, &state.ephemeral_ttl)?;
-        Ok(())
-    })
-    .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let ephemeral_ttl = state.ephemeral_ttl.clone();
+    state
+        .db
+        .run(move |db| {
+            #[cfg(feature = "indexer_stream")]
+            crate::db::ephemeral::ephemeral_ttl_tick(db, &ephemeral_ttl)?;
+            #[cfg(feature = "relay")]
+            crate::db::ephemeral::relay_events_ttl_tick(db, &ephemeral_ttl)?;
+            #[cfg(feature = "jetstream")]
+            crate::db::ephemeral::jetstream_events_ttl_tick(db, &ephemeral_ttl)?;
+            Ok::<_, miette::Report>(())
+        })
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     Ok(StatusCode::OK)
 }
@@ -258,29 +273,27 @@ pub async fn handle_debug_seed_watermark(
     State(state): State<Arc<AppState>>,
     Query(req): Query<DebugSeedWatermarkRequest>,
 ) -> Result<StatusCode, StatusCode> {
-    tokio::task::spawn_blocking(move || -> Result<(), StatusCode> {
-        #[cfg(feature = "indexer_stream")]
-        state
-            .db
-            .cursors
-            .insert(
-                crate::db::keys::event_watermark_key(req.ts),
-                req.event_id.to_be_bytes(),
-            )
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        #[cfg(feature = "relay")]
-        state
-            .db
-            .cursors
-            .insert(
-                crate::db::keys::relay_event_watermark_key(req.ts),
-                req.event_id.to_be_bytes(),
-            )
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        Ok(())
-    })
-    .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)??;
+    state
+        .db
+        .run(move |db| {
+            #[cfg(feature = "indexer_stream")]
+            db.cursors
+                .insert(
+                    crate::db::keys::event_watermark_key(req.ts),
+                    req.event_id.to_be_bytes(),
+                )
+                .into_diagnostic()?;
+            #[cfg(feature = "relay")]
+            db.cursors
+                .insert(
+                    crate::db::keys::relay_event_watermark_key(req.ts),
+                    req.event_id.to_be_bytes(),
+                )
+                .into_diagnostic()?;
+            Ok::<_, miette::Report>(())
+        })
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     Ok(StatusCode::OK)
 }
@@ -297,50 +310,50 @@ pub async fn handle_debug_seed_events(
     State(state): State<Arc<AppState>>,
     Query(req): Query<DebugSeedEventsRequest>,
 ) -> Result<StatusCode, StatusCode> {
-    tokio::task::spawn_blocking(move || -> Result<(), StatusCode> {
-        let mut batch = state.db.inner.batch();
-        if req.partition == "events" {
-            #[cfg(feature = "indexer_stream")]
-            {
-                for _ in 0..req.count {
-                    let seq = state
-                        .db
-                        .stream
-                        .next_event_id
-                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    state.db.stream.stage_event(
-                        &mut batch,
-                        crate::db::keys::event_key(seq),
-                        b"dummy",
-                    );
+    if req.partition != "events" && req.partition != "relay_events" {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    state
+        .db
+        .run(move |db| {
+            let mut batch = db.inner.batch();
+            if req.partition == "events" {
+                #[cfg(feature = "indexer_stream")]
+                {
+                    for _ in 0..req.count {
+                        let seq = db
+                            .stream
+                            .next_event_id
+                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        db.stream.stage_event(
+                            &mut batch,
+                            crate::db::keys::event_key(seq),
+                            b"dummy",
+                        );
+                    }
+                }
+            } else if req.partition == "relay_events" {
+                #[cfg(feature = "relay")]
+                {
+                    for _ in 0..req.count {
+                        let seq = db
+                            .relay
+                            .next_seq
+                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        batch.insert(
+                            &db.relay.events,
+                            crate::db::keys::relay_event_key(seq),
+                            b"dummy",
+                        );
+                    }
                 }
             }
-        } else if req.partition == "relay_events" {
-            #[cfg(feature = "relay")]
-            {
-                for _ in 0..req.count {
-                    let seq = state
-                        .db
-                        .relay
-                        .next_seq
-                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    batch.insert(
-                        &state.db.relay.events,
-                        crate::db::keys::relay_event_key(seq),
-                        b"dummy",
-                    );
-                }
-            }
-        } else {
-            return Err(StatusCode::BAD_REQUEST);
-        }
-        batch
-            .commit()
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        Ok(())
-    })
-    .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)??;
+            batch.commit().into_diagnostic()?;
+            Ok::<_, miette::Report>(())
+        })
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     Ok(StatusCode::OK)
 }

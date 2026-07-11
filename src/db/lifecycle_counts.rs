@@ -9,25 +9,26 @@ use crate::types::{GaugeState, ResyncErrorKind, ResyncState};
 
 use super::{CountDeltaReservation, CountDeltas, Db, deser_repo_meta, keys};
 
-pub(crate) struct LifecycleCountBatch<'a> {
+pub(super) struct LifecycleCountBatch<'a> {
     db: &'a Db,
     _lock: MutexGuard<'a, ()>,
     deltas: CountDeltas,
     staged: BTreeMap<Vec<u8>, GaugeState>,
 }
 
-pub(crate) struct LifecycleCountReservation<'a> {
+pub(super) struct LifecycleCountReservation<'a> {
     _lock: MutexGuard<'a, ()>,
     _count_reservation: Option<CountDeltaReservation>,
     deltas: CountDeltas,
 }
 
 impl Db {
-    pub(crate) fn lifecycle_counts(&self) -> LifecycleCountBatch<'_> {
+    pub(super) fn lifecycle_counts(&self) -> LifecycleCountBatch<'_> {
         LifecycleCountBatch {
             db: self,
             _lock: self
-                .indexer.lifecycle_count_lock
+                .indexer
+                .lifecycle_count_lock
                 .lock()
                 .expect("lifecycle count lock poisoned"),
             deltas: CountDeltas::default(),
@@ -35,14 +36,14 @@ impl Db {
         }
     }
 
-    pub(crate) fn apply_lifecycle_counts(&self, reservation: LifecycleCountReservation<'_>) {
+    pub(super) fn apply_lifecycle_counts(&self, reservation: LifecycleCountReservation<'_>) {
         self.apply_count_deltas(&reservation.deltas);
         drop(reservation);
     }
 }
 
 impl<'a> LifecycleCountBatch<'a> {
-    pub(crate) fn transition(
+    pub(super) fn transition(
         &mut self,
         batch: &mut OwnedWriteBatch,
         did: &Did<'_>,
@@ -64,7 +65,7 @@ impl<'a> LifecycleCountBatch<'a> {
         Ok(false)
     }
 
-    pub(crate) fn transition_pending_key(
+    pub(super) fn transition_pending_key(
         &mut self,
         batch: &mut OwnedWriteBatch,
         did: &Did<'_>,
@@ -79,7 +80,7 @@ impl<'a> LifecycleCountBatch<'a> {
         Ok(true)
     }
 
-    pub(crate) fn stage(self, batch: &mut OwnedWriteBatch) -> LifecycleCountReservation<'a> {
+    pub(super) fn stage(self, batch: &mut OwnedWriteBatch) -> LifecycleCountReservation<'a> {
         let count_reservation = self.db.stage_count_deltas(batch, &self.deltas);
         LifecycleCountReservation {
             _lock: self._lock,
@@ -112,7 +113,8 @@ impl<'a> LifecycleCountBatch<'a> {
             if let Some(index_id) = index_id {
                 if self
                     .db
-                    .indexer.pending
+                    .indexer
+                    .pending
                     .get(keys::pending_key(index_id))
                     .into_diagnostic()?
                     .is_some()
@@ -123,7 +125,9 @@ impl<'a> LifecycleCountBatch<'a> {
 
             let gauge = if is_pending {
                 GaugeState::Pending
-            } else if let Some(resync_bytes) = self.db.indexer.resync.get(did_key).into_diagnostic()? {
+            } else if let Some(resync_bytes) =
+                self.db.indexer.resync.get(did_key).into_diagnostic()?
+            {
                 gauge_from_resync(&resync_bytes)
             } else {
                 GaugeState::Synced
@@ -141,7 +145,13 @@ impl<'a> LifecycleCountBatch<'a> {
         };
 
         Ok(current.as_slice() == pending_key
-            && self.db.indexer.pending.get(current).into_diagnostic()?.is_some())
+            && self
+                .db
+                .indexer
+                .pending
+                .get(current)
+                .into_diagnostic()?
+                .is_some())
     }
 
     fn stage_membership(
@@ -301,7 +311,13 @@ mod tests {
         assert_eq!(db.get_count_sync("pending"), 1);
         assert!(!complete_pending(&db, &did, stale_pending)?);
         assert_eq!(db.get_count_sync("pending"), 1);
-        assert!(db.indexer.pending.get(current_pending).into_diagnostic()?.is_some());
+        assert!(
+            db.indexer
+                .pending
+                .get(current_pending)
+                .into_diagnostic()?
+                .is_some()
+        );
 
         Ok(())
     }
@@ -337,7 +353,8 @@ mod tests {
             let db = Db::open(&cfg)?;
             assert_eq!(db.get_count_sync("pending"), 0);
             assert!(
-                db.indexer.pending
+                db.indexer
+                    .pending
                     .get(keys::pending_key(1))
                     .into_diagnostic()?
                     .is_none()

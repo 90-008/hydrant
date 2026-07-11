@@ -307,20 +307,21 @@ impl FirehoseHandle {
 
         // persist to db first
         let key = keys::firehose_source_key(url.as_str());
-        tokio::task::spawn_blocking({
-            let state = self.state.clone();
-            move || {
-                let mut batch = state.db.inner.batch();
-                let value = rmp_serde::to_vec(&db::FirehoseSourceMeta { is_pds }).map_err(|e| {
-                    miette::miette!("failed to serialize firehose source meta: {e}")
-                })?;
-                batch.insert(&state.db.crawler, key, &value);
-                batch.commit().into_diagnostic()?;
-                state.db.persist()
-            }
-        })
-        .await
-        .into_diagnostic()??;
+        self.state
+            .db
+            .run({
+                let is_pds = is_pds;
+                move |db| {
+                    let mut batch = db.inner.batch();
+                    let value = rmp_serde::to_vec(&db::FirehoseSourceMeta { is_pds }).map_err(|e| {
+                        miette::miette!("failed to serialize firehose source meta: {e}")
+                    })?;
+                    batch.insert(&db.crawler, key, &value);
+                    batch.commit().into_diagnostic()?;
+                    db.persist()
+                }
+            })
+            .await?;
 
         let _ = self.known_sources.upsert_async(url.clone(), is_pds).await;
 
@@ -359,30 +360,30 @@ impl FirehoseHandle {
             return Ok(0);
         }
 
-        tokio::task::spawn_blocking({
-            let state = self.state.clone();
-            let sources = sources.clone();
-            move || {
-                let mut batch = state.db.inner.batch();
-                for source in &sources {
-                    let value = rmp_serde::to_vec(&db::FirehoseSourceMeta {
-                        is_pds: source.is_pds,
-                    })
-                    .map_err(|e| {
-                        miette::miette!("failed to serialize firehose source meta: {e}")
-                    })?;
-                    batch.insert(
-                        &state.db.crawler,
-                        keys::firehose_source_key(source.url.as_str()),
-                        &value,
-                    );
+        self.state
+            .db
+            .run({
+                let sources = sources.clone();
+                move |db| {
+                    let mut batch = db.inner.batch();
+                    for source in &sources {
+                        let value = rmp_serde::to_vec(&db::FirehoseSourceMeta {
+                            is_pds: source.is_pds,
+                        })
+                        .map_err(|e| {
+                            miette::miette!("failed to serialize firehose source meta: {e}")
+                        })?;
+                        batch.insert(
+                            &db.crawler,
+                            keys::firehose_source_key(source.url.as_str()),
+                            &value,
+                        );
+                    }
+                    batch.commit().into_diagnostic()?;
+                    db.persist()
                 }
-                batch.commit().into_diagnostic()?;
-                state.db.persist()
-            }
-        })
-        .await
-        .into_diagnostic()??;
+            })
+            .await?;
 
         let mut added = 0usize;
         for source in sources {
@@ -408,19 +409,15 @@ impl FirehoseHandle {
     pub async fn remove_source(&self, url: &Url) -> Result<bool> {
         if self.known_sources.contains_async(url).await {
             let url_str = url.to_string();
-            tokio::task::spawn_blocking({
-                let state = self.state.clone();
-                move || {
-                    state
-                        .db
-                        .crawler
+            self.state
+                .db
+                .run(move |db| {
+                    db.crawler
                         .remove(keys::firehose_source_key(&url_str))
                         .into_diagnostic()?;
-                    state.db.persist()
-                }
-            })
-            .await
-            .into_diagnostic()??;
+                    db.persist()
+                })
+                .await?;
             self.known_sources.remove_async(url).await;
         }
 
@@ -446,15 +443,13 @@ impl FirehoseHandle {
     pub async fn reset_cursor(&self, url: &str) -> Result<()> {
         let url = Url::parse(url).into_diagnostic()?;
         let key = keys::firehose_cursor_key_from_url(&url);
-        tokio::task::spawn_blocking({
-            let state = self.state.clone();
-            move || {
-                state.db.cursors.remove(key).into_diagnostic()?;
-                state.db.persist()
-            }
-        })
-        .await
-        .into_diagnostic()??;
+        self.state
+            .db
+            .run(move |db| {
+                db.cursors.remove(key).into_diagnostic()?;
+                db.persist()
+            })
+            .await?;
 
         self.state.firehose_cursors.remove_async(&url).await;
 

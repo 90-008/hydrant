@@ -1,18 +1,52 @@
+#[cfg(feature = "indexer")]
 use std::collections::HashMap;
+use std::time::Duration;
 
+#[cfg(feature = "indexer")]
 use bytes::Bytes;
-use jacquard_common::IntoStatic;
+#[cfg(feature = "indexer")]
 use jacquard_common::types::cid::IpldCid;
+#[cfg(feature = "indexer")]
 use jacquard_common::types::did::Did;
 use miette::{IntoDiagnostic, Result};
 
+#[cfg(feature = "indexer")]
 use crate::db::types::{DbAction, DbRkey, DbTid};
-use crate::db::{CountDeltas, Db, keys};
+use crate::db::{CountDeltas, Db};
+#[cfg(feature = "indexer")]
+use crate::db::{LifecycleCountBatch, keys};
+#[cfg(feature = "indexer")]
 use crate::ops::record_events::{EmitOp, RecordEmitter, RecordEventOrigin, RecordEvents};
+#[cfg(feature = "indexer")]
 use crate::state::AppState;
 #[cfg(feature = "indexer")]
-use crate::types::GaugeState;
-use crate::types::RepoState;
+use crate::types::{GaugeState, RepoState};
+
+#[cfg(feature = "firehose-diagnostics")]
+type TxnInstant = std::time::Instant;
+
+#[cfg(not(feature = "firehose-diagnostics"))]
+#[derive(Clone, Copy)]
+struct TxnInstant;
+
+#[cfg(not(feature = "firehose-diagnostics"))]
+impl TxnInstant {
+    #[inline(always)]
+    fn now() -> Self {
+        Self
+    }
+
+    #[inline(always)]
+    fn elapsed(&self) -> Duration {
+        Duration::ZERO
+    }
+}
+
+pub(crate) struct TxnCommitTimings {
+    pub(crate) stage_counts: Duration,
+    pub(crate) stage_and_commit: Duration,
+    pub(crate) apply_counts: Duration,
+}
 
 /// one atomic database write, including its in-memory count projections.
 ///
@@ -23,20 +57,36 @@ pub(crate) struct Txn<'db> {
     pub(crate) db: &'db Db,
     pub(crate) counts: CountDeltas,
     #[cfg(feature = "indexer")]
-    lifecycle_transitions: Vec<(Did<'static>, GaugeState)>,
+    lifecycle: Option<LifecycleCountBatch<'db>>,
 }
 
 impl<'db> Txn<'db> {
+    #[allow(dead_code)]
     pub(crate) fn new(db: &'db Db) -> Self {
         Self {
             batch: db.inner.batch(),
             db,
             counts: CountDeltas::default(),
             #[cfg(feature = "indexer")]
-            lifecycle_transitions: Vec::new(),
+            lifecycle: None,
         }
     }
 
+    pub(crate) fn from_parts(
+        db: &'db Db,
+        batch: fjall::OwnedWriteBatch,
+        counts: CountDeltas,
+    ) -> Self {
+        Self {
+            batch,
+            db,
+            counts,
+            #[cfg(feature = "indexer")]
+            lifecycle: None,
+        }
+    }
+
+    #[cfg(feature = "indexer")]
     pub(crate) fn records<'txn, 'did, 'repo>(
         &'txn mut self,
         state: &AppState,
@@ -46,6 +96,7 @@ impl<'db> Txn<'db> {
         self.record_scope(state, commit_rev, did, RecordEventOrigin::Live, false)
     }
 
+    #[cfg(feature = "indexer")]
     pub(crate) fn backfill_records<'txn, 'did, 'repo>(
         &'txn mut self,
         state: &AppState,
@@ -55,6 +106,7 @@ impl<'db> Txn<'db> {
         self.record_scope(state, commit_rev, did, RecordEventOrigin::Backfill, true)
     }
 
+    #[cfg(feature = "indexer")]
     fn record_scope<'txn, 'did, 'repo>(
         &'txn mut self,
         state: &AppState,
@@ -77,33 +129,77 @@ impl<'db> Txn<'db> {
     }
 
     #[cfg(feature = "indexer")]
-    pub(crate) fn transition_lifecycle(&mut self, did: &Did<'_>, gauge: GaugeState) {
-        self.lifecycle_transitions
-            .push((did.clone().into_static(), gauge));
+    pub(crate) fn transition_lifecycle(
+        &mut self,
+        did: &Did<'_>,
+        gauge: GaugeState,
+    ) -> Result<bool> {
+        let lifecycle = self
+            .lifecycle
+            .get_or_insert_with(|| self.db.lifecycle_counts());
+        lifecycle.transition(&mut self.batch, did, gauge)
     }
 
-    pub(crate) fn commit(mut self) -> Result<()> {
+    #[cfg(feature = "indexer")]
+    pub(crate) fn transition_pending_key(
+        &mut self,
+        did: &Did<'_>,
+        pending_key: &[u8],
+        gauge: GaugeState,
+    ) -> Result<bool> {
+        let lifecycle = self
+            .lifecycle
+            .get_or_insert_with(|| self.db.lifecycle_counts());
+        lifecycle.transition_pending_key(&mut self.batch, did, pending_key, gauge)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn commit(self) -> Result<()> {
+        self.commit_with(|_| Ok(())).map(|_| ())
+    }
+
+    /// stages count reservations, lets the caller add commit-coupled writes,
+    /// commits once, then applies the in-memory projections.
+    #[allow(dead_code)]
+    pub(crate) fn commit_with<T, F>(mut self, stage: F) -> Result<(T, TxnCommitTimings)>
+    where
+        F: FnOnce(&mut fjall::OwnedWriteBatch) -> Result<T>,
+    {
+        let stage_counts_started = TxnInstant::now();
         #[cfg(feature = "indexer")]
-        let lifecycle_reservation = {
-            let mut lifecycle = self.db.lifecycle_counts();
-            for (did, gauge) in self.lifecycle_transitions {
-                lifecycle.transition(&mut self.batch, &did, gauge)?;
-            }
-            lifecycle.stage(&mut self.batch)
-        };
+        let lifecycle_reservation = self
+            .lifecycle
+            .map(|lifecycle| lifecycle.stage(&mut self.batch));
         let count_reservation = self.db.stage_count_deltas(&mut self.batch, &self.counts);
+        let stage_counts = stage_counts_started.elapsed();
 
+        let stage_and_commit_started = TxnInstant::now();
+        let staged = stage(&mut self.batch)?;
         self.batch.commit().into_diagnostic()?;
+        let stage_and_commit = stage_and_commit_started.elapsed();
 
+        let apply_counts_started = TxnInstant::now();
         self.db.apply_count_deltas(&self.counts);
         drop(count_reservation);
         #[cfg(feature = "indexer")]
-        self.db.apply_lifecycle_counts(lifecycle_reservation);
-        Ok(())
+        if let Some(reservation) = lifecycle_reservation {
+            self.db.apply_lifecycle_counts(reservation);
+        }
+        let apply_counts = apply_counts_started.elapsed();
+
+        Ok((
+            staged,
+            TxnCommitTimings {
+                stage_counts,
+                stage_and_commit,
+                apply_counts,
+            },
+        ))
     }
 }
 
 /// one commit's record mutations within a larger atomic transaction.
+#[cfg(feature = "indexer")]
 pub(crate) struct RecordTxn<'txn, 'db, 'did, 'repo> {
     txn: &'txn mut Txn<'db>,
     emitter: RecordEmitter,
@@ -116,6 +212,7 @@ pub(crate) struct RecordTxn<'txn, 'db, 'did, 'repo> {
     collection_deltas: HashMap<String, i64>,
 }
 
+#[cfg(feature = "indexer")]
 impl RecordTxn<'_, '_, '_, '_> {
     pub(crate) fn put_record(
         &mut self,
@@ -130,7 +227,6 @@ impl RecordTxn<'_, '_, '_, '_> {
             self.records_delta += 1;
         }
 
-        #[cfg(feature = "indexer")]
         if !self.ephemeral {
             let cid_bytes = cid.to_bytes();
             if !self.only_index_links {
@@ -180,7 +276,6 @@ impl RecordTxn<'_, '_, '_, '_> {
             self.records_delta -= 1;
         }
 
-        #[cfg(feature = "indexer")]
         if !self.ephemeral {
             self.txn.batch.remove(
                 &self.txn.db.indexer.records,
@@ -223,7 +318,6 @@ impl RecordTxn<'_, '_, '_, '_> {
     }
 
     pub(crate) fn finish(self) -> Result<RecordEvents> {
-        #[cfg(feature = "indexer")]
         if !self.ephemeral {
             for (collection, delta) in &self.collection_deltas {
                 crate::db::update_record_count(

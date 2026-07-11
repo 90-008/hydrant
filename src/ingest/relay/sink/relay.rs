@@ -1,13 +1,13 @@
 use fjall::OwnedWriteBatch;
-use miette::{IntoDiagnostic, Result};
+use miette::Result;
 #[cfg(feature = "jetstream")]
 use smol_str::ToSmolStr;
 use std::sync::atomic::Ordering;
 use url::Url;
 
+use crate::db::keys;
 #[cfg(feature = "jetstream")]
 use crate::db::types::TrimmedDid;
-use crate::db::keys;
 use crate::ingest::stream::{Account, Commit, Identity, Sync, encode_frame};
 use crate::state::AppState;
 #[cfg(feature = "jetstream")]
@@ -121,7 +121,9 @@ impl EventSink {
             let has_subscribers = state.db.jetstream.tx.receiver_count() > 0;
             for (op_index, collection) in &jetstream_ops {
                 let ephemeral = has_subscribers
-                    .then(|| build_relay_commit_ephemeral(&commit, *op_index, collection, &parsed_blocks))
+                    .then(|| {
+                        build_relay_commit_ephemeral(&commit, *op_index, collection, &parsed_blocks)
+                    })
                     .flatten();
                 self.jetstream_events.push((
                     StoredJetstreamEvent::RelayCommit {
@@ -201,31 +203,34 @@ impl EventSink {
         Ok(())
     }
 
-    pub(crate) fn commit_batch(
+    pub(crate) fn commit_txn(
         &mut self,
         state: &AppState,
-        batch: OwnedWriteBatch,
-    ) -> Result<Staged> {
+        txn: crate::db::Txn<'_>,
+    ) -> Result<(Staged, crate::db::TxnCommitTimings)> {
         #[cfg(feature = "jetstream")]
         {
-            let mut batch = batch;
-            let mut jetstream_broadcasts = Vec::new();
             let _lock = state.db.jetstream.lock.lock();
-            for (event, ephemeral) in self.jetstream_events.drain(..) {
-                jetstream_broadcasts.push(crate::jetstream::stage_event(
-                    &mut batch, &state.db, event, ephemeral,
-                )?);
-            }
-            batch.commit().into_diagnostic()?;
-            Ok(Staged {
-                jetstream_broadcasts,
-            })
+            let (jetstream_broadcasts, timings) = txn.commit_with(|batch| {
+                self.jetstream_events
+                    .drain(..)
+                    .map(|(event, ephemeral)| {
+                        crate::jetstream::stage_event(batch, &state.db, event, ephemeral)
+                    })
+                    .collect::<Result<Vec<_>>>()
+            })?;
+            Ok((
+                Staged {
+                    jetstream_broadcasts,
+                },
+                timings,
+            ))
         }
         #[cfg(not(feature = "jetstream"))]
         {
             let _ = state;
-            batch.commit().into_diagnostic()?;
-            Ok(Staged {})
+            let (_, timings) = txn.commit_with(|_| Ok(()))?;
+            Ok((Staged {}, timings))
         }
     }
 

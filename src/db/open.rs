@@ -18,6 +18,41 @@ use super::{Db, migration, registry, schema};
 
 impl Db {
     pub fn open(cfg: &Config) -> Result<Self> {
+        let (db, count_delta_gc_watermark) = Self::open_database(cfg)?;
+
+        let dicts = Self::load_dicts(cfg);
+        let get_compression = |name: &str, level: i32| match cfg.data_compression {
+            Compression::Lz4 => CompressionType::Lz4,
+            Compression::Zstd => dicts
+                .get(name)
+                .map(|dict| CompressionType::ZstdDict {
+                    level,
+                    dict: dict.clone(),
+                })
+                .unwrap_or_else(|| CompressionType::Zstd { level }),
+            Compression::None => CompressionType::None,
+        };
+        let cx = OpenCx {
+            db: &db,
+            cfg,
+            compression: &get_compression,
+            opened: std::cell::RefCell::new(Vec::new()),
+        };
+
+        let this = Self::assemble_keyspaces_and_verify(&cx, count_delta_gc_watermark)?;
+
+        migration::run(&this)?;
+
+        this.init_modes()?;
+
+        this.load_persisted_counts()?;
+
+        this.restore_count_deltas_and_next_id()?;
+
+        Ok(this)
+    }
+
+    fn open_database(cfg: &Config) -> Result<(Arc<Database>, Arc<AtomicU64>)> {
         let count_delta_gc_watermark = Arc::new(AtomicU64::new(0));
         let db = Database::builder(&cfg.database_path)
             .cache_size(cfg.cache_size * 2_u64.pow(20) / 2)
@@ -44,7 +79,10 @@ impl Db {
             .open()
             .into_diagnostic()?;
         let db = Arc::new(db);
+        Ok((db, count_delta_gc_watermark))
+    }
 
+    fn load_dicts(cfg: &Config) -> StdHashMap<&'static str, Arc<[u8]>> {
         let load_dict = |name: &str| -> Option<Arc<[u8]>> {
             let path = cfg.database_path.join(format!("dict_{name}.bin"));
             if path.exists()
@@ -58,7 +96,7 @@ impl Db {
             }
             None
         };
-        let dicts = registry::trainable()
+        registry::trainable()
             .into_iter()
             .fold(StdHashMap::new(), |mut acc, (name, _)| {
                 let Some(dict) = load_dict(name) else {
@@ -66,41 +104,29 @@ impl Db {
                 };
                 acc.insert(name, dict);
                 acc
-            });
-        let get_compression = |name: &str, level: i32| match cfg.data_compression {
-            Compression::Lz4 => CompressionType::Lz4,
-            Compression::Zstd => dicts
-                .get(name)
-                .map(|dict| CompressionType::ZstdDict {
-                    level,
-                    dict: dict.clone(),
-                })
-                .unwrap_or_else(|| CompressionType::Zstd { level }),
-            Compression::None => CompressionType::None,
-        };
-        let cx = OpenCx {
-            db: &db,
-            cfg,
-            compression: &get_compression,
-            opened: std::cell::RefCell::new(Vec::new()),
-        };
+            })
+    }
 
-        let repos = Ks::<schema::Repos>::open(&cx)?;
-        let repo_metadata = Ks::<schema::RepoMetadata>::open(&cx)?;
-        let cursors = Ks::<schema::Cursors>::open(&cx)?;
-        let counts = Ks::<schema::Counts>::open(&cx)?;
-        let filter = Ks::<schema::Filter>::open(&cx)?;
-        let crawler = Ks::<schema::Crawler>::open(&cx)?;
+    fn assemble_keyspaces_and_verify(
+        cx: &OpenCx,
+        count_delta_gc_watermark: Arc<AtomicU64>,
+    ) -> Result<Self> {
+        let repos = Ks::<schema::Repos>::open(cx)?;
+        let repo_metadata = Ks::<schema::RepoMetadata>::open(cx)?;
+        let cursors = Ks::<schema::Cursors>::open(cx)?;
+        let counts = Ks::<schema::Counts>::open(cx)?;
+        let filter = Ks::<schema::Filter>::open(cx)?;
+        let crawler = Ks::<schema::Crawler>::open(cx)?;
         #[cfg(feature = "backlinks")]
-        let backlinks = Ks::<schema::Backlinks>::open(&cx)?;
+        let backlinks = Ks::<schema::Backlinks>::open(cx)?;
         #[cfg(feature = "indexer")]
-        let indexer = super::keyspaces::IndexerDb::open(&cx)?;
+        let indexer = super::keyspaces::IndexerDb::open(cx)?;
         #[cfg(feature = "indexer_stream")]
-        let stream = super::keyspaces::StreamDb::open(&cx)?;
+        let stream = super::keyspaces::StreamDb::open(cx)?;
         #[cfg(feature = "jetstream")]
-        let jetstream = super::keyspaces::JetstreamDb::open(&cx)?;
+        let jetstream = super::keyspaces::JetstreamDb::open(cx)?;
         #[cfg(feature = "relay")]
-        let relay = super::keyspaces::RelayDb::open(&cx)?;
+        let relay = super::keyspaces::RelayDb::open(cx)?;
 
         // every opened keyspace must have a registry row and vice versa, so the
         // by-name, /stats, /debug, and training tables cannot silently drift.
@@ -114,9 +140,9 @@ impl Db {
             );
         }
 
-        let this = Self {
-            inner: db,
-            path: cfg.database_path.clone(),
+        Ok(Self {
+            inner: Arc::clone(cx.db),
+            path: cx.cfg.database_path.clone(),
             repos,
             repo_metadata,
             cursors,
@@ -133,45 +159,51 @@ impl Db {
             relay,
             #[cfg(feature = "backlinks")]
             backlinks,
-            counts_map: HashMap::new(),
+            counts_map: Arc::new(HashMap::new()),
             next_count_delta_id: Arc::new(AtomicU64::new(0)),
             count_delta_checkpoint_watermark: Arc::new(AtomicU64::new(0)),
             count_delta_gc_watermark,
             count_delta_in_flight: Arc::new(Mutex::new(BTreeSet::new())),
             compaction_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        };
+        })
+    }
 
-        migration::run(&this)?;
-
+    fn init_modes(&self) -> Result<()> {
         #[cfg(feature = "relay")]
-        this.relay.init()?;
+        self.relay.init()?;
         #[cfg(feature = "indexer_stream")]
-        this.stream.init()?;
+        self.stream.init()?;
         #[cfg(feature = "jetstream")]
-        this.jetstream.init()?;
+        self.jetstream.init()?;
+        Ok(())
+    }
 
+    fn load_persisted_counts(&self) -> Result<()> {
         // load counts into memory
-        for guard in this.counts.prefix(keys::COUNT_KS_PREFIX) {
+        for guard in self.counts.prefix(keys::COUNT_KS_PREFIX) {
             let (k, v) = guard.into_inner().into_diagnostic()?;
             let name = std::str::from_utf8(&k[keys::COUNT_KS_PREFIX.len()..])
                 .into_diagnostic()
                 .wrap_err("expected valid utf8 for ks count key")?;
-            let _ = this
+            let _ = self
                 .counts_map
                 .insert_sync(SmolStr::new(name), read_u64_counter(&v)?);
         }
+        Ok(())
+    }
 
-        let durable_watermark = load_count_delta_watermark(&this)?;
-        replay_count_deltas(&this, durable_watermark)?;
-        this.count_delta_checkpoint_watermark
+    fn restore_count_deltas_and_next_id(&self) -> Result<()> {
+        let durable_watermark = load_count_delta_watermark(self)?;
+        replay_count_deltas(self, durable_watermark)?;
+        self.count_delta_checkpoint_watermark
             .store(durable_watermark, Ordering::Relaxed);
-        this.count_delta_gc_watermark
+        self.count_delta_gc_watermark
             .store(durable_watermark, Ordering::Relaxed);
 
         // always stay strictly above the durable watermark so that after a migration
         // deletes delta keys, new deltas are not assigned ids that checkpoint/replay
         // would silently skip (finding 5f309024bc588191aa1a79eb449e3630).
-        let next_count_delta_id = this
+        let next_count_delta_id = self
             .counts
             .prefix(keys::COUNT_DELTA_PREFIX)
             .next_back()
@@ -183,9 +215,9 @@ impl Db {
             .transpose()?
             .unwrap_or(0)
             .max(durable_watermark.saturating_add(1));
-        this.next_count_delta_id
+        self.next_count_delta_id
             .store(next_count_delta_id, Ordering::Relaxed);
 
-        Ok(this)
+        Ok(())
     }
 }

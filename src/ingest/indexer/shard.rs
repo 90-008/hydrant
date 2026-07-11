@@ -244,19 +244,24 @@ impl FirehoseWorker {
                 }
             }
 
-            for (did, gauge) in ctx.lifecycle_transitions.drain(..) {
-                ctx.txn.transition_lifecycle(&did, gauge);
+            let lifecycle_result = ctx
+                .lifecycle_transitions
+                .drain(..)
+                .try_for_each(|(did, gauge)| ctx.txn.transition_lifecycle(&did, gauge).map(|_| ()));
+            if let Err(e) = lifecycle_result {
+                error!(shard = id, err = %e, "failed to stage lifecycle transitions");
+                continue;
             }
             if let Err(e) = ctx.txn.commit() {
                 error!(shard = id, err = %e, "failed to commit transaction");
                 continue;
             }
             #[cfg(feature = "indexer_stream")]
-            for evt in broadcast_events.drain(..) {
+            for evt in ctx.broadcast_events.drain(..) {
                 let _ = state.db.stream.event_tx.send(evt);
             }
             #[cfg(feature = "jetstream")]
-            for evt in jetstream_events.drain(..) {
+            for evt in ctx.jetstream_events.drain(..) {
                 let _ = state.db.jetstream.tx.send(evt);
             }
 
@@ -520,8 +525,7 @@ impl FirehoseWorker {
         repo_state: RepoState<'s>,
     ) -> Result<RepoState<'s>, IngestError> {
         let db = &ctx.state.db;
-        let mut batch = db.inner.batch();
-        let mut lifecycle_counts = db.lifecycle_counts();
+        let mut txn = Txn::new(db);
         let repo_key = keys::repo_key(did);
         let meta_key = keys::repo_metadata_key(did);
 
@@ -548,22 +552,21 @@ impl FirehoseWorker {
         // remove old pending entry and insert new one with fresh index_id
         if had_metadata {
             // only remove if we had one so we dont delete a random entry
-            batch.remove(&db.indexer.pending, old_pkey);
+            txn.batch.remove(&db.indexer.pending, old_pkey);
         }
 
         metadata.index_id = rand::random::<u64>();
-        batch.insert(
+        txn.batch.insert(
             &db.indexer.pending,
             keys::pending_key(metadata.index_id),
             &repo_key,
         );
-        batch.insert(&db.repo_metadata, &meta_key, ser_repo_meta(&metadata)?);
+        txn.batch
+            .insert(&db.repo_metadata, &meta_key, ser_repo_meta(&metadata)?);
         if !was_pending {
-            lifecycle_counts.transition(&mut batch, did, GaugeState::Pending)?;
+            txn.transition_lifecycle(did, GaugeState::Pending)?;
         }
-        let lifecycle_reservation = lifecycle_counts.stage(&mut batch);
-        batch.commit().into_diagnostic()?;
-        db.apply_lifecycle_counts(lifecycle_reservation);
+        txn.commit()?;
 
         if !was_pending {
             ctx.state.notify_backfill();

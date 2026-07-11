@@ -64,7 +64,6 @@ impl Display for RepoStatus {
     }
 }
 
-
 #[cfg(feature = "indexer")]
 mod indexer {
     use super::*;

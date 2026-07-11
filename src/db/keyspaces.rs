@@ -49,6 +49,7 @@ impl OpenCx<'_> {
 }
 
 #[cfg(feature = "indexer")]
+#[derive(Clone)]
 pub struct IndexerDb {
     /// maps `{DID}|{COL}|{RKey}` -> record CID
     pub(super) records: Ks<schema::Records>,
@@ -98,6 +99,7 @@ impl IndexerDb {
 }
 
 #[cfg(feature = "indexer_stream")]
+#[derive(Clone)]
 pub struct StreamDb {
     /// maps `{ID}` (u64 BE) -> `StoredEvent`, the source for the json stream api
     pub(super) events: Ks<schema::Events>,
@@ -162,6 +164,7 @@ impl StreamDb {
 }
 
 #[cfg(feature = "jetstream")]
+#[derive(Clone)]
 pub(crate) struct JetstreamDb {
     /// maps `{time_us}|{ID}` (16 bytes) -> jetstream event data
     pub(crate) events: Ks<schema::JetstreamEvents>,
@@ -207,6 +210,7 @@ impl JetstreamDb {
 }
 
 #[cfg(feature = "relay")]
+#[derive(Clone)]
 pub(crate) struct RelayDb {
     /// maps `{SEQ}` (u64 BE) -> re-encoded relay frame
     pub(crate) events: Ks<schema::RelayEvents>,

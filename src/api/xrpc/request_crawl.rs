@@ -1,7 +1,6 @@
 use jacquard_api::com_atproto::sync::request_crawl::{
     RequestCrawlError, RequestCrawlRequest, RequestCrawlResponse,
 };
-use miette::IntoDiagnostic;
 use url::Url;
 
 use super::*;
@@ -43,14 +42,12 @@ pub async fn handle(
         // persist the new count before returning so a crash cannot reset the counter
         // and allow the budget to be replayed.
         if let Some((day, count)) = to_persist {
-            let state = hydrant.state.clone();
-            tokio::task::spawn_blocking(move || {
-                crate::db::save_pds_daily_adds(&state.db, day, count)
-            })
-            .await
-            .into_diagnostic()
-            .flatten()
-            .map_err(|e| internal_error(nsid, e))?;
+            hydrant
+                .state
+                .db
+                .run(move |db| crate::db::save_pds_daily_adds(db, day, count))
+                .await
+                .map_err(|e| internal_error(nsid, e))?;
         }
     }
 

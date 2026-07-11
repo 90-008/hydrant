@@ -71,16 +71,7 @@ impl RelayWorker {
                 .name(format!("relay-shard-{i}"))
                 .spawn(move || {
                     let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        Self::shard(
-                            i,
-                            rx,
-                            state,
-                            seed,
-                            verify,
-                            h,
-                            opts,
-                            http,
-                        );
+                        Self::shard(i, rx, state, seed, verify, h, opts, http);
                     }));
                     let _ = exit_tx.send((i, res));
                 })
@@ -172,29 +163,17 @@ impl RelayWorker {
             }
             let process_message = process_started.elapsed();
 
-            let mut batch = std::mem::replace(&mut ctx.batch, ctx.state.db.inner.batch());
-            let stage_counts_started = StatsInstant::now();
-            let reservation = ctx
-                .state
-                .db
-                .stage_count_deltas(&mut batch, &ctx.count_deltas);
-            let stage_counts = stage_counts_started.elapsed();
-
-            let stage_and_commit_started = StatsInstant::now();
-            let staged = match ctx.sink.commit_batch(&state, batch) {
+            let batch = std::mem::replace(&mut ctx.batch, ctx.state.db.inner.batch());
+            let count_deltas = std::mem::take(&mut ctx.count_deltas);
+            let txn = crate::db::Txn::from_parts(&ctx.state.db, batch, count_deltas);
+            let (staged, commit_timings) = match ctx.sink.commit_txn(&state, txn) {
                 Ok(staged) => staged,
                 Err(e) => {
                     shard_stats.record_commit_error();
                     error!(shard = id, err = %e, "relay shard: failed to commit batch");
-                    drop(reservation);
                     continue;
                 }
             };
-            let stage_and_commit = stage_and_commit_started.elapsed();
-            let apply_counts_started = StatsInstant::now();
-            ctx.state.db.apply_count_deltas(&ctx.count_deltas);
-            drop(reservation);
-            let apply_counts = apply_counts_started.elapsed();
 
             let broadcast_started = StatsInstant::now();
             ctx.sink.flush(&state, staged);
@@ -206,9 +185,9 @@ impl RelayWorker {
             ctx.sink.advance_cursor(&state, &firehose, seq);
             shard_stats.record_processed(crate::ingest::firehose_stats::RelayShardTimings {
                 process_message,
-                stage_counts,
-                stage_and_commit,
-                apply_counts,
+                stage_counts: commit_timings.stage_counts,
+                stage_and_commit: commit_timings.stage_and_commit,
+                apply_counts: commit_timings.apply_counts,
                 broadcast,
                 cursor: cursor_started.elapsed(),
                 total: message_started.elapsed(),

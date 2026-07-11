@@ -50,6 +50,7 @@ impl RetryProducer {
             had_more: bool,
         }
 
+        // CPU-bound JSON parsing + read-only DB scan, stays on spawn_blocking
         let ScanResult {
             ready,
             existing,
@@ -118,9 +119,8 @@ impl RetryProducer {
             .check_signals_batch(in_flight, &filter, &mut retry_batch, &existing)
             .await?;
 
-        tokio::task::spawn_blocking(move || retry_batch.commit().into_diagnostic())
+        self.checker.state.db.run(move |_db| retry_batch.commit().into_diagnostic())
             .await
-            .into_diagnostic()?
             .inspect_err(|e| error!(err = ?e, "retry state commit failed"))
             .ok();
 
