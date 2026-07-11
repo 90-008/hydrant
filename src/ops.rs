@@ -1,8 +1,6 @@
 use fjall::OwnedWriteBatch;
 use fjall::Slice;
 
-#[cfg(feature = "backlinks")]
-use jacquard_common::Data;
 use jacquard_common::IntoStatic;
 use jacquard_common::types::did::Did;
 use miette::{Context, IntoDiagnostic, Result};
@@ -19,16 +17,14 @@ use crate::types::{GaugeState, RepoState, RepoStatus, ResyncErrorKind, ResyncSta
 
 #[cfg(feature = "indexer_stream")]
 use {
-    crate::types::{
-        AccountEvt, BroadcastEvent, IdentityEvt, LiveRecordEvent, MarshallableEvt, StoredData,
-        StoredEvent,
-    },
-    jacquard_common::CowStr,
+    crate::types::{AccountEvt, BroadcastEvent, IdentityEvt, MarshallableEvt},
     std::sync::atomic::Ordering,
 };
 
-#[cfg(feature = "jetstream")]
-use crate::types::{JetstreamBroadcast, StoredJetstreamEvent};
+mod backlink_ops;
+pub(crate) mod record_events;
+
+use record_events::{EmitOp, RecordEmitter, RecordEvents};
 
 pub fn persist_to_resync_buffer(db: &Db, did: &Did, commit: &Commit) -> Result<()> {
     let key = keys::resync_buffer_key(did, DbTid::from(&commit.rev));
@@ -121,8 +117,7 @@ pub fn delete_repo(
     }
 
     // 5. remove backlinks for all records in this repo
-    #[cfg(feature = "backlinks")]
-    crate::backlinks::store::delete_repo(batch, &db.backlinks, did)?;
+    backlink_ops::delete_repo(batch, db, did)?;
 
     Ok(())
 }
@@ -223,12 +218,8 @@ pub struct ApplyCommitResults<'s> {
     pub repo_state: RepoState<'s>,
     pub records_delta: i64,
     pub blocks_count: i64,
-    #[cfg(feature = "indexer_stream")]
-    pub live_events: Vec<LiveRecordEvent>,
-    #[cfg(feature = "indexer_stream")]
-    pub last_event_id: Option<u64>,
-    #[cfg(feature = "jetstream")]
-    pub jetstream_events: Vec<JetstreamBroadcast>,
+    #[cfg_attr(not(feature = "indexer_stream"), allow(dead_code))]
+    pub events: RecordEvents,
 }
 
 pub fn apply_commit<'s>(
@@ -253,19 +244,7 @@ pub fn apply_commit<'s>(
     let mut records_delta = 0;
     let mut blocks_count = 0;
     let mut collection_deltas: HashMap<&str, i64> = HashMap::new();
-    #[cfg(feature = "indexer_stream")]
-    let rev = DbTid::from(&commit.rev);
-
-    #[cfg(feature = "indexer_stream")]
-    let should_broadcast_live = db.stream.event_tx.receiver_count() > 0;
-    #[cfg(feature = "indexer_stream")]
-    let mut live_events = Vec::new();
-    #[cfg(feature = "indexer_stream")]
-    let mut last_event_id = None;
-    #[cfg(feature = "jetstream")]
-    let should_stage_jetstream = db.jetstream.tx.receiver_count() > 0;
-    #[cfg(feature = "jetstream")]
-    let mut jetstream_events = Vec::new();
+    let mut emitter = RecordEmitter::new(state, &commit);
 
     for op in &commit.ops {
         let (collection, rkey) = parse_path(&op.path)?;
@@ -279,12 +258,8 @@ pub fn apply_commit<'s>(
 
         let action = DbAction::try_from(op.action.as_str())?;
 
-        #[cfg(feature = "indexer_stream")]
-        let mut cid_for_event: Option<jacquard_common::types::cid::IpldCid> = None;
-        #[cfg(feature = "indexer_stream")]
-        let mut block_inline_for_event: Option<bytes::Bytes> = None;
-        #[cfg(feature = "indexer_stream")]
-        let mut inline_block: Option<bytes::Bytes> = None;
+        let mut event_cid = None;
+        let mut event_block = None;
 
         match action {
             DbAction::Create | DbAction::Update => {
@@ -295,16 +270,13 @@ pub fn apply_commit<'s>(
                     .to_ipld()
                     .into_diagnostic()
                     .wrap_err("expected valid cid from relay")?;
-                #[cfg(feature = "indexer_stream")]
-                {
-                    cid_for_event = Some(cid_ipld);
-                }
-
+                event_cid = Some(cid_ipld);
                 let Some(bytes) = parsed.blocks.get(&cid_ipld) else {
                     return Err(miette::miette!(
                         "block {cid} not found in CAR for record {did}/{collection}/{rkey}"
                     ));
                 };
+                event_block = Some(bytes);
                 let cid_raw = cid_ipld.to_bytes();
                 let block_key = Slice::from(keys::block_key(collection, &cid_raw));
 
@@ -319,28 +291,14 @@ pub fn apply_commit<'s>(
                         records_delta += 1;
                         *collection_deltas.entry(collection).or_default() += 1;
                     }
-                    #[cfg(feature = "backlinks")]
-                    if let Ok(value) = serde_ipld_dagcbor::from_slice::<Data>(bytes.as_ref()) {
-                        crate::backlinks::store::index_record(
-                            batch,
-                            &db.backlinks,
-                            did.as_str(),
-                            collection,
-                            &rkey.to_smolstr(),
-                            &value,
-                        )?;
-                    }
-                    #[cfg(feature = "indexer_stream")]
-                    if should_broadcast_live && !only_index_links {
-                        // inline record bytes for live tailing so we don't have to load from blocks.
-                        inline_block = Some(bytes.clone());
-                    }
-                } else {
-                    #[cfg(feature = "indexer_stream")]
-                    {
-                        // in ephemeral mode, the event payload is the only place we persist the record.
-                        block_inline_for_event = Some(bytes.clone());
-                    }
+                    backlink_ops::index_record(
+                        batch,
+                        db,
+                        did,
+                        collection,
+                        &rkey.to_smolstr(),
+                        bytes.as_ref(),
+                    )?;
                 }
             }
             DbAction::Delete => {
@@ -351,90 +309,23 @@ pub fn apply_commit<'s>(
                     records_delta -= 1;
                     *collection_deltas.entry(collection).or_default() -= 1;
 
-                    #[cfg(feature = "backlinks")]
-                    crate::backlinks::store::delete_record(
-                        batch,
-                        &db.backlinks,
-                        did.as_str(),
-                        collection,
-                        &rkey.to_smolstr(),
-                    )?;
+                    backlink_ops::delete_record(batch, db, did, collection, &rkey.to_smolstr())?;
                 }
             }
         };
 
-        #[cfg(feature = "indexer_stream")]
-        {
-            let data = block_inline_for_event
-                .clone()
-                .map(StoredData::Block)
-                .or_else(|| {
-                    (!only_index_links)
-                        .then(|| cid_for_event.map(StoredData::Ptr))
-                        .flatten()
-                })
-                .unwrap_or(StoredData::Nothing);
-
-            let event_id = db.stream.next_event_id.fetch_add(1, Ordering::SeqCst);
-            last_event_id = Some(event_id);
-            let did_trimmed = TrimmedDid::from(did);
-            let collection = CowStr::Borrowed(collection);
-
-            let evt = StoredEvent {
-                live: true,
-                did: did_trimmed.clone(),
-                rev,
-                collection: collection.clone(),
-                rkey: rkey.clone(),
+        emitter.emit(
+            batch,
+            db,
+            EmitOp {
+                did,
+                collection,
+                rkey: &rkey,
                 action,
-                data: data.clone(),
-            };
-            let bytes = rmp_serde::to_vec(&evt).into_diagnostic()?;
-            batch.insert(&db.stream.events, keys::event_key(event_id), bytes);
-
-            #[cfg(feature = "jetstream")]
-            {
-                let jetstream = StoredJetstreamEvent::Commit {
-                    did: did_trimmed.clone().into_static(),
-                    collection: collection.clone().into_static(),
-                    event_id,
-                    live: true,
-                };
-                let ephemeral = should_stage_jetstream
-                    .then(|| {
-                        crate::jetstream::build_ephemeral_from_stored(
-                            did_trimmed.to_did().as_str(),
-                            rev.to_tid().as_str(),
-                            action.as_str(),
-                            collection.as_str(),
-                            rkey.to_smolstr().as_str(),
-                            &data,
-                            inline_block.as_ref(),
-                            true,
-                        )
-                    })
-                    .flatten();
-                jetstream_events.push(crate::jetstream::stage_event(
-                    batch, db, jetstream, ephemeral,
-                )?);
-            }
-
-            if should_broadcast_live {
-                live_events.push(LiveRecordEvent {
-                    id: event_id,
-                    stored: StoredEvent {
-                        live: evt.live,
-                        did: did_trimmed.into_static(),
-                        rev: evt.rev,
-                        collection: collection.into_static(),
-                        rkey,
-                        action: evt.action,
-                        data,
-                    },
-                    inline_block,
-                });
-            }
-        }
+                cid: event_cid,
+                block: event_block,
+            },
+        )?;
     }
 
     // update counts
@@ -448,12 +339,7 @@ pub fn apply_commit<'s>(
         repo_state,
         records_delta,
         blocks_count,
-        #[cfg(feature = "indexer_stream")]
-        live_events,
-        #[cfg(feature = "indexer_stream")]
-        last_event_id,
-        #[cfg(feature = "jetstream")]
-        jetstream_events,
+        events: emitter.finish(),
     })
 }
 

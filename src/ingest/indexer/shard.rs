@@ -385,18 +385,18 @@ impl FirehoseWorker {
         {
             use std::sync::Arc;
 
-            let mut live_events = res.live_events;
+            let mut live_events = res.events.live_events;
             for evt in live_events.drain(..) {
                 ctx.broadcast_events
                     .push(BroadcastEvent::LiveRecord(Arc::new(evt)));
             }
-            if let Some(last_id) = res.last_event_id {
+            if let Some(last_id) = res.events.last_event_id {
                 ctx.broadcast_events
                     .push(BroadcastEvent::Persisted(last_id));
             }
         }
         #[cfg(feature = "jetstream")]
-        ctx.jetstream_events.extend(res.jetstream_events);
+        ctx.jetstream_events.extend(res.events.jetstream_events);
 
         Ok(RepoProcessResult::Ok(repo_state))
     }
