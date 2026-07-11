@@ -141,6 +141,9 @@ pub(crate) async fn process_did_sparse(
     let parsed = jacquard_repo::car::reader::parse_car_bytes(&proof.body)
         .await
         .into_diagnostic()?;
+    if app_state.verify_cids {
+        crate::car::validate_block_cids(&parsed.blocks)?;
+    }
     let root_bytes = parsed
         .blocks
         .get(&parsed.root)
@@ -196,7 +199,16 @@ pub(crate) async fn process_did_sparse(
                         miette::miette!("sparse mst scan exceeded missing block limit").into(),
                     );
                 }
-                let blocks = fetch_blocks(http, pds, did, &missing, &throttle, &tier).await?;
+                let blocks = fetch_blocks(
+                    http,
+                    pds,
+                    did,
+                    &missing,
+                    &throttle,
+                    &tier,
+                    app_state.verify_cids,
+                )
+                .await?;
                 if missing.iter().all(|cid| !blocks.contains_key(cid)) {
                     return Ok(SparseBackfillResult::Skipped);
                 }
@@ -230,7 +242,18 @@ pub(crate) async fn process_did_sparse(
         .filter_map(|cid| scanned_blocks.remove(cid).map(|bytes| (*cid, bytes)))
         .collect::<BTreeMap<_, _>>();
     drop(scanned_blocks);
-    record_blocks.extend(fetch_blocks(http, pds, did, &missing_records, &throttle, &tier).await?);
+    record_blocks.extend(
+        fetch_blocks(
+            http,
+            pds,
+            did,
+            &missing_records,
+            &throttle,
+            &tier,
+            app_state.verify_cids,
+        )
+        .await?,
+    );
 
     if let Some((_, missing)) = scan
         .leaves
@@ -271,12 +294,13 @@ async fn fetch_blocks(
     cids: &[IpldCid],
     throttle: &ThrottleHandle,
     tier: &RateTier,
+    verify_cids: bool,
 ) -> Result<BTreeMap<IpldCid, bytes::Bytes>, BackfillError> {
     let mut out = BTreeMap::new();
 
     let fetches = cids
         .chunks(SPARSE_GET_BLOCKS_CHUNK)
-        .map(|chunk| fetch_block_chunk(http, pds, did, chunk, throttle, tier))
+        .map(|chunk| fetch_block_chunk(http, pds, did, chunk, throttle, tier, verify_cids))
         .collect::<Vec<_>>();
     let fetches = stream::iter(fetches).buffer_unordered(SPARSE_GET_BLOCKS_PARALLELISM);
     futures::pin_mut!(fetches);
@@ -295,6 +319,7 @@ async fn fetch_block_chunk(
     cids: &[IpldCid],
     throttle: &ThrottleHandle,
     tier: &RateTier,
+    verify_cids: bool,
 ) -> Result<BTreeMap<IpldCid, bytes::Bytes>, BackfillError> {
     let mut url = pds
         .join("xrpc/com.atproto.sync.getBlocks")
@@ -342,7 +367,11 @@ async fn fetch_block_chunk(
             .bytes()
             .await
             .map_err(|e| BackfillError::Transport(e.to_string().into()))?;
-        crate::car::parse_car_blocks(body).map_err(BackfillError::from)
+        let blocks = crate::car::parse_car_blocks(body).map_err(BackfillError::from)?;
+        if verify_cids {
+            crate::car::validate_block_cids(&blocks)?;
+        }
+        Ok(blocks)
     } else {
         let retry_after = if status == StatusCode::TOO_MANY_REQUESTS {
             crate::util::parse_retry_after(&resp)
@@ -749,7 +778,15 @@ mod tests {
 
         let blocks = tokio::time::timeout(
             Duration::from_secs(5),
-            fetch_blocks(&http, &pds, &did, &cids, &throttle, &RateTier::trusted()),
+            fetch_blocks(
+                &http,
+                &pds,
+                &did,
+                &cids,
+                &throttle,
+                &RateTier::trusted(),
+                false,
+            ),
         )
         .await
         .expect("getBlocks chunks were fetched serially")
@@ -760,5 +797,82 @@ mod tests {
             state.max_active.load(Ordering::SeqCst) > 1,
             "expected more than one getBlocks chunk in flight"
         );
+    }
+
+    async fn spawn_car_server(car: bytes::Bytes) -> url::Url {
+        let app = Router::new().route(
+            "/xrpc/com.atproto.sync.getBlocks",
+            get(move || {
+                let car = car.clone();
+                async move {
+                    (
+                        [(
+                            reqwest::header::CONTENT_TYPE.as_str(),
+                            "application/vnd.ipld.car",
+                        )],
+                        car,
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = url::Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        url
+    }
+
+    async fn car_with_block(cid: IpldCid, payload: &[u8]) -> bytes::Bytes {
+        let mut car = Vec::new();
+        let mut writer =
+            iroh_car::CarWriter::new(iroh_car::CarHeader::new_v1(Vec::new()), &mut car);
+        writer.write(cid, payload.to_vec()).await.unwrap();
+        writer.finish().await.unwrap();
+        car.into()
+    }
+
+    async fn fetch_one(
+        pds: &url::Url,
+        wanted: IpldCid,
+        verify_cids: bool,
+    ) -> Result<BTreeMap<IpldCid, bytes::Bytes>, BackfillError> {
+        let throttler = crate::util::throttle::Throttler::new(1, 10);
+        let http = ThrottledHttpClient::new(vec![reqwest::Client::new()], throttler.clone());
+        let throttle = throttler.get_handle(pds).await;
+        let did = Did::new_static("did:plc:aaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
+        fetch_blocks(
+            &http,
+            pds,
+            &did,
+            &[wanted],
+            &throttle,
+            &RateTier::trusted(),
+            verify_cids,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn verify_cids_rejects_mismatched_get_blocks_car() {
+        let pds = spawn_car_server(car_with_block(cid(1), b"forged").await).await;
+
+        let err = fetch_one(&pds, cid(1), true).await.unwrap_err();
+        assert!(err.to_string().contains("CAR block CID mismatch"));
+    }
+
+    #[tokio::test]
+    async fn verify_cids_accepts_matching_get_blocks_car() {
+        let real_cid = jacquard_repo::mst::util::compute_cid(b"trusted").unwrap();
+        let pds = spawn_car_server(car_with_block(real_cid, b"trusted").await).await;
+
+        let blocks = fetch_one(&pds, real_cid, true).await.unwrap();
+        assert_eq!(blocks.get(&real_cid).unwrap().as_ref(), b"trusted");
+    }
+
+    #[tokio::test]
+    async fn verify_cids_disabled_accepts_mismatched_get_blocks_car() {
+        let pds = spawn_car_server(car_with_block(cid(1), b"forged").await).await;
+
+        let blocks = fetch_one(&pds, cid(1), false).await.unwrap();
+        assert_eq!(blocks.get(&cid(1)).unwrap().as_ref(), b"forged");
     }
 }

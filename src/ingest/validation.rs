@@ -4,7 +4,7 @@ use jacquard_repo::Mst;
 use jacquard_repo::car::reader::{ParsedCar, parse_car_bytes};
 use jacquard_repo::commit::Commit as AtpCommit;
 use jacquard_repo::mst::VerifiedWriteOp;
-use jacquard_repo::{BlockStore, MemoryBlockStore};
+use jacquard_repo::MemoryBlockStore;
 use miette::IntoDiagnostic;
 use smol_str::ToSmolStr;
 use std::sync::Arc;
@@ -210,17 +210,8 @@ pub fn validate_commit<'c>(
         .map_err(|e| CommitValidationError::MalformedCar(miette::miette!("{e}")))?;
 
     if opts.verify_cids {
-        let temp_store = MemoryBlockStore::new();
-        for (claimed_cid, bytes) in &parsed.blocks {
-            let computed_cid = handle
-                .block_on(temp_store.put(bytes.as_ref()))
-                .map_err(|e| CommitValidationError::MalformedCar(miette::miette!("{e}")))?;
-            if computed_cid != *claimed_cid {
-                return Err(CommitValidationError::MalformedCar(miette::miette!(
-                    "CAR block CID mismatch: claimed {claimed_cid}, computed {computed_cid}"
-                )));
-            }
-        }
+        crate::car::validate_block_cids(&parsed.blocks)
+            .map_err(CommitValidationError::MalformedCar)?;
     }
 
     let root_bytes = parsed.blocks.get(&parsed.root).ok_or_else(|| {
@@ -318,17 +309,8 @@ pub fn validate_sync<'c>(
         .map_err(|e| SyncValidationError::MalformedCar(miette::miette!("{e}")))?;
 
     if opts.verify_cids {
-        let temp_store = MemoryBlockStore::new();
-        for (claimed_cid, bytes) in &parsed.blocks {
-            let computed_cid = handle
-                .block_on(temp_store.put(bytes.as_ref()))
-                .map_err(|e| SyncValidationError::MalformedCar(miette::miette!("{e}")))?;
-            if computed_cid != *claimed_cid {
-                return Err(SyncValidationError::MalformedCar(miette::miette!(
-                    "CAR block CID mismatch: claimed {claimed_cid}, computed {computed_cid}"
-                )));
-            }
-        }
+        crate::car::validate_block_cids(&parsed.blocks)
+            .map_err(SyncValidationError::MalformedCar)?;
     }
 
     let root_bytes = parsed.blocks.get(&parsed.root).ok_or_else(|| {

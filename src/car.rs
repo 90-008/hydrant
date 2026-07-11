@@ -5,6 +5,7 @@ use bytes::Bytes;
 use cid::Cid as IpldCid;
 use miette::{IntoDiagnostic, Result};
 
+#[cfg_attr(not(feature = "indexer"), allow(dead_code))]
 pub(crate) fn parse_car_blocks(data: Bytes) -> Result<BTreeMap<IpldCid, Bytes>> {
     let mut offset = 0;
     let Some(header_len) = read_uvarint(&data, &mut offset)? else {
@@ -42,6 +43,23 @@ pub(crate) fn parse_car_blocks(data: Bytes) -> Result<BTreeMap<IpldCid, Bytes>> 
     Ok(blocks)
 }
 
+/// validates that each block's payload hashes to its claimed CID (sha2-256, dag-cbor).
+pub(crate) fn validate_block_cids<'a>(
+    blocks: impl IntoIterator<Item = (&'a IpldCid, &'a Bytes)>,
+) -> Result<()> {
+    for (claimed_cid, bytes) in blocks {
+        let computed_cid =
+            jacquard_repo::mst::util::compute_cid(bytes.as_ref()).into_diagnostic()?;
+        if computed_cid != *claimed_cid {
+            return Err(miette::miette!(
+                "CAR block CID mismatch: claimed {claimed_cid}, computed {computed_cid}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg_attr(not(feature = "indexer"), allow(dead_code))]
 fn read_uvarint(data: &[u8], offset: &mut usize) -> Result<Option<usize>> {
     if *offset == data.len() {
         return Ok(None);
@@ -89,5 +107,20 @@ mod tests {
 
         let blocks = parse_car_blocks(buf.into()).unwrap();
         assert_eq!(blocks.get(&cid).unwrap().as_ref(), b"block");
+    }
+
+    #[test]
+    fn validate_block_cids_rejects_mismatched_cid() {
+        let blocks = BTreeMap::from([(cid(1), Bytes::from_static(b"forged"))]);
+        let err = validate_block_cids(&blocks).unwrap_err();
+        assert!(err.to_string().contains("CAR block CID mismatch"));
+    }
+
+    #[test]
+    fn validate_block_cids_accepts_matching_cid() {
+        let bytes = Bytes::from_static(b"trusted");
+        let claimed = jacquard_repo::mst::util::compute_cid(bytes.as_ref()).unwrap();
+        let blocks = BTreeMap::from([(claimed, bytes)]);
+        validate_block_cids(&blocks).unwrap();
     }
 }

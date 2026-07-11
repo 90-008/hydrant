@@ -335,11 +335,10 @@ pub(crate) async fn process_did(
 
     let start = Instant::now();
     let root_cid = parsed.root;
-    let store = if app_state.verify_cids {
-        Arc::new(validate_car_blocks(parsed.blocks).await?)
-    } else {
-        Arc::new(MemoryBlockStore::new_from_blocks(parsed.blocks))
-    };
+    if app_state.verify_cids {
+        crate::car::validate_block_cids(&parsed.blocks)?;
+    }
+    let store = Arc::new(MemoryBlockStore::new_from_blocks(parsed.blocks));
     // parsed.blocks was moved into the store; parsed.root is now root_cid. drop the raw
     // CAR bytes here so we don't hold two copies of the block data (raw + parsed) for
     // the entire duration of the spawn_blocking call below.
@@ -698,55 +697,4 @@ pub(crate) async fn process_did(
 
     trace!("complete");
     Ok(Some(previous_state))
-}
-
-async fn validate_car_blocks(
-    blocks: std::collections::BTreeMap<cid::Cid, bytes::Bytes>,
-) -> Result<MemoryBlockStore> {
-    let store = MemoryBlockStore::new();
-
-    for (claimed_cid, bytes) in blocks {
-        let computed_cid = store.put(bytes.as_ref()).await.into_diagnostic()?;
-        if computed_cid != claimed_cid {
-            return Err(miette::miette!(
-                "CAR block CID mismatch: claimed {claimed_cid}, computed {computed_cid}"
-            ));
-        }
-    }
-
-    Ok(store)
-}
-
-#[cfg(test)]
-mod tests {
-    use bytes::Bytes;
-    use std::collections::BTreeMap;
-
-    use super::*;
-
-    #[tokio::test]
-    async fn validate_car_blocks_rejects_mismatched_cid() {
-        let trusted_store = MemoryBlockStore::new();
-        let claimed_cid = trusted_store.put(b"trusted").await.unwrap();
-
-        let blocks = BTreeMap::from([(claimed_cid, Bytes::from_static(b"forged"))]);
-
-        let err = validate_car_blocks(blocks).await.unwrap_err();
-        assert!(err.to_string().contains("CAR block CID mismatch"));
-    }
-
-    #[tokio::test]
-    async fn validate_car_blocks_accepts_matching_cid() {
-        let trusted_store = MemoryBlockStore::new();
-        let bytes = Bytes::from_static(b"trusted");
-        let claimed_cid = trusted_store.put(bytes.as_ref()).await.unwrap();
-
-        let blocks = BTreeMap::from([(claimed_cid, bytes.clone())]);
-        let validated_store = validate_car_blocks(blocks).await.unwrap();
-
-        assert_eq!(
-            validated_store.get(&claimed_cid).await.unwrap().as_deref(),
-            Some(bytes.as_ref())
-        );
-    }
 }

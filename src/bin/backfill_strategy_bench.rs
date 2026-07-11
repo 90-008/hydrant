@@ -1,4 +1,5 @@
 #[path = "../car.rs"]
+#[allow(dead_code)]
 mod car;
 #[path = "../sparse_mst.rs"]
 mod sparse_mst;

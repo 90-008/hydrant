@@ -39,7 +39,6 @@ pub(crate) mod api;
 pub(crate) mod backfill;
 #[cfg(feature = "backlinks")]
 pub mod backlinks;
-#[cfg(feature = "indexer")]
 pub(crate) mod car;
 #[cfg(feature = "indexer")]
 pub(crate) mod crawler;
