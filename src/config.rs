@@ -21,6 +21,49 @@ pub const DEFAULT_RATETIER: RateTier = if cfg!(feature = "indexer") {
     RateTier::default_tier()
 };
 
+/// per-mode configuration defaults.
+///
+/// the indexer and relay modes are parallel modules with an identical
+/// interface, selected by a single cfg pair. this is the only place the
+/// mode choice bends `Config::default`; the struct initializer below is
+/// unconditional, so adding a field can never silently break one mode.
+#[cfg(not(feature = "relay"))]
+mod mode_defaults {
+    use super::{Duration, FirehoseSource, Url};
+
+    pub(super) const EPHEMERAL: bool = false;
+    pub(super) const EPHEMERAL_TTL: Duration = Duration::from_secs(3600); // 1 hour
+    pub(super) const FULL_NETWORK: bool = false;
+
+    pub(super) fn relays() -> Vec<FirehoseSource> {
+        vec![FirehoseSource {
+            url: Url::parse("wss://relay.fire.hose.cam/").unwrap(),
+            is_pds: false,
+        }]
+    }
+
+    pub(super) fn seed_hosts() -> Vec<Url> {
+        vec![]
+    }
+}
+
+#[cfg(feature = "relay")]
+mod mode_defaults {
+    use super::{Duration, FirehoseSource, Url};
+
+    pub(super) const EPHEMERAL: bool = true;
+    pub(super) const EPHEMERAL_TTL: Duration = Duration::from_secs(3600 * 24 * 3); // 3 days
+    pub(super) const FULL_NETWORK: bool = true;
+
+    pub(super) fn relays() -> Vec<FirehoseSource> {
+        vec![]
+    }
+
+    pub(super) fn seed_hosts() -> Vec<Url> {
+        vec![Url::parse("https://bsky.network").unwrap()]
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     /// path to the database folder. set via `HYDRANT_DATABASE_PATH`.
@@ -260,29 +303,11 @@ impl Default for Config {
         const BASE_MEMTABLE_MB: u64 = 32;
         Self {
             database_path: PathBuf::from("./hydrant.db"),
-            #[cfg(not(feature = "relay"))]
-            ephemeral: false,
-            #[cfg(feature = "relay")]
-            ephemeral: true,
-            #[cfg(not(feature = "relay"))]
-            ephemeral_ttl: Duration::from_secs(3600), // 1 hour
-            #[cfg(feature = "relay")]
-            ephemeral_ttl: Duration::from_secs(3600 * 24 * 3), // 3 days
-            #[cfg(not(feature = "relay"))]
-            full_network: false,
-            #[cfg(feature = "relay")]
-            full_network: true,
-            #[cfg(not(feature = "relay"))]
-            relays: vec![FirehoseSource {
-                url: Url::parse("wss://relay.fire.hose.cam/").unwrap(),
-                is_pds: false,
-            }],
-            #[cfg(feature = "relay")]
-            relays: vec![],
-            #[cfg(not(feature = "relay"))]
-            seed_hosts: vec![],
-            #[cfg(feature = "relay")]
-            seed_hosts: vec![Url::parse("https://bsky.network").unwrap()],
+            ephemeral: mode_defaults::EPHEMERAL,
+            ephemeral_ttl: mode_defaults::EPHEMERAL_TTL,
+            full_network: mode_defaults::FULL_NETWORK,
+            relays: mode_defaults::relays(),
+            seed_hosts: mode_defaults::seed_hosts(),
             plc_urls: vec![Url::parse("https://plc.wtf").unwrap()],
             enable_firehose: true,
             enable_backfill: true,
