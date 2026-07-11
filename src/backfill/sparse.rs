@@ -3,7 +3,7 @@ use crate::backfill::error::BackfillError;
 use crate::config::{BackfillStrategy, RateTier};
 use crate::db::types::{DbAction, DbRkey, TrimmedDid};
 use crate::db::{self, CountDeltas, keys, ser_repo_state};
-use crate::filter::FilterMode;
+use crate::filter::{FilterConfig, FilterMode};
 use crate::ops;
 use crate::sparse_mst::{SparseScanner, mst_node_layer, sparse_probe_collection, sparse_ranges};
 use crate::state::AppState;
@@ -51,9 +51,26 @@ pub(crate) enum SparseBackfillResult {
 }
 
 const SPARSE_GET_BLOCKS_CHUNK: usize = 100;
-const SPARSE_GET_BLOCKS_PARALLELISM: usize = 1;
+const SPARSE_GET_BLOCKS_PARALLELISM: usize = 4;
 const SPARSE_MAX_SCAN_ROUNDS: usize = 256;
 const SPARSE_AUTO_FULL_MAX_ROOT_LAYER: usize = 2;
+fn sparse_probe(filter: &FilterConfig) -> Option<(SmolStr, &'static str)> {
+    filter
+        .collections
+        .iter()
+        .find(|collection| !collection.ends_with(".*") && collection.ends_with(".profile"))
+        .or_else(|| {
+            filter
+                .signals
+                .iter()
+                .find(|signal| signal.ends_with(".profile") && filter.matches_collection(signal))
+        })
+        .cloned()
+        .map(|collection| (collection, "self"))
+        .or_else(|| {
+            sparse_probe_collection(&filter.collections).map(|collection| (collection, "-"))
+        })
+}
 
 pub(crate) async fn process_did_sparse(
     app_state: &Arc<AppState>,
@@ -65,7 +82,7 @@ pub(crate) async fn process_did_sparse(
     strategy: BackfillStrategy,
 ) -> Result<SparseBackfillResult, BackfillError> {
     let filter = app_state.filter.load();
-    let Some(probe_collection) = sparse_probe_collection(&filter.collections) else {
+    let Some((probe_collection, probe_rkey)) = sparse_probe(&filter) else {
         return Ok(SparseBackfillResult::Skipped);
     };
     let ranges = sparse_ranges(&filter.collections);
@@ -74,7 +91,7 @@ pub(crate) async fn process_did_sparse(
     }
 
     let probe_collection = Nsid::new_owned(probe_collection.as_str()).into_diagnostic()?;
-    let probe_rkey = RecordKey::any_static("-").into_diagnostic()?;
+    let probe_rkey = RecordKey::any_static(probe_rkey).into_diagnostic()?;
     let req = GetRecord::new()
         .did(did.clone())
         .collection(probe_collection)
@@ -138,20 +155,17 @@ pub(crate) async fn process_did_sparse(
     }
 
     let root_cid = root_commit.data;
-    if strategy == BackfillStrategy::Auto {
-        if let Some(root_bytes) = parsed.blocks.get(&root_cid) {
-            if let Some(root_layer) = mst_node_layer(root_bytes)? {
-                if root_layer <= SPARSE_AUTO_FULL_MAX_ROOT_LAYER {
-                    debug!(
-                        root_layer,
-                        max_sparse_layer = SPARSE_AUTO_FULL_MAX_ROOT_LAYER,
-                        "sparse auto selected full getRepo for small repo"
-                    );
-                    return Ok(SparseBackfillResult::Skipped);
-                }
-            }
-        }
-    }
+    let auto_full_layer = if strategy == BackfillStrategy::Auto {
+        parsed
+            .blocks
+            .get(&root_cid)
+            .map(|root_bytes| mst_node_layer(root_bytes))
+            .transpose()?
+            .flatten()
+            .filter(|layer| *layer <= SPARSE_AUTO_FULL_MAX_ROOT_LAYER)
+    } else {
+        None
+    };
 
     let root_commit = Commit::from(root_commit);
     let mut scanner = SparseScanner::new(ranges, parsed.blocks);
@@ -160,6 +174,14 @@ pub(crate) async fn process_did_sparse(
         match scanner.scan(root_cid)? {
             Ok(scan) => break scan,
             Err(missing) => {
+                if let Some(root_layer) = auto_full_layer {
+                    debug!(
+                        root_layer,
+                        max_sparse_layer = SPARSE_AUTO_FULL_MAX_ROOT_LAYER,
+                        "sparse auto selected full getRepo because the probe omitted MST nodes"
+                    );
+                    return Ok(SparseBackfillResult::Skipped);
+                }
                 scan_rounds += 1;
                 if scan_rounds > SPARSE_MAX_SCAN_ROUNDS {
                     return Err(
@@ -193,6 +215,16 @@ pub(crate) async fn process_did_sparse(
         .iter()
         .filter_map(|cid| (!scanned_blocks.contains_key(cid)).then_some(*cid))
         .collect::<Vec<_>>();
+    if !missing_records.is_empty()
+        && let Some(root_layer) = auto_full_layer
+    {
+        debug!(
+            root_layer,
+            max_sparse_layer = SPARSE_AUTO_FULL_MAX_ROOT_LAYER,
+            "sparse auto selected full getRepo because the probe omitted record blocks"
+        );
+        return Ok(SparseBackfillResult::Skipped);
+    }
     let mut record_blocks = record_cids
         .iter()
         .filter_map(|cid| scanned_blocks.remove(cid).map(|bytes| (*cid, bytes)))
@@ -244,17 +276,7 @@ async fn fetch_blocks(
 
     let fetches = cids
         .chunks(SPARSE_GET_BLOCKS_CHUNK)
-        .filter(|chunk| !chunk.is_empty())
-        .map(|chunk| {
-            fetch_block_chunk(
-                http.clone(),
-                pds.clone(),
-                did.clone(),
-                chunk.to_vec(),
-                throttle,
-                tier,
-            )
-        })
+        .map(|chunk| fetch_block_chunk(http, pds, did, chunk, throttle, tier))
         .collect::<Vec<_>>();
     let fetches = stream::iter(fetches).buffer_unordered(SPARSE_GET_BLOCKS_PARALLELISM);
     futures::pin_mut!(fetches);
@@ -267,10 +289,10 @@ async fn fetch_blocks(
 }
 
 async fn fetch_block_chunk(
-    http: ThrottledHttpClient,
-    pds: url::Url,
-    did: Did<'static>,
-    cids: Vec<IpldCid>,
+    http: &ThrottledHttpClient,
+    pds: &url::Url,
+    did: &Did<'_>,
+    cids: &[IpldCid],
     throttle: &ThrottleHandle,
     tier: &RateTier,
 ) -> Result<BTreeMap<IpldCid, bytes::Bytes>, BackfillError> {
@@ -280,7 +302,7 @@ async fn fetch_block_chunk(
     {
         let mut query = url.query_pairs_mut();
         query.append_pair("did", did.as_str());
-        for cid in &cids {
+        for cid in cids {
             query.append_pair("cids", &cid.to_string());
         }
     }
@@ -320,9 +342,7 @@ async fn fetch_block_chunk(
             .bytes()
             .await
             .map_err(|e| BackfillError::Transport(e.to_string().into()))?;
-        crate::car::parse_car_blocks(&body)
-            .await
-            .map_err(BackfillError::from)
+        crate::car::parse_car_blocks(body).map_err(BackfillError::from)
     } else {
         let retry_after = if status == StatusCode::TOO_MANY_REQUESTS {
             crate::util::parse_retry_after(&resp)
@@ -613,4 +633,132 @@ async fn persist_sparse_backfill(
     .await
     .into_diagnostic()?
     .map_err(BackfillError::from)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::filter::FilterConfig;
+    use axum::{Router, extract::State, response::IntoResponse, routing::get};
+    use cid::Cid;
+    use cid::multihash::Multihash;
+    use jacquard_common::types::crypto::{DAG_CBOR, SHA2_256};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+    use tokio::sync::Barrier;
+
+    #[derive(Clone)]
+    struct FetchState {
+        started: Arc<AtomicUsize>,
+        active: Arc<AtomicUsize>,
+        max_active: Arc<AtomicUsize>,
+        barrier: Arc<Barrier>,
+        car: bytes::Bytes,
+    }
+
+    async fn delayed_car(State(state): State<FetchState>) -> impl IntoResponse {
+        let ordinal = state.started.fetch_add(1, Ordering::SeqCst) + 1;
+        let active = state.active.fetch_add(1, Ordering::SeqCst) + 1;
+        state.max_active.fetch_max(active, Ordering::SeqCst);
+        if ordinal <= 2 {
+            state.barrier.wait().await;
+        }
+        state.active.fetch_sub(1, Ordering::SeqCst);
+        (
+            [(
+                reqwest::header::CONTENT_TYPE.as_str(),
+                "application/vnd.ipld.car",
+            )],
+            state.car,
+        )
+    }
+
+    fn cid(byte: u8) -> IpldCid {
+        let hash = [byte; 32];
+        let multihash = Multihash::<64>::wrap(SHA2_256, &hash).unwrap();
+        Cid::new_v1(DAG_CBOR, multihash)
+    }
+
+    fn filter(collections: &[&str], signals: &[&str]) -> FilterConfig {
+        let mut filter = FilterConfig::new(FilterMode::Filter);
+        filter.collections = collections.iter().map(SmolStr::new).collect();
+        filter.signals = signals.iter().map(SmolStr::new).collect();
+        filter
+    }
+
+    #[test]
+    fn sparse_probe_prefers_matching_profile_signal() {
+        let filter = filter(
+            &["sh.tangled.*"],
+            &["sh.tangled.actor.profile", "app.bsky.actor.profile"],
+        );
+
+        assert_eq!(
+            sparse_probe(&filter),
+            Some((SmolStr::new("sh.tangled.actor.profile"), "self"))
+        );
+    }
+
+    #[test]
+    fn sparse_probe_ignores_profile_signal_outside_filter() {
+        let filter = filter(&["sh.tangled.*"], &["app.bsky.actor.profile"]);
+
+        assert_eq!(
+            sparse_probe(&filter),
+            Some((SmolStr::new("sh.tangled.probe"), "-"))
+        );
+    }
+
+    #[test]
+    fn sparse_probe_uses_self_for_exact_profile_collection() {
+        let filter = filter(&["app.bsky.actor.profile"], &[]);
+
+        assert_eq!(
+            sparse_probe(&filter),
+            Some((SmolStr::new("app.bsky.actor.profile"), "self"))
+        );
+    }
+
+    #[tokio::test]
+    async fn fetches_independent_get_blocks_chunks_concurrently() {
+        let mut car = Vec::new();
+        let mut writer =
+            iroh_car::CarWriter::new(iroh_car::CarHeader::new_v1(Vec::new()), &mut car);
+        let response_cid = cid(u8::MAX);
+        writer.write(response_cid, b"block".to_vec()).await.unwrap();
+        writer.finish().await.unwrap();
+        let state = FetchState {
+            started: Arc::new(AtomicUsize::new(0)),
+            active: Arc::new(AtomicUsize::new(0)),
+            max_active: Arc::new(AtomicUsize::new(0)),
+            barrier: Arc::new(Barrier::new(2)),
+            car: car.into(),
+        };
+        let app = Router::new()
+            .route("/xrpc/com.atproto.sync.getBlocks", get(delayed_car))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let pds = url::Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let throttler = crate::util::throttle::Throttler::new(1, 10);
+        let http = ThrottledHttpClient::new(vec![reqwest::Client::new()], throttler.clone());
+        let throttle = throttler.get_handle(&pds).await;
+        let did = Did::new_static("did:plc:aaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
+        let cids = (0..=200).map(|byte| cid(byte as u8)).collect::<Vec<_>>();
+
+        let blocks = tokio::time::timeout(
+            Duration::from_secs(5),
+            fetch_blocks(&http, &pds, &did, &cids, &throttle, &RateTier::trusted()),
+        )
+        .await
+        .expect("getBlocks chunks were fetched serially")
+        .unwrap();
+
+        assert_eq!(blocks.get(&response_cid).unwrap().as_ref(), b"block");
+        assert!(
+            state.max_active.load(Ordering::SeqCst) > 1,
+            "expected more than one getBlocks chunk in flight"
+        );
+    }
 }

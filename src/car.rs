@@ -5,9 +5,9 @@ use bytes::Bytes;
 use cid::Cid as IpldCid;
 use miette::{IntoDiagnostic, Result};
 
-pub(crate) async fn parse_car_blocks(data: &[u8]) -> Result<BTreeMap<IpldCid, Bytes>> {
+pub(crate) fn parse_car_blocks(data: Bytes) -> Result<BTreeMap<IpldCid, Bytes>> {
     let mut offset = 0;
-    let Some(header_len) = read_uvarint(data, &mut offset)? else {
+    let Some(header_len) = read_uvarint(&data, &mut offset)? else {
         return Err(miette::miette!("empty CAR file"));
     };
     let header_end = offset
@@ -19,7 +19,7 @@ pub(crate) async fn parse_car_blocks(data: &[u8]) -> Result<BTreeMap<IpldCid, By
     offset = header_end;
 
     let mut blocks = BTreeMap::new();
-    while let Some(section_len) = read_uvarint(data, &mut offset)? {
+    while let Some(section_len) = read_uvarint(&data, &mut offset)? {
         let section_end = offset
             .checked_add(section_len)
             .ok_or_else(|| miette::miette!("CAR block length overflow"))?;
@@ -27,16 +27,16 @@ pub(crate) async fn parse_car_blocks(data: &[u8]) -> Result<BTreeMap<IpldCid, By
             return Err(miette::miette!("truncated CAR block"));
         }
 
-        let section = &data[offset..section_end];
+        let section = data.slice(offset..section_end);
         offset = section_end;
 
-        let mut cursor = Cursor::new(section);
+        let mut cursor = Cursor::new(section.as_ref());
         let cid = IpldCid::read_bytes(&mut cursor).into_diagnostic()?;
         let block_start = cursor.position() as usize;
         if block_start >= section.len() {
             return Err(miette::miette!("CAR block has no payload for {cid}"));
         }
-        blocks.insert(cid, Bytes::copy_from_slice(&section[block_start..]));
+        blocks.insert(cid, section.slice(block_start..));
     }
 
     Ok(blocks)
@@ -87,7 +87,7 @@ mod tests {
         writer.write(cid, b"block".to_vec()).await.unwrap();
         writer.finish().await.unwrap();
 
-        let blocks = parse_car_blocks(&buf).await.unwrap();
+        let blocks = parse_car_blocks(buf.into()).unwrap();
         assert_eq!(blocks.get(&cid).unwrap().as_ref(), b"block");
     }
 }

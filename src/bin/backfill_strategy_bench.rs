@@ -36,6 +36,8 @@ struct Args {
     index_url: Url,
     plc_url: Url,
     limit: usize,
+    probe_collection: Option<SmolStr>,
+    probe_rkey: SmolStr,
 }
 
 impl Args {
@@ -45,6 +47,8 @@ impl Args {
         let mut index_url = Url::parse("https://lightrail.microcosm.blue").into_diagnostic()?;
         let mut plc_url = Url::parse("https://plc.directory").into_diagnostic()?;
         let mut limit = 5usize;
+        let mut probe_collection = None;
+        let mut probe_rkey = SmolStr::new("-");
 
         let mut args = std::env::args().skip(1);
         while let Some(arg) = args.next() {
@@ -57,6 +61,8 @@ impl Args {
                 "--index" => index_url = Url::parse(&value).into_diagnostic()?,
                 "--plc" => plc_url = Url::parse(&value).into_diagnostic()?,
                 "--limit" => limit = value.parse().into_diagnostic()?,
+                "--probe-collection" => probe_collection = Some(SmolStr::new(value)),
+                "--probe-rkey" => probe_rkey = SmolStr::new(value),
                 _ => return Err(miette::miette!("unknown argument {arg}")),
             }
         }
@@ -67,6 +73,8 @@ impl Args {
             index_url,
             plc_url,
             limit,
+            probe_collection,
+            probe_rkey,
         })
     }
 }
@@ -107,6 +115,8 @@ struct FullBench {
 #[derive(Debug)]
 struct SparseBench {
     total: Duration,
+    requests: usize,
+    auto_requests: usize,
     root_layer: Option<usize>,
     seed_bytes: usize,
     node_bytes: usize,
@@ -149,7 +159,7 @@ async fn main() -> Result<()> {
     let ranges = sparse_ranges(&[args.pattern.clone()]);
 
     println!(
-        "did,pds,full_fetch_ms,full_parse_walk_ms,full_bytes,full_blocks,full_leaves,full_matching,sparse_total_ms,sparse_root_layer,sparse_seed_bytes,sparse_node_bytes,sparse_record_bytes,sparse_node_blocks,sparse_records"
+        "did,pds,full_fetch_ms,full_parse_walk_ms,full_bytes,full_blocks,full_leaves,full_matching,sparse_total_ms,sparse_requests,auto_requests,sparse_root_layer,sparse_seed_bytes,sparse_node_bytes,sparse_record_bytes,sparse_node_blocks,sparse_records"
     );
 
     let mut totals = BenchTotals::default();
@@ -168,7 +178,16 @@ async fn main() -> Result<()> {
                 continue;
             }
         };
-        let sparse = match bench_sparse(&http, &pds, &did, &[args.pattern.clone()]).await {
+        let sparse = match bench_sparse(
+            &http,
+            &pds,
+            &did,
+            &[args.pattern.clone()],
+            args.probe_collection.as_deref(),
+            args.probe_rkey.as_str(),
+        )
+        .await
+        {
             Ok(sparse) => sparse,
             Err(err) => {
                 eprintln!("skipping {did}: sparse bench failed: {err:?}");
@@ -176,7 +195,7 @@ async fn main() -> Result<()> {
             }
         };
         println!(
-            "{did},{pds},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            "{did},{pds},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
             full.fetch.as_millis(),
             full.parse_and_walk.as_millis(),
             full.bytes,
@@ -184,6 +203,8 @@ async fn main() -> Result<()> {
             full.leaves,
             full.matching,
             sparse.total.as_millis(),
+            sparse.requests,
+            sparse.auto_requests,
             sparse
                 .root_layer
                 .map(|layer| layer.to_string())
@@ -307,16 +328,20 @@ async fn bench_sparse(
     pds: &Url,
     did: &Did<'static>,
     patterns: &[SmolStr],
+    probe_collection: Option<&str>,
+    probe_rkey: &str,
 ) -> Result<SparseBench> {
     let start = Instant::now();
     let ranges = sparse_ranges(patterns);
-    let probe_collection = sparse_probe_collection(patterns)
+    let probe_collection = probe_collection
+        .map(SmolStr::new)
+        .or_else(|| sparse_probe_collection(patterns))
         .ok_or_else(|| miette::miette!("no sparse-compatible probe collection"))?;
 
     let req = GetRecord::new()
         .did(did.clone())
         .collection(Nsid::new_owned(probe_collection.as_str()).into_diagnostic()?)
-        .rkey(RecordKey::any_static("-").into_diagnostic()?)
+        .rkey(RecordKey::any(probe_rkey).into_diagnostic()?)
         .build();
     let resp = http.xrpc(to_fluent_uri(pds)).send(&req).await?;
     let seed = resp
@@ -346,13 +371,16 @@ async fn bench_sparse(
         .flatten();
 
     let mut node_fetch_bytes = 0usize;
+    let mut requests = 1usize;
     let mut scanner = SparseScanner::new(ranges, parsed.blocks);
     let scan = loop {
         match scanner.scan(root_cid)? {
             Ok(scan) => break scan,
             Err(missing) => {
-                let (blocks, bytes) = fetch_blocks(http, pds, did, &missing).await?;
+                let (blocks, bytes, chunk_requests) =
+                    fetch_blocks(http, pds, did, &missing).await?;
                 node_fetch_bytes += bytes;
+                requests += chunk_requests;
                 scanner.insert_blocks(blocks);
             }
         }
@@ -364,11 +392,21 @@ async fn bench_sparse(
         .iter()
         .filter_map(|(_, cid)| (!blocks.contains_key(cid)).then_some(*cid))
         .collect();
-    let (record_blocks, record_bytes) = fetch_blocks(http, pds, did, &missing_records).await?;
+    let (record_blocks, record_bytes, chunk_requests) =
+        fetch_blocks(http, pds, did, &missing_records).await?;
+    requests += chunk_requests;
     blocks.extend(record_blocks);
+
+    let auto_requests = if requests > 1 && root_layer.is_some_and(|layer| layer <= 2) {
+        2
+    } else {
+        requests
+    };
 
     Ok(SparseBench {
         total: start.elapsed(),
+        requests,
+        auto_requests,
         root_layer,
         seed_bytes,
         node_bytes: scan.node_bytes_seen + node_fetch_bytes,
@@ -383,7 +421,7 @@ async fn fetch_blocks(
     pds: &Url,
     did: &Did<'static>,
     cids: &[IpldCid],
-) -> Result<(BTreeMap<IpldCid, Bytes>, usize)> {
+) -> Result<(BTreeMap<IpldCid, Bytes>, usize, usize)> {
     let mut out = BTreeMap::new();
     let mut bytes = 0usize;
 
@@ -392,6 +430,7 @@ async fn fetch_blocks(
         .filter(|chunk| !chunk.is_empty())
         .map(|chunk| fetch_block_chunk(http.clone(), pds.clone(), did.clone(), chunk.to_vec()))
         .collect::<Vec<_>>();
+    let requests = fetches.len();
     let fetches = stream::iter(fetches).buffer_unordered(GET_BLOCKS_PARALLELISM);
     futures::pin_mut!(fetches);
 
@@ -401,7 +440,7 @@ async fn fetch_blocks(
         out.extend(blocks);
     }
 
-    Ok((out, bytes))
+    Ok((out, bytes, requests))
 }
 
 async fn fetch_block_chunk(
@@ -423,7 +462,7 @@ async fn fetch_block_chunk(
         .into_output()
         .map_err(|err: XrpcError<_>| miette::miette!("getBlocks failed for {did}: {err}"))?;
     let bytes = car.body.len();
-    let parsed = car::parse_car_blocks(&car.body).await.wrap_err_with(|| {
+    let parsed = car::parse_car_blocks(car.body).wrap_err_with(|| {
         let cids = cids
             .iter()
             .map(ToString::to_string)
