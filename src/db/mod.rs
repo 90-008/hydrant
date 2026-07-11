@@ -122,38 +122,13 @@ impl Db {
 
     pub async fn get(ks: Keyspace, key: impl Into<Slice>) -> Result<Option<Slice>> {
         let key = key.into();
-        tokio::task::spawn_blocking(move || ks.get(key).into_diagnostic())
-            .await
-            .into_diagnostic()?
-    }
-
-    #[allow(dead_code)]
-    pub async fn insert(
-        ks: Keyspace,
-        key: impl Into<Slice>,
-        value: impl Into<Slice>,
-    ) -> Result<()> {
-        let key = key.into();
-        let value = value.into();
-        tokio::task::spawn_blocking(move || ks.insert(key, value).into_diagnostic())
-            .await
-            .into_diagnostic()?
-    }
-
-    #[allow(dead_code)]
-    pub async fn remove(ks: Keyspace, key: impl Into<Slice>) -> Result<()> {
-        let key = key.into();
-        tokio::task::spawn_blocking(move || ks.remove(key).into_diagnostic())
-            .await
-            .into_diagnostic()?
-    }
-
-    #[allow(dead_code)]
-    pub async fn contains_key(ks: Keyspace, key: impl Into<Slice>) -> Result<bool> {
-        let key = key.into();
-        tokio::task::spawn_blocking(move || ks.contains_key(key).into_diagnostic())
-            .await
-            .into_diagnostic()?
+        tokio::task::spawn_blocking(move || {
+            ks.get(key)
+                .inspect_err(check_poisoned)
+                .into_diagnostic()
+        })
+        .await
+        .into_diagnostic()?
     }
 }
 

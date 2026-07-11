@@ -2,6 +2,7 @@ use fjall::{Keyspace, OwnedWriteBatch};
 use jacquard_common::types::string::Did;
 use miette::{IntoDiagnostic, Result};
 
+use crate::db::keys::SEP;
 use crate::db::types::TrimmedDid;
 use crate::filter::{FilterConfig, FilterMode};
 use crate::patch::SetUpdate;
@@ -10,7 +11,6 @@ pub const MODE_KEY: &[u8] = b"m";
 pub const SIGNAL_PREFIX: u8 = b's';
 pub const COLLECTION_PREFIX: u8 = b'c';
 pub const EXCLUDE_PREFIX: u8 = b'x';
-pub const SEP: u8 = b'|';
 
 pub fn signal_key(val: &str) -> Result<Vec<u8>> {
     let mut key = Vec::with_capacity(2 + val.len());

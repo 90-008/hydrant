@@ -9,7 +9,7 @@ use {crate::db::types::TrimmedDid, jacquard_common::types::did::Did, miette::Int
 #[cfg(feature = "indexer")]
 pub(crate) fn migrate_v9(db: &Db, batch: &mut OwnedWriteBatch) -> Result<()> {
     // 1. Migrate excludes
-    let exclude_prefix = [crate::db::filter::EXCLUDE_PREFIX, crate::db::filter::SEP];
+    let exclude_prefix = [crate::db::filter::EXCLUDE_PREFIX, crate::db::keys::SEP];
     for guard in db.filter.prefix(exclude_prefix) {
         let (k, _) = guard.into_inner().into_diagnostic()?;
         let val_bytes = &k[exclude_prefix.len()..];
@@ -19,7 +19,7 @@ pub(crate) fn migrate_v9(db: &Db, batch: &mut OwnedWriteBatch) -> Result<()> {
                 let trimmed = TrimmedDid::from(&did);
                 let mut new_key = Vec::with_capacity(2 + trimmed.len());
                 new_key.push(crate::db::filter::EXCLUDE_PREFIX);
-                new_key.push(crate::db::filter::SEP);
+                new_key.push(crate::db::keys::SEP);
                 trimmed.write_to_vec(&mut new_key);
 
                 batch.insert(&db.filter, new_key, []);

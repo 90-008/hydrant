@@ -112,6 +112,38 @@ impl<S: Schema> Ks<S> {
     pub fn raw(&self) -> &Keyspace {
         &self.inner
     }
+
+    /// point reads/writes mirror [`Keyspace`]'s signatures exactly, adding
+    /// the fatal poison check every callsite previously had to remember.
+    /// inherent methods win over the deref bridge, so all `db.<ks>.<op>()`
+    /// callsites route through these.
+    #[inline]
+    pub fn get<K: AsRef<[u8]>>(&self, key: K) -> fjall::Result<Option<fjall::Slice>> {
+        self.inner.get(key).inspect_err(super::check_poisoned)
+    }
+
+    #[inline]
+    pub fn contains_key<K: AsRef<[u8]>>(&self, key: K) -> fjall::Result<bool> {
+        self.inner
+            .contains_key(key)
+            .inspect_err(super::check_poisoned)
+    }
+
+    #[inline]
+    pub fn insert<K: Into<fjall::UserKey>, V: Into<fjall::UserValue>>(
+        &self,
+        key: K,
+        value: V,
+    ) -> fjall::Result<()> {
+        self.inner
+            .insert(key, value)
+            .inspect_err(super::check_poisoned)
+    }
+
+    #[inline]
+    pub fn remove<K: Into<fjall::UserKey>>(&self, key: K) -> fjall::Result<()> {
+        self.inner.remove(key).inspect_err(super::check_poisoned)
+    }
 }
 
 /// phase-1 migration bridge: existing callsites use raw `Keyspace` methods
