@@ -71,6 +71,19 @@ pub struct Config {
     /// set via `HYDRANT_BACKFILL_STRATEGY`.
     pub backfill_strategy: BackfillStrategy,
 
+    /// proxy URLs (http/https/socks5) used to distribute backfill repo fetches across multiple
+    /// egress IPs, bypassing per-IP PDS rate limits. the direct (unproxied) connection is always
+    /// part of the pool alongside these, so `pool size = proxies + 1`. per-PDS in-flight
+    /// concurrency and rate-tier pacing both scale by pool size, so a rate tier describes the
+    /// budget for a single egress IP. defaults to empty (pool size 1, no behavior change).
+    /// set via `HYDRANT_BACKFILL_PROXIES` (comma-separated).
+    pub backfill_proxies: Vec<Url>,
+
+    /// max concurrent in-flight backfill requests per PDS, per egress IP (multiplied by the
+    /// egress pool size). raise it so rate-tier pacing rather than concurrency is the binding
+    /// limit when the proxy pool adds round-trip latency. set via `HYDRANT_PER_PDS_CONCURRENCY`.
+    pub per_pds_concurrency: usize,
+
     /// whether to run the network crawler. `None` defers to the default for the current mode.
     /// set via `HYDRANT_ENABLE_CRAWLER`.
     pub enable_crawler: Option<bool>,
@@ -279,6 +292,8 @@ impl Default for Config {
             repo_fetch_timeout: Duration::from_secs(300),
             backfill_concurrency_limit: 16,
             backfill_strategy: BackfillStrategy::Auto,
+            backfill_proxies: vec![],
+            per_pds_concurrency: crate::util::throttle::DEFAULT_PER_PDS_CONCURRENCY_PER_IP,
             enable_crawler: None,
             crawler_max_pending_repos: 2000,
             crawler_resume_pending_repos: 1000,
@@ -380,10 +395,12 @@ impl fmt::Display for Config {
         config_line!(f, "plc urls", format_args!("{:?}", self.plc_urls))?;
         config_line!(f, "full network indexing", self.full_network)?;
         config_line!(f, "verify signatures", self.verify_signatures)?;
+        config_line!(f, "per-pds concurrency", self.per_pds_concurrency)?;
         config_line!(f, "backfill enabled", self.enable_backfill)?;
         config_line!(f, "firehose enabled", self.enable_firehose)?;
         config_line!(f, "backfill concurrency", self.backfill_concurrency_limit)?;
         config_line!(f, "backfill strategy", self.backfill_strategy)?;
+        config_line!(f, "backfill proxies", self.backfill_proxies.len())?;
         config_line!(f, "identity cache size", self.identity_cache_size)?;
         config_line!(
             f,

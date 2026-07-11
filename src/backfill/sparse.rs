@@ -289,7 +289,6 @@ async fn fetch_block_chunk(
         let _permit = throttle.acquire().await;
         throttle.wait_for_allow(1, tier).await;
         match http
-            .client
             .get(url)
             .header(reqwest::header::ACCEPT, "application/vnd.ipld.car")
             .send()

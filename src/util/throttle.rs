@@ -8,9 +8,12 @@ use std::time::{Duration, Instant};
 use tokio::sync::{Notify, Semaphore, SemaphorePermit};
 use url::Url;
 
-/// max concurrent in-flight requests per PDS before we start queuing
-/// ref pds allows 10 requests per second... so 10 should be fine
-const PER_PDS_CONCURRENCY: usize = 10;
+/// default max concurrent in-flight requests per PDS *per egress IP* before we queue.
+/// ref pds allows ~10 requests per second per IP. the effective per-PDS limit is this
+/// multiplied by the egress pool size (direct + proxies). overridable via
+/// `HYDRANT_PER_PDS_CONCURRENCY`; raise it so rate-tier pacing (not concurrency) is the
+/// binding limit when the pool has high round-trip latency.
+pub const DEFAULT_PER_PDS_CONCURRENCY_PER_IP: usize = 10;
 
 // per second, hour and day
 const DURATIONS: [Duration; 3] = [
@@ -22,6 +25,11 @@ const DURATIONS: [Duration; 3] = [
 #[derive(Clone)]
 pub struct Throttler {
     states: Arc<HashMap<Url, Arc<State>>>,
+    /// number of egress IPs (direct + proxies) sharing this throttler. multiplies the
+    /// per-PDS concurrency and rate-tier pacing so tiers describe a single IP's budget.
+    pool_size: usize,
+    /// per-egress-IP in-flight concurrency; the per-PDS semaphore is this times `pool_size`.
+    per_pds_base: usize,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -54,22 +62,29 @@ pub struct FailureSnapshot {
 }
 
 impl Throttler {
-    pub fn new() -> Self {
+    /// `pool_size` is the number of egress IPs (direct connection + proxies) that share this
+    /// throttler; it multiplies per-PDS concurrency and rate-tier pacing. pass `1` when there
+    /// are no proxies.
+    pub fn new(pool_size: usize, per_pds_base: usize) -> Self {
         Self {
             states: Arc::new(HashMap::new()),
+            pool_size: pool_size.max(1),
+            per_pds_base: per_pds_base.max(1),
         }
     }
 
     pub async fn get_handle(&self, url: &Url) -> ThrottleHandle {
+        let pool_size = self.pool_size;
+        let concurrency = self.per_pds_base * pool_size;
         let state = self
             .states
             .entry_async(url.clone())
             .await
-            .or_insert_with(|| Arc::new(State::new()))
+            .or_insert_with(|| Arc::new(State::new(concurrency)))
             .get()
             .clone();
 
-        ThrottleHandle { state }
+        ThrottleHandle { state, pool_size }
     }
 
     /// drop entries with no active throttle and no consecutive failures.
@@ -107,14 +122,14 @@ struct State {
 }
 
 impl State {
-    fn new() -> Self {
+    fn new(concurrency: usize) -> Self {
         Self {
             throttled_until: AtomicI64::new(0),
             consecutive_failures: AtomicUsize::new(0),
             consecutive_timeouts: AtomicUsize::new(0),
             last_failure: Mutex::new(None),
             failure_notify: Notify::new(),
-            semaphore: Semaphore::new(PER_PDS_CONCURRENCY),
+            semaphore: Semaphore::new(concurrency),
             rate_limiter: RateLimiter::new(),
         }
     }
@@ -122,6 +137,7 @@ impl State {
 
 pub struct ThrottleHandle {
     state: Arc<State>,
+    pool_size: usize,
 }
 
 impl ThrottleHandle {
@@ -242,18 +258,25 @@ impl ThrottleHandle {
     /// waits until the rate tier's limits allow more events for this PDS.
     /// sleeps precisely until the most restrictive window opens rather than polling.
     pub async fn wait_for_allow(&self, num_accounts: u64, tier: &RateTier) {
-        let limits = limits_for(num_accounts, tier);
+        let limits = limits_for(num_accounts, tier, self.pool_size);
         while let Some(wait) = self.state.rate_limiter.try_acquire(limits) {
             tokio::time::sleep(wait).await;
         }
     }
 }
 
-fn limits_for(num_accounts: u64, tier: &RateTier) -> [u64; 3] {
+/// computes the `[per_second, per_hour, per_day]` window limits for a PDS. the tier describes
+/// the budget for a single egress IP, so every window scales by `pool_size` (direct + proxies).
+fn limits_for(num_accounts: u64, tier: &RateTier, pool_size: usize) -> [u64; 3] {
+    let pool = pool_size.max(1) as u64;
     let per_sec = tier
         .per_second_base
         .max((num_accounts as f64 * tier.per_second_account_mul) as u64);
-    [per_sec, tier.per_hour, tier.per_day]
+    [
+        per_sec.saturating_mul(pool),
+        tier.per_hour.saturating_mul(pool),
+        tier.per_day.saturating_mul(pool),
+    ]
 }
 
 struct WindowState {
@@ -361,3 +384,43 @@ pub trait OrFailure<T, E>: Future<Output = Result<T, E>> {
 }
 
 impl<T, E, F: Future<Output = Result<T, E>>> OrFailure<T, E> for F {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn limits_for_pool_size_one_is_unscaled() {
+        let tier = RateTier::default_tier();
+        let base = limits_for(0, &tier, 1);
+        assert_eq!(base[0], tier.per_second_base);
+        assert_eq!(base[1], tier.per_hour);
+        assert_eq!(base[2], tier.per_day);
+    }
+
+    #[test]
+    fn limits_for_scales_every_window_by_pool_size() {
+        let tier = RateTier::default_tier();
+        let one = limits_for(0, &tier, 1);
+        let eight = limits_for(0, &tier, 8);
+        assert_eq!(eight[0], one[0] * 8);
+        assert_eq!(eight[1], one[1] * 8);
+        assert_eq!(eight[2], one[2] * 8);
+    }
+
+    #[test]
+    fn limits_for_account_floor_then_scales() {
+        // per_second = max(base, accounts * mul), then multiplied by the pool.
+        let tier = RateTier::default_tier();
+        let accounts = ((tier.per_second_base as f64 / tier.per_second_account_mul) as u64) + 100;
+        let expected_per_sec = (accounts as f64 * tier.per_second_account_mul) as u64;
+        let scaled = limits_for(accounts, &tier, 4);
+        assert_eq!(scaled[0], expected_per_sec * 4);
+    }
+
+    #[test]
+    fn limits_for_pool_size_zero_treated_as_one() {
+        let tier = RateTier::default_tier();
+        assert_eq!(limits_for(0, &tier, 0), limits_for(0, &tier, 1));
+    }
+}

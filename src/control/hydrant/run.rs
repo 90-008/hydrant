@@ -77,6 +77,7 @@ impl Hydrant {
                         SignatureVerification::Full | SignatureVerification::BackfillOnly
                     ),
                     config.backfill_strategy,
+                    config.backfill_proxies.clone(),
                     state.backfill_enabled.subscribe(),
                 )
                 .run()

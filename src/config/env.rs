@@ -142,6 +142,29 @@ impl Config {
             defaults.backfill_concurrency_limit
         );
         let backfill_strategy = cfg!("BACKFILL_STRATEGY", defaults.backfill_strategy);
+
+        // comma-separated proxy URLs to spread backfill fetches across egress IPs.
+        let backfill_proxies: Vec<Url> = std::env::var("HYDRANT_BACKFILL_PROXIES")
+            .ok()
+            .map(|s| {
+                s.split(',')
+                    .filter_map(|u| {
+                        let u = u.trim();
+                        if u.is_empty() {
+                            return None;
+                        }
+                        Url::parse(u)
+                            .or_else(|_| Url::parse(&format!("http://{u}")))
+                            .ok()
+                            .or_else(|| {
+                                tracing::warn!("invalid backfill proxy URL: {u}");
+                                None
+                            })
+                    })
+                    .collect()
+            })
+            .unwrap_or_else(|| defaults.backfill_proxies.clone());
+        let per_pds_concurrency = cfg!("PER_PDS_CONCURRENCY", defaults.per_pds_concurrency);
         let firehose_workers = cfg!("FIREHOSE_WORKERS", defaults.firehose_workers);
         let firehose_max_failures = cfg!("FIREHOSE_MAX_FAILURES", defaults.firehose_max_failures);
 
@@ -339,6 +362,8 @@ impl Config {
             repo_fetch_timeout,
             backfill_concurrency_limit,
             backfill_strategy,
+            backfill_proxies,
+            per_pds_concurrency,
             enable_crawler,
             crawler_max_pending_repos,
             crawler_resume_pending_repos,

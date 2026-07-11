@@ -128,7 +128,10 @@ impl AppState {
             only_index_links: config.only_index_links,
             verify_cids: config.verify_cids,
             get_repo_semaphore: Semaphore::new(config.get_repo_concurrency_limit),
-            throttler: Throttler::new(),
+            throttler: Throttler::new(
+                config.backfill_proxies.len() + 1,
+                config.per_pds_concurrency,
+            ),
             #[cfg(feature = "relay")]
             pds_daily_limit,
         })

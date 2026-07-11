@@ -1,11 +1,44 @@
 use crate::util::throttle::Throttler;
 use jacquard_common::http_client::HttpClient;
 use reqwest::StatusCode;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
+/// an http client that spreads requests across a pool of egress connections (the direct
+/// connection plus any configured proxies) via round-robin, and records 429 rate-limit
+/// responses into the shared [`Throttler`] before jacquard discards the headers.
 #[derive(Clone)]
 pub struct ThrottledHttpClient {
-    pub client: reqwest::Client,
+    clients: Arc<Vec<reqwest::Client>>,
+    next: Arc<AtomicUsize>,
     pub throttler: Throttler,
+}
+
+impl ThrottledHttpClient {
+    /// builds a client from a non-empty pool. panics if `clients` is empty.
+    pub fn new(clients: Vec<reqwest::Client>, throttler: Throttler) -> Self {
+        assert!(
+            !clients.is_empty(),
+            "throttled client pool must be non-empty"
+        );
+        Self {
+            clients: Arc::new(clients),
+            next: Arc::new(AtomicUsize::new(0)),
+            throttler,
+        }
+    }
+
+    /// picks the next client in round-robin order.
+    fn pick(&self) -> &reqwest::Client {
+        let idx = self.next.fetch_add(1, Ordering::Relaxed) % self.clients.len();
+        &self.clients[idx]
+    }
+
+    /// starts a raw GET request on the next client in the pool. used by the sparse getBlocks
+    /// path, which fetches CAR bytes directly rather than through the xrpc layer.
+    pub fn get(&self, url: url::Url) -> reqwest::RequestBuilder {
+        self.pick().get(url)
+    }
 }
 
 impl HttpClient for ThrottledHttpClient {
@@ -25,7 +58,7 @@ impl HttpClient for ThrottledHttpClient {
             None
         };
 
-        let res = self.client.send_http(request).await;
+        let res = self.pick().send_http(request).await;
 
         if let Ok(ref resp) = res {
             if resp.status() == StatusCode::TOO_MANY_REQUESTS {

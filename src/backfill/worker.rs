@@ -34,22 +34,35 @@ impl BackfillWorker {
         concurrency_limit: usize,
         verify_signatures: bool,
         strategy: BackfillStrategy,
+        proxies: Vec<url::Url>,
         enabled: tokio::sync::watch::Receiver<bool>,
     ) -> Self {
-        let client = reqwest::Client::builder()
-            .timeout(timeout)
-            .zstd(true)
-            .brotli(true)
-            .gzip(true)
-            .build()
-            .expect("failed to build http client");
+        let build = |proxy: Option<reqwest::Proxy>| {
+            let mut builder = reqwest::Client::builder()
+                .timeout(timeout)
+                .zstd(true)
+                .brotli(true)
+                .gzip(true);
+            if let Some(proxy) = proxy {
+                builder = builder.proxy(proxy);
+            }
+            builder.build().expect("failed to build http client")
+        };
+
+        // the direct connection is always in the pool; each proxy adds another egress IP.
+        let mut clients = vec![build(None)];
+        for url in &proxies {
+            match reqwest::Proxy::all(url.as_str()) {
+                Ok(proxy) => clients.push(build(Some(proxy))),
+                Err(e) => error!(url = %url, err = %e, "invalid backfill proxy, skipping"),
+            }
+        }
+        info!(egress_ips = clients.len(), "backfill client pool ready");
+
         Self {
             state: state.clone(),
             buffer_tx,
-            http: ThrottledHttpClient {
-                client,
-                throttler: state.throttler.clone(),
-            },
+            http: ThrottledHttpClient::new(clients, state.throttler.clone()),
             semaphore: Arc::new(Semaphore::new(concurrency_limit)),
             verify_signatures,
             strategy,
