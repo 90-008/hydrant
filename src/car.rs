@@ -6,19 +6,50 @@ use cid::Cid as IpldCid;
 use miette::{IntoDiagnostic, Result};
 
 #[cfg_attr(not(feature = "indexer"), allow(dead_code))]
+#[derive(Debug)]
+pub(crate) struct ParsedCar {
+    pub root: IpldCid,
+    pub blocks: BTreeMap<IpldCid, Bytes>,
+}
+
+#[cfg_attr(not(feature = "indexer"), allow(dead_code))]
+pub(crate) fn parse_car(data: Bytes) -> Result<ParsedCar> {
+    let (header_start, blocks_start) = car_header_bounds(&data)?;
+    let header =
+        iroh_car::CarHeader::decode(&data[header_start..blocks_start]).into_diagnostic()?;
+    let root = header
+        .roots()
+        .first()
+        .copied()
+        .ok_or_else(|| miette::miette!("CAR file has no roots"))?;
+    let blocks = parse_car_blocks_from(data, blocks_start)?;
+
+    Ok(ParsedCar { root, blocks })
+}
+
+#[cfg_attr(not(feature = "indexer"), allow(dead_code))]
 pub(crate) fn parse_car_blocks(data: Bytes) -> Result<BTreeMap<IpldCid, Bytes>> {
+    let (_, blocks_start) = car_header_bounds(&data)?;
+    parse_car_blocks_from(data, blocks_start)
+}
+
+fn car_header_bounds(data: &[u8]) -> Result<(usize, usize)> {
     let mut offset = 0;
-    let Some(header_len) = read_uvarint(&data, &mut offset)? else {
+    let Some(header_len) = read_uvarint(data, &mut offset)? else {
         return Err(miette::miette!("empty CAR file"));
     };
-    let header_end = offset
+    let header_start = offset;
+    let header_end = header_start
         .checked_add(header_len)
         .ok_or_else(|| miette::miette!("CAR header length overflow"))?;
     if header_end > data.len() {
         return Err(miette::miette!("truncated CAR header"));
     }
-    offset = header_end;
 
+    Ok((header_start, header_end))
+}
+
+fn parse_car_blocks_from(data: Bytes, mut offset: usize) -> Result<BTreeMap<IpldCid, Bytes>> {
     let mut blocks = BTreeMap::new();
     while let Some(section_len) = read_uvarint(&data, &mut offset)? {
         let section_end = offset
@@ -107,6 +138,28 @@ mod tests {
 
         let blocks = parse_car_blocks(buf.into()).unwrap();
         assert_eq!(blocks.get(&cid).unwrap().as_ref(), b"block");
+    }
+
+    #[tokio::test]
+    async fn parses_rooted_car_with_zero_copy_payloads() {
+        let root = cid(1);
+        let block = cid(2);
+        let mut buf = Vec::new();
+        let header = iroh_car::CarHeader::new_v1(vec![root]);
+        let mut writer = iroh_car::CarWriter::new(header, &mut buf);
+        writer.write(block, b"record".to_vec()).await.unwrap();
+        writer.finish().await.unwrap();
+
+        let data = Bytes::from(buf);
+        let data_range = data.as_ptr() as usize..data.as_ptr() as usize + data.len();
+        let parsed = parse_car(data).unwrap();
+        let payload = parsed.blocks.get(&block).unwrap();
+        let payload_range = payload.as_ptr() as usize..payload.as_ptr() as usize + payload.len();
+
+        assert_eq!(parsed.root, root);
+        assert_eq!(payload.as_ref(), b"record");
+        assert!(data_range.start <= payload_range.start);
+        assert!(payload_range.end <= data_range.end);
     }
 
     #[test]

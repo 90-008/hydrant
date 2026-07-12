@@ -152,24 +152,24 @@ pub(crate) async fn process_did(
                     let app_state_clone = app_state.clone();
                     let did = did.clone();
                     let pending_key = pending_key.clone();
-                    app_state_clone.db.run(move |db| {
-                        let mut txn = DbTxn::new(db);
-                        let applied = txn.transition_pending_key(
-                            &did,
-                            pending_key.as_ref(),
-                            GaugeState::Synced,
-                        )?;
-                        txn.batch
-                            .remove(&db.indexer.pending, pending_key);
-                        if applied {
-                            txn.batch.remove(&db.repos, &did_key);
-                            txn.batch
-                                .remove(&db.repo_metadata, &metadata_key);
-                            txn.counts.add_repos(-1);
-                        }
-                        txn.commit()
-                    })
-                    .await?;
+                    app_state_clone
+                        .db
+                        .run(move |db| {
+                            let mut txn = DbTxn::new(db);
+                            let applied = txn.transition_pending_key(
+                                &did,
+                                pending_key.as_ref(),
+                                GaugeState::Synced,
+                            )?;
+                            txn.batch.remove(&db.indexer.pending, pending_key);
+                            if applied {
+                                txn.batch.remove(&db.repos, &did_key);
+                                txn.batch.remove(&db.repo_metadata, &metadata_key);
+                                txn.counts.add_repos(-1);
+                            }
+                            txn.commit()
+                        })
+                        .await?;
 
                     return Ok(None);
                 }
@@ -260,31 +260,33 @@ pub(crate) async fn process_did(
                 let app_state_clone = app_state.clone();
                 let did = did.clone();
                 let pending_key = pending_key.clone();
-                app_state_clone.db.run(move |db| {
-                    let mut txn = DbTxn::new(db);
-                    let applied = txn.transition_pending_key(
-                        &did,
-                        pending_key.as_ref(),
-                        GaugeState::Resync(None),
-                    )?;
-                    txn.batch.remove(&db.indexer.pending, pending_key.clone());
-                    if applied {
-                        crate::db::Db::update_repo_state(
-                            &mut txn.batch,
-                            &db.repos,
+                app_state_clone
+                    .db
+                    .run(move |db| {
+                        let mut txn = DbTxn::new(db);
+                        let applied = txn.transition_pending_key(
                             &did,
-                            move |state, (key, batch)| {
-                                state.active = false;
-                                state.status = status;
-                                batch.insert(&db.indexer.resync, key, resync_bytes);
-                                Ok((true, ()))
-                            },
+                            pending_key.as_ref(),
+                            GaugeState::Resync(None),
                         )?;
-                    }
-                    txn.commit()?;
-                    Ok::<_, miette::Report>(())
-                })
-                .await?;
+                        txn.batch.remove(&db.indexer.pending, pending_key.clone());
+                        if applied {
+                            crate::db::Db::update_repo_state(
+                                &mut txn.batch,
+                                &db.repos,
+                                &did,
+                                move |state, (key, batch)| {
+                                    state.active = false;
+                                    state.status = status;
+                                    batch.insert(&db.indexer.resync, key, resync_bytes);
+                                    Ok((true, ()))
+                                },
+                            )?;
+                        }
+                        txn.commit()?;
+                        Ok::<_, miette::Report>(())
+                    })
+                    .await?;
 
                 return Ok(None);
             }
@@ -316,9 +318,7 @@ pub(crate) async fn process_did(
 
     // 3. import repo
     let start = Instant::now();
-    let parsed = jacquard_repo::car::reader::parse_car_bytes(&car_bytes.body)
-        .await
-        .into_diagnostic()?;
+    let parsed = crate::car::parse_car(car_bytes.body.into())?;
     trace!(elapsed = %start.elapsed().as_secs_f32(), "parsed car");
 
     let start = Instant::now();
@@ -327,10 +327,6 @@ pub(crate) async fn process_did(
         crate::car::validate_block_cids(&parsed.blocks)?;
     }
     let store = Arc::new(MemoryBlockStore::new_from_blocks(parsed.blocks));
-    // parsed.blocks was moved into the store; parsed.root is now root_cid. drop the raw
-    // CAR bytes here so we don't hold two copies of the block data (raw + parsed) for
-    // the entire duration of the spawn_blocking call below.
-    drop(car_bytes);
     trace!(
         blocks = store.len(),
         elapsed = ?start.elapsed(),
@@ -362,10 +358,14 @@ pub(crate) async fn process_did(
 
     let root_commit = Commit::from(root_commit);
 
-    // 5. walk mst
+    // 5. walk mst and fetch every record block under one store lock
     let start = Instant::now();
     let mst: Mst<MemoryBlockStore> = Mst::load(store, root_commit.data, None);
     let leaves = mst.leaves().await.into_diagnostic()?;
+    let leaf_cids = leaves.iter().map(|(_, cid)| *cid).collect::<Vec<_>>();
+    let leaf_blocks = mst.storage().get_many(&leaf_cids).await.into_diagnostic()?;
+    let records = leaves.into_iter().zip(leaf_blocks);
+    drop(mst);
     trace!(elapsed = %start.elapsed().as_secs_f32(), "walked mst");
 
     // 6. insert records into db
@@ -382,11 +382,8 @@ pub(crate) async fn process_did(
             let mut collection_counts: HashMap<SmolStr, u64> = HashMap::new();
             let mut txn = DbTxn::new(&app_state.db);
             let mut record_txn = txn.backfill_records(&app_state, &rev, &did);
-            // clone the Arc so we hold an independent reference to the block store,
-            // allowing mst (and its entire loaded node tree) to be freed immediately
-            // rather than surviving until the end of spawn_blocking.
-            let store = mst.storage().clone();
-            drop(mst);
+            // the MST and non-record blocks were released before entering this blocking
+            // persistence phase; records contains only leaf metadata and payload slices.
 
             let prefix = keys::record_prefix_did(&did);
             let mut existing_cids: HashMap<(SmolStr, DbRkey), SmolStr> = HashMap::new();
@@ -420,11 +417,7 @@ pub(crate) async fn process_did(
 
             let mut signal_seen = filter.mode == FilterMode::Full || filter.signals.is_empty();
 
-            for (key, cid) in leaves {
-                let val_bytes = tokio::runtime::Handle::current()
-                    .block_on(store.get(&cid))
-                    .into_diagnostic()?;
-
+            for ((key, cid), val_bytes) in records {
                 if let Some(val) = val_bytes {
                     let (collection, rkey) = ops::parse_path(&key)?;
 
@@ -468,9 +461,6 @@ pub(crate) async fn process_did(
                 }
             }
 
-            // all blocks have been read; free the MemoryBlockStore now so it does not
-            // survive through the final batch commit or any fjall backpressure stall.
-            drop(store);
 
             // remove any remaining existing records (they weren't in the new MST)
             for ((collection, rkey), cid) in existing_cids {
@@ -530,23 +520,24 @@ pub(crate) async fn process_did(
         let backfill_pending_key = pending_key.clone();
         let app_state = app_state.clone();
         let did = did.clone();
-        app_state.db.run(move |db| {
-            let mut txn = DbTxn::new(db);
-            let applied = txn.transition_pending_key(
-                &did,
-                backfill_pending_key.as_ref(),
-                GaugeState::Synced,
-            )?;
-            txn.batch
-                .remove(&db.indexer.pending, backfill_pending_key);
-            if applied {
-                txn.batch.remove(&db.repos, &did_key);
-                txn.batch.remove(&db.repo_metadata, &metadata_key);
-                txn.counts.add_repos(-1);
-            }
-            txn.commit()
-        })
-        .await?;
+        app_state
+            .db
+            .run(move |db| {
+                let mut txn = DbTxn::new(db);
+                let applied = txn.transition_pending_key(
+                    &did,
+                    backfill_pending_key.as_ref(),
+                    GaugeState::Synced,
+                )?;
+                txn.batch.remove(&db.indexer.pending, backfill_pending_key);
+                if applied {
+                    txn.batch.remove(&db.repos, &did_key);
+                    txn.batch.remove(&db.repo_metadata, &metadata_key);
+                    txn.counts.add_repos(-1);
+                }
+                txn.commit()
+            })
+            .await?;
         return Ok(None);
     };
 
