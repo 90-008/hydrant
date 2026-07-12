@@ -2,23 +2,24 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
+use bytes::Bytes;
 use fjall::Slice;
 use miette::{IntoDiagnostic, Result};
+use reqwest::StatusCode;
 use smol_str::{SmolStr, ToSmolStr};
 use tracing::{debug, error, trace, warn};
 
-use jacquard_api::com_atproto::sync::get_repo::{GetRepo, GetRepoError};
+use jacquard_api::com_atproto::sync::get_repo::GetRepoError;
 use jacquard_common::IntoStatic;
 use jacquard_common::types::cid::Cid as AtCid;
 use jacquard_common::types::did::Did;
-use jacquard_common::xrpc::{XrpcError, XrpcExt};
 use jacquard_repo::mst::Mst;
 use jacquard_repo::{BlockStore, MemoryBlockStore};
 
-use crate::backfill::client::ThrottledHttpClient;
+use crate::backfill::client::{ThrottledHttpClient, collect_body_bounded};
 use crate::backfill::error::BackfillError;
 use crate::backfill::sparse::{SparseBackfillResult, process_did_sparse};
-use crate::config::BackfillStrategy;
+use crate::config::{BackfillStrategy, RateTier};
 use crate::db::types::{DbAction, DbRkey};
 use crate::db::{self, Txn as DbTxn, keys};
 use crate::filter::FilterMode;
@@ -26,7 +27,7 @@ use crate::ops;
 use crate::sparse_mst::sparse_probe_collection;
 use crate::state::AppState;
 use crate::types::{Commit, GaugeState, RepoState, RepoStatus, ResyncState};
-use crate::util::url_to_fluent_uri;
+use crate::util::{parse_retry_after, throttle::ThrottleHandle};
 
 #[cfg(feature = "indexer_stream")]
 use crate::types::{AccountEvt, BroadcastEvent};
@@ -194,106 +195,78 @@ pub(crate) async fn process_did(
 
     // 2. fetch repo (car)
     let start = Instant::now();
-    let req = GetRepo::new().did(did.clone()).build();
     let throttle = app_state.throttler.get_handle(&pds).await;
-    if throttle.is_throttled() {
-        return Err(BackfillError::PreemptivelyThrottled);
-    }
     let tier = app_state.resolve_pds_tier(pds.host_str().unwrap_or(""));
-    let resp = {
-        let _permit = throttle.acquire().await;
-        if throttle.is_throttled() {
-            return Err(BackfillError::PreemptivelyThrottled);
-        }
-        throttle.wait_for_allow(1, &tier).await;
-        if throttle.is_throttled() {
-            return Err(BackfillError::PreemptivelyThrottled);
-        }
-        match http.xrpc(url_to_fluent_uri(&pds)).send(&req).await {
-            Ok(resp) => {
-                if !throttle.is_throttled() {
-                    throttle.record_success();
+    let car_bytes = match fetch_full_repo_car(
+        http,
+        &pds,
+        did,
+        &throttle,
+        &tier,
+        app_state.max_car_body_bytes,
+    )
+    .await?
+    {
+        FullRepoOutcome::Car(body) => body,
+        FullRepoOutcome::NotFound => {
+            warn!("repo not found, deleting");
+            let mut txn = DbTxn::new(db);
+            let applied =
+                txn.transition_pending_key(did, pending_key.as_ref(), GaugeState::Synced)?;
+            txn.batch.remove(&db.indexer.pending, pending_key.clone());
+            if applied {
+                if let Err(e) = crate::ops::delete_repo(&mut txn.batch, db, did, &state) {
+                    error!(err = %e, "failed to wipe repo during backfill");
                 }
-                resp
             }
-            Err(e) => return Err(BackfillError::from_sparse_client(e, &throttle)),
+            txn.commit()?;
+            // return None so did_task skips sending BackfillFinished (nothing to drain for a deleted repo)
+            return Ok(None);
         }
-    };
+        FullRepoOutcome::Inactive(status) => {
+            warn!(?status, "repo is inactive, stopping backfill");
 
-    let car_bytes = match resp.into_output() {
-        Ok(o) => o,
-        Err(XrpcError::Xrpc(e)) => {
-            if matches!(e, GetRepoError::RepoNotFound(_)) {
-                warn!("repo not found, deleting");
-                let mut txn = DbTxn::new(db);
-                let applied =
-                    txn.transition_pending_key(did, pending_key.as_ref(), GaugeState::Synced)?;
-                txn.batch.remove(&db.indexer.pending, pending_key.clone());
-                if applied {
-                    if let Err(e) = crate::ops::delete_repo(&mut txn.batch, db, did, &state) {
-                        error!(err = %e, "failed to wipe repo during backfill");
-                    }
-                }
-                txn.commit()?;
-                // return None so did_task skips sending BackfillFinished (nothing to drain for a deleted repo)
-                return Ok(None);
-            }
+            #[cfg(feature = "indexer_stream")]
+            emit_identity(&status, false);
 
-            let inactive_status = match e {
-                GetRepoError::RepoDeactivated(_) => Some(RepoStatus::Deactivated),
-                GetRepoError::RepoTakendown(_) => Some(RepoStatus::Takendown),
-                GetRepoError::RepoSuspended(_) => Some(RepoStatus::Suspended),
-                _ => None,
+            let resync_state = ResyncState::Gone {
+                status: status.clone(),
             };
+            let resync_bytes = rmp_serde::to_vec(&resync_state).into_diagnostic()?;
 
-            if let Some(status) = inactive_status {
-                warn!(?status, "repo is inactive, stopping backfill");
-
-                #[cfg(feature = "indexer_stream")]
-                emit_identity(&status, false);
-
-                let resync_state = ResyncState::Gone {
-                    status: status.clone(),
-                };
-                let resync_bytes = rmp_serde::to_vec(&resync_state).into_diagnostic()?;
-
-                let app_state_clone = app_state.clone();
-                let did = did.clone();
-                let pending_key = pending_key.clone();
-                app_state_clone
-                    .db
-                    .run(move |db| {
-                        let mut txn = DbTxn::new(db);
-                        let applied = txn.transition_pending_key(
+            let app_state_clone = app_state.clone();
+            let did = did.clone();
+            let pending_key = pending_key.clone();
+            app_state_clone
+                .db
+                .run(move |db| {
+                    let mut txn = DbTxn::new(db);
+                    let applied = txn.transition_pending_key(
+                        &did,
+                        pending_key.as_ref(),
+                        GaugeState::Resync(None),
+                    )?;
+                    txn.batch.remove(&db.indexer.pending, pending_key.clone());
+                    if applied {
+                        crate::db::Db::update_repo_state(
+                            &mut txn.batch,
+                            &db.repos,
                             &did,
-                            pending_key.as_ref(),
-                            GaugeState::Resync(None),
+                            move |state, (key, batch)| {
+                                state.active = false;
+                                state.status = status;
+                                batch.insert(&db.indexer.resync, key, resync_bytes);
+                                Ok((true, ()))
+                            },
                         )?;
-                        txn.batch.remove(&db.indexer.pending, pending_key.clone());
-                        if applied {
-                            crate::db::Db::update_repo_state(
-                                &mut txn.batch,
-                                &db.repos,
-                                &did,
-                                move |state, (key, batch)| {
-                                    state.active = false;
-                                    state.status = status;
-                                    batch.insert(&db.indexer.resync, key, resync_bytes);
-                                    Ok((true, ()))
-                                },
-                            )?;
-                        }
-                        txn.commit()?;
-                        Ok::<_, miette::Report>(())
-                    })
-                    .await?;
+                    }
+                    txn.commit()?;
+                    Ok::<_, miette::Report>(())
+                })
+                .await?;
 
-                return Ok(None);
-            }
-
-            Err(e).into_diagnostic()?
+            return Ok(None);
         }
-        Err(e) => Err(e).into_diagnostic()?,
     };
 
     // emit identity event so any consumers know, but only if something changed
@@ -306,19 +279,14 @@ pub(crate) async fn process_did(
     }
 
     trace!(
-        bytes = car_bytes.body.len(),
+        bytes = car_bytes.len(),
         elapsed = ?start.elapsed(),
         "fetched car bytes"
     );
 
-    // TODO: enforce a max_car_body_bytes limit here before parsing to prevent a malicious
-    // or compromised PDS from returning an unbounded response and causing OOM.
-    // also apply to the sparse path in sparse.rs.
-    // (finding d87fbd22402c81919fceb9cdfee53cd4)
-
     // 3. import repo
     let start = Instant::now();
-    let parsed = crate::car::parse_car(car_bytes.body.into())?;
+    let parsed = crate::car::parse_car(car_bytes)?;
     trace!(elapsed = %start.elapsed().as_secs_f32(), "parsed car");
 
     let start = Instant::now();
@@ -554,4 +522,207 @@ pub(crate) async fn process_did(
 
     trace!("complete");
     Ok(Some(previous_state))
+}
+
+/// upper bound on a buffered xrpc error body. error responses are tiny json objects; this only
+/// guards against a peer streaming an unbounded body on the error path.
+const ERROR_BODY_MAX_BYTES: usize = 64 * 1024;
+
+/// outcome of a full-repository `getRepo` fetch that the caller must act on. transport and
+/// rate-limit failures are surfaced as [`BackfillError`] instead.
+#[derive(Debug)]
+enum FullRepoOutcome {
+    /// the streamed CAR body, within the configured size ceiling.
+    Car(Bytes),
+    /// the PDS reported that the repository does not exist (`RepoNotFound`).
+    NotFound,
+    /// the PDS reported the repository is inactive; carries the status to record.
+    Inactive(RepoStatus),
+}
+
+/// fetches a full repository CAR by streaming `com.atproto.sync.getRepo` directly through the
+/// backfill client, enforcing `max_body_bytes` as chunks arrive so a runaway or malicious
+/// response cannot exhaust memory. this bypasses the typed xrpc layer (which materializes the
+/// entire decompressed body as one `Vec<u8>` before the caller sees it) while preserving the
+/// same handling: `RepoNotFound`/`RepoDeactivated`/`RepoTakendown`/`RepoSuspended` are decoded
+/// from the xrpc error body, and 429 responses feed the throttler from the rate-limit headers.
+async fn fetch_full_repo_car(
+    http: &ThrottledHttpClient,
+    pds: &url::Url,
+    did: &Did<'_>,
+    throttle: &ThrottleHandle,
+    tier: &RateTier,
+    max_body_bytes: usize,
+) -> Result<FullRepoOutcome, BackfillError> {
+    let mut url = pds
+        .join("xrpc/com.atproto.sync.getRepo")
+        .map_err(|e| BackfillError::Generic(miette::miette!("invalid PDS URL: {e}")))?;
+    url.query_pairs_mut().append_pair("did", did.as_str());
+
+    // hold the per-pds permit for the entire download, not just until response headers: full
+    // repo bodies are large, so releasing early would let unbounded concurrent downloads run
+    // against a single pds and defeat per-pds concurrency (the original xrpc getRepo held it
+    // for the whole download, since its transport read the full body before returning).
+    let _permit = throttle.acquire().await;
+    if throttle.is_throttled() {
+        return Err(BackfillError::PreemptivelyThrottled);
+    }
+    throttle.wait_for_allow(1, tier).await;
+    if throttle.is_throttled() {
+        return Err(BackfillError::PreemptivelyThrottled);
+    }
+    let resp = match http
+        .get(url)
+        .header(reqwest::header::ACCEPT, "application/vnd.ipld.car")
+        .send()
+        .await
+    {
+        Ok(resp) => {
+            if !throttle.is_throttled() {
+                throttle.record_success();
+            }
+            resp
+        }
+        Err(e) => {
+            let reason = e.to_string();
+            if let Some(secs) = throttle.record_failure_detail("transport", reason.clone()) {
+                warn!(%pds, reason, "PDS offline, blacklisting for {secs}s");
+            }
+            return Err(BackfillError::Transport(reason.into()));
+        }
+    };
+
+    let status = resp.status();
+    if status.is_success() {
+        return match collect_body_bounded(resp, max_body_bytes)
+            .await
+            .map_err(|e| BackfillError::Transport(e.to_string().into()))?
+        {
+            Some(body) => Ok(FullRepoOutcome::Car(body)),
+            None => Err(BackfillError::Generic(miette::miette!(
+                "getRepo response for {did} exceeded max body size of {max_body_bytes} bytes"
+            ))),
+        };
+    }
+
+    // non-success: decode the (tiny) xrpc error body to preserve typed error handling.
+    let retry_after = (status == StatusCode::TOO_MANY_REQUESTS)
+        .then(|| parse_retry_after(&resp))
+        .flatten();
+    let body = collect_body_bounded(resp, ERROR_BODY_MAX_BYTES)
+        .await
+        .map_err(|e| BackfillError::Transport(e.to_string().into()))?
+        .unwrap_or_default();
+
+    if let Ok(err) = serde_json::from_slice::<GetRepoError>(&body) {
+        match err {
+            GetRepoError::RepoNotFound(_) => return Ok(FullRepoOutcome::NotFound),
+            GetRepoError::RepoDeactivated(_) => {
+                return Ok(FullRepoOutcome::Inactive(RepoStatus::Deactivated));
+            }
+            GetRepoError::RepoTakendown(_) => {
+                return Ok(FullRepoOutcome::Inactive(RepoStatus::Takendown));
+            }
+            GetRepoError::RepoSuspended(_) => {
+                return Ok(FullRepoOutcome::Inactive(RepoStatus::Suspended));
+            }
+            _ => {}
+        }
+    }
+
+    if status == StatusCode::TOO_MANY_REQUESTS {
+        throttle.record_ratelimit(retry_after);
+        return Err(BackfillError::Ratelimited);
+    }
+
+    Err(BackfillError::Generic(miette::miette!(
+        "getRepo failed with HTTP {status}: {}",
+        String::from_utf8_lossy(&body)
+    )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::Router;
+    use axum::routing::get;
+
+    /// spawns a server answering `com.atproto.sync.getRepo` with a fixed status and body.
+    async fn spawn_get_repo(status: StatusCode, body: Vec<u8>) -> url::Url {
+        let app = Router::new().route(
+            "/xrpc/com.atproto.sync.getRepo",
+            get(move || {
+                let body = body.clone();
+                async move { (status, body) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = url::Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        url
+    }
+
+    async fn fetch(
+        pds: &url::Url,
+        max_body_bytes: usize,
+    ) -> Result<FullRepoOutcome, BackfillError> {
+        let throttler = crate::util::throttle::Throttler::new(1, 10);
+        let http = ThrottledHttpClient::new(vec![reqwest::Client::new()], throttler.clone());
+        let throttle = throttler.get_handle(pds).await;
+        let did = Did::new_static("did:plc:aaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
+        fetch_full_repo_car(
+            &http,
+            pds,
+            &did,
+            &throttle,
+            &RateTier::trusted(),
+            max_body_bytes,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn full_get_repo_streams_body_within_ceiling() {
+        let pds = spawn_get_repo(StatusCode::OK, b"car-bytes".to_vec()).await;
+        match fetch(&pds, 1024).await.unwrap() {
+            FullRepoOutcome::Car(body) => assert_eq!(body.as_ref(), b"car-bytes"),
+            other => panic!("expected Car, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn full_get_repo_rejects_oversized_body() {
+        let pds = spawn_get_repo(StatusCode::OK, vec![0u8; 4096]).await;
+        let err = fetch(&pds, 64).await.unwrap_err();
+        assert!(
+            err.to_string().contains("exceeded max body size"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn full_get_repo_maps_repo_not_found() {
+        let pds = spawn_get_repo(
+            StatusCode::BAD_REQUEST,
+            br#"{"error":"RepoNotFound","message":"nope"}"#.to_vec(),
+        )
+        .await;
+        assert!(matches!(
+            fetch(&pds, 1024).await.unwrap(),
+            FullRepoOutcome::NotFound
+        ));
+    }
+
+    #[tokio::test]
+    async fn full_get_repo_maps_inactive_status() {
+        let pds = spawn_get_repo(
+            StatusCode::BAD_REQUEST,
+            br#"{"error":"RepoDeactivated"}"#.to_vec(),
+        )
+        .await;
+        match fetch(&pds, 1024).await.unwrap() {
+            FullRepoOutcome::Inactive(status) => assert_eq!(status, RepoStatus::Deactivated),
+            other => panic!("expected Inactive, got {other:?}"),
+        }
+    }
 }

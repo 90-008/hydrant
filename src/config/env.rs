@@ -119,6 +119,7 @@ impl Config {
 
         let cursor_save_interval = cfg!("CURSOR_SAVE_INTERVAL", defaults.cursor_save_interval, sec);
         let repo_fetch_timeout = cfg!("REPO_FETCH_TIMEOUT", defaults.repo_fetch_timeout, sec);
+        let max_car_body_bytes = cfg!("MAX_CAR_BODY_BYTES", defaults.max_car_body_bytes);
 
         let ephemeral: bool = cfg!("EPHEMERAL", defaults.ephemeral);
         let ephemeral_ttl = cfg!("EPHEMERAL_TTL", defaults.ephemeral_ttl, sec);
@@ -360,6 +361,7 @@ impl Config {
             cursor_save_interval,
             enable_backfill,
             repo_fetch_timeout,
+            max_car_body_bytes,
             backfill_concurrency_limit,
             backfill_strategy,
             backfill_proxies,

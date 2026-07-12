@@ -104,6 +104,13 @@ pub struct Config {
     /// timeout for fetching a full repository CAR during backfill.
     /// set via `HYDRANT_REPO_FETCH_TIMEOUT` (humantime duration, e.g. `5min`).
     pub repo_fetch_timeout: Duration,
+    /// maximum size in bytes of a full-repository `getRepo` CAR response accepted during
+    /// backfill. the body is streamed and rejected before it is fully buffered once it would
+    /// exceed this ceiling, bounding per-task memory regardless of what a PDS returns (the same
+    /// ceiling also bounds sparse `getBlocks` fetches). legitimate repositories are far smaller;
+    /// lower this on memory-constrained hosts running high backfill concurrency.
+    /// set via `HYDRANT_MAX_CAR_BODY_BYTES`.
+    pub max_car_body_bytes: usize,
     /// maximum number of concurrent backfill tasks.
     /// set via `HYDRANT_BACKFILL_CONCURRENCY_LIMIT`.
     pub backfill_concurrency_limit: usize,
@@ -315,6 +322,9 @@ impl Default for Config {
             firehose_max_failures: 15,
             cursor_save_interval: Duration::from_secs(3),
             repo_fetch_timeout: Duration::from_secs(300),
+            // 2 GiB safety ceiling: never rejects a legitimate repository, only a runaway or
+            // malicious response. memory-constrained/high-concurrency hosts should lower it.
+            max_car_body_bytes: 2 * 1024 * 1024 * 1024,
             backfill_concurrency_limit: 16,
             backfill_strategy: BackfillStrategy::Auto,
             backfill_proxies: vec![],
@@ -436,6 +446,11 @@ impl fmt::Display for Config {
             f,
             "repo fetch timeout",
             format_args!("{}sec", self.repo_fetch_timeout.as_secs())
+        )?;
+        config_line!(
+            f,
+            "max car body",
+            format_args!("{} mb", self.max_car_body_bytes / (1024 * 1024))
         )?;
         config_line!(f, "ephemeral", self.ephemeral)?;
         config_line!(f, "database path", self.database_path.to_string_lossy())?;

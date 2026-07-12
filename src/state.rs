@@ -44,6 +44,7 @@ pub struct AppState {
     pub ephemeral_ttl: Duration,
     pub only_index_links: bool,
     pub verify_cids: bool,
+    pub max_car_body_bytes: usize,
     pub get_repo_semaphore: Semaphore,
 }
 
@@ -124,6 +125,7 @@ impl AppState {
             ephemeral_ttl: config.ephemeral_ttl,
             only_index_links: config.only_index_links,
             verify_cids: config.verify_cids,
+            max_car_body_bytes: config.max_car_body_bytes,
             get_repo_semaphore: Semaphore::new(config.get_repo_concurrency_limit),
             throttler: Throttler::new(
                 config.backfill_proxies.len() + 1,

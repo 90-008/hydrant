@@ -1,4 +1,5 @@
 use crate::util::throttle::Throttler;
+use bytes::{Bytes, BytesMut};
 use jacquard_common::http_client::HttpClient;
 use reqwest::StatusCode;
 use std::sync::Arc;
@@ -89,4 +90,32 @@ impl HttpClient for ThrottledHttpClient {
 
         res
     }
+}
+
+/// streams a response body into a single contiguous [`Bytes`], enforcing a hard byte ceiling.
+///
+/// returns `Ok(None)` when the body exceeds `max_bytes`: the response is dropped without
+/// buffering the remainder, so per-task memory stays bounded regardless of what the PDS sends
+/// (a chunked response with no `Content-Length`, or a decompression bomb — `chunk` yields
+/// already-decoded bytes, so the ceiling applies to the decompressed size). the buffer is grown
+/// in place and never double-buffered: at most `buf + one chunk` is resident at any point.
+pub(crate) async fn collect_body_bounded(
+    mut resp: reqwest::Response,
+    max_bytes: usize,
+) -> Result<Option<Bytes>, reqwest::Error> {
+    // reject early when a declared (uncompressed) length already exceeds the ceiling. reqwest
+    // strips `Content-Length` from decoded responses, so a present value is the real body size.
+    let content_length = resp.content_length();
+    if content_length.is_some_and(|len| len > max_bytes as u64) {
+        return Ok(None);
+    }
+    let reserve = content_length.unwrap_or(0).min(max_bytes as u64) as usize;
+    let mut buf = BytesMut::with_capacity(reserve);
+    while let Some(chunk) = resp.chunk().await? {
+        if buf.len() + chunk.len() > max_bytes {
+            return Ok(None);
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(Some(buf.freeze()))
 }

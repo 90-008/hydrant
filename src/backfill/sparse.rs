@@ -1,4 +1,4 @@
-use crate::backfill::client::ThrottledHttpClient;
+use crate::backfill::client::{ThrottledHttpClient, collect_body_bounded};
 use crate::backfill::error::BackfillError;
 use crate::config::{BackfillStrategy, RateTier};
 use crate::db::types::{DbAction, DbRkey};
@@ -199,6 +199,7 @@ pub(crate) async fn process_did_sparse(
                     &throttle,
                     &tier,
                     app_state.verify_cids,
+                    app_state.max_car_body_bytes,
                 )
                 .await?;
                 if missing.iter().all(|cid| !blocks.contains_key(cid)) {
@@ -243,6 +244,7 @@ pub(crate) async fn process_did_sparse(
             &throttle,
             &tier,
             app_state.verify_cids,
+            app_state.max_car_body_bytes,
         )
         .await?,
     );
@@ -287,12 +289,24 @@ async fn fetch_blocks(
     throttle: &ThrottleHandle,
     tier: &RateTier,
     verify_cids: bool,
+    max_body_bytes: usize,
 ) -> Result<BTreeMap<IpldCid, bytes::Bytes>, BackfillError> {
     let mut out = BTreeMap::new();
 
     let fetches = cids
         .chunks(SPARSE_GET_BLOCKS_CHUNK)
-        .map(|chunk| fetch_block_chunk(http, pds, did, chunk, throttle, tier, verify_cids))
+        .map(|chunk| {
+            fetch_block_chunk(
+                http,
+                pds,
+                did,
+                chunk,
+                throttle,
+                tier,
+                verify_cids,
+                max_body_bytes,
+            )
+        })
         .collect::<Vec<_>>();
     let fetches = stream::iter(fetches).buffer_unordered(SPARSE_GET_BLOCKS_PARALLELISM);
     futures::pin_mut!(fetches);
@@ -312,6 +326,7 @@ async fn fetch_block_chunk(
     throttle: &ThrottleHandle,
     tier: &RateTier,
     verify_cids: bool,
+    max_body_bytes: usize,
 ) -> Result<BTreeMap<IpldCid, bytes::Bytes>, BackfillError> {
     let mut url = pds
         .join("xrpc/com.atproto.sync.getBlocks")
@@ -355,10 +370,14 @@ async fn fetch_block_chunk(
 
     let status = resp.status();
     if status.is_success() {
-        let body = resp
-            .bytes()
+        let Some(body) = collect_body_bounded(resp, max_body_bytes)
             .await
-            .map_err(|e| BackfillError::Transport(e.to_string().into()))?;
+            .map_err(|e| BackfillError::Transport(e.to_string().into()))?
+        else {
+            return Err(BackfillError::Generic(miette::miette!(
+                "getBlocks response for {did} exceeded max body size of {max_body_bytes} bytes"
+            )));
+        };
         let blocks = crate::car::parse_car_blocks(body).map_err(BackfillError::from)?;
         if verify_cids {
             crate::car::validate_block_cids(&blocks)?;
@@ -660,6 +679,7 @@ mod tests {
                 &throttle,
                 &RateTier::trusted(),
                 false,
+                64 * 1024 * 1024,
             ),
         )
         .await
@@ -708,6 +728,7 @@ mod tests {
         pds: &url::Url,
         wanted: IpldCid,
         verify_cids: bool,
+        max_body_bytes: usize,
     ) -> Result<BTreeMap<IpldCid, bytes::Bytes>, BackfillError> {
         let throttler = crate::util::throttle::Throttler::new(1, 10);
         let http = ThrottledHttpClient::new(vec![reqwest::Client::new()], throttler.clone());
@@ -721,6 +742,7 @@ mod tests {
             &throttle,
             &RateTier::trusted(),
             verify_cids,
+            max_body_bytes,
         )
         .await
     }
@@ -729,7 +751,9 @@ mod tests {
     async fn verify_cids_rejects_mismatched_get_blocks_car() {
         let pds = spawn_car_server(car_with_block(cid(1), b"forged").await).await;
 
-        let err = fetch_one(&pds, cid(1), true).await.unwrap_err();
+        let err = fetch_one(&pds, cid(1), true, 64 * 1024 * 1024)
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("CAR block CID mismatch"));
     }
 
@@ -738,7 +762,9 @@ mod tests {
         let real_cid = jacquard_repo::mst::util::compute_cid(b"trusted").unwrap();
         let pds = spawn_car_server(car_with_block(real_cid, b"trusted").await).await;
 
-        let blocks = fetch_one(&pds, real_cid, true).await.unwrap();
+        let blocks = fetch_one(&pds, real_cid, true, 64 * 1024 * 1024)
+            .await
+            .unwrap();
         assert_eq!(blocks.get(&real_cid).unwrap().as_ref(), b"trusted");
     }
 
@@ -746,7 +772,17 @@ mod tests {
     async fn verify_cids_disabled_accepts_mismatched_get_blocks_car() {
         let pds = spawn_car_server(car_with_block(cid(1), b"forged").await).await;
 
-        let blocks = fetch_one(&pds, cid(1), false).await.unwrap();
+        let blocks = fetch_one(&pds, cid(1), false, 64 * 1024 * 1024)
+            .await
+            .unwrap();
         assert_eq!(blocks.get(&cid(1)).unwrap().as_ref(), b"forged");
+    }
+
+    #[tokio::test]
+    async fn get_blocks_rejects_oversized_body() {
+        let pds = spawn_car_server(car_with_block(cid(1), &[0u8; 4096]).await).await;
+
+        let err = fetch_one(&pds, cid(1), false, 64).await.unwrap_err();
+        assert!(err.to_string().contains("exceeded max body size"));
     }
 }
