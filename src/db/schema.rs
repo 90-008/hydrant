@@ -522,9 +522,10 @@ impl Schema for Events {
                 cx.cfg
                     .ephemeral
                     .then(|| BlockSizePolicy::new([kb(64), kb(128), kb(256)]))
-                    .unwrap_or_else(|| BlockSizePolicy::new([kb(16), kb(64)])),
+                    .unwrap_or_else(|| BlockSizePolicy::new([kb(128), kb(256)])),
             )
-            // we are streaming the new events to consumers so we dont want to compress them
+            // monotonic {ID} keys are trivial-moved down (never rewritten), so the L0
+            // policy is permanent; the live tail is served uncompressed from the memtable
             .data_block_compression_policy(
                 cx.cfg
                     .ephemeral
@@ -536,7 +537,7 @@ impl Schema for Events {
                     })
                     .unwrap_or_else(|| {
                         CompressionPolicy::new([
-                            CompressionType::None,
+                            (cx.compression)("events", 3),
                             (cx.compression)("events", 3),
                             (cx.compression)("events", 3),
                             (cx.compression)("events", 5),
@@ -583,9 +584,9 @@ impl Schema for JetstreamEvents {
             // time-ordered append-only stream metadata, only iterated for replay.
             .expect_point_read_hits(true)
             .max_memtable_size(mb(cx.cfg.db_events_memtable_size_mb))
-            .data_block_size_policy(BlockSizePolicy::new([kb(16), kb(64), kb(128)]))
+            .data_block_size_policy(BlockSizePolicy::new([kb(128), kb(256)]))
             .data_block_compression_policy(CompressionPolicy::new([
-                CompressionType::None,
+                (cx.compression)("jetstream_events", 3),
                 (cx.compression)("jetstream_events", 3),
                 (cx.compression)("jetstream_events", 5),
             ]))
@@ -615,12 +616,14 @@ impl Schema for RelayEvents {
             // only iterated for cursor replay
             .expect_point_read_hits(true)
             .max_memtable_size(mb(cx.cfg.db_events_memtable_size_mb))
-            .data_block_size_policy(BlockSizePolicy::new([kb(64), kb(128), kb(256)]))
+            .data_block_size_policy(BlockSizePolicy::new([kb(128), kb(256)]))
+            // monotonic {SEQ} keys are trivial-moved down (never rewritten), so L0
+            // compression is permanent; the live tail is served from the memtable
             .data_block_compression_policy(CompressionPolicy::new([
-                CompressionType::None,
-                (cx.compression)("events", 3),
-                (cx.compression)("events", 3),
-                (cx.compression)("events", 5),
+                (cx.compression)("relay_events", 3),
+                (cx.compression)("relay_events", 3),
+                (cx.compression)("relay_events", 3),
+                (cx.compression)("relay_events", 5),
             ]))
             .data_block_restart_interval_policy(RestartIntervalPolicy::new([64, 128]))
     }
