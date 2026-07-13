@@ -109,19 +109,17 @@ impl<'a> LifecycleCountBatch<'a> {
                 .and_then(|bytes| deser_repo_meta(bytes.as_ref()).ok())
                 .map(|meta| meta.index_id);
 
-            let mut is_pending = false;
-            if let Some(index_id) = index_id {
-                if self
-                    .db
-                    .indexer
-                    .pending
-                    .get(keys::pending_key(index_id))
-                    .into_diagnostic()?
-                    .is_some()
-                {
-                    is_pending = true;
-                }
-            }
+            let is_pending = index_id
+                .map(|index_id| {
+                    self.db
+                        .indexer
+                        .pending
+                        .get(keys::pending_key(index_id))
+                        .into_diagnostic()
+                })
+                .transpose()?
+                .flatten()
+                .is_some();
 
             let gauge = if is_pending {
                 GaugeState::Pending

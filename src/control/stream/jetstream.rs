@@ -113,14 +113,7 @@ fn latest_jetstream_head(state: &AppState) -> Option<(u64, u64)> {
 // drain the Jetstream broadcast channel without buffering, to prevent the
 // receiver from lagging during long replay windows.
 fn drain_jetstream_broadcast(event_rx: &mut broadcast::Receiver<JetstreamBroadcast>) {
-    loop {
-        match event_rx.try_recv() {
-            Ok(_) | Err(broadcast::error::TryRecvError::Lagged(_)) => {}
-            Err(broadcast::error::TryRecvError::Empty | broadcast::error::TryRecvError::Closed) => {
-                break;
-            }
-        }
-    }
+    while let Ok(_) | Err(broadcast::error::TryRecvError::Lagged(_)) = event_rx.try_recv() {}
 }
 
 // send one live Jetstream event, retrying until the channel drains or timeout.

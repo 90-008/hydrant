@@ -25,8 +25,8 @@ def test-pds-tier-management [url: string, pid: int] {
             }
         }
     }
-    if ($rate_tiers.trusted.per_second_base) <= ($rate_tiers.default.per_second_base) {
-        fail $"expected trusted.per_second_base > default, got ($rate_tiers.trusted.per_second_base) vs ($rate_tiers.default.per_second_base)" $pid
+    if $rate_tiers.default != $rate_tiers.trusted {
+        fail "expected indexer default rate tier to use trusted limits" $pid
     }
 
     print "  PUT /pds/tiers creates an assignment..."

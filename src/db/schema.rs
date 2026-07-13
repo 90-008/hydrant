@@ -292,10 +292,9 @@ fn render_counter(value: &[u8]) -> Value {
     if let Ok(arr) = value.try_into() {
         return Value::Number(u64::from_be_bytes(arr).into());
     }
-    if let Ok(s) = String::from_utf8(value.to_vec()) {
-        return Value::String(s);
-    }
-    Value::String(hex::encode(value))
+    std::str::from_utf8(value)
+        .map(|s| Value::String(s.to_owned()))
+        .unwrap_or_else(|_| Value::String(hex::encode(value)))
 }
 
 /// filter config: mode key, signal/collection/exclude sets, pds meta
@@ -359,13 +358,15 @@ impl Schema for Records {
 
     fn render_value(value: &[u8]) -> Value {
         use std::str::FromStr;
-        let Ok(s) = String::from_utf8(value.to_vec()) else {
-            return Value::String(hex::encode(value));
-        };
-        match jacquard_common::types::cid::Cid::from_str(&s) {
-            Ok(cid) => serde_json::to_value(cid).unwrap_or(Value::String(s)),
-            Err(_) => Value::String(s),
-        }
+        std::str::from_utf8(value).map_or_else(
+            |_| Value::String(hex::encode(value)),
+            |s| {
+                jacquard_common::types::cid::Cid::from_str(s)
+                    .ok()
+                    .and_then(|cid| serde_json::to_value(cid).ok())
+                    .unwrap_or_else(|| Value::String(s.to_owned()))
+            },
+        )
     }
 }
 

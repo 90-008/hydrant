@@ -77,19 +77,19 @@ mod enabled {
             op: EmitOp<'_>,
         ) -> Result<()> {
             // in ephemeral mode, the event payload is the only place we persist the record.
-            let block_inline_for_event = (self.ephemeral).then(|| op.block.cloned()).flatten();
+            let block_inline_for_event = op.block.filter(|_| self.ephemeral).cloned();
             // inline record bytes for live tailing so we don't have to load from blocks.
-            let inline_block =
-                (!self.ephemeral && self.should_broadcast_live && !self.only_index_links)
-                    .then(|| op.block.cloned())
-                    .flatten();
+            let inline_block = op
+                .block
+                .filter(|_| !self.ephemeral && self.should_broadcast_live && !self.only_index_links)
+                .cloned();
 
             let data = block_inline_for_event
                 .map(StoredData::Block)
                 .or_else(|| {
-                    (!self.only_index_links)
-                        .then(|| op.cid.map(StoredData::Ptr))
-                        .flatten()
+                    op.cid
+                        .filter(|_| !self.only_index_links)
+                        .map(StoredData::Ptr)
                 })
                 .unwrap_or(StoredData::Nothing);
 
@@ -119,21 +119,18 @@ mod enabled {
                     event_id,
                     live: self.live,
                 };
-                let ephemeral = self
-                    .should_stage_jetstream
-                    .then(|| {
-                        crate::jetstream::build_ephemeral_from_stored(
-                            did_trimmed.to_did().as_str(),
-                            self.rev.to_tid().as_str(),
-                            op.action.as_str(),
-                            collection.as_str(),
-                            op.rkey.to_smolstr().as_str(),
-                            &data,
-                            inline_block.as_ref(),
-                            self.live,
-                        )
-                    })
-                    .flatten();
+                let ephemeral = self.should_stage_jetstream.then_some(()).and_then(|()| {
+                    crate::jetstream::build_ephemeral_from_stored(
+                        did_trimmed.to_did().as_str(),
+                        self.rev.to_tid().as_str(),
+                        op.action.as_str(),
+                        collection.as_str(),
+                        op.rkey.to_smolstr().as_str(),
+                        &data,
+                        inline_block.as_ref(),
+                        self.live,
+                    )
+                });
                 let broadcast = crate::jetstream::stage_event(batch, db, jetstream, ephemeral)?;
                 if self.live {
                     self.jetstream_events.push(broadcast);

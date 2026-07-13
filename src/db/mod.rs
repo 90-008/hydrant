@@ -261,8 +261,10 @@ mod tests {
     #[tokio::test]
     async fn test_db_compact_concurrency_guard() -> Result<()> {
         let tmp = tempfile::tempdir().into_diagnostic()?;
-        let mut cfg = Config::default();
-        cfg.database_path = tmp.path().to_path_buf();
+        let cfg = Config {
+            database_path: tmp.path().to_path_buf(),
+            ..Config::default()
+        };
 
         let db = Db::open(&cfg)?;
 

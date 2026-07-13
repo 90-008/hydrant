@@ -275,17 +275,12 @@ impl FirehoseWorker {
         match e {
             IngestError::Commit(_) | IngestError::NoSigningKey(_) => false,
             IngestError::Generic(report) => {
-                if report
+                report
                     .downcast_ref::<jacquard_repo::error::CommitError>()
-                    .is_some()
-                    || report
+                    .is_none()
+                    && report
                         .downcast_ref::<crate::resolver::NoSigningKeyError>()
-                        .is_some()
-                {
-                    false
-                } else {
-                    true
-                }
+                        .is_none()
             }
             IngestError::Resolver(ResolverError::Ratelimited) => true,
             IngestError::Resolver(ResolverError::Transport(_)) => true,

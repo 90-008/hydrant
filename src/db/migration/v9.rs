@@ -13,19 +13,21 @@ pub(crate) fn migrate_v9(db: &Db, batch: &mut OwnedWriteBatch) -> Result<()> {
     for guard in db.filter.prefix(exclude_prefix) {
         let (k, _) = guard.into_inner().into_diagnostic()?;
         let val_bytes = &k[exclude_prefix.len()..];
-        if let Ok(s) = std::str::from_utf8(val_bytes) {
-            if s.starts_with("did:") {
-                let did = Did::new(s).into_diagnostic()?;
-                let trimmed = TrimmedDid::from(&did);
-                let mut new_key = Vec::with_capacity(2 + trimmed.len());
-                new_key.push(crate::db::filter::EXCLUDE_PREFIX);
-                new_key.push(crate::db::keys::SEP);
-                trimmed.write_to_vec(&mut new_key);
+        let Some(s) = std::str::from_utf8(val_bytes)
+            .ok()
+            .filter(|s| s.starts_with("did:"))
+        else {
+            continue;
+        };
+        let did = Did::new(s).into_diagnostic()?;
+        let trimmed = TrimmedDid::from(&did);
+        let mut new_key = Vec::with_capacity(2 + trimmed.len());
+        new_key.push(crate::db::filter::EXCLUDE_PREFIX);
+        new_key.push(crate::db::keys::SEP);
+        trimmed.write_to_vec(&mut new_key);
 
-                batch.insert(&db.filter, new_key, []);
-                batch.remove(&db.filter, k);
-            }
-        }
+        batch.insert(&db.filter, new_key, []);
+        batch.remove(&db.filter, k);
     }
 
     // 2. Migrate PDS status and tier keys

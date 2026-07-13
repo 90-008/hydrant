@@ -61,31 +61,32 @@ impl HttpClient for ThrottledHttpClient {
 
         let res = self.pick().send_http(request).await;
 
-        if let Ok(ref resp) = res {
-            if resp.status() == StatusCode::TOO_MANY_REQUESTS {
-                if let Some(ref host_url) = host_url {
-                    let headers = resp.headers();
-                    let retry_after = headers
-                        .get(http::header::RETRY_AFTER)
-                        .and_then(|v| v.to_str().ok())
-                        .and_then(|s| s.parse::<u64>().ok());
+        if let Some((resp, host_url)) = res
+            .as_ref()
+            .ok()
+            .filter(|resp| resp.status() == StatusCode::TOO_MANY_REQUESTS)
+            .zip(host_url.as_ref())
+        {
+            let headers = resp.headers();
+            let retry_after = headers
+                .get(http::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<u64>().ok());
 
-                    let rate_limit_reset = headers
-                        .get("ratelimit-reset")
-                        .and_then(|v| v.to_str().ok())
-                        .and_then(|s| s.parse::<i64>().ok())
-                        .map(|ts| {
-                            let now = chrono::Utc::now().timestamp();
-                            (ts - now).max(1) as u64
-                        });
+            let rate_limit_reset = headers
+                .get("ratelimit-reset")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<i64>().ok())
+                .map(|ts| {
+                    let now = chrono::Utc::now().timestamp();
+                    (ts - now).max(1) as u64
+                });
 
-                    let delay_secs = retry_after.or(rate_limit_reset);
-                    self.throttler
-                        .get_handle(host_url)
-                        .await
-                        .record_ratelimit(delay_secs);
-                }
-            }
+            let delay_secs = retry_after.or(rate_limit_reset);
+            self.throttler
+                .get_handle(host_url)
+                .await
+                .record_ratelimit(delay_secs);
         }
 
         res

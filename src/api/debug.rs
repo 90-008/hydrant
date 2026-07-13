@@ -238,7 +238,7 @@ pub async fn handle_debug_compact(
 pub async fn handle_debug_ephemeral_ttl_tick(
     State(state): State<Arc<AppState>>,
 ) -> Result<StatusCode, StatusCode> {
-    let ephemeral_ttl = state.ephemeral_ttl.clone();
+    let ephemeral_ttl = state.ephemeral_ttl;
     state
         .db
         .run(move |db| {

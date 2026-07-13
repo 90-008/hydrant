@@ -103,8 +103,9 @@ impl EventSink {
             .enumerate()
             .filter_map(|(idx, op)| {
                 matches!(op.action.as_str(), "create" | "update" | "delete")
-                    .then(|| split_collection(&op.path).map(|col| (idx as u32, col)))
-                    .flatten()
+                    .then_some(op)
+                    .and_then(|op| split_collection(&op.path))
+                    .map(|collection| (idx as u32, collection))
             })
             .collect::<Vec<_>>();
         #[cfg(feature = "jetstream")]
@@ -120,11 +121,9 @@ impl EventSink {
             // connected — the stream thread re-reads from relay_events as a fallback.
             let has_subscribers = state.db.jetstream.tx.receiver_count() > 0;
             for (op_index, collection) in &jetstream_ops {
-                let ephemeral = has_subscribers
-                    .then(|| {
-                        build_relay_commit_ephemeral(&commit, *op_index, collection, &parsed_blocks)
-                    })
-                    .flatten();
+                let ephemeral = has_subscribers.then_some(()).and_then(|()| {
+                    build_relay_commit_ephemeral(&commit, *op_index, collection, &parsed_blocks)
+                });
                 self.jetstream_events.push((
                     StoredJetstreamEvent::RelayCommit {
                         did: jetstream_did.clone(),

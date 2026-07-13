@@ -293,22 +293,23 @@ async fn fetch_blocks(
 ) -> Result<BTreeMap<IpldCid, bytes::Bytes>, BackfillError> {
     let mut out = BTreeMap::new();
 
-    let fetches = cids
-        .chunks(SPARSE_GET_BLOCKS_CHUNK)
-        .map(|chunk| {
+    let fetches = stream::iter((0..cids.len()).step_by(SPARSE_GET_BLOCKS_CHUNK))
+        .map(|start| {
+            let end = start
+                .saturating_add(SPARSE_GET_BLOCKS_CHUNK)
+                .min(cids.len());
             fetch_block_chunk(
                 http,
                 pds,
                 did,
-                chunk,
+                &cids[start..end],
                 throttle,
                 tier,
                 verify_cids,
                 max_body_bytes,
             )
         })
-        .collect::<Vec<_>>();
-    let fetches = stream::iter(fetches).buffer_unordered(SPARSE_GET_BLOCKS_PARALLELISM);
+        .buffer_unordered(SPARSE_GET_BLOCKS_PARALLELISM);
     futures::pin_mut!(fetches);
 
     while let Some(blocks) = fetches.next().await {
@@ -384,27 +385,28 @@ async fn fetch_block_chunk(
         }
         Ok(blocks)
     } else {
-        let retry_after = if status == StatusCode::TOO_MANY_REQUESTS {
-            crate::util::parse_retry_after(&resp)
-        } else {
-            None
-        };
+        let retry_after = (status == StatusCode::TOO_MANY_REQUESTS)
+            .then_some(())
+            .and_then(|()| crate::util::parse_retry_after(&resp));
 
         let body = resp
             .bytes()
             .await
             .map_err(|e| BackfillError::Transport(e.to_string().into()))?;
-        if let Ok(err) = serde_json::from_slice::<GetBlocksError>(&body) {
-            match err {
-                GetBlocksError::BlockNotFound(_)
-                | GetBlocksError::RepoNotFound(_)
-                | GetBlocksError::RepoTakendown(_)
-                | GetBlocksError::RepoSuspended(_)
-                | GetBlocksError::RepoDeactivated(_) => {
-                    return Ok(BTreeMap::new());
-                }
-                _ => {}
-            }
+        if serde_json::from_slice::<GetBlocksError>(&body)
+            .ok()
+            .is_some_and(|err| {
+                matches!(
+                    err,
+                    GetBlocksError::BlockNotFound(_)
+                        | GetBlocksError::RepoNotFound(_)
+                        | GetBlocksError::RepoTakendown(_)
+                        | GetBlocksError::RepoSuspended(_)
+                        | GetBlocksError::RepoDeactivated(_)
+                )
+            })
+        {
+            return Ok(BTreeMap::new());
         }
 
         if status == StatusCode::TOO_MANY_REQUESTS {
@@ -479,7 +481,7 @@ async fn persist_sparse_backfill(
             }
 
             let Some(val) = blocks.get(&cid) else {
-                return Err(miette::miette!("missing sparse record block {cid}").into());
+                return Err(miette::miette!("missing sparse record block {cid}"));
             };
 
             if !signal_seen && filter.matches_signal(collection) {
@@ -493,15 +495,15 @@ async fn persist_sparse_backfill(
 
             *collection_counts.entry(path.0.clone()).or_default() += 1;
 
-            let existing_cid = existing_cids.remove(&path);
-            let action = if let Some(existing_cid) = &existing_cid {
-                if existing_cid == cid_obj.as_str() {
-                    trace!(collection = %collection, rkey = %rkey, cid = %cid, "skip unchanged sparse record");
-                    continue;
-                }
-                DbAction::Update
-            } else {
-                DbAction::Create
+            let action = existing_cids.remove(&path).map_or(
+                Some(DbAction::Create),
+                |existing_cid| {
+                    (existing_cid != cid_obj.as_str()).then_some(DbAction::Update)
+                },
+            );
+            let Some(action) = action else {
+                trace!(collection = %collection, rkey = %rkey, cid = %cid, "skip unchanged sparse record");
+                continue;
             };
             trace!(collection = %collection, rkey = %rkey, cid = %cid, ?action, "action sparse record");
 

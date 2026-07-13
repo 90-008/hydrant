@@ -98,13 +98,8 @@ impl Db {
         };
         registry::trainable()
             .into_iter()
-            .fold(StdHashMap::new(), |mut acc, (name, _)| {
-                let Some(dict) = load_dict(name) else {
-                    return acc;
-                };
-                acc.insert(name, dict);
-                acc
-            })
+            .filter_map(|(name, _)| load_dict(name).map(|dict| (name, dict)))
+            .collect()
     }
 
     fn assemble_keyspaces_and_verify(

@@ -128,14 +128,15 @@ impl Hydrant {
                     .into_diagnostic()
                     .wrap_err("firehose cursor key contains non-utf8 hostname")?;
 
-                if let Some(after) = &cursor {
-                    if hostname <= after.as_str() {
-                        continue;
-                    }
+                if cursor
+                    .as_ref()
+                    .is_some_and(|after| hostname <= after.as_str())
+                {
+                    continue;
                 }
 
                 db_hosts.push(SmolStr::new(hostname));
-                if db_hosts.len() >= limit + 1 {
+                if db_hosts.len() > limit {
                     break;
                 }
             }
@@ -144,10 +145,11 @@ impl Hydrant {
             {
                 let meta = state_closure.pds_meta.load();
                 for hostname in meta.hosts.keys() {
-                    if let Some(after) = &cursor {
-                        if hostname.as_str() <= after.as_str() {
-                            continue;
-                        }
+                    if cursor
+                        .as_ref()
+                        .is_some_and(|after| hostname.as_str() <= after.as_str())
+                    {
+                        continue;
                     }
                     meta_hosts.push(SmolStr::new(hostname));
                 }

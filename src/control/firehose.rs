@@ -309,17 +309,14 @@ impl FirehoseHandle {
         let key = keys::firehose_source_key(url.as_str());
         self.state
             .db
-            .run({
-                let is_pds = is_pds;
-                move |db| {
-                    let mut batch = db.inner.batch();
-                    let value = rmp_serde::to_vec(&db::FirehoseSourceMeta { is_pds }).map_err(|e| {
-                        miette::miette!("failed to serialize firehose source meta: {e}")
-                    })?;
-                    batch.insert(&db.crawler, key, &value);
-                    batch.commit().into_diagnostic()?;
-                    db.persist()
-                }
+            .run(move |db| {
+                let mut batch = db.inner.batch();
+                let value = rmp_serde::to_vec(&db::FirehoseSourceMeta { is_pds }).map_err(|e| {
+                    miette::miette!("failed to serialize firehose source meta: {e}")
+                })?;
+                batch.insert(&db.crawler, key, &value);
+                batch.commit().into_diagnostic()?;
+                db.persist()
             })
             .await?;
 

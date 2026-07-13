@@ -52,12 +52,7 @@ pub(crate) async fn process_did(
     let Some(state_bytes) = db
         .run({
             let did_key = did_key.clone();
-            move |db| {
-                db.repos
-                    .get(did_key)
-                    .inspect_err(crate::db::check_poisoned)
-                    .into_diagnostic()
-            }
+            move |db| db.repos.get(did_key).into_diagnostic()
         })
         .await?
     else {
@@ -94,10 +89,7 @@ pub(crate) async fn process_did(
         let evt = AccountEvt {
             did: did.clone(),
             active,
-            status: status
-                .is_empty()
-                .then_some(None)
-                .unwrap_or_else(|| Some(status.into())),
+            status: (!status.is_empty()).then(|| status.into()),
         };
         let _ = app_state
             .db
@@ -110,13 +102,7 @@ pub(crate) async fn process_did(
         let filter = app_state.filter.load();
         let sparse_supported = !filter.collections.is_empty()
             && sparse_probe_collection(&filter.collections).is_some();
-        let should_try_sparse = match strategy {
-            BackfillStrategy::Full => false,
-            BackfillStrategy::SparseFilter => sparse_supported,
-            BackfillStrategy::Auto => sparse_supported,
-        };
-
-        if should_try_sparse {
+        if sparse_supported {
             match process_did_sparse(
                 app_state,
                 http,
@@ -148,30 +134,7 @@ pub(crate) async fn process_did(
                     return Ok(Some(previous_state));
                 }
                 Ok(SparseBackfillResult::Discarded) => {
-                    let did_key = keys::repo_key(did);
-                    let metadata_key = keys::repo_metadata_key(did);
-                    let app_state_clone = app_state.clone();
-                    let did = did.clone();
-                    let pending_key = pending_key.clone();
-                    app_state_clone
-                        .db
-                        .run(move |db| {
-                            let mut txn = DbTxn::new(db);
-                            let applied = txn.transition_pending_key(
-                                &did,
-                                pending_key.as_ref(),
-                                GaugeState::Synced,
-                            )?;
-                            txn.batch.remove(&db.indexer.pending, pending_key);
-                            if applied {
-                                txn.batch.remove(&db.repos, &did_key);
-                                txn.batch.remove(&db.repo_metadata, &metadata_key);
-                                txn.counts.add_repos(-1);
-                            }
-                            txn.commit()
-                        })
-                        .await?;
-
+                    remove_discarded_repo(app_state, did, &pending_key).await?;
                     return Ok(None);
                 }
                 Ok(SparseBackfillResult::Skipped) => {
@@ -214,11 +177,10 @@ pub(crate) async fn process_did(
             let applied =
                 txn.transition_pending_key(did, pending_key.as_ref(), GaugeState::Synced)?;
             txn.batch.remove(&db.indexer.pending, pending_key.clone());
-            if applied {
-                if let Err(e) = crate::ops::delete_repo(&mut txn.batch, db, did, &state) {
-                    error!(err = %e, "failed to wipe repo during backfill");
-                }
-            }
+            let _ = applied
+                .then(|| crate::ops::delete_repo(&mut txn.batch, db, did, &state))
+                .and_then(Result::err)
+                .inspect(|e| error!(err = %e, "failed to wipe repo during backfill"));
             txn.commit()?;
             // return None so did_task skips sending BackfillFinished (nothing to drain for a deleted repo)
             return Ok(None);
@@ -385,48 +347,47 @@ pub(crate) async fn process_did(
 
             let mut signal_seen = filter.mode == FilterMode::Full || filter.signals.is_empty();
 
-            for ((key, cid), val_bytes) in records {
-                if let Some(val) = val_bytes {
-                    let (collection, rkey) = ops::parse_path(&key)?;
+            for ((key, cid), val) in
+                records.filter_map(|(leaf, value)| value.map(|value| (leaf, value)))
+            {
+                let (collection, rkey) = ops::parse_path(&key)?;
 
-                    if !filter.matches_collection(collection) {
-                        continue;
-                    }
-
-                    if !signal_seen && filter.matches_signal(collection) {
-                        debug!(collection = %collection, "signal matched");
-                        signal_seen = true;
-                    }
-
-                    let rkey = DbRkey::new(rkey);
-                    let path = (collection.to_smolstr(), rkey.clone());
-                    let cid_obj = AtCid::ipld(cid);
-
-                    *collection_counts.entry(path.0.clone()).or_default() += 1;
-
-                    // check if this record already exists with same CID
-                    let existing_cid = existing_cids.remove(&path);
-                    let action = if let Some(existing_cid) = &existing_cid {
-                        if existing_cid == cid_obj.as_str() {
-                            trace!(collection = %collection, rkey = %rkey, cid = %cid, "skip unchanged record");
-                            continue; // skip unchanged record
-                        }
-                        DbAction::Update
-                    } else {
-                        DbAction::Create
-                    };
-                    trace!(collection = %collection, rkey = %rkey, cid = %cid, ?action, "action record");
-
-                    record_txn.put_record(
-                        collection,
-                        &rkey,
-                        cid_obj.to_ipld().expect("valid cid"),
-                        &val,
-                        action,
-                    )?;
-
-                    count += 1;
+                if !filter.matches_collection(collection) {
+                    continue;
                 }
+
+                if !signal_seen && filter.matches_signal(collection) {
+                    debug!(collection = %collection, "signal matched");
+                    signal_seen = true;
+                }
+
+                let rkey = DbRkey::new(rkey);
+                let path = (collection.to_smolstr(), rkey.clone());
+                let cid_obj = AtCid::ipld(cid);
+
+                *collection_counts.entry(path.0.clone()).or_default() += 1;
+
+                let action = existing_cids.remove(&path).map_or(
+                    Some(DbAction::Create),
+                    |existing_cid| {
+                        (existing_cid != cid_obj.as_str()).then_some(DbAction::Update)
+                    },
+                );
+                let Some(action) = action else {
+                    trace!(collection = %collection, rkey = %rkey, cid = %cid, "skip unchanged record");
+                    continue;
+                };
+                trace!(collection = %collection, rkey = %rkey, cid = %cid, ?action, "action record");
+
+                record_txn.put_record(
+                    collection,
+                    &rkey,
+                    cid_obj.to_ipld().expect("valid cid"),
+                    &val,
+                    action,
+                )?;
+
+                count += 1;
             }
 
 
@@ -483,29 +444,7 @@ pub(crate) async fn process_did(
 
     let Some(count) = result else {
         // signal mode: no signal-matching records found, clean up the optimistically-added repo
-        let did_key = keys::repo_key(did);
-        let metadata_key = keys::repo_metadata_key(did);
-        let backfill_pending_key = pending_key.clone();
-        let app_state = app_state.clone();
-        let did = did.clone();
-        app_state
-            .db
-            .run(move |db| {
-                let mut txn = DbTxn::new(db);
-                let applied = txn.transition_pending_key(
-                    &did,
-                    backfill_pending_key.as_ref(),
-                    GaugeState::Synced,
-                )?;
-                txn.batch.remove(&db.indexer.pending, backfill_pending_key);
-                if applied {
-                    txn.batch.remove(&db.repos, &did_key);
-                    txn.batch.remove(&db.repo_metadata, &metadata_key);
-                    txn.counts.add_repos(-1);
-                }
-                txn.commit()
-            })
-            .await?;
+        remove_discarded_repo(app_state, did, &pending_key).await?;
         return Ok(None);
     };
 
@@ -522,6 +461,33 @@ pub(crate) async fn process_did(
 
     trace!("complete");
     Ok(Some(previous_state))
+}
+
+async fn remove_discarded_repo(
+    app_state: &Arc<AppState>,
+    did: &Did<'static>,
+    pending_key: &Slice,
+) -> Result<(), BackfillError> {
+    let did_key = keys::repo_key(did);
+    let metadata_key = keys::repo_metadata_key(did);
+    let did = did.clone();
+    let pending_key = pending_key.clone();
+    app_state
+        .db
+        .run(move |db| {
+            let mut txn = DbTxn::new(db);
+            let applied =
+                txn.transition_pending_key(&did, pending_key.as_ref(), GaugeState::Synced)?;
+            txn.batch.remove(&db.indexer.pending, pending_key);
+            if applied {
+                txn.batch.remove(&db.repos, &did_key);
+                txn.batch.remove(&db.repo_metadata, &metadata_key);
+                txn.counts.add_repos(-1);
+            }
+            txn.commit()
+        })
+        .await?;
+    Ok(())
 }
 
 /// upper bound on a buffered xrpc error body. error responses are tiny json objects; this only
@@ -607,8 +573,8 @@ async fn fetch_full_repo_car(
 
     // non-success: decode the (tiny) xrpc error body to preserve typed error handling.
     let retry_after = (status == StatusCode::TOO_MANY_REQUESTS)
-        .then(|| parse_retry_after(&resp))
-        .flatten();
+        .then_some(())
+        .and_then(|()| parse_retry_after(&resp));
     let body = collect_body_bounded(resp, ERROR_BODY_MAX_BYTES)
         .await
         .map_err(|e| BackfillError::Transport(e.to_string().into()))?

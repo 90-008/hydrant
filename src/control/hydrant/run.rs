@@ -52,7 +52,7 @@ impl Hydrant {
             #[cfg(feature = "indexer")]
             let sink_seed = crate::ingest::relay::sink::SinkSeed::new(indexer_tx.clone());
             #[cfg(not(feature = "indexer"))]
-            let sink_seed = crate::ingest::relay::sink::SinkSeed::default();
+            let sink_seed = crate::ingest::relay::sink::SinkSeed;
 
             // raw firehose events from pds/relay to RelayWorker.
             let (buffer_tx, relay_worker) = crate::ingest::relay::RelayWorker::new(
@@ -90,11 +90,13 @@ impl Hydrant {
             // 6. re-queue any repos that lost their backfill state, then start the retry worker
             #[cfg(feature = "indexer")]
             {
-                if let Err(e) = state.db.run({
-                    let state = state.clone();
-                    move |_db| crate::backfill::manager::queue_gone_backfills(&state)
-                })
-                .await
+                if let Err(e) = state
+                    .db
+                    .run({
+                        let state = state.clone();
+                        move |_db| crate::backfill::manager::queue_gone_backfills(&state)
+                    })
+                    .await
                 {
                     error!(err = %e, "failed to queue gone backfills");
                     db::check_poisoned_report(&e);
@@ -261,10 +263,7 @@ impl Hydrant {
             }
 
             // add persisted hosts
-            let persisted_sources = state.db.run({
-                move |db| load_persisted_firehose_sources(db)
-            })
-            .await?;
+            let persisted_sources = state.db.run(load_persisted_firehose_sources).await?;
             for source in &persisted_sources {
                 let _ = firehose
                     .known_sources
@@ -439,10 +438,7 @@ impl Hydrant {
                     let _ = crawler.tasks.insert_async(source.url.clone(), handle).await;
                 }
 
-                let persisted_sources = state.db.run({
-                    move |db| load_persisted_crawler_sources(db)
-                })
-                .await?;
+                let persisted_sources = state.db.run(load_persisted_crawler_sources).await?;
 
                 for source in &persisted_sources {
                     let _ = crawler.persisted.insert_async(source.url.clone()).await;
